@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterator
+
+from .paths import DEFAULT_DB, ensure_dirs
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+
+CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asin TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL DEFAULT 'amazon',
+    url TEXT,
+    title TEXT NOT NULL DEFAULT '',
+    brand TEXT NOT NULL DEFAULT '',
+    price REAL,
+    currency TEXT NOT NULL DEFAULT 'USD',
+    category TEXT NOT NULL DEFAULT '',
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    overview_json TEXT NOT NULL DEFAULT '[]',
+    about_json TEXT NOT NULL DEFAULT '[]',
+    images_json TEXT NOT NULL DEFAULT '[]',
+    options_json TEXT NOT NULL DEFAULT '{}',
+    rating REAL,
+    review_count INTEGER,
+    source_url TEXT,
+    list_page INTEGER,
+    raw_json TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    archived INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS import_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_key TEXT NOT NULL UNIQUE,
+    source_path TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    files_seen INTEGER NOT NULL DEFAULT 0,
+    rows_read INTEGER NOT NULL DEFAULT 0,
+    inserted INTEGER NOT NULL DEFAULT 0,
+    updated INTEGER NOT NULL DEFAULT 0,
+    duplicates INTEGER NOT NULL DEFAULT 0,
+    invalid INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'RUNNING',
+    error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS product_occurrences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    import_run_id INTEGER REFERENCES import_runs(id) ON DELETE SET NULL,
+    job_id TEXT,
+    source_file TEXT,
+    collected_at TEXT,
+    source_url TEXT,
+    list_page INTEGER,
+    UNIQUE(product_id, job_id, source_file)
+);
+
+CREATE TABLE IF NOT EXISTS stores (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    store_id TEXT NOT NULL UNIQUE,
+    store_name TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT '',
+    profile_json TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS store_product_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    store_id TEXT NOT NULL,
+    product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    fit_score REAL NOT NULL DEFAULT 0,
+    price_status TEXT NOT NULL,
+    risk_status TEXT NOT NULL,
+    auto_status TEXT NOT NULL,
+    final_status TEXT NOT NULL,
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    manual_override INTEGER NOT NULL DEFAULT 0,
+    memo TEXT NOT NULL DEFAULT '',
+    classified_at TEXT NOT NULL,
+    UNIQUE(store_id, product_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_products_price ON products(price);
+CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);
+CREATE INDEX IF NOT EXISTS idx_decisions_store_status ON store_product_decisions(store_id, final_status);
+CREATE INDEX IF NOT EXISTS idx_occurrence_job ON product_occurrences(job_id);
+"""
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def db_path(path: str | Path | None = None) -> Path:
+    ensure_dirs()
+    return Path(path) if path else DEFAULT_DB
+
+
+@contextmanager
+def connect(path: str | Path | None = None) -> Iterator[sqlite3.Connection]:
+    p = db_path(path)
+    con = sqlite3.connect(p)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys=ON")
+    try:
+        yield con
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def init_db(path: str | Path | None = None) -> Path:
+    p = db_path(path)
+    with connect(p) as con:
+        con.executescript(SCHEMA)
+    return p
+
+
+def upsert_store(profile: dict, path: str | Path | None = None) -> None:
+    required = {"store_id", "store_name", "category"}
+    missing = required - set(profile)
+    if missing:
+        raise ValueError(f"Missing store profile keys: {sorted(missing)}")
+    now = utc_now()
+    with connect(path) as con:
+        con.execute(
+            """
+            INSERT INTO stores(store_id, store_name, category, profile_json, created_at, updated_at)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(store_id) DO UPDATE SET
+                store_name=excluded.store_name,
+                category=excluded.category,
+                profile_json=excluded.profile_json,
+                enabled=1,
+                updated_at=excluded.updated_at
+            """,
+            (
+                profile["store_id"], profile["store_name"], profile.get("category", ""),
+                json.dumps(profile, ensure_ascii=False), now, now,
+            ),
+        )
+
+
+def get_store(store_id: str, path: str | Path | None = None) -> dict:
+    with connect(path) as con:
+        row = con.execute("SELECT profile_json FROM stores WHERE store_id=?", (store_id,)).fetchone()
+    if not row:
+        raise KeyError(f"Store profile not found: {store_id}")
+    return json.loads(row["profile_json"])

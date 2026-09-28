@@ -1,0 +1,20 @@
+{
+  "store_id": "002",
+  "store_name": "The Garage Fix",
+  "category": "garage_workshop",
+  "minimum_fit_score": 34,
+  "price_bands": [
+    {"name": "under_30", "min": 0, "max": 30, "status": "LOW_RESERVE"},
+    {"name": "30_to_50", "min": 30, "max": 50, "status": "RESERVE_B"},
+    {"name": "50_to_120", "min": 50, "max": 120, "status": "PRIMARY"},
+    {"name": "120_to_180", "min": 120, "max": 180, "status": "RESERVE_A"},
+    {"name": "180_plus", "min": 180, "max": null, "status": "HIGH_RESERVE"}
+  ],
+  "include_keywords": ["tool organizer", "garage storage", "pegboard", "wall storage", "magnetic tool", "cable reel", "parts organizer", "workbench organizer"],
+  "exclude_keywords": ["automotive engine", "medical"],
+  "risk_rules": [
+    {"code": "powered_tool", "status": "REVIEW", "terms": ["power drill", "circular saw", "angle grinder", "chainsaw"]},
+    {"code": "blade", "status": "REVIEW", "terms": ["knife", "blade", "machete"]},
+    {"code": "chemical", "status": "REVIEW", "terms": ["solvent", "aerosol", "paint thinner", "fuel additive"]}
+  ]
+}

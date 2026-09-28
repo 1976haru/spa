@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shop-source-studio"
+version = "0.1.0"
+description = "Local master sourcing database for multi-store Shopify operations"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{name = "1976haru"}]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+shopsource = "shopsource.cli:main"
+shopsource-gui = "shopsource.ui.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

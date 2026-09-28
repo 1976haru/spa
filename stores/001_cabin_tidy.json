@@ -1,0 +1,26 @@
+{
+  "store_id": "001",
+  "store_name": "Cabin Tidy",
+  "category": "auto_interior",
+  "minimum_fit_score": 34,
+  "price_bands": [
+    {"name": "under_30", "min": 0, "max": 30, "status": "LOW_RESERVE"},
+    {"name": "30_to_35", "min": 30, "max": 35, "status": "RESERVE_C"},
+    {"name": "35_to_40", "min": 35, "max": 40, "status": "RESERVE_B"},
+    {"name": "40_to_100", "min": 40, "max": 100, "status": "PRIMARY"},
+    {"name": "100_to_120", "min": 100, "max": 120, "status": "RESERVE_A"},
+    {"name": "120_plus", "min": 120, "max": null, "status": "HIGH_RESERVE"}
+  ],
+  "include_keywords": [
+    "organizer", "storage", "trunk", "console", "backseat", "seat back", "cup holder",
+    "gap filler", "car interior", "vehicle interior", "headrest hook", "cable organizer", "car trash"
+  ],
+  "exclude_keywords": ["motorcycle", "exterior", "engine", "tire", "headlight", "windshield motor"],
+  "risk_rules": [
+    {"code": "battery", "status": "REVIEW", "terms": ["lithium battery", "rechargeable battery", "battery pack"]},
+    {"code": "camera_gps", "status": "REVIEW", "terms": ["dash cam", "dashboard camera", "gps tracker", "tracking device"]},
+    {"code": "safety_critical", "status": "RESTRICTED", "terms": ["airbag", "seat belt extender", "seatbelt extender", "child car seat", "brake"]},
+    {"code": "chemical_liquid", "status": "REVIEW", "terms": ["aerosol", "cleaner spray", "cleaning spray", "liquid cleaner", "chemical cleaner"]},
+    {"code": "weapon_tactical", "status": "RESTRICTED", "terms": ["tactical knife", "self defense weapon", "pepper spray"]}
+  ]
+}

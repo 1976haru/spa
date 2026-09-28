@@ -1,0 +1,19 @@
+{
+  "store_id": "003",
+  "store_name": "Bathroom Sorted",
+  "category": "bathroom",
+  "minimum_fit_score": 34,
+  "price_bands": [
+    {"name": "under_25", "min": 0, "max": 25, "status": "LOW_RESERVE"},
+    {"name": "25_to_40", "min": 25, "max": 40, "status": "RESERVE_B"},
+    {"name": "40_to_90", "min": 40, "max": 90, "status": "PRIMARY"},
+    {"name": "90_to_120", "min": 90, "max": 120, "status": "RESERVE_A"},
+    {"name": "120_plus", "min": 120, "max": null, "status": "HIGH_RESERVE"}
+  ],
+  "include_keywords": ["shower organizer", "bathroom organizer", "toothbrush holder", "squeegee", "shower caddy", "under sink", "bathroom storage"],
+  "exclude_keywords": ["medicine", "supplement"],
+  "risk_rules": [
+    {"code": "chemical", "status": "REVIEW", "terms": ["bleach", "mold remover", "chemical cleaner", "aerosol"]},
+    {"code": "electrical_wet_area", "status": "REVIEW", "terms": ["electric", "rechargeable", "battery powered"]}
+  ]
+}
