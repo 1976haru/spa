@@ -1,0 +1,99 @@
+ShopSource Studio — Phase 1B / Spark Handoff Audit
+
+Repository:
+- local: D:\shop\001_so_amazon
+- remote: https://github.com/1976haru/spa.git
+- branch: main
+
+이번 작업은 직접 Amazon crawler를 만드는 작업이 아니다.
+사용자가 제공한 Spark 공식 사용법에서 다음 흐름이 확인됐다.
+
+Spark:
+1) 검색 결과 또는 상품 상세 링크로 소싱
+2) 데이터 관리 > 최근 작업 데이터 불러오기
+3) 데이터 관리 > 데이터 불러오기에서 기존 소싱 파일 선택 가능
+4) 업로드 전에 Shopify Location 선택
+5) 데이터 관리 > 업로드
+6) Spark 설정에는 store name / Shopify AccessToken / margin 설정 존재
+
+따라서 개발 방향을 'Spark Center API 추측'에서
+'Spark 공식 데이터 불러오기와 호환되는 handoff/export 계약을 먼저 검증'으로 수정한다.
+
+작업 시작 전 반드시:
+- git status
+- git branch --show-current
+- git remote -v
+- git pull --ff-only
+- git log --oneline -8
+
+그리고 다음 문서를 전부 읽어라:
+- AGENTS.md
+- CLAUDE.md
+- docs/MASTER_SPEC.md
+- docs/SPARK_INTEGRATION.md
+- docs/ROADMAP.md
+- docs/DATABASE.md
+- docs/STORE_PROFILE.md
+- docs/VALIDATION_STORAGE.md
+
+중요 원칙:
+- 가격 때문에 상품을 삭제하지 않는다.
+- $35 상품도 MASTER DB에 보존한다.
+- Store Profile의 price band를 바꾸면 재수집 없이 상태가 바뀌어야 한다.
+- ASIN은 MASTER Product 1개, 수집 이력은 occurrence로 보존한다.
+- 위험상품도 삭제보다 REVIEW/RESTRICTED + reason으로 보존한다.
+- Spark 파일 원본은 읽기 전용으로 취급한다.
+- exact Spark import file contract가 확인되기 전에는 임의 스키마를 만들어 'Spark compatible'이라고 부르지 않는다.
+- Spark 내부 DB 조작, undocumented server endpoint, 인증 우회, CAPTCHA/차단 우회 금지.
+- 실제 AccessToken, credential, 실제 상품 DB를 Git에 커밋 금지.
+
+이번 Phase 1B에서 할 일:
+
+A. 현재 코드 감사
+1. Spark storage ZIP/folder importer가 데이터 원본을 손상시키지 않는지 확인.
+2. datasets의 JSON만 쓰는지, 다른 storage 구성요소를 무시해도 현재 import에는 문제 없는지 문서화.
+3. export 모듈을 찾아 현재 CSV/JSON export와 향후 SparkHandoffConnector의 경계를 정리.
+4. Connector 인터페이스가 없다면 최소한의 추상 인터페이스/프로토콜만 추가하되 실제 Spark write 구현은 하지 마라.
+5. 향후 '원본 Spark sample -> schema probe -> subset export -> round-trip verification' 테스트를 넣을 수 있는 구조로 정리.
+
+B. Round-trip 준비 기능
+1. 사용자가 Spark '데이터 불러오기'에 실제로 쓰는 샘플 파일/폴더를 나중에 넣을 수 있는 fixtures 디렉터리와 README를 준비.
+2. sample이 없으면 테스트는 skip 처리하고, 형식을 추측하지 마라.
+3. schema probe/report 기능을 추가할 수 있으면 구현:
+   - 파일/폴더 목록
+   - JSON key summary
+   - 필드 타입/누락률
+   - 상품 수
+   - unique ASIN
+   - duplicate count
+   단, 원본 파일 수정 금지.
+4. subset selection/export 계획을 코드/문서에 명확히 남겨라.
+5. Export manifest에는 store_id, source job, product count, ASIN list hash, created_at, schema version 정도를 포함할 수 있게 설계.
+
+C. 기존 핵심 보존 검증
+1. $40~100 -> $30~120로 price bands 변경 후 기존 RESERVE가 PRIMARY로 승격되는 테스트.
+2. 낮은 가격 상품이 MASTER에서 삭제되지 않는 테스트.
+3. manual override가 reclassify 이후에도 유지되는 테스트.
+4. 반복 import idempotency 테스트.
+5. Windows 한글/공백 경로 테스트.
+
+D. 테스트
+- python -m compileall -q src tests
+- pytest -q
+- git diff --check
+
+완료 보고 형식:
+- 현재 구조 진단
+- Spark manual 반영 내용
+- 수정한 파일
+- 새로 추가한 Connector/Schema probe 구조
+- 테스트 결과
+- 아직 모르는 Spark import 계약
+- 사용자가 다음에 제공해야 할 샘플
+- v0.2 Round-trip에서 할 일
+- commit SHA
+
+이번 Phase에서는 실제 Spark-compatible export를 완성했다고 주장하면 안 된다.
+실제 Spark '데이터 불러오기' 샘플 계약과 round-trip PASS가 있어야만 compatible로 승격한다.
+
+변경은 commit하고 origin/main까지 push하라.
