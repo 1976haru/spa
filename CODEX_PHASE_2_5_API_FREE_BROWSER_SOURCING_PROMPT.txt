@@ -1,0 +1,1130 @@
+ShopSource Studio — Phase 2.5 / API-Free Browser Sourcing + Spark Ready Pipeline
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+
+==================================================
+0. 목표
+==================================================
+
+사용자는 Keepa 등 유료 API 없이도
+Spark Center에 올릴 수 있는 상품자료를 완성하고 싶어 한다.
+
+이번 Phase의 최종 운영 흐름:
+
+Store 선택
+→ Keyword Studio 추천 주제어
+→ Amazon 검색 열기
+→ ShopSource Capture 확장으로 현재 검색결과 가져오기
+→ 선택 상품 상세 보강
+→ MASTER
+→ 현재 Store 자동 분류
+→ PRIMARY 검토
+→ Spark Center 업로드 package 생성
+→ ready/<package_id> 폴더 수동 업로드
+
+중요:
+이번 Phase의 목표는 "API key 없이도 실제 자료를 완성하는 것"이다.
+
+단:
+- CAPTCHA 우회 금지
+- WAF 우회 금지
+- stealth/proxy rotation 금지
+- Amazon cookie/session/localStorage 수집 금지
+- undocumented endpoint 사용 금지
+- 로그인 자격증명/authorization header 수집 금지
+
+==================================================
+1. 작업 시작
+==================================================
+
+반드시:
+
+git status
+git pull --ff-only
+git log --oneline -10
+
+working tree clean 확인.
+
+먼저 읽기:
+
+AGENTS.md
+CLAUDE.md
+README.md
+docs/MASTER_SPEC.md
+docs/ARCHITECTURE.md
+docs/DATABASE.md
+docs/STORE_PROFILE.md
+docs/AUTO_SOURCING.md
+docs/KEYWORD_INTELLIGENCE.md
+docs/UI_V2.md
+docs/SPARK_INTEGRATION.md
+docs/ROADMAP.md
+
+핵심 코드:
+
+src/shopsource/ui/v2.py
+src/shopsource/ui/v2_service.py
+src/shopsource/intelligence/
+src/shopsource/importer.py
+src/shopsource/db.py
+src/shopsource/sourcing/mapping.py
+src/shopsource/connectors/spark_handoff.py
+src/shopsource/connectors/spark_center_package.py
+
+기존 Phase 2.4 UI V2와 Keepa 자동 소싱은 유지한다.
+Keepa는 선택적 유료 자동화 기능으로 남긴다.
+
+==================================================
+2. 아키텍처
+==================================================
+
+새 기능은 다음 4개 층으로 분리한다.
+
+A. Browser Extension
+browser_extension/shopsource_capture/
+
+B. Local Capture Bridge
+src/shopsource/capture/
+  bridge.py
+  models.py
+  amazon_parser.py
+  service.py
+  validation.py
+
+C. MASTER ingestion
+기존 importer / DB / classifier 재사용
+
+D. Spark-compatible export
+기존 SparkHandoffConnector / SparkCenterPackageService 재사용
+
+브라우저 확장은 Amazon 페이지에서 보이는 상품정보만 추출하고
+localhost ShopSource에 전달한다.
+
+==================================================
+3. Browser Extension
+==================================================
+
+Chrome/Edge Manifest V3 확장을 만든다.
+
+경로:
+
+browser_extension/shopsource_capture/
+
+필수 파일 예:
+
+manifest.json
+background.js
+content_search.js
+content_product.js
+popup.html
+popup.js
+options.html
+options.js
+README.md
+
+지원 브라우저:
+- Microsoft Edge
+- Google Chrome
+
+확장 설치 방식:
+개발자 모드 → 압축해제된 확장 로드
+
+CRX 자동 설치/강제 설치는 하지 않는다.
+
+==================================================
+4. 권한 최소화
+==================================================
+
+Manifest 권한은 최소화.
+
+host_permissions:
+
+https://www.amazon.com/*
+http://127.0.0.1:8081/*
+
+필요시 localhost port를 설정 가능하게 한다.
+
+금지 권한:
+- cookies
+- webRequest blocking
+- history
+- passwords
+- downloads 전체 접근
+- proxy
+- nativeMessaging
+
+chrome.storage.local은
+localhost bridge URL과 pairing token 저장에만 사용.
+
+Amazon cookie, session token, 인증값은 저장 금지.
+
+==================================================
+5. Local Capture Bridge
+==================================================
+
+UI V2 서버가 이미 127.0.0.1:8081에서 동작하므로
+동일 NiceGUI/FastAPI app에 localhost-only API를 추가하는 것을 우선한다.
+
+예:
+
+GET  /api/capture/health
+POST /api/capture/search-results
+POST /api/capture/product-detail
+POST /api/capture/heartbeat
+
+외부 interface에 bind하지 마라.
+
+기본:
+127.0.0.1 only.
+
+==================================================
+6. Pairing token
+==================================================
+
+브라우저 확장이 아무 웹페이지에서나 localhost DB에 쓰지 못하도록
+간단한 local pairing token을 사용한다.
+
+ShopSource Settings 화면:
+
+[브라우저 캡처 연결]
+Pairing code: XXXXXXXX
+[새 코드 만들기]
+[복사]
+
+Extension options:
+ShopSource URL
+Pairing code
+[연결 테스트]
+
+HTTP header 예:
+
+X-ShopSource-Pairing: <token>
+
+이 token은 외부 credential이 아니다.
+하지만 Git에 commit하지 마라.
+
+DB app_settings 또는 로컬 ignored settings에 보존 가능.
+
+==================================================
+7. Amazon Search Result Capture
+==================================================
+
+사용자가 Amazon 검색결과 페이지를 열었을 때
+확장이 현재 페이지에 작은 ShopSource control을 제공한다.
+
+버튼:
+
+[현재 검색결과 ShopSource로 가져오기]
+
+현재 페이지에 실제 표시된 search result card만 읽는다.
+
+1차 DOM selector:
+
+[data-component-type="s-search-result"][data-asin]
+
+각 card에서 가능한 값:
+
+asin
+title
+url
+price
+image
+rating
+reviewCount
+sponsored 여부
+capturedAt
+sourceSearchUrl
+pageNumber
+
+selector는 한 곳에 상수화.
+
+값이 없으면 null.
+
+절대 임의 값 생성 금지.
+
+==================================================
+8. Search JSON payload
+==================================================
+
+Bridge로 보낼 형식:
+
+{
+  "source_kind": "BROWSER_CAPTURE_SEARCH",
+  "marketplace": "US",
+  "search_url": "...",
+  "keyword": "...",
+  "captured_at": "...",
+  "products": [
+    {
+      "asin": "...",
+      "title": "...",
+      "url": "...",
+      "price": 39.99,
+      "images": ["..."],
+      "rating": 4.5,
+      "reviewCount": 1234,
+      "_sourceUrl": "...",
+      "_listPage": 1,
+      "_collectedAt": "..."
+    }
+  ]
+}
+
+==================================================
+9. Sponsored products
+==================================================
+
+sponsored 여부를 식별할 수 있으면 기록한다.
+
+기본 운영:
+sponsored 결과도 자동 삭제하지 않는다.
+
+candidate metadata:
+sponsored = true/false/null
+
+Store classifier에는 직접 영향을 주지 않는다.
+
+UI filter에서 sponsored 제외 가능하게 한다.
+
+==================================================
+10. Product Detail Capture
+==================================================
+
+Amazon 상품 상세 페이지에서:
+
+[이 상품 ShopSource로 가져오기]
+
+버튼 제공.
+
+가능하면 먼저 JSON-LD 구조화 데이터를 확인하고,
+그 다음 DOM selector fallback 사용.
+
+최소 필드:
+
+asin
+url
+title
+brand
+price
+category
+overview
+aboutThis
+images
+rating
+reviewCount
+options
+quantity
+_sourceUrl
+_listPage
+_collectedAt
+
+가능하면:
+manufacturer
+availability
+selected_variant
+breadcrumb
+
+도 metadata로 보존 가능.
+
+==================================================
+11. JSON-LD 우선
+==================================================
+
+script[type="application/ld+json"] 중 Product schema를 먼저 파싱.
+
+JSON-LD에서:
+name
+image
+brand
+offers.price
+aggregateRating
+sku/asin 유사값
+
+등을 읽는다.
+
+ASIN identity는:
+1. Amazon URL /dp/<ASIN>
+2. #ASIN input
+3. page embedded ASIN
+순으로 보강.
+
+ASIN이 없으면 저장 금지.
+
+==================================================
+12. DOM fallback
+==================================================
+
+대표 selector를 centralized selector map으로 관리.
+
+예:
+
+title:
+#productTitle
+
+brand:
+#bylineInfo
+
+price:
+#corePrice_feature_div .a-offscreen
+.a-price .a-offscreen
+
+bullets:
+#feature-bullets li span
+
+category:
+#wayfinding-breadcrumbs_feature_div a
+
+rating:
+#acrPopover
+.a-icon-alt
+
+review count:
+#acrCustomerReviewText
+
+images:
+#landingImage
+[data-a-dynamic-image]
+
+options:
+#twister
+
+Amazon HTML 변화에 대비하여
+selector fallback list를 사용한다.
+
+파싱 실패는 오류로 기록하고 앱 전체를 중단하지 않는다.
+
+==================================================
+13. 옵션/variation
+==================================================
+
+options는 가능한 범위만 추출한다.
+
+예:
+color
+size
+style
+pattern
+
+선택된 옵션 + 화면에 노출된 가능한 option labels.
+
+모든 variation ASIN 자동 탐색은 이번 Phase에서 하지 않는다.
+
+==================================================
+14. 이미지
+==================================================
+
+이미지 binary는 다운로드하지 않는다.
+
+페이지에 노출된 Amazon image URL만 저장한다.
+
+가능하면 고해상도 URL을 DOM data attribute에서 선택.
+
+상품 이미지의 사용권/재사용 조건은 별도 확인 필요하다는
+기존 경고 유지.
+
+==================================================
+15. 금지 데이터 검사
+==================================================
+
+확장과 bridge 둘 다 아래를 절대 읽거나 저장하지 않는다.
+
+document.cookie
+localStorage의 Amazon token
+sessionStorage의 Amazon token
+Authorization
+AWS/WAF token
+password
+account id
+shipping address
+user profile
+order history
+
+payload에 민감키가 들어오면 server validation에서 REJECT.
+
+==================================================
+16. CAPTCHA / robot check
+==================================================
+
+Amazon page title/body에:
+
+captcha
+robot check
+enter the characters you see
+
+등이 감지되면
+capture를 즉시 중단한다.
+
+UI:
+
+"Amazon에서 확인 화면이 감지되었습니다.
+브라우저에서 직접 확인한 뒤 다시 시도하세요."
+
+우회 구현 금지.
+
+==================================================
+17. API-Free Candidate Queue
+==================================================
+
+새 DB table 권장:
+
+browser_capture_runs
+- id
+- run_id
+- store_id
+- keyword
+- search_url
+- status
+- captured_at
+- candidates
+- detailed
+- completed
+
+browser_capture_candidates
+- id
+- run_id
+- asin
+- search_payload_json
+- detail_payload_json
+- completeness_score
+- capture_status
+- selected
+- created_at
+- updated_at
+
+capture_status:
+
+SEARCH_CAPTURED
+NEEDS_DETAIL
+DETAIL_COMPLETE
+MASTER_IMPORTED
+REJECTED
+ERROR
+
+ASIN UNIQUE는 run 내 기준.
+
+==================================================
+18. Completeness Score
+==================================================
+
+Spark Center package 준비도를 보여주는 completeness score를 만든다.
+
+예:
+
+ASIN        필수
+title       필수
+url         10
+price       15
+image       15
+brand       10
+category    10
+aboutThis   10
+overview    10
+rating      5
+reviewCount 5
+options     5
+기타        5
+
+정확한 weight는 상수로 분리.
+
+필수 asin/title 없으면 0.
+
+예:
+Search result capture만 하면 45~65점.
+Detail capture 후 80~100점.
+
+UI에서는:
+
+자료 준비도 92%
+
+처럼 표시.
+
+==================================================
+19. MASTER Import 기준
+==================================================
+
+Search capture 단계에서도 MASTER candidate로 임시 저장할 수 있지만
+정식 MASTER import는 기본적으로 DETAIL_COMPLETE 권장.
+
+단:
+기존 MASTER 원칙상 불완전 상품을 삭제하지 않는다.
+
+상세가 부족하면:
+REVIEW / SOURCE_INCOMPLETE
+
+등으로 보존.
+
+==================================================
+20. source_kind
+==================================================
+
+새 source_kind:
+
+BROWSER_CAPTURE
+
+products.source:
+amazon_browser
+
+product_occurrences.source_kind:
+BROWSER_CAPTURE
+
+occurrence raw_json은
+Spark-compatible canonical payload를 저장.
+
+별도 capture raw metadata는 browser_capture_candidates에 보존.
+
+==================================================
+21. Spark-compatible canonical builder
+==================================================
+
+새 함수:
+
+browser_capture_to_spark_payload(...)
+
+필드:
+
+url
+asin
+title
+brand
+price
+options
+quantity
+tags
+category
+overview
+aboutThis
+images
+rating
+reviewCount
+_sourceUrl
+_listPage
+_collectedAt
+
+현재 Spark handoff가 이미 검증한 field surface와 맞춘다.
+
+값이 없으면:
+null / [] / {}
+
+사용.
+
+가짜 값 생성 금지.
+
+==================================================
+22. SparkHandoff source-aware export
+==================================================
+
+현재:
+
+SPARK_STORAGE
+KEEPA
+
+분기 외에:
+
+BROWSER_CAPTURE
+
+추가.
+
+BROWSER_CAPTURE raw payload가 이미 Spark-compatible canonical이면
+그 payload 사용.
+
+capability string:
+
+BROWSER_CAPTURE_TO_SPARK_MAPPING_UNVERIFIED
+
+실제 Spark Center round-trip 전까지 유지.
+
+==================================================
+23. Keyword Studio → Amazon 검색
+==================================================
+
+UI V2 Keyword Studio에서 각 추천 keyword 옆에:
+
+[Amazon 검색 열기]
+
+추가.
+
+URL:
+https://www.amazon.com/s?k=<urlencoded keyword>
+
+사용자 기본 브라우저에서 연다.
+
+추가:
+
+[선택 검색어 모두 열기]
+
+최대 5개 제한.
+
+한꺼번에 수십 탭 열지 마라.
+
+==================================================
+24. 무료 소싱 페이지
+==================================================
+
+Sourcing 화면에 모드를 명확히 분리.
+
+[무료 브라우저 소싱]
+API 필요 없음
+
+[Keepa 자동 소싱]
+Keepa API 필요
+
+[소싱 파일 가져오기]
+API 필요 없음
+
+기본 탭:
+무료 브라우저 소싱
+
+Keepa가 없다고 프로그램 핵심 기능이 막히면 안 된다.
+
+==================================================
+25. 무료 브라우저 소싱 UI
+==================================================
+
+표시:
+
+Store
+추천 keyword
+브라우저 확장 연결 상태
+최근 capture
+Candidates
+Needs Detail
+Detail Complete
+MASTER Imported
+
+버튼:
+
+[확장 연결 확인]
+[Amazon 검색 열기]
+[후보 새로고침]
+[선택 상세 보강]
+[MASTER로 보내기]
+
+==================================================
+26. 상세 보강 방식
+==================================================
+
+사용자 시작형 workflow.
+
+선택 candidate 최대 5개:
+
+[선택 상세 보강]
+
+클릭 시 해당 Amazon detail page를 새 탭으로 연다.
+
+처음 구현은:
+사용자가 각 탭에서 확장의
+[이 상품 ShopSource로 가져오기]
+버튼을 누르게 해도 된다.
+
+선택적 개선:
+ShopSource가 연 tab에 capture marker query를 붙이고
+extension이 marker를 감지해 자동 capture 후 성공 표시.
+
+단:
+- max 5 tab
+- CAPTCHA 감지 즉시 중단
+- background page flood 금지
+- infinite auto traversal 금지
+
+==================================================
+27. Search page batch
+==================================================
+
+현재 Amazon search page 하나에서
+visible result 전부 capture.
+
+페이지네이션 자동 순회는 이번 Phase 기본 기능으로 하지 않는다.
+
+사용자가 다음 페이지로 이동 후
+다시 [현재 검색결과 가져오기].
+
+향후 필요하면 별도 controlled phase.
+
+==================================================
+28. Duplicate 처리
+==================================================
+
+동일 ASIN이 여러 keyword/search page에 나와도:
+
+MASTER = 1개.
+
+capture evidence는 여러 개 보존 가능.
+
+candidate table에서:
+seen_count
+keywords
+search_urls
+를 aggregate 가능.
+
+==================================================
+29. 자동 분류
+==================================================
+
+MASTER import 후 현재 Store 자동 classify.
+
+결과:
+
+PRIMARY
+RESERVE_A/B/C
+LOW/HIGH
+REVIEW
+RESTRICTED
+
+기존 classifier 그대로 사용.
+
+==================================================
+30. Spark Center package
+==================================================
+
+무료 브라우저 소싱으로 수집된 상품도
+기존 Spark Center package 화면에서 동일하게 사용 가능해야 한다.
+
+최종 흐름 테스트:
+
+5 detail-complete products
+→ MASTER
+→ classify
+→ PRIMARY 또는 사용자가 선택한 상태
+→ Spark Center 폴더 만들기
+→ ready/<package_id>
+→ JSON 5개
+
+Validation PASS.
+
+==================================================
+31. 실제 Spark Center 테스트 준비
+==================================================
+
+Package manifest/report에 source mix 추가 권장:
+
+source_kinds:
+{
+  "BROWSER_CAPTURE": 5
+}
+
+browser capture mapping capability:
+BROWSER_CAPTURE_TO_SPARK_MAPPING_UNVERIFIED
+
+실제 Spark Center 포털이 5상품을 정상 인식하면
+후속 Phase에서 VERIFIED로 승격.
+
+==================================================
+32. Extension 설치 UX
+==================================================
+
+Settings > 브라우저 캡처:
+
+1. [확장 폴더 열기]
+2. Edge 설치 안내
+3. Chrome 설치 안내
+4. Pairing code
+5. [연결 테스트]
+
+README에 매우 친절하게:
+
+Edge:
+edge://extensions
+→ 개발자 모드
+→ 압축해제된 확장 로드
+→ browser_extension/shopsource_capture 선택
+
+Chrome:
+chrome://extensions
+→ 개발자 모드
+→ 압축해제된 확장 로드
+
+==================================================
+33. Pairing/health
+==================================================
+
+Extension popup:
+
+ShopSource Studio
+연결: 정상 / 연결 안 됨
+현재 페이지: 검색 / 상품 / 기타
+
+검색페이지:
+[현재 검색결과 가져오기]
+
+상품페이지:
+[이 상품 가져오기]
+
+기타:
+지원하지 않는 페이지
+
+==================================================
+34. Error UX
+==================================================
+
+에러 메시지는 사용자용 한국어로.
+
+예:
+
+- ShopSource UI V2가 실행 중이 아닙니다.
+- Pairing code가 맞지 않습니다.
+- Amazon 검색결과를 찾지 못했습니다.
+- ASIN을 확인할 수 없습니다.
+- CAPTCHA/Robot Check가 감지되었습니다.
+- 상품 상세정보가 부족합니다.
+- 이미 가져온 상품이며 최신 정보로 보강했습니다.
+
+==================================================
+35. 테스트
+==================================================
+
+Python unit:
+
+- pairing auth
+- health
+- search payload validation
+- detail payload validation
+- sensitive key rejection
+- ASIN normalization
+- dedupe
+- completeness score
+- browser_capture_to_spark_payload
+- MASTER upsert
+- occurrence
+- auto classify
+- Spark package regression
+
+JS parser:
+가능하면 fixture HTML 기반 테스트.
+
+synthetic HTML fixture만 사용.
+실제 Amazon HTML dump를 Git에 넣지 마라.
+
+필수 parser test:
+
+- search result 2개
+- product JSON-LD
+- product DOM fallback
+- missing price
+- missing image
+- malformed rating
+- CAPTCHA page
+- sensitive field absent
+
+==================================================
+36. 보안
+==================================================
+
+확장은:
+
+Amazon 상품 페이지 정보
+→ localhost ShopSource
+
+외의 외부 전송을 하지 않는다.
+
+Analytics/telemetry 금지.
+
+API key 없음.
+
+Cookie access permission 없음.
+
+localhost server는 127.0.0.1만.
+
+pairing token required.
+
+==================================================
+37. 성능
+==================================================
+
+search result capture:
+현재 페이지 visible cards만.
+
+detail:
+최대 5개 사용자 시작형.
+
+DB:
+batch transaction.
+
+UI:
+background task.
+
+대량 30,000개 자동 브라우저 크롤링은 이번 Phase 범위 아님.
+
+==================================================
+38. 현실적 한계 문서화
+==================================================
+
+docs/API_FREE_SOURCING.md 생성.
+
+명시:
+
+- API 비용 없음
+- 브라우저에서 사용자가 보는 Amazon 페이지를 캡처
+- Amazon HTML 변경 시 selector maintenance 필요
+- CAPTCHA 우회하지 않음
+- 대규모 완전무인 30,000개 자동 수집용은 아님
+- 대규모 무인 자동화는 Keepa 같은 provider가 더 안정적
+- Spark Center portal compatibility는 실제 5상품 업로드로 검증 필요
+
+==================================================
+39. UI 우선순위
+==================================================
+
+현재 Sourcing 화면 상단에:
+
+소싱 방식
+
+○ 무료 브라우저 소싱 (추천 / API 없음)
+○ Keepa 자동 소싱 (유료 API)
+○ 파일 가져오기
+
+표시.
+
+현재 Keepa API 설정이 없어도
+"무료 브라우저 소싱"은 정상 작동.
+
+==================================================
+40. Phase 완료 조건
+==================================================
+
+A.
+UI V2에서 Cabin Tidy 선택.
+
+B.
+Keyword Studio 추천 keyword에서
+Amazon 검색 열기 가능.
+
+C.
+Edge/Chrome extension 연결 PASS.
+
+D.
+Amazon search page의 visible product 후보를 ShopSource에 capture.
+
+E.
+상품 상세 5개 capture.
+
+F.
+5개 MASTER 저장.
+
+G.
+Store classify.
+
+H.
+Spark Center package 5개 생성.
+
+I.
+ready/<package_id>에 Spark-compatible JSON 5개.
+
+J.
+Validation PASS.
+
+실제 Spark Center portal upload는 사용자 수동 테스트로 남긴다.
+
+==================================================
+41. 기존 기능 보존
+==================================================
+
+절대 깨뜨리지 말 것:
+
+- Tkinter UI
+- UI V2
+- Keepa sourcing
+- Source Inbox
+- Spark import
+- MASTER DB
+- classifier
+- manual override
+- package history
+- Spark handoff
+- Spark Center package
+- CLI
+
+==================================================
+42. 테스트 명령
+==================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+UI:
+shopsource-ui-v2 --help
+
+CLI 기존 회귀:
+shopsource --help
+shopsource source-auto --store 001 --dry-run
+shopsource spark-center-package --help
+
+Browser capture bridge smoke:
+GET /api/capture/health
+잘못된 pairing → 401/403
+올바른 pairing → PASS
+
+Synthetic payload:
+search result 5개
+→ detail 5개
+→ MASTER
+→ classify
+→ Spark package
+end-to-end PASS.
+
+==================================================
+43. 문서
+==================================================
+
+추가:
+
+docs/API_FREE_SOURCING.md
+browser_extension/shopsource_capture/README.md
+
+업데이트:
+
+README.md
+docs/ARCHITECTURE.md
+docs/DATABASE.md
+docs/ROADMAP.md
+docs/UI_V2.md
+THIRD_PARTY_LICENSES.md
+
+==================================================
+44. Commit / Push
+==================================================
+
+모든 테스트 PASS 후:
+
+git add -A
+git commit -m "Add API-free browser sourcing pipeline"
+git push origin main
+
+마지막:
+
+git status
+git log --oneline -7
+git rev-list --left-right --count main...origin/main
+
+working tree clean
+main...origin/main = 0 0
+
+==================================================
+45. 완료 보고
+==================================================
+
+[1] 구현 개요
+[2] API 없이 가능한 운영 흐름
+[3] Browser Extension 구조
+[4] Local Capture Bridge
+[5] Amazon Search parser
+[6] Product Detail parser
+[7] 민감정보 보호
+[8] CAPTCHA 처리
+[9] Completeness Score
+[10] MASTER import
+[11] Store classify
+[12] Spark-compatible mapping
+[13] UI V2 변경
+[14] Extension 설치방법
+[15] Tests
+[16] 실제 Amazon 페이지 live 테스트 여부
+[17] Spark Center package 생성 결과
+[18] 아직 미검증
+[19] 다음 사용자가 할 실제 테스트
+[20] commit SHA
+
+지금 바로 Phase 2.5를 구현하라.
