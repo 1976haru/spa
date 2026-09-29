@@ -73,6 +73,25 @@
 - [ ] 5개 → 50개 → 500개 단계별 live test
 - [ ] 30,000개/Store 확장 benchmark 전에는 대규모 실행 금지
 
+
+## v0.2.4 SOURCING INTELLIGENCE + OPERATOR UI V2 — 다음
+- [ ] Store Profile 기반 '검색 주제어 추천' 엔진
+- [ ] 기존 recipe + Keepa 결과 제목에서 후보 키워드/2~4그램 추출
+- [ ] KeyBERT / sentence-transformers 기반 의미 적합도 점수
+- [ ] RapidFuzz 기반 유사 키워드/중복 정리
+- [ ] Keepa Product Finder로 추천 주제어 후보수·가격대·위험률 검증
+- [ ] 추천 주제어별 근거/예상 효율/위험도/추가 버튼
+- [ ] Store 생성 Wizard: 샵 콘셉트 → 가격대/키워드/제외어/recipe 초안
+- [ ] Tkinter backend/service는 유지하고 신규 UI v2를 별도 구현
+- [ ] UI v2 1차 후보: NiceGUI + AG Grid Community
+- [ ] 좌측 내비게이션: 대시보드/스토어/소싱/상품/패키지/기록/설정
+- [ ] 상품 Grid: 썸네일/ASIN/가격/Fit/Risk/Status/Source + 검색/필터/정렬/페이지네이션/다중선택
+- [ ] bulk actions: 상태 변경/수동 승격·강등/패키지 후보 추가
+- [ ] Keepa API key Windows Credential Manager 저장 옵션
+- [ ] 현재 Tkinter GUI는 안정화 기간 동안 fallback으로 유지
+- [ ] SQLite는 OLTP 원장으로 유지; 대규모 분석 필요 시 DuckDB/Polars sidecar 검토
+- [ ] 001 Cabin Tidy에서 Keyword Studio → 자동소싱 → MASTER → Spark Center package end-to-end 검증
+
 ## v0.3 STORE ENGINE
 - [ ] UI에서 가격구간 직접 편집
 - [ ] Store 추가/복제/비활성
