@@ -13,12 +13,13 @@
 - [x] 3개 Store Profile 예제
 - [x] Spark 공식 사용법 기준 handoff 전략 문서화
 
-## v0.1.1 STABILITY AUDIT — 다음
-- [ ] 대량 import idempotency 검증
-- [ ] 수동 override 보존 검증
-- [ ] Windows 한글/공백 경로 검증
-- [ ] DB 인덱스/트랜잭션/배치 성능 점검
-- [ ] Git에 실제 상품 DB/credential이 포함되지 않는지 점검
+## v0.1.1 STABILITY AUDIT — Phase 1B
+- [x] import idempotency 회귀 테스트
+- [x] 수동 override 보존/해제 검증
+- [x] Windows 한글/공백 경로 및 ZIP/폴더 테스트
+- [x] DB 인덱스/트랜잭션/streaming 분류 점검
+- [x] Git에 실제 상품 DB/credential이 포함되지 않는지 점검
+- [x] 읽기 전용 schema probe와 malformed import report
 
 ## v0.2 SPARK HANDOFF MVP
 - [ ] Spark '데이터 관리 > 데이터 불러오기'에 사용하는 실제 원본 샘플 확보

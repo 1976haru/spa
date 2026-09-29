@@ -66,6 +66,16 @@ CREATE TABLE IF NOT EXISTS product_occurrences (
     UNIQUE(product_id, job_id, source_file)
 );
 
+CREATE TABLE IF NOT EXISTS import_errors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_run_id INTEGER NOT NULL REFERENCES import_runs(id) ON DELETE CASCADE,
+    job_id TEXT,
+    source_file TEXT,
+    error_code TEXT NOT NULL,
+    error_message TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS stores (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     store_id TEXT NOT NULL UNIQUE,
@@ -96,7 +106,11 @@ CREATE TABLE IF NOT EXISTS store_product_decisions (
 CREATE INDEX IF NOT EXISTS idx_products_price ON products(price);
 CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);
 CREATE INDEX IF NOT EXISTS idx_decisions_store_status ON store_product_decisions(store_id, final_status);
+CREATE INDEX IF NOT EXISTS idx_decisions_product ON store_product_decisions(product_id);
 CREATE INDEX IF NOT EXISTS idx_occurrence_job ON product_occurrences(job_id);
+CREATE INDEX IF NOT EXISTS idx_occurrence_product ON product_occurrences(product_id);
+CREATE INDEX IF NOT EXISTS idx_occurrence_import_run ON product_occurrences(import_run_id);
+CREATE INDEX IF NOT EXISTS idx_import_errors_run ON import_errors(import_run_id);
 """
 
 
@@ -115,6 +129,7 @@ def connect(path: str | Path | None = None) -> Iterator[sqlite3.Connection]:
     con = sqlite3.connect(p)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA busy_timeout=5000")
     try:
         yield con
         con.commit()

@@ -10,6 +10,18 @@ from typing import Iterable, Iterator
 from .base import ProductSourceConnector
 
 
+def _safe_extract(zf: zipfile.ZipFile, destination: Path) -> None:
+    """Extract only members that stay below destination (Zip Slip protection)."""
+    root = destination.resolve()
+    for member in zf.infolist():
+        target = (root / member.filename).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"Unsafe ZIP member path: {member.filename}") from exc
+    zf.extractall(root)
+
+
 @contextmanager
 def materialize_source(source: Path) -> Iterator[Path]:
     if source.is_dir():
@@ -19,7 +31,7 @@ def materialize_source(source: Path) -> Iterator[Path]:
         raise ValueError("Spark source must be a storage directory or .zip file")
     with tempfile.TemporaryDirectory(prefix="shopsource_spark_") as td:
         with zipfile.ZipFile(source) as zf:
-            zf.extractall(td)
+            _safe_extract(zf, Path(td))
         yield Path(td)
 
 
@@ -46,6 +58,7 @@ class SparkStorageConnector(ProductSourceConnector):
                         yield {"_invalid": str(exc)}, {
                             "job_id": job_id,
                             "source_file": file.name,
+                            "error_code": "MALFORMED_JSON",
                         }
                         continue
                     meta = {

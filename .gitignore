@@ -11,5 +11,13 @@ exports/*
 !exports/.gitkeep
 *.zip
 *.log
+storage/
+storage_*/
+tests/fixtures/spark_handoff/*
+!tests/fixtures/spark_handoff/README.md
+!tests/fixtures/spark_handoff/.gitkeep
+exports/**/*.json
+exports/**/*.csv
+*.xlsx
 .DS_Store
 Thumbs.db

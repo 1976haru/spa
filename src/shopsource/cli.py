@@ -4,11 +4,12 @@ import argparse
 import json
 from pathlib import Path
 
-from .classifier import classify_store, manual_override
+from .classifier import classify_store, clear_manual_override, manual_override
 from .db import init_db, upsert_store
 from .exporter import export_store
 from .importer import import_spark
 from .stats import master_summary, store_summary
+from .schema_probe import probe_schema
 
 
 def load_json(path: str | Path) -> dict:
@@ -41,6 +42,13 @@ def main(argv=None) -> int:
     p.add_argument("--status", required=True)
     p.add_argument("--memo", default="")
 
+    p = sub.add_parser("clear-override")
+    p.add_argument("--store", required=True)
+    p.add_argument("--asin", required=True)
+
+    p = sub.add_parser("probe-schema")
+    p.add_argument("source", help="Read-only JSON, folder, or ZIP input")
+
     p = sub.add_parser("export")
     p.add_argument("--store", required=True)
     p.add_argument("--format", choices=["csv", "json"], default="csv")
@@ -68,6 +76,11 @@ def main(argv=None) -> int:
     elif args.cmd == "override":
         manual_override(args.store, args.asin, args.status, args.memo, db)
         print(json.dumps({"ok": True, "store": args.store, "asin": args.asin, "status": args.status.upper()}, ensure_ascii=False))
+    elif args.cmd == "clear-override":
+        clear_manual_override(args.store, args.asin, db)
+        print(json.dumps({"ok": True, "store": args.store, "asin": args.asin, "manual_override": False}, ensure_ascii=False))
+    elif args.cmd == "probe-schema":
+        print(json.dumps(probe_schema(args.source), ensure_ascii=False, indent=2))
     elif args.cmd == "export":
         target = export_store(args.store, args.format, args.statuses, args.out, db)
         print(target)

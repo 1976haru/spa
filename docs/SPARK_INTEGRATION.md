@@ -32,6 +32,10 @@ storage/
 images, rating/reviewCount, `_sourceUrl`, `_listPage`, `_collectedAt` 등이 존재한다.
 
 v0.1은 `datasets`를 **읽기 전용**으로 import하며 Spark 파일을 수정하지 않는다.
+Malformed JSON은 해당 파일만 건너뛰고 `import_errors`에 기록한다. ZIP 입력은 경로 이탈 항목을 거부한다.
+
+`shopsource probe-schema <파일|폴더|ZIP>`은 원본을 수정하지 않고 파일/JSON/상품 수,
+ASIN 중복, 키·필드 타입·누락률, Job ID, 가능한 버전 필드를 출력한다.
 
 ## 3. 연동 우선순위
 
@@ -88,6 +92,7 @@ Spark/Spark Center 의존성을 낮출 필요가 생기면 별도 Connector로 �
 - 100~200개 샵을 Spark/Spark Center에서 어떤 방식으로 계정 분할해야 하는지
 
 따라서 Codex는 이 부분을 추측해서 구현하면 안 된다.
+현재 `SparkHandoffConnector` 상태는 명시적으로 `CONTRACT_PENDING`이며 export 호출은 실패하도록 닫혀 있다.
 
 ## 6. Round-trip 검증 게이트
 

@@ -36,31 +36,67 @@ def import_spark(source: str | Path, db=None, allow_reimport: bool = False) -> d
     key = _import_key(source)
     stats = {"files_seen": 0, "rows_read": 0, "inserted": 0, "updated": 0,
              "duplicates": 0, "invalid": 0, "job_ids": set()}
+    fatal_error: Exception | None = None
 
     connector = SparkStorageConnector()
     with connect(db) as con:
-        previous = con.execute("SELECT status FROM import_runs WHERE import_key=?", (key,)).fetchone()
+        previous = con.execute("SELECT id,status FROM import_runs WHERE import_key=?", (key,)).fetchone()
         if previous and previous["status"] == "DONE" and not allow_reimport:
             return {**stats, "job_ids": [], "skipped": True, "reason": "source already imported"}
         if previous:
-            con.execute("DELETE FROM import_runs WHERE import_key=?", (key,))
-        cur = con.execute(
-            "INSERT INTO import_runs(import_key, source_path, started_at) VALUES(?,?,?)",
-            (key, str(source.resolve()), utc_now()),
-        )
-        run_id = cur.lastrowid
+            run_id = previous["id"]
+            con.execute("DELETE FROM import_errors WHERE import_run_id=?", (run_id,))
+            con.execute(
+                """
+                UPDATE import_runs SET source_path=?,started_at=?,finished_at=NULL,files_seen=0,
+                  rows_read=0,inserted=0,updated=0,duplicates=0,invalid=0,status='RUNNING',error=NULL
+                WHERE id=?
+                """,
+                (str(source.resolve()), utc_now(), run_id),
+            )
+        else:
+            cur = con.execute(
+                "INSERT INTO import_runs(import_key, source_path, started_at) VALUES(?,?,?)",
+                (key, str(source.resolve()), utc_now()),
+            )
+            run_id = cur.lastrowid
 
+        con.execute("SAVEPOINT import_payload")
         try:
             for payload, meta in connector.iter_products(source):
                 stats["files_seen"] += 1
                 stats["job_ids"].add(meta.get("job_id") or "")
                 if payload.get("_invalid"):
                     stats["invalid"] += 1
+                    con.execute(
+                        """
+                        INSERT INTO import_errors(
+                          import_run_id,job_id,source_file,error_code,error_message,created_at
+                        ) VALUES(?,?,?,?,?,?)
+                        """,
+                        (
+                            run_id, meta.get("job_id"), meta.get("source_file"),
+                            meta.get("error_code", "MALFORMED_JSON"),
+                            str(payload["_invalid"])[:2000], utc_now(),
+                        ),
+                    )
                     continue
-                asin = str(payload.get("asin") or "").strip()
+                asin = str(payload.get("asin") or "").strip().upper()
                 title = str(payload.get("title") or "").strip()
                 if not asin or not title:
                     stats["invalid"] += 1
+                    missing = [name for name, value in (("asin", asin), ("title", title)) if not value]
+                    con.execute(
+                        """
+                        INSERT INTO import_errors(
+                          import_run_id,job_id,source_file,error_code,error_message,created_at
+                        ) VALUES(?,?,?,?,?,?)
+                        """,
+                        (
+                            run_id, meta.get("job_id"), meta.get("source_file"),
+                            "MISSING_REQUIRED_FIELD", "Missing: " + ", ".join(missing), utc_now(),
+                        ),
+                    )
                     continue
                 stats["rows_read"] += 1
                 now = utc_now()
@@ -123,11 +159,16 @@ def import_spark(source: str | Path, db=None, allow_reimport: bool = False) -> d
                 (utc_now(), stats["files_seen"], stats["rows_read"], stats["inserted"], stats["updated"],
                  stats["duplicates"], stats["invalid"], run_id),
             )
+            con.execute("RELEASE SAVEPOINT import_payload")
         except Exception as exc:
+            con.execute("ROLLBACK TO SAVEPOINT import_payload")
+            con.execute("RELEASE SAVEPOINT import_payload")
             con.execute("UPDATE import_runs SET finished_at=?, status='FAILED', error=? WHERE id=?",
                         (utc_now(), str(exc), run_id))
-            raise
+            fatal_error = exc
 
+    if fatal_error is not None:
+        raise fatal_error
     stats["job_ids"] = sorted(x for x in stats["job_ids"] if x)
     stats["skipped"] = False
     return stats

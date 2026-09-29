@@ -6,6 +6,11 @@ from pathlib import Path
 from .core.rules import classify
 from .db import connect, get_store, init_db, utc_now
 
+ALLOWED_STATUSES = {
+    "PRIMARY", "RESERVE_A", "RESERVE_B", "RESERVE_C", "LOW_RESERVE",
+    "HIGH_RESERVE", "REVIEW", "RESTRICTED", "ARCHIVED",
+}
+
 
 def classify_store(store_id: str, db: str | Path | None = None) -> dict:
     init_db(db)
@@ -13,7 +18,7 @@ def classify_store(store_id: str, db: str | Path | None = None) -> dict:
     counts: dict[str, int] = {}
     processed = 0
     with connect(db) as con:
-        products = con.execute("SELECT * FROM products WHERE archived=0 ORDER BY id").fetchall()
+        products = con.execute("SELECT * FROM products WHERE archived=0 ORDER BY id")
         for row in products:
             result = classify(row, profile)
             old = con.execute(
@@ -52,6 +57,8 @@ def classify_store(store_id: str, db: str | Path | None = None) -> dict:
 
 def manual_override(store_id: str, asin: str, status: str, memo: str = "", db=None) -> None:
     status = status.upper()
+    if status not in ALLOWED_STATUSES:
+        raise ValueError(f"Unsupported decision status: {status}")
     with connect(db) as con:
         product = con.execute("SELECT id FROM products WHERE asin=?", (asin,)).fetchone()
         if not product:
@@ -65,4 +72,23 @@ def manual_override(store_id: str, asin: str, status: str, memo: str = "", db=No
         con.execute(
             "UPDATE store_product_decisions SET final_status=?, manual_override=1, memo=?, classified_at=? WHERE id=?",
             (status, memo, utc_now(), row["id"]),
+        )
+
+
+def clear_manual_override(store_id: str, asin: str, db=None) -> None:
+    """Remove an override; the next classification restores the automatic result."""
+    with connect(db) as con:
+        row = con.execute(
+            """
+            SELECT d.id FROM store_product_decisions d
+            JOIN products p ON p.id=d.product_id
+            WHERE d.store_id=? AND p.asin=?
+            """,
+            (store_id, asin),
+        ).fetchone()
+        if not row:
+            raise KeyError("Product has not been classified for this store yet")
+        con.execute(
+            "UPDATE store_product_decisions SET manual_override=0, memo='', classified_at=? WHERE id=?",
+            (utc_now(), row["id"]),
         )
