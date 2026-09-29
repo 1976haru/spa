@@ -117,7 +117,33 @@ Spark 정상 소싱
 이 방식이 성공하면 ShopSource Studio는 상품 선별·분류를 담당하고,
 실제 Shopify 업로드는 Spark의 기존 공식 UI/AccessToken 흐름을 그대로 이용한다.
 
-### B. 차선 — Spark Center 공식 Import/API
+### B. 우선 운영 경로 — Spark Center 수동 폴더 업로드
+
+2026-09-29 사용자 운영 확인 기준으로 Spark Center 측에서 **사용자가 직접 소싱한 파일/폴더를 업로드하는 방식이 허용됨**을 안내받았다.
+따라서 100~200개 스토어 운영의 기본 handoff는 C드라이브 Spark runtime 폴더가 아니라 프로젝트 로컬의 관리 가능한 출력 폴더를 사용한다.
+
+권장 기본 구조:
+
+```text
+<repo>/exports/spark_center/
+  001_Cabin_Tidy/
+    ready/<package_id>/
+      000000001.json
+      000000002.json
+      ...
+    manifests/<package_id>.manifest.json
+    reports/<package_id>.validation.json
+```
+
+Spark Center에 실제 업로드하는 대상은 `ready/<package_id>` 폴더이며 그 안에는 상품 JSON만 둔다.
+Manifest와 validation report는 ShopSource Studio 내부 추적용으로 폴더 밖에 둔다.
+
+운영 기본값은 **프로젝트 로컬 출력**이다. `%APPDATA%\\spark\\storage\\datasets` 직접 출력은 Spark 데스크톱 호환 검증용 고급 옵션으로만 유지한다.
+
+단, Spark Center 포털이 현재 생성된 datasets JSON 폴더를 실제로 그대로 수용하는지는 다음 수동 round-trip에서 최종 확인한다.
+지원팀의 '외부 소싱 파일/폴더 업로드 가능' 안내와 '현재 JSON package가 포털에서 정상 수용됨'은 서로 다른 검증 단계로 기록한다.
+
+### C. 차선 — Spark Center 공식 Import/API
 
 100~200개 샵 운영에서 Spark Center가 필수라면 다음 중 하나가 공식적으로 확인된 뒤 구현한다.
 
@@ -126,7 +152,7 @@ Spark 정상 소싱
 3. 문서화된 handoff 폴더/파일 계약
 4. 스파미팀이 허용한 외부 입력 방식
 
-### C. 향후 — Shopify 직접 Connector
+### D. 향후 — Shopify 직접 Connector
 
 Spark/Spark Center 의존성을 낮출 필요가 생기면 별도 Connector로 검토한다.
 단, v0.1~v0.2에서 Spark의 동작을 복제하려고 하지 않는다.
