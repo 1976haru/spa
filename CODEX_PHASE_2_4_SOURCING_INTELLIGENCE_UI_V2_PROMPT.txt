@@ -1,0 +1,829 @@
+ShopSource Studio — Phase 2.4 / Sourcing Intelligence + Operator UI V2
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+
+==================================================
+0. 작업 시작 전
+==================================================
+
+반드시:
+git status
+git pull --ff-only
+git log --oneline -10
+
+working tree clean 확인.
+
+먼저 읽기:
+AGENTS.md
+CLAUDE.md
+README.md
+docs/MASTER_SPEC.md
+docs/ARCHITECTURE.md
+docs/DATABASE.md
+docs/STORE_PROFILE.md
+docs/AUTO_SOURCING.md
+docs/SPARK_INTEGRATION.md
+docs/ROADMAP.md
+
+현재 핵심 코드:
+src/shopsource/ui/app.py
+src/shopsource/sourcing/
+src/shopsource/classifier.py
+src/shopsource/db.py
+src/shopsource/connectors/spark_center_package.py
+stores/001_cabin_tidy.json
+
+==================================================
+1. 이번 Phase의 목적
+==================================================
+
+현재 프로그램은 자동 소싱까지 동작하지만,
+운영자가 100~200개 샵을 다루기에는 GUI가 너무 단순하고
+각 Store에 어떤 Amazon 검색 주제어를 넣을지 사람이 직접 설계해야 한다.
+
+이번 Phase의 목표는 두 가지다.
+
+A. Store별 검색 주제어 추천/검증 시스템
+B. 운영자용 현대적 UI V2
+
+기존 backend / DB / classifier / Spark Center package는 유지한다.
+기존 Tkinter UI도 fallback으로 유지한다.
+새 UI는 별도 entry point로 만든다.
+
+==================================================
+2. UI 기술 선택
+==================================================
+
+1차 UI V2는 NiceGUI를 사용한다.
+
+이유:
+- Python 중심 개발
+- 로컬 브라우저 또는 native window 사용 가능
+- dashboard/card/dialog/table 구조 구현 용이
+- 기존 Python service layer 재사용 가능
+
+Data Grid는 NiceGUI의 AG Grid integration을 사용하되
+AG Grid Community 기능만 사용한다.
+
+Enterprise 전용 기능에 의존하지 마라.
+
+기존 Tkinter:
+shopsource-gui
+유지.
+
+신규:
+shopsource-ui-v2
+또는 run_ui_v2.bat
+
+추가.
+
+처음부터 기존 UI를 삭제하거나 대체하지 마라.
+
+==================================================
+3. UI 정보 구조
+==================================================
+
+좌측 sidebar는 7개 이하로 단순화:
+
+1. 대시보드
+2. 스토어
+3. 소싱
+4. 상품
+5. 패키지
+6. 기록
+7. 설정
+
+각 페이지는 한 가지 주요 목적만 갖는다.
+
+==================================================
+4. 대시보드
+==================================================
+
+상단 KPI:
+- MASTER 상품
+- PRIMARY
+- REVIEW
+- RESTRICTED
+- 최근 소싱
+- 최근 Spark Center package
+
+Store 선택 dropdown.
+
+최근 작업:
+- sourcing run
+- package
+- error
+
+빠른 실행:
+- 자동 소싱
+- 상품 보기
+- Spark Center package 만들기
+
+MASTER 0 상태에서는
+명확한 empty state와 첫 행동을 보여준다.
+
+==================================================
+5. Store Workbench
+==================================================
+
+Store 상세 페이지:
+
+기본 정보:
+- Store ID
+- 이름
+- 카테고리
+- PRIMARY 가격대
+- reserve 가격대
+- include keywords
+- exclude keywords
+- risk rules
+
+Sourcing settings:
+- provider
+- marketplace
+- target candidates
+- rating
+- reviews
+- image count
+- token budget
+
+새 기능:
+[검색 주제어 추천]
+
+==================================================
+6. Keyword Intelligence Engine
+==================================================
+
+새 package:
+
+src/shopsource/intelligence/
+  keyword_engine.py
+  keyword_models.py
+  keyword_scoring.py
+  text_features.py
+
+목표:
+Store별로 Amazon/Keepa 자동 소싱에 사용할 검색 주제어를 추천한다.
+
+입력:
+- store_name
+- category
+- include_keywords
+- exclude_keywords
+- risk_rules
+- existing sourcing recipes
+- MASTER 상품 title/category/brand
+- 해당 Store의 PRIMARY/RESERVE 상품 title
+- Keepa sourcing 결과 title
+
+출력 예:
+[
+  {
+    "keyword": "trunk organizer",
+    "semantic_fit": 0.94,
+    "candidate_yield": 86,
+    "price_fit": 0.82,
+    "risk_rate": 0.02,
+    "novelty": 0.71,
+    "duplicate_of": null,
+    "score": 91.2,
+    "reason": [...]
+  }
+]
+
+==================================================
+7. Keyword 생성 단계
+==================================================
+
+Stage A — deterministic seed expansion
+
+Store profile의 category/include keyword를 기반으로
+문제/장소/용도 조합 생성.
+
+예:
+car + trunk + organizer
+car + backseat + storage
+center console + tray
+seat gap + filler
+
+단 특정 Cabin Tidy 문구를 core에 hardcode하지 말고
+Store Profile 기반 generic template engine으로 구현.
+
+Store별 seed template은 profile optional field로 확장 가능.
+
+==================================================
+8. Existing Product Text Mining
+==================================================
+
+MASTER/Keepa에서 확보한 상품 title과 category를 이용해
+candidate n-gram을 추출한다.
+
+1~4 gram 후보.
+
+stopword:
+the, and, for, with, of 등 일반어 제외.
+
+브랜드명 과대표집 방지.
+
+ASIN/숫자/사이즈 문자열 제거.
+
+상품 0개일 때도 profile seed만으로 동작.
+
+==================================================
+9. KeyBERT
+==================================================
+
+KeyBERT를 optional intelligence dependency로 사용.
+
+목적:
+상품 title 묶음과 store description에서
+의미 있는 keyword/keyphrase 추출.
+
+KeyBERT가 설치되지 않은 환경에서는
+deterministic ngram fallback으로 동작.
+
+프로그램 전체가 시작 실패하면 안 된다.
+
+==================================================
+10. sentence-transformers
+==================================================
+
+optional dependency.
+
+Store concept text embedding과
+candidate keyword embedding cosine similarity로
+semantic_fit 계산.
+
+권장 모델:
+가벼운 sentence-transformers 모델.
+
+모델 이름은 설정 가능하게 하고,
+첫 실행 시 큰 모델을 자동으로 강제 download하지 마라.
+
+모델 미설치/오프라인이면
+lexical scoring fallback.
+
+==================================================
+11. RapidFuzz
+==================================================
+
+RapidFuzz를 사용해:
+- 거의 같은 keyword
+- 단어 순서만 다른 keyword
+- singular/plural 유사어
+
+중복 제거.
+
+예:
+car trunk organizer
+trunk organizer for car
+car trunk storage organizer
+
+를 완전히 동일하게 처리하지는 말되
+유사도 threshold 기반 그룹으로 묶는다.
+
+사용자가 대표 keyword를 선택 가능.
+
+==================================================
+12. Keepa로 Keyword Validation
+==================================================
+
+추천 keyword를 실제로 sourcing recipe에 추가하기 전에
+Keepa Product Finder로 lightweight validation 가능하게 한다.
+
+[검증] 버튼.
+
+검증 항목:
+- 후보 ASIN yield
+- 가격대 적합 비율
+- rating/review 조건 충족
+- 위험상품 비율
+- 이미 MASTER에 있는 ASIN 비율
+
+Token 비용이 발생하므로:
+- 검증 전 예상 token 안내
+- 5~10 keyword씩 batch
+- 사용자가 직접 실행
+- 자동 전체 검증 금지
+
+결과를 keyword score에 반영.
+
+==================================================
+13. Keyword Score
+==================================================
+
+score를 설명 가능한 방식으로 계산.
+
+예:
+semantic_fit 35%
+candidate_yield 20%
+price_fit 20%
+quality_fit 10%
+novelty 10%
+risk penalty -25%
+
+정확한 weight는 config 상수로 분리.
+
+사용자에게:
+"왜 추천됐는지"
+표시.
+
+AI가 근거 없이 BEST라고 표시하지 마라.
+
+==================================================
+14. Cabin Tidy 초기 추천
+==================================================
+
+001 Cabin Tidy profile에서 최소 다음 범주의 후보가
+추천될 수 있게 하되,
+실제 score는 profile/data에서 계산한다.
+
+예시 후보:
+- trunk organizer
+- backseat organizer
+- seat back organizer
+- center console organizer
+- center console tray
+- seat gap filler
+- headrest hook
+- car trash can
+- cup holder expander
+- car cable organizer
+- glove box organizer
+- visor organizer
+- under seat storage
+- cargo net organizer
+- car tissue holder
+- sunglass holder
+
+이 목록은 초기 seed example일 뿐
+고정된 최종 recipe가 아니다.
+
+==================================================
+15. Keyword Studio UI
+==================================================
+
+Store 페이지에 Keyword Studio 추가.
+
+표 컬럼:
+- 선택 checkbox
+- Keyword
+- Source
+- Semantic Fit
+- Candidate Yield
+- Price Fit
+- Risk
+- Score
+- Status
+
+Source:
+PROFILE
+NGRAM
+KEYBERT
+KEEPA_DISCOVERY
+MANUAL
+
+상단:
+[추천 생성]
+[선택 항목 Keepa 검증]
+[선택 항목 recipe에 추가]
+[제외]
+
+검색/정렬/필터.
+
+==================================================
+16. Store Wizard
+==================================================
+
+새 Store 생성 Wizard.
+
+Step 1:
+Store 이름 / 카테고리 / 판매 콘셉트
+
+Step 2:
+목표 가격대
+
+Step 3:
+위험/제외 범주
+
+Step 4:
+추천 keyword 생성
+
+Step 5:
+추천 sourcing recipe preview
+
+Step 6:
+Store Profile 저장
+
+사용자가 JSON을 직접 수정하지 않아도 되게 한다.
+
+Wizard 결과는 기존 Store Profile JSON 형식과 호환.
+
+==================================================
+17. Product Grid
+==================================================
+
+상품 페이지는 AG Grid Community 기반.
+
+컬럼:
+- checkbox
+- thumbnail
+- ASIN
+- title
+- brand
+- price
+- source
+- fit score
+- price status
+- risk
+- final status
+- first seen
+- last seen
+
+필수:
+- column sort
+- filter
+- pagination
+- search
+- row selection
+- multi select
+
+Bulk actions:
+- PRIMARY 승격
+- RESERVE 이동
+- REVIEW
+- ARCHIVE
+- manual override clear
+- Spark Center 후보 선택
+
+기존 DB의 final_status/manual override semantics 유지.
+
+==================================================
+18. Product Detail Drawer
+==================================================
+
+상품 클릭:
+오른쪽 drawer 또는 dialog.
+
+표시:
+- images
+- title
+- ASIN
+- source
+- price
+- rating/reviews
+- category
+- fit score
+- price classification
+- risk reason
+- sourcing provenance
+- occurrence history
+- raw payload는 고급 section
+
+버튼:
+- 수동 승격
+- 수동 강등
+- override 해제
+
+==================================================
+19. Sourcing Page
+==================================================
+
+Store
+Provider
+Target
+Token Budget
+Keyword Recipes
+
+Recipe chips/table:
+keyword
+enabled
+verified
+last yield
+last run
+
+[Keyword Studio]
+[Dry Run]
+[자동 소싱 시작]
+
+현재 run:
+progress bar
+recipe x/y
+candidates
+hydrated
+inserted
+updated
+tokens
+status
+
+Run history table.
+
+==================================================
+20. Package Page
+==================================================
+
+Spark Center package 목록.
+
+컬럼:
+- Created
+- Store
+- Package ID
+- Statuses
+- Products
+- Validation
+- Package Status
+- Uploaded At
+
+Actions:
+- 폴더 열기
+- 경로 복사
+- 업로드 완료 표시
+- Archive
+
+ready folder만 업로드하도록 안내.
+
+==================================================
+21. Settings
+==================================================
+
+Keepa:
+- API key status
+- [저장]
+- [연결 테스트]
+- [삭제]
+
+Python keyring을 사용해 Windows Credential Manager에 저장.
+
+fallback:
+environment variable.
+
+plaintext 파일 저장 금지.
+
+기타:
+- default target
+- token budget
+- UI theme
+- log level
+
+==================================================
+22. Keepa Python Client 검토
+==================================================
+
+현재 raw urllib KeepaProvider는 동작한다.
+
+하지만 공개된 akaszynski/keepa Python client를 비교 검토한다.
+
+장점:
+- product_finder
+- query
+- AsyncKeepa
+- ProductParams validation
+- typed/Pydantic response 지원
+
+Phase 2.4에서 즉시 전체 provider를 갈아엎지는 말고
+adapter spike를 작성한다.
+
+조건:
+- 현재 tests와 token control 유지 가능
+- API key redaction 유지
+- query field validation 개선
+- dependency 증가 비용 검토
+
+결과가 좋으면 KeepaClientAdapter로 전환.
+아니면 현재 provider 유지.
+
+선택 이유를 문서화.
+
+==================================================
+23. Data Layer
+==================================================
+
+SQLite는 transactional source of truth로 유지.
+
+현재 단계에서 PostgreSQL migration 금지.
+
+대규모 분석:
+100k~millions product에서 병목이 확인되면
+DuckDB 또는 Polars를 read-only analytics sidecar로 검토.
+
+이번 Phase에서는
+analytics adapter interface와 benchmark만 가능.
+
+==================================================
+24. UI 성능
+==================================================
+
+UI에서 모든 row를 한꺼번에 메모리에 올리지 마라.
+
+Products:
+server-side/page query
+LIMIT/OFFSET 또는 cursor.
+
+필터를 DB query에 push.
+
+500-row hard limit 방식 제거.
+
+thumbnail lazy load.
+
+긴 작업:
+background task.
+
+UI freeze 금지.
+
+==================================================
+25. 라이선스
+==================================================
+
+사용 라이브러리 라이선스를 THIRD_PARTY_LICENSES.md에 기록.
+
+특히:
+NiceGUI
+AG Grid Community
+KeyBERT
+sentence-transformers
+RapidFuzz
+keyring
+keepa client
+
+Enterprise/상업 라이선스 필요한 UI library는
+명시적 승인 없이 도입하지 마라.
+
+QFluentWidgets는 commercial 사용 licensing 이슈가 있으므로
+이번 Phase dependency로 사용하지 마라.
+
+==================================================
+26. 기존 기능 보존
+==================================================
+
+절대 깨뜨리지 말 것:
+
+- MASTER DB
+- Source Inbox
+- Spark storage import
+- Keepa automatic sourcing
+- Store classify
+- manual override
+- Spark Desktop handoff
+- Spark Center package
+- package history
+- CLI
+- Tkinter GUI
+
+UI V2는 service layer 재사용.
+
+==================================================
+27. 테스트
+==================================================
+
+필수:
+- keyword seed generation
+- ngram extraction
+- stopword
+- brand suppression
+- fuzzy dedupe
+- semantic fallback
+- keyword scoring
+- risk penalty
+- Keepa keyword validation fake provider
+- no network in unit tests
+- recipe add/remove
+- Store Wizard profile generation
+- product pagination
+- bulk override
+- keyring adapter fake
+- current sourcing regression
+- Spark package regression
+
+UI:
+가능한 helper/service unit test.
+
+==================================================
+28. UX 원칙
+==================================================
+
+Shopify/Saleor류 관리자 UI를 참고해:
+- 적은 수의 sidebar category
+- resource index table
+- search/filter/sort
+- bulk action
+- status badge
+- actionable empty state
+- 한 페이지 한 목적
+
+버튼 이름은 작업 결과가 예측 가능하게 한국어 동사+명사로.
+
+예:
+"추천 주제어 만들기"
+"선택 주제어 검증"
+"recipe에 추가"
+"자동 소싱 시작"
+"Spark Center 폴더 만들기"
+
+==================================================
+29. 완료 조건
+==================================================
+
+Phase 2.4 완료 기준:
+
+A.
+Cabin Tidy Store 화면에서
+추천 검색 주제어 10개 이상 생성.
+
+B.
+각 keyword에 source/score/reason 표시.
+
+C.
+선택 keyword를 sourcing recipe에 추가 가능.
+
+D.
+Keepa 검증은 fake test PASS,
+실제 API key가 있으면 1~3 keyword 소규모 live validation만 수행.
+
+E.
+UI V2:
+Dashboard
+Store
+Sourcing
+Products
+Packages
+History
+Settings
+페이지 이동 PASS.
+
+F.
+Products grid filter/sort/page/bulk action PASS.
+
+G.
+기존 Tkinter GUI와 CLI regression PASS.
+
+==================================================
+30. 테스트 명령
+==================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+신규:
+shopsource-ui-v2 또는 동등 entry point smoke.
+
+기존:
+shopsource --help
+shopsource source-auto --store 001 --dry-run
+shopsource spark-center-package --help
+
+==================================================
+31. 문서
+==================================================
+
+추가:
+docs/UI_V2.md
+docs/KEYWORD_INTELLIGENCE.md
+THIRD_PARTY_LICENSES.md
+
+README:
+- 기존 GUI
+- UI V2
+- Keyword Studio 사용 흐름
+
+==================================================
+32. Commit / Push
+==================================================
+
+모든 테스트 PASS 후:
+
+git add -A
+git commit -m "Add sourcing intelligence and operator UI v2"
+git push origin main
+
+마지막:
+git status
+git rev-list --left-right --count main...origin/main
+
+working tree clean
+0 0 확인.
+
+==================================================
+33. 완료 보고
+==================================================
+
+[1] 조사한 라이브러리와 선택 이유
+[2] UI V2 구조
+[3] Keyword Intelligence 구조
+[4] Cabin Tidy 추천 keyword 결과
+[5] Keepa validation
+[6] Store Wizard
+[7] Product Grid / bulk action
+[8] Credential storage
+[9] performance/pagination
+[10] 라이선스
+[11] 기존 기능 regression
+[12] tests
+[13] 아직 미검증
+[14] 다음 단계
+[15] commit SHA
+
+지금 구현을 시작하라.
