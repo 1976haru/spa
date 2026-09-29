@@ -1,0 +1,813 @@
+ShopSource Studio — Phase 2.2 / Amazon Source Inbox
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+
+==================================================
+0. 작업 시작 전
+==================================================
+
+반드시 실행:
+
+git status
+git branch --show-current
+git remote -v
+git pull --ff-only
+git log --oneline -10
+
+working tree가 clean인지 확인한다.
+
+먼저 읽을 파일:
+
+AGENTS.md
+CLAUDE.md
+README.md
+docs/MASTER_SPEC.md
+docs/ARCHITECTURE.md
+docs/DATABASE.md
+docs/STORE_PROFILE.md
+docs/SPARK_INTEGRATION.md
+docs/ROADMAP.md
+docs/VALIDATION_STORAGE.md
+
+현재 구현 확인:
+
+src/shopsource/paths.py
+src/shopsource/db.py
+src/shopsource/importer.py
+src/shopsource/connectors/spark_storage.py
+src/shopsource/classifier.py
+src/shopsource/ui/app.py
+src/shopsource/cli.py
+src/shopsource/connectors/spark_handoff.py
+src/shopsource/connectors/spark_center_package.py
+tests/test_phase1b.py
+tests/test_spark_handoff.py
+tests/test_spark_center_package.py
+
+==================================================
+1. 현재 사용자 상황
+==================================================
+
+현재 MASTER 상품 수는 0이다.
+
+사용자는 더 이상 C:\Users\...\AppData\Roaming\spark\storage를 기본 작업경로로 쓰고 싶어 하지 않는다.
+
+앞으로 기본 작업영역은 프로젝트 로컬:
+
+D:\shop\001_so_amazon
+
+이다.
+
+소싱 원본 기본 폴더:
+
+<repo>/source/amazon
+
+Spark Center 업로드 결과:
+
+<repo>/exports/spark_center
+
+운영 흐름:
+
+Amazon에서 사용자가 확보한 소싱 파일
+→ source/amazon
+→ MASTER DB
+→ Store 분류
+→ PRIMARY 등 상태
+→ Spark Center 업로드 package 생성
+→ Spark Center 수동 업로드
+
+이번 Phase에서는 Amazon 웹사이트를 자동 크롤링하지 않는다.
+
+중요:
+- CAPTCHA 우회 금지
+- stealth/proxy rotation 금지
+- Amazon session/cookie 재사용 금지
+- undocumented Amazon endpoint 구현 금지
+
+이번 Phase의 목표는 "사용자가 확보한 Amazon 상품 JSON을 프로젝트 로컬 Source Inbox에서 MASTER DB로 안전하게 가져오는 것"이다.
+
+==================================================
+2. source/amazon 작업공간
+==================================================
+
+프로그램 최초 실행 또는 ensure_dirs 시 다음 폴더를 자동 생성한다.
+
+source/
+  amazon/
+    inbox/
+    samples_or_docs/
+
+실제 상품 원본은:
+
+source/amazon/inbox/
+
+에 둔다.
+
+단, 실제 상품 JSON은 Git에 절대 올리지 않는다.
+
+.gitignore에 최소:
+
+source/amazon/inbox/*
+!source/amazon/inbox/.gitkeep
+
+또는 더 안전한 동등한 규칙을 적용한다.
+
+samples_or_docs에는 실제 Amazon 상품 payload를 넣지 마라.
+문서나 synthetic 예제만 허용한다.
+
+원본 파일은:
+- 이동하지 않는다
+- 삭제하지 않는다
+- 이름을 바꾸지 않는다
+- 덮어쓰지 않는다
+
+읽기 전용으로 취급한다.
+
+==================================================
+3. 지원 입력 형식
+==================================================
+
+Phase 2.2에서는 확인된 JSON 계열만 지원한다.
+
+지원해야 할 것:
+
+A. 일반 상품 JSON 폴더
+예:
+source/amazon/inbox/batch_001/
+  000000001.json
+  000000002.json
+  ...
+
+B. 한 단계 하위 batch 폴더가 여러 개인 구조
+예:
+source/amazon/inbox/
+  batch_001/*.json
+  batch_002/*.json
+
+C. 기존 Spark storage 폴더
+storage/
+  datasets/<job_id>/*.json
+
+D. 기존 storage.zip
+
+E. 가능하면 단일 JSON 파일
+
+지원하지 않는 것:
+- CSV
+- XLSX
+- HTML
+- 브라우저 쿠키
+- request_queue
+- key_value/session pool
+
+CSV/XLSX는 실제 필드 계약이 확인되기 전까지 추측 구현하지 않는다.
+
+==================================================
+4. 일반 JSON 상품 최소 계약
+==================================================
+
+일반 JSON 상품은 최소:
+
+asin
+title
+
+이 있어야 MASTER로 가져올 수 있다.
+
+가능한 필드는 그대로 보존:
+
+url
+asin
+title
+brand
+price
+options
+quantity
+tags
+category
+overview
+aboutThis
+images
+rating
+reviewCount
+_sourceUrl
+_listPage
+_collectedAt
+
+원본 JSON object 전체를 raw_json으로 보존한다.
+
+ShopSource 내부 필드를 원본에 삽입하지 않는다.
+
+asin은 MASTER identity용으로 trim + uppercase 가능하지만
+raw payload 자체는 변경하지 않는다.
+
+==================================================
+5. 새 Source Connector 설계
+==================================================
+
+기존 SparkStorageConnector는 Spark storage 구조 전용으로 유지한다.
+
+새로 예를 들어:
+
+src/shopsource/connectors/amazon_source_folder.py
+
+또는:
+
+src/shopsource/connectors/json_product_folder.py
+
+를 만든다.
+
+권장 클래스:
+
+AmazonSourceFolderConnector
+
+역할:
+- 일반 폴더의 *.json 탐색
+- batch/job 정보 추출
+- payload + meta 반환
+- 원본 수정 없음
+
+meta 최소:
+
+source_kind = "AMAZON_SOURCE_FOLDER"
+batch_id
+source_file
+relative_path
+collected_at
+source_url
+list_page
+
+batch_id:
+가능하면 부모 폴더명 사용.
+JSON이 inbox root에 직접 있으면 안정적인 기본 batch id를 만든다.
+
+중첩 탐색은 무제한 재귀보다 안전한 범위를 사용하거나
+명확한 규칙을 문서화한다.
+
+==================================================
+6. Importer 구조
+==================================================
+
+현재 import_spark()에 모든 로직을 복붙하지 마라.
+
+MASTER upsert 공통 로직을 추출해서:
+
+- SparkStorageConnector
+- AmazonSourceFolderConnector
+
+둘 다 같은 import core를 쓰도록 리팩터링하는 것을 권장한다.
+
+예:
+
+import_products(source, connector, source_type, db, allow_reimport=False)
+
+또는 architecture에 맞는 동등한 구조.
+
+핵심:
+- ASIN unique MASTER 유지
+- occurrence/history 유지
+- malformed JSON 오류 기록
+- raw_json 보존
+- transaction/savepoint 유지
+- source read-only
+- 같은 원본 재가져오기 idempotent
+
+기존 import_spark CLI/API는 깨뜨리지 마라.
+
+==================================================
+7. Import key 개선
+==================================================
+
+현재 directory import key가 디렉터리 자체 stat에만 의존하면
+inbox에 새 파일이 추가될 때 안정적이지 않을 수 있다.
+
+Phase 2.2에서 이를 점검하고 개선하라.
+
+목표:
+- 동일 batch 그대로 재import → skip 가능
+- batch에 실제 파일이 추가/변경됨 → 새로운 import로 인식 가능
+- 수천 파일에서 과도하게 느리지 않게
+
+권장:
+파일 상대경로 + size + mtime_ns를 정렬하여 hash
+
+전체 파일 내용 SHA256까지 매번 읽는 것은 대량 파일에서 비쌀 수 있으므로 필요성 검토.
+
+선택 이유를 완료 보고에 설명하라.
+
+기존 Spark import idempotency 테스트도 유지한다.
+
+==================================================
+8. occurrence source 구분
+==================================================
+
+향후 provenance가 중요하다.
+
+현재 product_occurrences에 필요한 경우 additive column을 검토:
+
+source_kind
+batch_id
+
+하지만 기존 job_id를 batch id로 재사용할 수 있다면 과도한 migration은 피한다.
+
+권장:
+- Spark storage: source_kind = SPARK_STORAGE
+- 프로젝트 source/amazon: source_kind = AMAZON_SOURCE_FOLDER
+
+DB schema 변경 시 additive migration만 사용한다.
+
+MASTER product는 출처와 관계없이 ASIN 기준 하나다.
+
+==================================================
+9. 새 Import Service
+==================================================
+
+사용자 친화 API를 만든다.
+
+예:
+
+import_amazon_source(
+    source=None,
+    db=None,
+    allow_reimport=False
+)
+
+source=None이면 기본:
+
+<repo>/source/amazon/inbox
+
+를 사용한다.
+
+결과:
+
+files_seen
+rows_read
+inserted
+updated
+duplicates
+invalid
+batches
+skipped
+source_path
+
+MASTER 0개에서 첫 import도 정상 동작해야 한다.
+
+폴더가 비어 있으면 traceback 대신 친절한 결과/오류:
+
+"소싱 상품 JSON이 없습니다. source/amazon/inbox에 상품 파일을 넣어주세요."
+
+==================================================
+10. GUI 개편
+==================================================
+
+현재 GUI의:
+
+"Spark ZIP/Storage Import"
+
+를 기본 운영 버튼에서 제거하거나 이름을 바꾼다.
+
+기본 버튼:
+
+"소싱 상품 가져오기"
+
+옆에:
+
+"소싱 폴더 열기"
+
+를 추가한다.
+
+동작:
+
+[소싱 폴더 열기]
+→ <repo>/source/amazon/inbox 를 Windows Explorer로 연다.
+
+[소싱 상품 가져오기]
+→ 기본 source/amazon/inbox에서 상품 JSON 가져오기
+→ 완료 summary 표시
+
+완료 메시지 예:
+
+소싱 상품 가져오기 완료
+
+신규 MASTER: 120
+갱신: 10
+중복: 35
+오류: 2
+MASTER 전체: 165
+
+원본 폴더:
+D:\shop\001_so_amazon\source\amazon\inbox
+
+오류가 있으면:
+"오류 상세는 import report/log에서 확인"
+
+기존 Spark storage/ZIP import는 삭제하지 말고
+"고급 가져오기..." 또는 메뉴/별도 버튼으로 남겨라.
+
+C:\AppData Spark storage를 기본으로 열지 마라.
+
+==================================================
+11. MASTER 0개 UX
+==================================================
+
+현재처럼 MASTER가 0이면 GUI에서 사용자가 다음 행동을 바로 알 수 있어야 한다.
+
+Summary 근처에 안내:
+
+"MASTER 상품이 없습니다.
+1) '소싱 폴더 열기'에 Amazon 상품 JSON을 넣고
+2) '소싱 상품 가져오기'를 누르세요."
+
+MASTER가 1개 이상이면 이 안내를 숨기거나 정상 summary로 바꾼다.
+
+PRIMARY 필터와 Spark Center package 버튼은 상품 0개일 때:
+- disabled 처리하거나
+- 클릭 시 명확한 안내
+
+"먼저 소싱 상품을 MASTER에 가져오세요."
+
+무의미한 traceback 금지.
+
+==================================================
+12. Classify 흐름
+==================================================
+
+Import 성공 후 현재 Store에 대해 자동 classify할지 검토한다.
+
+권장 UX:
+
+소싱 상품 가져오기 성공
+→ 현재 Store 자동 classify
+
+단, 100~200 Store 확장을 고려해 모든 Store 자동 classify는 이번 Phase에서 하지 않는다.
+
+현재 선택된 Store만 자동 classify하고,
+완료 메시지에:
+
+"Cabin Tidy 자동 분류 완료"
+
+를 표시하는 방식 권장.
+
+기존 Classify 버튼은 유지한다.
+
+자동 classify 구현이 side effect가 크면
+완료 후 "Classify 버튼을 눌러주세요" 대신
+명확한 버튼 흐름을 제공한다.
+
+선택 이유를 보고한다.
+
+==================================================
+13. Source Folder 구조 예시 문서
+==================================================
+
+README에 초보자 기준으로 정확하게 추가한다.
+
+예:
+
+D:\shop\001_so_amazon\source\amazon\inbox\batch_001\
+  000000001.json
+  000000002.json
+  000000003.json
+
+그 후:
+
+run_gui.bat 더블클릭
+→ 소싱 상품 가져오기
+→ Classify 또는 자동 분류
+→ PRIMARY
+→ 상품 수
+→ Spark Center 업로드 폴더 만들기
+
+PowerShell은 일반 사용 시 필요 없다고 명시한다.
+
+개발/업데이트 때만 git pull 등을 위해 PowerShell을 쓴다.
+
+==================================================
+14. 실행 UX
+==================================================
+
+현재 run_gui.bat는 유지한다.
+
+사용자에게 평상시 실행은:
+D:\shop\001_so_amazon\run_gui.bat 더블클릭
+
+만 하면 되도록 유지한다.
+
+가능하면 추가로:
+run_gui_silent.vbs
+
+또는 동등한 Windows launcher를 만들어
+검은 콘솔 창 없이 실행 가능하게 한다.
+
+단:
+- 외부 프로그램 설치 필요 없음
+- 현재 bat 실행도 계속 동작
+- 보안상 난해한 script 금지
+
+README에:
+"평상시에는 PowerShell에서 실행할 필요 없음"
+을 명시한다.
+
+==================================================
+15. 소싱 파일 Validation
+==================================================
+
+Import 전에/중간에 다음 검증:
+
+- JSON parse
+- object 여부
+- asin
+- title
+- 중복 ASIN 허용하되 MASTER dedupe
+- payload에 credential/session cookie 키가 있으면 MASTER raw_json에 저장하지 말고 해당 파일을 REJECT 또는 import error 처리
+
+민감 키 예:
+
+cookie
+session-token
+access-token
+authorization
+password
+secret
+aws-waf-token
+
+기존 Spark runtime session 파일은 일반 product input으로 읽지 않도록 한다.
+
+SDK_SESSION_POOL_STATE.json
+SDK_CRAWLER_STATISTICS_*.json
+
+은 source 폴더에 실수로 있어도 상품으로 import하지 말고
+skip/error reason 기록.
+
+==================================================
+16. Import Report
+==================================================
+
+가능하면 import run별 report를:
+
+reports/imports/
+
+또는:
+data/reports/
+
+같은 Git ignored 영역에 저장.
+
+최소:
+source path
+started
+finished
+files seen
+valid
+inserted
+updated
+duplicates
+invalid
+batch ids
+error count
+
+개별 malformed error는 DB import_errors에 이미 있으므로 중복 대형 report는 피한다.
+
+GUI에서 최근 import summary를 표시해도 좋다.
+
+==================================================
+17. CLI
+==================================================
+
+새 명령:
+
+shopsource import-amazon-source
+
+기본:
+
+shopsource import-amazon-source
+
+→ <repo>/source/amazon/inbox 사용
+
+사용자 지정:
+
+shopsource import-amazon-source "D:\my amazon batch"
+
+옵션:
+--allow-reimport
+
+기존:
+shopsource import-spark
+
+는 유지.
+
+도움말에 차이를 명확히 적는다.
+
+==================================================
+18. 테스트
+==================================================
+
+필수 테스트:
+
+1. 빈 source/amazon/inbox
+2. 단일 JSON
+3. 일반 folder 직접 JSON
+4. batch subfolder 여러 개
+5. 한글/공백 경로
+6. malformed JSON
+7. asin 없음
+8. title 없음
+9. 동일 ASIN 여러 파일 → MASTER 1개
+10. occurrence 여러 개 보존
+11. 동일 batch 재import skip/idempotent
+12. batch 파일 추가 후 새 import 감지
+13. raw payload 보존
+14. 민감 키 payload 거부
+15. SDK_SESSION_POOL_STATE skip
+16. crawler statistics skip
+17. 기존 Spark storage import 회귀 PASS
+18. 기존 ZIP import 회귀 PASS
+19. import 후 현재 Store classify 가능
+20. MASTER 0 UX helper
+21. source/amazon actual data gitignore
+22. run_gui.bat 회귀
+23. optional silent launcher 동작 구조
+24. Spark Center package 기존 테스트 전부 PASS
+
+==================================================
+19. 대량 확장 고려
+==================================================
+
+향후 30,000개/스토어 및 100~200 Store를 고려한다.
+
+이번 Phase에서:
+- 전체 JSON을 한꺼번에 메모리 list로 올리지 않는다.
+- iterator/streaming 유지
+- SQLite transaction 적절히 사용
+- 파일별 commit 금지
+- UI thread block 금지
+- progress가 가능하면 files processed count 표시
+
+다만 이번 Phase에서 PostgreSQL migration은 하지 않는다.
+
+==================================================
+20. 하지 말 것
+==================================================
+
+- Amazon 자동 크롤러 개발
+- CAPTCHA 우회
+- stealth
+- proxy rotation
+- WAF token 사용
+- Amazon cookie 재사용
+- Spark 내부 DB 수정
+- Spark Center API 자동 업로드
+- Shopify 직접 API upload
+- CSV/XLSX schema 추측 구현
+- source 원본 파일 이동/삭제
+- 가격 미달 상품 MASTER 삭제
+- 기존 Phase 2/2.1 기능 파괴
+
+==================================================
+21. 문서 업데이트
+==================================================
+
+업데이트:
+
+README.md
+docs/ROADMAP.md
+docs/ARCHITECTURE.md
+docs/DATABASE.md
+필요 시 docs/MASTER_SPEC.md
+
+README 첫 사용 흐름은 실제 운영 순서로 바꾼다.
+
+1. run_gui.bat 더블클릭
+2. 소싱 폴더 열기
+3. source/amazon/inbox에 상품 JSON 넣기
+4. 소싱 상품 가져오기
+5. Cabin Tidy 분류
+6. PRIMARY
+7. 상품 수 설정
+8. Spark Center 업로드 폴더 만들기
+9. ready/<package_id> 업로드
+
+C:\AppData Spark 경로를 메인 가이드에서 제거한다.
+고급/legacy 입력 설명에만 남긴다.
+
+==================================================
+22. 테스트 명령
+==================================================
+
+완료 후:
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+CLI smoke:
+
+shopsource --help
+shopsource import-amazon-source --help
+shopsource import-spark --help
+shopsource spark-center-package --help
+
+temp SQLite + temp source directory로
+end-to-end:
+
+source JSON
+→ import
+→ classify
+→ PRIMARY
+→ Spark Center package
+
+smoke를 수행한다.
+
+==================================================
+23. 완료 보고
+==================================================
+
+아래 형식:
+
+[1] 시작 상태
+- branch
+- origin
+- start commit
+
+[2] Phase 2.2 구현 요약
+
+[3] source/amazon 구조
+
+[4] 지원 입력 형식
+
+[5] AmazonSourceFolderConnector 구조
+
+[6] 공통 Import core 리팩터링
+
+[7] Import key / idempotency 방식
+
+[8] GUI 변경
+- 소싱 상품 가져오기
+- 소싱 폴더 열기
+- MASTER 0 안내
+- 자동 classify 여부
+
+[9] 평상시 실행 방법
+- PowerShell 불필요
+- run_gui.bat / silent launcher
+
+[10] CLI
+
+[11] DB migration
+
+[12] 보안/민감필드 처리
+
+[13] 테스트 결과
+- compileall
+- pytest
+- diff check
+- CLI smoke
+- e2e smoke
+
+[14] 기존 Phase 2/2.1 회귀 여부
+
+[15] 100~200 Store 확장 시 병목
+
+[16] 사용자가 다음에 할 실제 테스트
+- source/amazon/inbox에 실제 소싱 JSON 5개 넣기
+- GUI 가져오기
+- MASTER=5 확인
+- PRIMARY 분류 확인
+- Spark Center package 5개 생성
+- 포털 업로드
+
+[17] 아직 미구현
+- Amazon 자동 sourcing
+- CSV/XLSX
+- Spark Center portal 자동 전송
+- Shopify end-to-end
+
+[18] 다음 Phase 권장
+
+[19] commit SHA
+
+==================================================
+24. Commit / Push
+==================================================
+
+모든 테스트 PASS 후 commit.
+
+권장 message:
+
+Add project-local Amazon source inbox workflow
+
+git push origin main
+
+마지막:
+
+git status
+git log --oneline -5
+git rev-list --left-right --count main...origin/main
+
+working tree clean
+main...origin/main = 0 0
+
+확인.
+
+지금 바로 Phase 2.2 구현을 시작하라.
