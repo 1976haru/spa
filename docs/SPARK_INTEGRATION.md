@@ -142,7 +142,26 @@ Spark/Spark Center 의존성을 낮출 필요가 생기면 별도 Connector로 �
 - Spark가 자동 제외하는 약물성·규정 위반·재고 없음 등의 실패 결과와 ShopSource Studio의 위험 분류는 별개로 기록한다.
 - request queue 오류 메타데이터는 MASTER 상품 삭제 근거가 아니라 수집 상태/오류 이력으로 취급한다.
 
-## 5. 아직 확인되지 않은 것
+## 5. 데이터 불러오기 UI에서 추가로 확인된 것
+
+실제 Spark의 `데이터 관리 > 데이터 불러오기`를 실행했을 때 Windows **폴더 선택** 대화상자가 열렸고,
+기본 위치가 `C:\\Users\\user\\AppData\\Roaming\\spark\\storage\\datasets`로 잡혀 있었다.
+화면에는 각 job id 폴더가 나열되며 하단 버튼도 `폴더 선택`이다.
+
+따라서 현재 증거상 Spark의 수동 데이터 불러오기 입력 단위는 개별 JSON 파일이 아니라
+**`datasets/<job_id>` 폴더**일 가능성이 매우 높다.
+
+다음 검증 단계:
+
+1. 기존 정상 job 폴더를 그대로 선택해 재불러오기 PASS 확인
+2. 해당 job에서 상품 5개 JSON만 복제한 신규 test job 폴더 생성
+3. test job 폴더를 Spark에서 불러오기
+4. 상품명/가격/이미지/옵션 보존 확인
+5. Location 선택 및 테스트 업로드
+
+이 round-trip이 통과하면 datasets-only handoff를 지원 계약으로 승격할 수 있다.
+
+## 6. 아직 확인되지 않은 것
 
 다음은 현재 문서/샘플만으로 확정할 수 없다.
 
@@ -155,7 +174,7 @@ Spark/Spark Center 의존성을 낮출 필요가 생기면 별도 Connector로 �
 따라서 Codex는 이 부분을 추측해서 구현하면 안 된다.
 현재 `SparkHandoffConnector` 상태는 명시적으로 `CONTRACT_PENDING`이며 export 호출은 실패하도록 닫혀 있다.
 
-## 6. Round-trip 검증 게이트
+## 7. Round-trip 검증 게이트
 
 Spark-compatible Export는 아래가 모두 PASS일 때만 '지원' 상태로 전환한다.
 
@@ -168,7 +187,7 @@ Spark-compatible Export는 아래가 모두 PASS일 때만 '지원' 상태로 �
 - 실패 상품이 MASTER DB에서 사라지지 않음
 - 실제 상품 DB/AccessToken/credential이 Git에 포함되지 않음
 
-## 7. NO-GO
+## 8. NO-GO
 
 - Spark 내부 DB를 추측해서 직접 변경
 - undocumented server endpoint 재현
