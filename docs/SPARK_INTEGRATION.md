@@ -159,14 +159,21 @@ Spark/Spark Center 의존성을 낮출 필요가 생기면 별도 Connector로 �
 4. 상품명/가격/이미지/옵션 보존 확인
 5. Location 선택 및 테스트 업로드
 
-이 round-trip이 통과하면 datasets-only handoff를 지원 계약으로 승격할 수 있다.
+실제 5개 상품 JSON만 넣은 테스트 폴더 `TEST_5ITEMS_20260929_192255`를 Spark에서 선택했을 때,
+Spark 데이터 관리 화면에 **전체 5개 / 포함 5개 / 제외 0개**로 정상 로드되었다.
+화면에서 상품 이미지, ASIN, 상품명, 옵션 라벨, 브랜드가 표시되는 것도 확인됐다.
+
+이 테스트에서는 `request_queues`와 `key_value_stores`를 함께 제공하지 않았으므로,
+**Spark의 수동 '데이터 불러오기'에는 datasets/<job_id> 폴더만으로 상품 목록 로드가 가능함이 확인됐다.**
+
+따라서 datasets-only handoff의 '목록 불러오기' 단계는 PASS로 승격한다.
+다만 Shopify 실제 업로드까지의 end-to-end 호환은 Location 선택 및 테스트 업로드가 끝난 뒤 최종 확정한다.
 
 ## 6. 아직 확인되지 않은 것
 
 다음은 현재 문서/샘플만으로 확정할 수 없다.
 
-- '데이터 불러오기'가 정확히 어떤 파일 확장자/폴더 구조를 요구하는지
-- datasets JSON만 있으면 되는지, key_value_stores/request_queues도 필요한지
+- Shopify 실제 업로드 단계에서도 datasets-only handoff가 충분한지
 - 파일명을 바꿔도 된다는 규칙이 어느 단위(작업파일/폴더)에 적용되는지
 - Spark Center가 Spark 로컬 파일을 직접 수용하는지
 - 100~200개 샵을 Spark/Spark Center에서 어떤 방식으로 계정 분할해야 하는지
