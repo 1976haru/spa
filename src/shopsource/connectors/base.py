@@ -14,5 +14,5 @@ class ProductSourceConnector(ABC):
 
 class ExportConnector(ABC):
     @abstractmethod
-    def export(self, *args, **kwargs) -> Path:
+    def export(self, *args, **kwargs) -> object:
         raise NotImplementedError

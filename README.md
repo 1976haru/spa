@@ -14,6 +14,7 @@
 - CSV / JSON Export
 - Windows 기본 Tkinter GUI
 - Spark Center 연동용 Connector 인터페이스 자리 확보 (실제 연동 방식은 아직 미확정)
+- 검증된 `datasets/<job_id>` 형식의 Spark handoff 폴더 자동 생성
 
 ## 가장 중요한 원칙
 
@@ -42,7 +43,12 @@ shopsource import-spark "D:\경로\storage.zip"
 shopsource classify --store 001
 shopsource summary --store 001
 shopsource export --store 001 --format csv
+shopsource spark-handoff --store 001 --status PRIMARY --limit 5
 ```
+
+Spark handoff 기본 출력은 `exports/spark_handoff/jobs/<job_id>/`이며 상품 JSON만 포함합니다.
+Manifest와 validation report는 job 폴더 밖에 생성됩니다. 실제 사용자 테스트에서 5개 상품
+dataset 폴더가 Spark UI에 정상 로드됐지만, Shopify 실제 업로드는 아직 검증되지 않았습니다.
 
 ## 스토어별 가격 규칙 수정
 
@@ -63,6 +69,8 @@ shopsource classify --store 001
 
 ## Spark Center
 
-v0.1은 Spark Center에 쓰기 작업을 하지 않습니다. 외부 CSV/JSON Import, API 또는 공식/안정적인 전달 경로를 먼저 확인해야 합니다. `connectors/spark_center` 구현은 그 계약이 확인된 뒤 진행합니다.
+Spark Center에는 쓰기 작업을 하지 않습니다. 공식 API 또는 Import 계약이 확인되기 전까지
+`connectors/spark_center`는 `CONTRACT_PENDING`을 유지합니다. 로컬 Spark dataset handoff의
+capability는 `DATASET_LOAD_VERIFIED`이며 Shopify 업로드 지원을 의미하지 않습니다.
 
 자세한 내용은 `docs/MASTER_SPEC.md`, `docs/SPARK_INTEGRATION.md`, `docs/ROADMAP.md`를 참고하세요.

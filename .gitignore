@@ -9,6 +9,7 @@ data/*.sqlite
 data/*.sqlite3
 exports/*
 !exports/.gitkeep
+exports/spark_handoff/
 *.zip
 *.log
 storage/

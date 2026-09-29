@@ -165,11 +165,11 @@ def test_schema_probe_is_read_only_and_reports_shape(tmp_path):
     assert broken.read_bytes() == before
 
 
-def test_handoff_is_explicitly_pending_and_manifest_has_no_credentials():
+def test_handoff_capability_and_manifest_have_no_credentials():
     connector = SparkHandoffConnector()
-    assert connector.capability.status == "CONTRACT_PENDING"
-    with pytest.raises(RuntimeError, match="CONTRACT_PENDING"):
-        connector.export()
+    assert connector.capability.status == "DATASET_LOAD_VERIFIED"
+    assert connector.capability.dataset_folder_load_verified is True
+    assert connector.capability.shopify_upload_verified is False
     manifest = build_manifest(
         store_id="001", store_name="Cabin Tidy", asins=["B2", "B1", "B1"],
         source_job_ids=["job2", "job1"], filter_profile={"statuses": ["PRIMARY"]},
@@ -185,12 +185,16 @@ def test_scaling_indexes_exist(tmp_path):
     with connect(db) as con:
         indexes = {
             row["name"]
-            for table in ("products", "product_occurrences", "store_product_decisions", "import_errors")
+            for table in (
+                "products", "product_occurrences", "store_product_decisions", "import_errors",
+                "export_runs",
+            )
             for row in con.execute(f"PRAGMA index_list({table})")
         }
     assert {
         "idx_decisions_store_status", "idx_decisions_product", "idx_occurrence_job",
         "idx_occurrence_product", "idx_occurrence_import_run", "idx_import_errors_run",
+        "idx_export_runs_store_created",
     } <= indexes
 
 
@@ -209,6 +213,6 @@ def test_existing_occurrence_table_gets_additive_raw_json_migration(tmp_path):
     assert "raw_json" in columns
 
 
-@pytest.mark.skip(reason="Approved real Spark Data Import fixture has not been provided")
-def test_real_spark_handoff_round_trip_pending():
-    """Activation requires Spark UI import, Location selection, and test upload evidence."""
+@pytest.mark.skip(reason="Shopify Location selection and actual upload remain unverified")
+def test_spark_shopify_upload_pending():
+    """Activation requires Spark UI Location selection and test upload evidence."""

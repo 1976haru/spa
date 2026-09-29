@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .classifier import classify_store, clear_manual_override, manual_override
+from .connectors.spark_handoff import SparkHandoffConnector
 from .db import init_db, upsert_store
 from .exporter import export_store
 from .importer import import_spark
@@ -49,6 +50,15 @@ def main(argv=None) -> int:
     p = sub.add_parser("probe-schema")
     p.add_argument("source", help="Read-only JSON, folder, or ZIP input")
 
+    p = sub.add_parser("spark-handoff", help="Create a verified Spark datasets job folder")
+    p.add_argument("--store", required=True)
+    p.add_argument("--status", action="append", dest="statuses")
+    p.add_argument("--limit", type=int)
+    p.add_argument("--asin", action="append", dest="asins")
+    p.add_argument("--out-root", help="Parent folder where the new Spark job folder is created")
+    p.add_argument("--job-id")
+    p.add_argument("--allow-restricted", action="store_true")
+
     p = sub.add_parser("export")
     p.add_argument("--store", required=True)
     p.add_argument("--format", choices=["csv", "json"], default="csv")
@@ -81,6 +91,18 @@ def main(argv=None) -> int:
         print(json.dumps({"ok": True, "store": args.store, "asin": args.asin, "manual_override": False}, ensure_ascii=False))
     elif args.cmd == "probe-schema":
         print(json.dumps(probe_schema(args.source), ensure_ascii=False, indent=2))
+    elif args.cmd == "spark-handoff":
+        result = SparkHandoffConnector().export(
+            store_id=args.store,
+            statuses=args.statuses,
+            limit=args.limit,
+            asins=args.asins,
+            out_root=args.out_root,
+            job_id=args.job_id,
+            db=db,
+            allow_restricted=args.allow_restricted,
+        )
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
     elif args.cmd == "export":
         target = export_store(args.store, args.format, args.statuses, args.out, db)
         print(target)

@@ -29,3 +29,9 @@ override를 명시적으로 해제한 뒤 재분류하면 최신 자동 판정�
 - `product_occurrences(product_id, job_id, source_file)` UNIQUE가 동일 Spark occurrence 재입력을 막는다.
 - store/status, decision product, occurrence product/job/import run, import error run에 인덱스를 둔다.
 - 기존 DB에는 `CREATE ... IF NOT EXISTS` 방식으로 테이블/인덱스를 추가하여 호환성을 유지한다.
+
+## export_runs
+
+Spark handoff의 job id, store, 선택 status, 출력 경로, 상품 수, ASIN hash, validation 결과를
+run 단위로 기록한다. 이번 단계에서는 수백만 행으로 커질 수 있는 상품별 export membership는
+추가하지 않고 manifest를 상세 감사 기록으로 사용한다.

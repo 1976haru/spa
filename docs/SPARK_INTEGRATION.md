@@ -179,7 +179,22 @@ Spark 데이터 관리 화면에 **전체 5개 / 포함 5개 / 제외 0개**로 
 - 100~200개 샵을 Spark/Spark Center에서 어떤 방식으로 계정 분할해야 하는지
 
 따라서 Codex는 이 부분을 추측해서 구현하면 안 된다.
-현재 `SparkHandoffConnector` 상태는 명시적으로 `CONTRACT_PENDING`이며 export 호출은 실패하도록 닫혀 있다.
+`SparkHandoffConnector`의 datasets 폴더 load capability는 `DATASET_LOAD_VERIFIED`다.
+이는 5개 상품 폴더가 Spark UI에 로드된 범위만 의미하며 `shopify_upload_verified=false`를 유지한다.
+Spark Center Connector는 별도 계약이므로 계속 `CONTRACT_PENDING`이다.
+
+자동 handoff 구조:
+
+```text
+exports/spark_handoff/
+  jobs/<job_id>/000000001.json
+  manifests/<job_id>.manifest.json
+  reports/<job_id>.validation.json
+```
+
+상품은 `final_status`와 manual override가 반영된 최종 판정으로 선택하며 ASIN 오름차순으로 쓴다.
+최근 유효 occurrence raw JSON을 우선하고 없으면 product raw JSON으로 fallback한다.
+job 폴더에는 상품 JSON 외의 manifest, runtime, request queue, key-value 파일을 만들지 않는다.
 
 ## 7. Round-trip 검증 게이트
 

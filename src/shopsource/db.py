@@ -104,6 +104,18 @@ CREATE TABLE IF NOT EXISTS store_product_decisions (
     UNIQUE(store_id, product_id)
 );
 
+CREATE TABLE IF NOT EXISTS export_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL UNIQUE,
+    store_id TEXT NOT NULL,
+    statuses_json TEXT NOT NULL,
+    output_path TEXT NOT NULL,
+    product_count INTEGER NOT NULL,
+    asin_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    validation_status TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_products_price ON products(price);
 CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);
 CREATE INDEX IF NOT EXISTS idx_decisions_store_status ON store_product_decisions(store_id, final_status);
@@ -112,6 +124,7 @@ CREATE INDEX IF NOT EXISTS idx_occurrence_job ON product_occurrences(job_id);
 CREATE INDEX IF NOT EXISTS idx_occurrence_product ON product_occurrences(product_id);
 CREATE INDEX IF NOT EXISTS idx_occurrence_import_run ON product_occurrences(import_run_id);
 CREATE INDEX IF NOT EXISTS idx_import_errors_run ON import_errors(import_run_id);
+CREATE INDEX IF NOT EXISTS idx_export_runs_store_created ON export_runs(store_id, created_at);
 """
 
 

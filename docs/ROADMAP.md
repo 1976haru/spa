@@ -28,9 +28,11 @@
 - [x] 5개 상품 subset 테스트 폴더 생성
 - [x] Spark UI에서 5개 subset 재불러오기 PASS
 - [~] 이미지/ASIN/제목/옵션/브랜드 표시 확인; 가격/세부필드 추가 검증 필요
+- [x] Store Decision 기반 datasets handoff generator
+- [x] Export manifest / validation report
+- [x] 수동 override/status/limit/ASIN 선택 및 RESTRICTED 안전 게이트
 - [ ] 미국 Shopify Location 선택 가능 확인
 - [ ] 테스트 Shopify 스토어 업로드 확인
-- [ ] Export manifest / validation report
 - [ ] 재업로드 시 중복 동작 기록
 
 ## v0.3 STORE ENGINE

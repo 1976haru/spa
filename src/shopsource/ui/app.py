@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -11,7 +12,8 @@ from shopsource.db import connect, init_db, upsert_store
 from shopsource.exporter import export_store
 from shopsource.importer import import_spark
 from shopsource.connectors.spark_center import capability as spark_center_capability
-from shopsource.paths import STORE_DIR
+from shopsource.connectors.spark_handoff import SparkHandoffConnector, SparkHandoffResult
+from shopsource.paths import EXPORT_DIR, STORE_DIR
 from shopsource.stats import master_summary, store_summary
 
 
@@ -38,6 +40,7 @@ class App(tk.Tk):
         ttk.Button(top, text="Classify", command=self.classify).pack(side="left", padx=4)
         ttk.Button(top, text="Export CSV", command=lambda: self.export("csv")).pack(side="left", padx=4)
         ttk.Button(top, text="Export JSON", command=lambda: self.export("json")).pack(side="left", padx=4)
+        ttk.Button(top, text="Spark Handoff", command=self.spark_handoff).pack(side="left", padx=4)
         cap = spark_center_capability()
         self.spark_button = ttk.Button(top, text=f"Spark Center: {cap.status}", state="disabled")
         self.spark_button.pack(side="left", padx=4)
@@ -89,13 +92,13 @@ class App(tk.Tk):
     def store_id(self) -> str:
         return self.store_var.get().split("|", 1)[0].strip() or "001"
 
-    def _run(self, fn):
+    def _run(self, fn, on_done=None):
         self.progress.start(12)
         self.msg.set("Working...")
         def task():
             try:
                 result = fn()
-                self.after(0, lambda: self._done(result))
+                self.after(0, lambda: (on_done or self._done)(result))
             except Exception as exc:
                 self.after(0, lambda: self._error(exc))
         threading.Thread(target=task, daemon=True).start()
@@ -134,6 +137,38 @@ class App(tk.Tk):
             messagebox.showinfo("Export complete", str(p))
         except Exception as exc:
             messagebox.showerror("Export failed", str(exc))
+
+    def spark_handoff(self):
+        status = self.status_var.get()
+        statuses = ["PRIMARY"] if status == "ALL" else [status]
+        appdata = os.environ.get("APPDATA")
+        spark_datasets = Path(appdata) / "spark" / "storage" / "datasets" if appdata else None
+        default_jobs = EXPORT_DIR / "spark_handoff" / "jobs"
+        initial = spark_datasets if spark_datasets and spark_datasets.is_dir() else default_jobs
+        selected = filedialog.askdirectory(
+            title="Select parent folder for the new Spark job",
+            initialdir=str(initial),
+            mustexist=False,
+        )
+        if not selected:
+            return
+        connector = SparkHandoffConnector()
+        self._run(
+            lambda: connector.export(
+                store_id=self.store_id(), statuses=statuses, out_root=selected
+            ),
+            self._handoff_done,
+        )
+
+    def _handoff_done(self, result: SparkHandoffResult):
+        self.progress.stop()
+        self.msg.set(f"Spark handoff {result.validation_status}: {result.product_count} products")
+        messagebox.showinfo(
+            "Spark Handoff complete",
+            f"Job ID: {result.job_id}\nProducts: {result.product_count}\n"
+            f"Folder: {result.folder}\nValidation: {result.validation_status}",
+        )
+        self.refresh()
 
     def refresh(self):
         try:

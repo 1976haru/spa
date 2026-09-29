@@ -14,11 +14,16 @@ def build_manifest(
     source_job_ids: list[str] | None = None,
     filter_profile: dict | None = None,
     export_status: str = "PREPARED",
+    job_id: str | None = None,
+    selected_statuses: list[str] | None = None,
+    output_folder: str | None = None,
+    capability_status: str | None = None,
+    shopify_upload_verified: bool = False,
 ) -> dict:
     """Build credential-free metadata shared by future export connectors."""
     normalized_asins = sorted({str(asin).strip().upper() for asin in asins if str(asin).strip()})
     digest = hashlib.sha256("\n".join(normalized_asins).encode("utf-8")).hexdigest()
-    return {
+    manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "store_id": store_id,
         "store_name": store_name,
@@ -30,3 +35,12 @@ def build_manifest(
         "filter_profile": filter_profile or {},
         "export_status": export_status,
     }
+    if job_id is not None:
+        manifest.update({
+            "job_id": job_id,
+            "selected_statuses": selected_statuses or [],
+            "output_folder": output_folder,
+            "capability_status": capability_status,
+            "shopify_upload_verified": shopify_upload_verified,
+        })
+    return manifest
