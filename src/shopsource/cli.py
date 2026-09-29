@@ -13,7 +13,7 @@ from .connectors.spark_center_package import (
 )
 from .db import init_db, upsert_store
 from .exporter import export_store
-from .importer import import_spark
+from .importer import import_amazon_source, import_spark
 from .stats import master_summary, store_summary
 from .schema_probe import probe_schema
 
@@ -34,6 +34,10 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("import-spark")
     p.add_argument("source", help="Spark storage directory or storage.zip")
+    p.add_argument("--allow-reimport", action="store_true")
+
+    p = sub.add_parser("import-amazon-source", help="Import product JSON from the local source inbox")
+    p.add_argument("source", nargs="?", help="JSON file/folder (default: source/amazon/inbox)")
     p.add_argument("--allow-reimport", action="store_true")
 
     p = sub.add_parser("classify")
@@ -100,6 +104,9 @@ def main(argv=None) -> int:
         print(json.dumps({"added": profile["store_id"], "name": profile["store_name"]}, ensure_ascii=False))
     elif args.cmd == "import-spark":
         result = import_spark(args.source, db, args.allow_reimport)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif args.cmd == "import-amazon-source":
+        result = import_amazon_source(args.source, db, args.allow_reimport)
         print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.cmd == "classify":
         print(json.dumps(classify_store(args.store, db), ensure_ascii=False, indent=2))

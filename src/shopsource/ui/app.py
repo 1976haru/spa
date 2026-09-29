@@ -8,10 +8,9 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from shopsource.classifier import classify_store
-from shopsource.db import connect, init_db, upsert_store
+from shopsource.db import init_db, upsert_store
 from shopsource.exporter import export_store
-from shopsource.importer import import_spark
-from shopsource.connectors.spark_center import capability as spark_center_capability
+from shopsource.importer import import_amazon_source, import_spark
 from shopsource.connectors.spark_center_package import (
     SparkCenterPackageResult,
     SparkCenterPackageService,
@@ -19,7 +18,7 @@ from shopsource.connectors.spark_center_package import (
     mark_package,
 )
 from shopsource.connectors.spark_handoff import SparkHandoffConnector, SparkHandoffResult
-from shopsource.paths import EXPORT_DIR, STORE_DIR
+from shopsource.paths import AMAZON_INBOX_DIR, EXPORT_DIR, STORE_DIR, ensure_dirs
 from shopsource.stats import master_summary, store_summary
 
 
@@ -27,8 +26,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ShopSource Studio v0.1")
-        self.geometry("1150x780")
-        self.minsize(1000, 680)
+        self.geometry("820x520")
+        self.minsize(720, 460)
         self.latest_package = None
         init_db()
         self._build()
@@ -36,72 +35,78 @@ class App(tk.Tk):
         self.refresh()
 
     def _build(self):
-        top = ttk.Frame(self, padding=10)
-        top.pack(fill="x")
-        ttk.Label(top, text="Store").pack(side="left")
+        menu = tk.Menu(self)
+        advanced = tk.Menu(menu, tearoff=False)
+        advanced.add_command(label="현재 Store 다시 분류", command=self.classify)
+        advanced.add_command(label="Spark Storage/ZIP 가져오기...", command=self.import_source)
+        advanced.add_separator()
+        advanced.add_command(label="CSV 내보내기...", command=lambda: self.export("csv"))
+        advanced.add_command(label="JSON 내보내기...", command=lambda: self.export("json"))
+        advanced.add_command(label="Spark Desktop 호환 폴더...", command=self.spark_handoff)
+        menu.add_cascade(label="고급", menu=advanced)
+        self.configure(menu=menu)
+
+        body = ttk.Frame(self, padding=18)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="ShopSource Studio", font=("Segoe UI", 18, "bold")).pack(anchor="w")
+
+        store = ttk.Frame(body, padding=(0, 16, 0, 8))
+        store.pack(fill="x")
+        ttk.Label(store, text="Store:", font=("Segoe UI", 11, "bold")).pack(side="left")
         self.store_var = tk.StringVar(value="001")
-        self.store_combo = ttk.Combobox(top, textvariable=self.store_var, width=28, state="readonly")
+        self.store_combo = ttk.Combobox(store, textvariable=self.store_var, width=34, state="readonly")
         self.store_combo.pack(side="left", padx=6)
         self.store_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh())
-        ttk.Button(top, text="Spark ZIP/Storage Import", command=self.import_source).pack(side="left", padx=4)
-        ttk.Button(top, text="Classify", command=self.classify).pack(side="left", padx=4)
-        ttk.Button(top, text="Export CSV", command=lambda: self.export("csv")).pack(side="left", padx=4)
-        ttk.Button(top, text="Export JSON", command=lambda: self.export("json")).pack(side="left", padx=4)
-        ttk.Button(top, text="Spark Desktop Handoff...", command=self.spark_handoff).pack(side="left", padx=4)
-        cap = spark_center_capability()
-        self.spark_button = ttk.Button(top, text=f"Spark Center: {cap.status}", state="disabled")
-        self.spark_button.pack(side="left", padx=4)
 
-        status = ttk.LabelFrame(self, text="MASTER / Store Summary", padding=10)
-        status.pack(fill="x", padx=10, pady=(0, 8))
+        source = ttk.LabelFrame(body, text="소싱 상품", padding=12)
+        source.pack(fill="x", pady=(0, 10))
+        ttk.Button(source, text="소싱 폴더 열기", command=self.open_source_folder).pack(side="left", padx=(0, 8))
+        ttk.Button(source, text="소싱 상품 가져오기", command=self.import_amazon_inbox).pack(side="left")
+
+        summary = ttk.Frame(body, padding=(4, 8))
+        summary.pack(fill="x")
         self.summary_text = tk.StringVar(value="")
-        ttk.Label(status, textvariable=self.summary_text, justify="left").pack(anchor="w")
+        ttk.Label(summary, textvariable=self.summary_text, font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        self.empty_master_text = tk.StringVar(value="")
+        ttk.Label(summary, textvariable=self.empty_master_text, justify="left", foreground="#8a4b08").pack(
+            anchor="w", pady=(8, 0)
+        )
 
-        filters = ttk.Frame(self, padding=(10, 0))
-        filters.pack(fill="x")
-        ttk.Label(filters, text="Status filter").pack(side="left")
-        self.status_var = tk.StringVar(value="ALL")
-        self.status_combo = ttk.Combobox(filters, textvariable=self.status_var, width=20, state="readonly",
+        ttk.Separator(body, orient="horizontal").pack(fill="x", pady=14)
+
+        package = ttk.LabelFrame(body, text="Spark Center 업로드 package", padding=12)
+        package.pack(fill="x")
+        ttk.Label(package, text="Status:").grid(row=0, column=0, sticky="w")
+        self.status_var = tk.StringVar(value="PRIMARY")
+        self.status_combo = ttk.Combobox(package, textvariable=self.status_var, width=18, state="readonly",
                                          values=["ALL","PRIMARY","RESERVE_A","RESERVE_B","RESERVE_C","LOW_RESERVE","HIGH_RESERVE","REVIEW","RESTRICTED","ARCHIVED"])
-        self.status_combo.pack(side="left", padx=6)
-        self.status_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_table())
-        ttk.Button(filters, text="Refresh", command=self.refresh).pack(side="left", padx=4)
-
-        package = ttk.LabelFrame(self, text="Spark Center manual upload package", padding=10)
-        package.pack(fill="x", padx=10, pady=8)
-        ttk.Label(package, text="Product count").grid(row=0, column=0, sticky="w")
+        self.status_combo.grid(row=0, column=1, padx=(6, 20), sticky="w")
+        ttk.Label(package, text="Product count:").grid(row=0, column=2, sticky="w")
         self.package_limit_var = tk.StringVar(value="50")
         ttk.Entry(package, textvariable=self.package_limit_var, width=8).grid(
-            row=0, column=1, padx=6, sticky="w"
+            row=0, column=3, padx=6, sticky="w"
         )
-        ttk.Button(
+        self.create_package_button = ttk.Button(
             package,
             text="Spark Center 업로드 폴더 만들기",
             command=self.create_spark_center_package,
-        ).grid(row=0, column=2, padx=6, sticky="w")
+        )
+        self.create_package_button.grid(row=1, column=0, columnspan=2, padx=(0, 8), pady=(12, 0), sticky="w")
         self.open_package_button = ttk.Button(
             package, text="폴더 열기", command=self.open_latest_package, state="disabled"
         )
-        self.open_package_button.grid(row=0, column=3, padx=6)
+        self.open_package_button.grid(row=1, column=2, padx=6, pady=(12, 0))
         self.mark_uploaded_button = ttk.Button(
             package, text="업로드 완료 표시", command=self.mark_latest_uploaded, state="disabled"
         )
-        self.mark_uploaded_button.grid(row=0, column=4, padx=6)
+        self.mark_uploaded_button.grid(row=1, column=3, padx=6, pady=(12, 0))
         self.package_info_var = tk.StringVar(value="Recent package: none")
         ttk.Label(
-            package, textvariable=self.package_info_var, justify="left", wraplength=1050
-        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
+            package, textvariable=self.package_info_var, justify="left", wraplength=1000
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(12, 0))
 
-        cols = ("asin","price","title","fit","price_status","risk","final")
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=20)
-        widths = {"asin":105,"price":70,"title":460,"fit":65,"price_status":115,"risk":100,"final":120}
-        for c in cols:
-            self.tree.heading(c, text=c)
-            self.tree.column(c, width=widths[c], anchor="w")
-        self.tree.pack(fill="both", expand=True, padx=10, pady=8)
-
-        bottom = ttk.Frame(self, padding=10)
-        bottom.pack(fill="x")
+        bottom = ttk.Frame(body, padding=(0, 18, 0, 0))
+        bottom.pack(fill="x", side="bottom")
         self.progress = ttk.Progressbar(bottom, mode="indeterminate")
         self.progress.pack(side="left", fill="x", expand=True)
         self.msg = tk.StringVar(value="Ready")
@@ -153,6 +158,35 @@ class App(tk.Tk):
             return
         self._run(lambda: import_spark(path))
 
+    def open_source_folder(self):
+        ensure_dirs()
+        os.startfile(str(AMAZON_INBOX_DIR))
+
+    def import_amazon_inbox(self):
+        self._run(self._import_and_classify_current_store, self._source_import_done)
+
+    def _import_and_classify_current_store(self):
+        result = import_amazon_source()
+        classification = classify_store(self.store_id())
+        return {"import": result, "classification": classification}
+
+    def _source_import_done(self, result):
+        self.progress.stop()
+        imported = result["import"]
+        master = master_summary()
+        self.msg.set(f"소싱 가져오기 완료: MASTER {master['unique_products']:,}")
+        messagebox.showinfo(
+            "소싱 상품 가져오기 완료",
+            f"신규 MASTER: {imported['inserted']:,}\n"
+            f"갱신: {imported['updated']:,}\n"
+            f"중복: {imported['duplicates']:,}\n"
+            f"오류: {imported['invalid']:,}\n"
+            f"MASTER 전체: {master['unique_products']:,}\n\n"
+            f"{self.store_var.get()} 자동 분류 완료\n\n"
+            f"원본 폴더:\n{imported['source_path']}",
+        )
+        self.refresh()
+
     def classify(self):
         self._run(lambda: classify_store(self.store_id()))
 
@@ -203,6 +237,12 @@ class App(tk.Tk):
         self.refresh()
 
     def create_spark_center_package(self):
+        if master_summary()["unique_products"] == 0:
+            messagebox.showinfo(
+                "소싱 상품이 필요합니다",
+                "먼저 소싱 폴더에 상품 JSON을 넣고 소싱 상품 가져오기를 눌러주세요.",
+            )
+            return
         try:
             limit = int(self.package_limit_var.get().strip())
         except ValueError:
@@ -300,38 +340,23 @@ class App(tk.Tk):
     def refresh(self):
         try:
             master = master_summary()
-            store = store_summary(self.store_id())
-            self.summary_text.set(
-                f"MASTER unique products: {master['unique_products']:,} | occurrences: {master['occurrences']:,} | repeats: {master['duplicates_or_repeats']:,} | Spark jobs: {master['spark_jobs']}\n"
-                f"Store {self.store_id()}: {store['total']:,} classified | " + ", ".join(f"{k} {v:,}" for k, v in store['counts'].items())
-            )
+            count = master["unique_products"]
+            self.summary_text.set(f"MASTER products: {count:,}")
+            if count == 0:
+                self.empty_master_text.set(
+                    "소싱 폴더에 상품 JSON을 넣고\n소싱 상품 가져오기를 눌러주세요."
+                )
+                self.create_package_button.configure(state="disabled")
+            else:
+                store = store_summary(self.store_id())
+                counts = ", ".join(f"{key} {value:,}" for key, value in store["counts"].items())
+                self.empty_master_text.set(
+                    f"현재 Store 분류: {store['total']:,}" + (f" | {counts}" if counts else "")
+                )
+                self.create_package_button.configure(state="normal")
         except Exception as exc:
             self.summary_text.set(str(exc))
-        self.refresh_table()
         self.refresh_package_info()
-
-    def refresh_table(self):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        sid = self.store_id()
-        status = self.status_var.get()
-        where = "d.store_id=?"
-        params = [sid]
-        if status != "ALL":
-            where += " AND d.final_status=?"
-            params.append(status)
-        sql = f"""
-        SELECT p.asin,p.price,p.title,d.fit_score,d.price_status,d.risk_status,d.final_status
-        FROM store_product_decisions d JOIN products p ON p.id=d.product_id
-        WHERE {where} ORDER BY d.final_status,p.price LIMIT 500
-        """
-        try:
-            with connect() as con:
-                rows = con.execute(sql, params).fetchall()
-            for r in rows:
-                self.tree.insert("", "end", values=(r["asin"], r["price"], r["title"], r["fit_score"], r["price_status"], r["risk_status"], r["final_status"]))
-        except Exception:
-            pass
 
 
 def main():

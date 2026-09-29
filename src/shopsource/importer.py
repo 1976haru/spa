@@ -5,8 +5,10 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .connectors.amazon_source_folder import AmazonSourceFolderConnector
 from .connectors.spark_storage import SparkStorageConnector
 from .db import connect, init_db, utc_now
+from .paths import AMAZON_INBOX_DIR
 
 
 def _normalize_epoch(value) -> str | None:
@@ -22,27 +24,48 @@ def _normalize_epoch(value) -> str | None:
         return str(value)
 
 
-def _import_key(source: Path) -> str:
-    stat = source.stat()
-    raw = f"{source.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:24]
+def _import_key(source: Path, source_type: str) -> str:
+    if source.is_file():
+        stat = source.stat()
+        inventory = [(source.name, stat.st_size, stat.st_mtime_ns)]
+    else:
+        inventory = []
+        for file in sorted(source.rglob("*.json")):
+            stat = file.stat()
+            inventory.append((str(file.relative_to(source)), stat.st_size, stat.st_mtime_ns))
+    raw = json.dumps(
+        [source_type, str(source.resolve()), inventory], ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
-def import_spark(source: str | Path, db=None, allow_reimport: bool = False) -> dict:
+def import_products(
+    source: str | Path,
+    connector,
+    source_type: str,
+    db=None,
+    allow_reimport: bool = False,
+) -> dict:
     source = Path(source)
     if not source.exists():
         raise FileNotFoundError(source)
     init_db(db)
-    key = _import_key(source)
+    key = _import_key(source, source_type)
     stats = {"files_seen": 0, "rows_read": 0, "inserted": 0, "updated": 0,
-             "duplicates": 0, "invalid": 0, "job_ids": set()}
+             "duplicates": 0, "invalid": 0, "job_ids": set(), "batches": set(),
+             "source_path": str(source.resolve())}
     fatal_error: Exception | None = None
 
-    connector = SparkStorageConnector()
     with connect(db) as con:
         previous = con.execute("SELECT id,status FROM import_runs WHERE import_key=?", (key,)).fetchone()
         if previous and previous["status"] == "DONE" and not allow_reimport:
-            return {**stats, "job_ids": [], "skipped": True, "reason": "source already imported"}
+            return {
+                **stats,
+                "job_ids": [],
+                "batches": [],
+                "skipped": True,
+                "reason": "source already imported",
+            }
         if previous:
             run_id = previous["id"]
             con.execute("DELETE FROM import_errors WHERE import_run_id=?", (run_id,))
@@ -66,6 +89,7 @@ def import_spark(source: str | Path, db=None, allow_reimport: bool = False) -> d
             for payload, meta in connector.iter_products(source):
                 stats["files_seen"] += 1
                 stats["job_ids"].add(meta.get("job_id") or "")
+                stats["batches"].add(meta.get("batch_id") or meta.get("job_id") or "")
                 if payload.get("_invalid"):
                     stats["invalid"] += 1
                     con.execute(
@@ -173,5 +197,28 @@ def import_spark(source: str | Path, db=None, allow_reimport: bool = False) -> d
     if fatal_error is not None:
         raise fatal_error
     stats["job_ids"] = sorted(x for x in stats["job_ids"] if x)
+    stats["batches"] = sorted(x for x in stats["batches"] if x)
     stats["skipped"] = False
     return stats
+
+
+def import_spark(source: str | Path, db=None, allow_reimport: bool = False) -> dict:
+    return import_products(
+        source, SparkStorageConnector(), "SPARK_STORAGE", db, allow_reimport
+    )
+
+
+def import_amazon_source(
+    source: str | Path | None = None,
+    db=None,
+    allow_reimport: bool = False,
+) -> dict:
+    source_path = Path(source) if source is not None else AMAZON_INBOX_DIR
+    if source_path.exists() and source_path.is_dir() and not any(source_path.rglob("*.json")):
+        raise ValueError(
+            "소싱 상품 JSON이 없습니다. source/amazon/inbox에 상품 파일을 넣어주세요."
+        )
+    result = import_products(
+        source_path, AmazonSourceFolderConnector(), "AMAZON_SOURCE_FOLDER", db, allow_reimport
+    )
+    return result

@@ -5,6 +5,7 @@
 ## v0.1에서 되는 것
 
 - Spark `storage.zip` 또는 `storage/` 폴더 읽기
+- 프로젝트 로컬 `source/amazon/inbox/`의 상품 JSON 가져오기
 - 여러 Spark 실행의 상품을 하나의 SQLite MASTER DB로 통합
 - ASIN 기준 중복 제거, 출현 이력(job/file) 별도 보존
 - 가격 때문에 상품을 삭제하지 않고 `PRIMARY / RESERVE_A/B/C / LOW_RESERVE / HIGH_RESERVE` 등으로 동적 분류
@@ -53,13 +54,14 @@ dataset 폴더가 Spark UI에 정상 로드됐지만, Shopify 실제 업로드�
 ## 초보자용 Spark Center 수동 업로드 순서
 
 1. `run_gui.bat` 실행
-2. Store 선택 후 `Classify` 실행
-3. Status를 `PRIMARY`로 선택
-4. 상품 수 입력(기본 50)
-5. `Spark Center 업로드 폴더 만들기` 클릭
-6. Validation PASS 확인 후 `폴더 열기`
-7. 표시된 `ready/<package_id>` 폴더 하나만 Spark Center에 수동 업로드
-8. 업로드를 수행했다면 `업로드 완료 표시` 클릭
+2. `소싱 폴더 열기`를 눌러 `source/amazon/inbox/`에 상품 JSON을 넣기
+3. `소싱 상품 가져오기`를 눌러 MASTER 저장 및 현재 Store 자동 분류
+4. Status를 `PRIMARY`로 선택
+5. 상품 수 입력(기본 50)
+6. `Spark Center 업로드 폴더 만들기` 클릭
+7. Validation PASS 확인 후 `폴더 열기`
+8. 표시된 `ready/<package_id>` 폴더 하나만 Spark Center에 수동 업로드
+9. 업로드를 수행했다면 `업로드 완료 표시` 클릭
 
 기본 출력은 저장소 상대경로 `exports/spark_center/<store>/`입니다. `업로드 완료 표시`는
 사용자 운영 기록일 뿐 Spark Center 포털이나 Shopify 성공을 자동 검증하지 않습니다.
@@ -78,8 +80,9 @@ shopsource classify --store 001
 ## 데이터 파일
 
 - DB: `data/shopsource.sqlite3`
+- 사용자 소싱 inbox: `source/amazon/inbox/`
 - 내보내기: `exports/`
-- 실제 DB와 export 파일은 Git에 올리지 않습니다.
+- 실제 DB, inbox 상품 JSON, export 파일은 Git에 올리지 않습니다.
 
 ## Spark Center
 
