@@ -46,6 +46,20 @@
 - [x] 기존 Spark desktop handoff는 고급 호환 옵션으로 유지
 - [ ] 실제 Spark Center 포털에 생성 폴더 업로드 round-trip 검증
 
+## v0.2.2 AMAZON SOURCE INBOX — 다음
+- [ ] 프로젝트 로컬 `source/amazon/` 작업공간 자동 생성
+- [ ] 기존 C드라이브 Spark storage를 기본 입력에서 제거
+- [ ] 일반 상품 JSON 폴더를 MASTER DB로 가져오기
+- [ ] 기존 Spark storage/ZIP import는 레거시/고급 입력으로 유지
+- [ ] 원본 소싱 파일은 읽기 전용으로 보존
+- [ ] ASIN 기준 MASTER dedupe 및 occurrence/history 유지
+- [ ] GUI 버튼을 '소싱 상품 가져오기' 중심으로 단순화
+- [ ] '소싱 폴더 열기' 제공
+- [ ] 가져오기 결과(신규/갱신/중복/오류) 명확히 표시
+- [ ] MASTER 0개 상태에서 다음 행동을 안내
+- [ ] 현재 Store 재분류 흐름 연결
+- [ ] source/amazon 실제 상품 데이터 Git 제외
+
 ## v0.3 STORE ENGINE
 - [ ] UI에서 가격구간 직접 편집
 - [ ] Store 추가/복제/비활성
