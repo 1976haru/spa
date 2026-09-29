@@ -144,9 +144,9 @@ def import_products(
                         """
                         UPDATE products SET url=?, title=?, brand=?, price=?, currency=?, category=?,
                         tags_json=?, overview_json=?, about_json=?, images_json=?, options_json=?, rating=?,
-                        review_count=?, source_url=?, list_page=?, raw_json=?, last_seen_at=? WHERE id=?
+                        review_count=?, source_url=?, list_page=?, raw_json=?, last_seen_at=?,source_kind=? WHERE id=?
                         """,
-                        values + (product_id,),
+                        values + (source_type, product_id),
                     )
                     stats["updated"] += 1
                 else:
@@ -155,10 +155,10 @@ def import_products(
                         INSERT INTO products(
                           asin,url,title,brand,price,currency,category,tags_json,overview_json,about_json,
                           images_json,options_json,rating,review_count,source_url,list_page,raw_json,
-                          first_seen_at,last_seen_at
-                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                          first_seen_at,last_seen_at,source_kind
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                         """,
-                        (asin,) + values[:-1] + (now, now),
+                        (asin,) + values[:-1] + (now, now, source_type),
                     )
                     product_id = cur2.lastrowid
                     stats["inserted"] += 1
@@ -166,15 +166,15 @@ def import_products(
                 con.execute(
                     """
                     INSERT INTO product_occurrences(
-                      product_id,import_run_id,job_id,source_file,collected_at,source_url,list_page,raw_json
-                    ) VALUES(?,?,?,?,?,?,?,?)
+                      product_id,import_run_id,job_id,source_file,collected_at,source_url,list_page,raw_json,source_kind
+                    ) VALUES(?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(product_id,job_id,source_file) DO UPDATE SET
                       raw_json=COALESCE(product_occurrences.raw_json,excluded.raw_json)
                     """,
                     (
                         product_id, run_id, meta.get("job_id"), meta.get("source_file"),
                         _normalize_epoch(meta.get("collected_at")), meta.get("source_url"),
-                        meta.get("list_page"), raw,
+                        meta.get("list_page"), raw, source_type,
                     ),
                 )
 

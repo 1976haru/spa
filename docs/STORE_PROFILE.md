@@ -19,3 +19,8 @@
 ```
 
 가격 경계는 `min <= price < max`를 사용한다. 가격 구간은 코드 수정 없이 JSON에서 바꾼다.
+
+선택적인 `sourcing` 섹션에서 provider, 후보 가격 범위, rating/review/image 조건, token budget과
+keyword recipe를 지정할 수 있다. 기존 profile에 이 섹션이 없어도 분류 기능은 그대로 동작한다.
+Cabin Tidy는 PRIMARY `$40~100` 주변 reserve 확보를 위해 discovery 범위를 `$30~120`으로 둔다.
+이는 범위 밖 MASTER 상품을 삭제한다는 뜻이 아니다.

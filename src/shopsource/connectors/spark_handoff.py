@@ -13,6 +13,7 @@ from .manifest import build_manifest
 from ..classifier import ALLOWED_STATUSES
 from ..db import connect, get_store, init_db, utc_now
 from ..paths import EXPORT_DIR
+from ..sourcing.mapping import KEEPA_TO_SPARK_CAPABILITY, to_spark_product_payload
 
 CAPABILITY_STATUS = "DATASET_LOAD_VERIFIED"
 INTERNAL_FIELDS = {
@@ -190,7 +191,7 @@ class SparkHandoffConnector(ExportConnector):
         if not rows:
             raise ValueError("No products matched the requested Store Decision filters")
 
-        payloads, source_job_ids, preflight_errors = self._payloads(rows, db)
+        payloads, source_job_ids, preflight_errors, keepa_mapping = self._payloads(rows, db)
         jobs_root.mkdir(parents=True, exist_ok=True)
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -213,11 +214,15 @@ class SparkHandoffConnector(ExportConnector):
             export_status="VALIDATION_PENDING",
             selected_statuses=list(selected_statuses),
             output_folder=str(job_folder),
-            capability_status=CAPABILITY_STATUS,
+            capability_status=KEEPA_TO_SPARK_CAPABILITY if keepa_mapping else CAPABILITY_STATUS,
             shopify_upload_verified=False,
         )
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         report = self._validate(job_folder, manifest, preflight_errors)
+        if keepa_mapping:
+            report["warnings"].append(
+                "Keepa canonical to Spark payload mapping has not completed a portal round-trip test"
+            )
         manifest["export_status"] = report["status"]
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -249,7 +254,7 @@ class SparkHandoffConnector(ExportConnector):
             clauses.append(f"p.asin IN ({','.join('?' for _ in asins)})")
             params.extend(asins)
         sql = f"""
-            SELECT p.id,p.asin,p.raw_json
+            SELECT p.id,p.asin,p.raw_json,p.source_kind
             FROM store_product_decisions d JOIN products p ON p.id=d.product_id
             WHERE {' AND '.join(clauses)} ORDER BY p.asin ASC
         """
@@ -276,15 +281,22 @@ class SparkHandoffConnector(ExportConnector):
         payloads: list[dict] = []
         source_job_ids: set[str] = set()
         errors: list[str] = []
+        keepa_mapping = False
         for row in rows:
             payload = None
             source_job_id = None
-            for occurrence in occurrences[row["id"]]:
-                candidate = _parse_payload(occurrence["raw_json"])
-                if candidate is not None:
-                    payload = candidate
-                    source_job_id = occurrence["job_id"]
-                    break
+            if row["source_kind"] == "KEEPA":
+                canonical = _parse_payload(row["raw_json"])
+                if canonical is not None:
+                    payload = to_spark_product_payload(canonical)
+                    keepa_mapping = True
+            else:
+                for occurrence in occurrences[row["id"]]:
+                    candidate = _parse_payload(occurrence["raw_json"])
+                    if candidate is not None:
+                        payload = candidate
+                        source_job_id = occurrence["job_id"]
+                        break
             if payload is None:
                 payload = _parse_payload(row["raw_json"])
             if payload is None:
@@ -307,7 +319,7 @@ class SparkHandoffConnector(ExportConnector):
             payloads.append(payload)
             if source_job_id:
                 source_job_ids.add(source_job_id)
-        return payloads, source_job_ids, errors
+        return payloads, source_job_ids, errors, keepa_mapping
 
     @staticmethod
     def _validate(job_folder: Path, manifest: dict, preflight_errors: list[str]) -> dict:

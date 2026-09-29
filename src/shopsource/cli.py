@@ -16,6 +16,7 @@ from .exporter import export_store
 from .importer import import_amazon_source, import_spark
 from .stats import master_summary, store_summary
 from .schema_probe import probe_schema
+from .sourcing.engine import SourcingEngine
 
 
 def load_json(path: str | Path) -> dict:
@@ -92,6 +93,22 @@ def main(argv=None) -> int:
     p.add_argument("--status", action="append", dest="statuses")
     p.add_argument("--out")
 
+    p = sub.add_parser("source-auto", help="Preview or run provider-based candidate sourcing")
+    p.add_argument("--store", required=True)
+    p.add_argument("--target", type=int, default=5)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--max-tokens", type=int, default=1000)
+    p.add_argument("--min-token-reserve", type=int, default=100)
+
+    p = sub.add_parser("source-status", help="Show automated sourcing run status")
+    p.add_argument("--run", required=True)
+
+    p = sub.add_parser("source-resume", help="Resume a paused automated sourcing run")
+    p.add_argument("--run", required=True)
+
+    p = sub.add_parser("source-cancel", help="Cancel an automated sourcing run")
+    p.add_argument("--run", required=True)
+
     args = parser.parse_args(argv)
     db = args.db
 
@@ -156,6 +173,19 @@ def main(argv=None) -> int:
     elif args.cmd == "export":
         target = export_store(args.store, args.format, args.statuses, args.out, db)
         print(target)
+    elif args.cmd == "source-auto":
+        engine = SourcingEngine()
+        result = (engine.preview(args.store, args.target, db) if args.dry_run else
+                  engine.run(args.store, args.target, db=db,
+                             max_tokens_per_run=args.max_tokens,
+                             min_tokens_reserve=args.min_token_reserve))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif args.cmd == "source-status":
+        print(json.dumps(SourcingEngine.status(args.run, db), ensure_ascii=False, indent=2))
+    elif args.cmd == "source-resume":
+        print(json.dumps(SourcingEngine().resume(args.run, db), ensure_ascii=False, indent=2))
+    elif args.cmd == "source-cancel":
+        print(json.dumps(SourcingEngine.cancel(args.run, db), ensure_ascii=False, indent=2))
     return 0
 
 

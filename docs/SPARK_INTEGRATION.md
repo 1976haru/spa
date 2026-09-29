@@ -99,6 +99,10 @@ ASIN 중복, 키·필드 타입·누락률, Job ID, 가능한 버전 필드를 �
 
 ## 3. 연동 우선순위
 
+자동 소싱 Keepa 상품은 Spark 원본 JSON이 아니다. `source_kind=KEEPA` 상품은 별도 canonical→Spark
+adapter를 사용하며 실제 포털 round-trip 전 capability는 `KEEPA_TO_SPARK_MAPPING_UNVERIFIED`다.
+기존 `SPARK_STORAGE` 상품의 최신 occurrence raw payload 전략은 그대로 유지한다.
+
 ### A. 최우선 — Spark 공식 '데이터 불러오기' 호환 Export
 
 다음을 실제 Round-trip 테스트로 확인한다.

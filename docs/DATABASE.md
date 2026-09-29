@@ -47,3 +47,14 @@ Phase 2.1 additive migration 필드:
 
 기존 행은 `target=SPARK_DESKTOP`, `package_id=job_id`로 보존한다. `UPLOADED`는 사용자 수동
 표시이며 포털 또는 Shopify 성공 검증을 의미하지 않는다.
+
+## sourcing_runs / sourcing_run_candidates
+
+`sourcing_runs`는 provider, Store, recipe snapshot, target, token telemetry, 진행 통계와
+`checkpoint_json`을 보존한다. 상태는 `PENDING / RUNNING / PAUSED / PAUSED_TOKEN_BUDGET /
+DONE / FAILED / CANCELLED`이다. `sourcing_run_candidates`는 ASIN별 recipe/page/rank/query hash와
+위험 거부 이유를 보존한다.
+
+`products.source_kind`와 `product_occurrences.source_kind`는 additive migration으로 추가된다.
+Keepa의 provider raw는 occurrence에, canonical payload는 MASTER `raw_json`에 저장하여 Spark 원본과
+혼동하지 않는다.

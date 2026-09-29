@@ -46,35 +46,30 @@
 - [x] 기존 Spark desktop handoff는 고급 호환 옵션으로 유지
 - [ ] 실제 Spark Center 포털에 생성 폴더 업로드 round-trip 검증
 
-## v0.2.2 AMAZON SOURCE INBOX — 다음
-- [ ] 프로젝트 로컬 `source/amazon/` 작업공간 자동 생성
-- [ ] 기존 C드라이브 Spark storage를 기본 입력에서 제거
-- [ ] 일반 상품 JSON 폴더를 MASTER DB로 가져오기
-- [ ] 기존 Spark storage/ZIP import는 레거시/고급 입력으로 유지
-- [ ] 원본 소싱 파일은 읽기 전용으로 보존
-- [ ] ASIN 기준 MASTER dedupe 및 occurrence/history 유지
-- [ ] GUI 버튼을 '소싱 상품 가져오기' 중심으로 단순화
-- [ ] '소싱 폴더 열기' 제공
-- [ ] 가져오기 결과(신규/갱신/중복/오류) 명확히 표시
-- [ ] MASTER 0개 상태에서 다음 행동을 안내
-- [ ] 현재 Store 재분류 흐름 연결
-- [ ] source/amazon 실제 상품 데이터 Git 제외
+## v0.2.2 AMAZON SOURCE INBOX
+- [x] 프로젝트 로컬 `source/amazon/` 작업공간 자동 생성
+- [x] 일반 상품 JSON 폴더를 MASTER DB로 가져오기
+- [x] 기존 Spark storage/ZIP import는 레거시/고급 입력으로 유지
+- [x] 원본 읽기 전용, ASIN dedupe, occurrence/history 유지
+- [x] GUI 소싱 폴더 열기/가져오기/MASTER 0 안내/자동 재분류
+- [x] source/amazon 실제 상품 데이터 Git 제외
 
-## v0.2.3 AUTOMATED AMAZON CANDIDATE SOURCING — 다음
-- [ ] Provider abstraction 기반 자동 소싱 엔진
-- [ ] 1차 provider: Keepa API (Product Finder / Product Request / Best Sellers)
-- [ ] Keepa API key를 Git 밖에서 안전하게 관리
-- [ ] Store Profile 기반 keyword/category/price/risk sourcing recipe
-- [ ] 후보 ASIN 대량 검색 및 checkpoint/resume
-- [ ] Keepa token budget / rate pacing / retry / backoff
-- [ ] Product Finder 결과 ASIN → 상세 Product Request 보강
-- [ ] Keepa raw 응답은 provider 원본으로 보존하고 ShopSource canonical payload로 별도 정규화
+## v0.2.3 AUTOMATED AMAZON CANDIDATE SOURCING — 현재
+- [x] Provider abstraction 기반 자동 소싱 엔진
+- [x] 1차 provider: Keepa API Product Finder / Product Request
+- [x] Keepa API key를 Git 밖의 환경변수/GUI session에서 관리
+- [x] Store Profile 기반 keyword/price/risk sourcing recipe
+- [x] 후보 ASIN 검색 및 checkpoint/resume/cancel
+- [x] Keepa token budget / retry / bounded backoff
+- [x] Product Finder 결과 ASIN → 최대 100개 Product Request 보강
+- [x] Keepa raw occurrence와 ShopSource canonical MASTER 분리
 - [ ] Amazon Creators API는 Shopify 재판매용 sourcing feed로 사용하지 않음
-- [ ] 위험/성인/HazMat/배터리/금지 키워드 prefilter
-- [ ] 동일 ASIN MASTER dedupe 및 Store별 classification 연결
-- [ ] Cabin Tidy 자동 소싱 recipe 1차 구현
-- [ ] GUI: 자동 소싱 시작/중지/진행률/예상 token cost/결과 요약
-- [ ] DRY RUN과 실제 API 실행 분리
+- [x] 위험/성인/HazMat 후보 상태와 이유 보존
+- [x] 동일 ASIN MASTER dedupe 및 Store별 classification 연결
+- [x] Cabin Tidy 자동 소싱 recipe 1차 구현
+- [x] GUI: 설정/미리보기/시작/일시정지/계속/취소/진행 요약
+- [x] DRY RUN과 실제 API 실행 분리
+- [ ] Keepa→Spark mapping 5상품 portal round-trip 검증
 - [ ] 5개 → 50개 → 500개 단계별 live test
 - [ ] 30,000개/Store 확장 benchmark 전에는 대규모 실행 금지
 

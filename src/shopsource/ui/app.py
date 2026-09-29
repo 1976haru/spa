@@ -5,7 +5,7 @@ import os
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from shopsource.classifier import classify_store
 from shopsource.db import init_db, upsert_store
@@ -20,15 +20,19 @@ from shopsource.connectors.spark_center_package import (
 from shopsource.connectors.spark_handoff import SparkHandoffConnector, SparkHandoffResult
 from shopsource.paths import AMAZON_INBOX_DIR, EXPORT_DIR, STORE_DIR, ensure_dirs
 from shopsource.stats import master_summary, store_summary
+from shopsource.sourcing.engine import SourcingEngine, new_run_id
+from shopsource.sourcing.providers.keepa import KeepaProvider
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ShopSource Studio v0.1")
-        self.geometry("820x520")
-        self.minsize(720, 460)
+        self.geometry("980x650")
+        self.minsize(900, 600)
         self.latest_package = None
+        self.current_sourcing_run = None
+        self.keepa_session_key = None
         init_db()
         self._build()
         self._load_store_profiles()
@@ -62,6 +66,22 @@ class App(tk.Tk):
         source.pack(fill="x", pady=(0, 10))
         ttk.Button(source, text="소싱 폴더 열기", command=self.open_source_folder).pack(side="left", padx=(0, 8))
         ttk.Button(source, text="소싱 상품 가져오기", command=self.import_amazon_inbox).pack(side="left")
+
+        automatic = ttk.LabelFrame(body, text="자동 소싱 (Keepa)", padding=12)
+        automatic.pack(fill="x", pady=(0, 10))
+        ttk.Button(automatic, text="API 설정", command=self.configure_keepa).grid(row=0, column=0, padx=(0, 8))
+        ttk.Label(automatic, text="Target candidates:").grid(row=0, column=1)
+        self.auto_target_var = tk.StringVar(value="5")
+        ttk.Entry(automatic, textvariable=self.auto_target_var, width=7).grid(row=0, column=2, padx=6)
+        ttk.Button(automatic, text="소싱 미리보기", command=self.preview_sourcing).grid(row=0, column=3, padx=4)
+        ttk.Button(automatic, text="자동 소싱 시작", command=self.start_sourcing).grid(row=0, column=4, padx=4)
+        ttk.Button(automatic, text="일시정지", command=self.pause_sourcing).grid(row=0, column=5, padx=4)
+        ttk.Button(automatic, text="계속", command=self.resume_sourcing).grid(row=0, column=6, padx=4)
+        ttk.Button(automatic, text="취소", command=self.cancel_sourcing).grid(row=0, column=7, padx=4)
+        self.sourcing_info_var = tk.StringVar(value="Status: IDLE")
+        ttk.Label(automatic, textvariable=self.sourcing_info_var, wraplength=760).grid(
+            row=1, column=0, columnspan=8, sticky="w", pady=(8, 0)
+        )
 
         summary = ttk.Frame(body, padding=(4, 8))
         summary.pack(fill="x")
@@ -189,6 +209,96 @@ class App(tk.Tk):
 
     def classify(self):
         self._run(lambda: classify_store(self.store_id()))
+
+    def configure_keepa(self):
+        key = simpledialog.askstring(
+            "Keepa API 설정",
+            "Keepa API key를 입력하세요. 이 값은 현재 실행 메모리에만 보관되며 파일/DB에 저장되지 않습니다.",
+            show="*",
+            parent=self,
+        )
+        if key:
+            self.keepa_session_key = key.strip()
+            messagebox.showinfo("Keepa API 설정", "현재 세션용 API key가 설정되었습니다.")
+
+    def _auto_target(self):
+        try:
+            target = int(self.auto_target_var.get())
+        except ValueError:
+            raise ValueError("Target candidates는 정수여야 합니다.")
+        if target < 1:
+            raise ValueError("Target candidates는 1 이상이어야 합니다.")
+        return target
+
+    def preview_sourcing(self):
+        try:
+            preview = SourcingEngine().preview(self.store_id(), self._auto_target())
+        except Exception as exc:
+            messagebox.showerror("자동 소싱 미리보기", str(exc))
+            return
+        messagebox.showinfo("자동 소싱 미리보기 (network 요청 없음)", json.dumps(preview, ensure_ascii=False, indent=2))
+
+    def start_sourcing(self):
+        try:
+            target = self._auto_target()
+            provider = KeepaProvider(api_key=self.keepa_session_key)
+        except Exception as exc:
+            messagebox.showerror("자동 소싱", str(exc))
+            return
+        self.current_sourcing_run = new_run_id(self.store_id())
+        self.sourcing_info_var.set(f"Run {self.current_sourcing_run} | Status: RUNNING")
+        self._run(
+            lambda: SourcingEngine(provider, self._queue_sourcing_progress).run(
+                self.store_id(), target, run_id=self.current_sourcing_run
+            ),
+            self._sourcing_done,
+        )
+
+    def _sourcing_done(self, result):
+        self.progress.stop()
+        self.sourcing_info_var.set(
+            f"Run {result['run_id']} | Status: {result['status']} | Candidates {result['discovered_asins']} | "
+            f"Hydrated {result['hydrated_products']} | MASTER +{result['inserted']} / updated {result['updated']} | "
+            f"Tokens {result['tokens_consumed']} / left {result['tokens_left']}"
+        )
+        self.refresh()
+
+    def _queue_sourcing_progress(self, result):
+        self.after(0, lambda: self.sourcing_info_var.set(
+            f"Run {result['run_id']} | Status: {result['status']} | Candidates {result['discovered_asins']} | "
+            f"Hydrated {result['hydrated_products']} | MASTER +{result['inserted']} / updated {result['updated']} | "
+            f"Tokens {result['tokens_consumed']} / left {result['tokens_left']}"
+        ))
+
+    def pause_sourcing(self):
+        if self.current_sourcing_run:
+            try:
+                SourcingEngine.pause(self.current_sourcing_run)
+                self.sourcing_info_var.set(f"Run {self.current_sourcing_run} | Status: PAUSED")
+            except Exception as exc:
+                messagebox.showerror("자동 소싱", str(exc))
+
+    def resume_sourcing(self):
+        if not self.current_sourcing_run:
+            messagebox.showinfo("자동 소싱", "계속할 sourcing run이 없습니다.")
+            return
+        try:
+            provider = KeepaProvider(api_key=self.keepa_session_key)
+        except Exception as exc:
+            messagebox.showerror("자동 소싱", str(exc))
+            return
+        self._run(
+            lambda: SourcingEngine(provider, self._queue_sourcing_progress).resume(self.current_sourcing_run),
+            self._sourcing_done,
+        )
+
+    def cancel_sourcing(self):
+        if self.current_sourcing_run:
+            try:
+                result = SourcingEngine.cancel(self.current_sourcing_run)
+                self.sourcing_info_var.set(f"Run {result['run_id']} | Status: CANCELLED")
+            except Exception as exc:
+                messagebox.showerror("자동 소싱", str(exc))
 
     def export(self, fmt):
         sid = self.store_id()

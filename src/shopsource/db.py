@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS products (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     asin TEXT NOT NULL UNIQUE,
     source TEXT NOT NULL DEFAULT 'amazon',
+    source_kind TEXT NOT NULL DEFAULT 'SPARK_STORAGE',
     url TEXT,
     title TEXT NOT NULL DEFAULT '',
     brand TEXT NOT NULL DEFAULT '',
@@ -64,6 +65,7 @@ CREATE TABLE IF NOT EXISTS product_occurrences (
     source_url TEXT,
     list_page INTEGER,
     raw_json TEXT,
+    source_kind TEXT NOT NULL DEFAULT 'SPARK_STORAGE',
     UNIQUE(product_id, job_id, source_file)
 );
 
@@ -124,6 +126,46 @@ CREATE TABLE IF NOT EXISTS export_runs (
     portal_package_verified INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS sourcing_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL UNIQUE,
+    provider TEXT NOT NULL,
+    store_id TEXT NOT NULL,
+    marketplace TEXT NOT NULL DEFAULT 'US',
+    recipe_snapshot_json TEXT NOT NULL,
+    target_candidates INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    checkpoint_json TEXT NOT NULL DEFAULT '{}',
+    started_at TEXT,
+    finished_at TEXT,
+    finder_requests INTEGER NOT NULL DEFAULT 0,
+    product_requests INTEGER NOT NULL DEFAULT 0,
+    tokens_consumed INTEGER NOT NULL DEFAULT 0,
+    tokens_left INTEGER,
+    discovered_asins INTEGER NOT NULL DEFAULT 0,
+    hydrated_products INTEGER NOT NULL DEFAULT 0,
+    inserted INTEGER NOT NULL DEFAULT 0,
+    updated INTEGER NOT NULL DEFAULT 0,
+    duplicates INTEGER NOT NULL DEFAULT 0,
+    invalid INTEGER NOT NULL DEFAULT 0,
+    error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sourcing_run_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES sourcing_runs(run_id) ON DELETE CASCADE,
+    asin TEXT NOT NULL,
+    recipe_id TEXT NOT NULL,
+    keyword TEXT NOT NULL DEFAULT '',
+    finder_page INTEGER NOT NULL DEFAULT 0,
+    discovered_at TEXT NOT NULL,
+    discovery_rank INTEGER NOT NULL,
+    query_hash TEXT NOT NULL,
+    decision TEXT NOT NULL DEFAULT 'DISCOVERED',
+    reason_json TEXT NOT NULL DEFAULT '[]',
+    UNIQUE(run_id, asin, recipe_id, finder_page)
+);
+
 CREATE INDEX IF NOT EXISTS idx_products_price ON products(price);
 CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);
 CREATE INDEX IF NOT EXISTS idx_decisions_store_status ON store_product_decisions(store_id, final_status);
@@ -133,6 +175,9 @@ CREATE INDEX IF NOT EXISTS idx_occurrence_product ON product_occurrences(product
 CREATE INDEX IF NOT EXISTS idx_occurrence_import_run ON product_occurrences(import_run_id);
 CREATE INDEX IF NOT EXISTS idx_import_errors_run ON import_errors(import_run_id);
 CREATE INDEX IF NOT EXISTS idx_export_runs_store_created ON export_runs(store_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_sourcing_runs_store_created ON sourcing_runs(store_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_sourcing_runs_status ON sourcing_runs(status);
+CREATE INDEX IF NOT EXISTS idx_sourcing_candidates_run_asin ON sourcing_run_candidates(run_id, asin);
 """
 
 EXPORT_RUN_ADDITIVE_COLUMNS = {
@@ -146,6 +191,15 @@ EXPORT_RUN_ADDITIVE_COLUMNS = {
     "portal_package_verified": "INTEGER NOT NULL DEFAULT 0",
 }
 
+PRODUCT_ADDITIVE_COLUMNS = {
+    "source_kind": "TEXT NOT NULL DEFAULT 'SPARK_STORAGE'",
+}
+
+OCCURRENCE_ADDITIVE_COLUMNS = {
+    "raw_json": "TEXT",
+    "source_kind": "TEXT NOT NULL DEFAULT 'SPARK_STORAGE'",
+}
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -153,7 +207,9 @@ def utc_now() -> str:
 
 def db_path(path: str | Path | None = None) -> Path:
     ensure_dirs()
-    return Path(path) if path else DEFAULT_DB
+    result = Path(path) if path else DEFAULT_DB
+    result.parent.mkdir(parents=True, exist_ok=True)
+    return result
 
 
 @contextmanager
@@ -177,11 +233,16 @@ def init_db(path: str | Path | None = None) -> Path:
     p = db_path(path)
     with connect(p) as con:
         con.executescript(SCHEMA)
+        product_columns = {row["name"] for row in con.execute("PRAGMA table_info(products)")}
+        for name, declaration in PRODUCT_ADDITIVE_COLUMNS.items():
+            if name not in product_columns:
+                con.execute(f"ALTER TABLE products ADD COLUMN {name} {declaration}")
         occurrence_columns = {
             row["name"] for row in con.execute("PRAGMA table_info(product_occurrences)")
         }
-        if "raw_json" not in occurrence_columns:
-            con.execute("ALTER TABLE product_occurrences ADD COLUMN raw_json TEXT")
+        for name, declaration in OCCURRENCE_ADDITIVE_COLUMNS.items():
+            if name not in occurrence_columns:
+                con.execute(f"ALTER TABLE product_occurrences ADD COLUMN {name} {declaration}")
         export_columns = {
             row["name"] for row in con.execute("PRAGMA table_info(export_runs)")
         }

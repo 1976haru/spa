@@ -24,6 +24,14 @@ Spark storage.zip / storage/
                          (contract pending)
 ```
 
+자동 소싱 경로는 `Store Profile → Sourcing Recipe → SourcingProvider → canonical MASTER → classifier`이다.
+현재 provider는 Keepa이며 `sourcing/providers` 뒤에 격리된다. Keepa provider raw는 occurrence에,
+ShopSource canonical JSON은 MASTER에 저장한다. API key는 두 위치 모두에 저장하지 않는다.
+
+Spark export는 source-aware하다. `SPARK_STORAGE`는 검증된 최신 Spark occurrence payload를 사용하고,
+`KEEPA`는 canonical payload를 별도 adapter로 매핑한다. 후자는 실제 portal round-trip 전까지
+`KEEPA_TO_SPARK_MAPPING_UNVERIFIED`이다.
+
 ## 모듈 경계
 
 - `connectors/`: 외부/로컬 시스템 입출력. 핵심 DB/규칙 엔진과 분리한다.

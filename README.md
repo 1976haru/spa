@@ -6,6 +6,7 @@
 
 - Spark `storage.zip` 또는 `storage/` 폴더 읽기
 - 프로젝트 로컬 `source/amazon/inbox/`의 상품 JSON 가져오기
+- Keepa-first 자동 후보 소싱(DRY RUN, token budget, checkpoint/resume)
 - 여러 Spark 실행의 상품을 하나의 SQLite MASTER DB로 통합
 - ASIN 기준 중복 제거, 출현 이력(job/file) 별도 보존
 - 가격 때문에 상품을 삭제하지 않고 `PRIMARY / RESERVE_A/B/C / LOW_RESERVE / HIGH_RESERVE` 등으로 동적 분류
@@ -65,6 +66,25 @@ dataset 폴더가 Spark UI에 정상 로드됐지만, Shopify 실제 업로드�
 
 기본 출력은 저장소 상대경로 `exports/spark_center/<store>/`입니다. `업로드 완료 표시`는
 사용자 운영 기록일 뿐 Spark Center 포털이나 Shopify 성공을 자동 검증하지 않습니다.
+
+## 자동 소싱 운영 순서
+
+1. `run_gui.bat` 더블클릭 후 Store를 선택합니다.
+2. `소싱 미리보기`로 keyword, 가격 범위, 예상 요청/token을 확인합니다. 미리보기는 network를 사용하지 않습니다.
+3. `KEEPA_API_KEY` 환경변수를 설정하거나 `API 설정`에서 현재 GUI 세션 key를 입력합니다.
+4. 첫 실제 실행은 Target `5`로 시작합니다. 확인 후 `50`, `500` 순서로 확대합니다.
+5. 완료된 상품은 MASTER에 저장되고 현재 Store로 자동 분류됩니다.
+6. PRIMARY를 사람이 검토한 뒤 Spark Center 업로드 폴더를 만듭니다.
+
+CLI 미리보기:
+
+```powershell
+shopsource source-auto --store 001 --target 5 --dry-run
+```
+
+API key를 CLI 인자로 전달하는 옵션은 제공하지 않습니다. Keepa 원본은 Spark 원본과 구분되며,
+Keepa→Spark payload mapping은 `KEEPA_TO_SPARK_MAPPING_UNVERIFIED` 상태입니다.
+수동 `source/amazon/inbox/` 가져오기는 fallback으로 계속 사용할 수 있습니다.
 
 ## 스토어별 가격 규칙 수정
 

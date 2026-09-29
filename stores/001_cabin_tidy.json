@@ -3,6 +3,33 @@
   "store_name": "Cabin Tidy",
   "category": "auto_interior",
   "minimum_fit_score": 34,
+  "sourcing": {
+    "provider": "keepa",
+    "marketplace": "US",
+    "target_candidates": 5,
+    "price_min": 30,
+    "price_max": 120,
+    "min_rating": 4.0,
+    "min_reviews": 30,
+    "min_images": 2,
+    "single_variation": true,
+    "exclude_adult": true,
+    "exclude_hazmat": true,
+    "max_tokens_per_run": 1000,
+    "min_tokens_reserve": 100,
+    "recipes": [
+      {"keyword": "trunk organizer"},
+      {"keyword": "car seat organizer"},
+      {"keyword": "backseat organizer"},
+      {"keyword": "center console organizer"},
+      {"keyword": "car trash can"},
+      {"keyword": "headrest hook"},
+      {"keyword": "car cup holder"},
+      {"keyword": "car gap filler"},
+      {"keyword": "car storage organizer"},
+      {"keyword": "vehicle organizer"}
+    ]
+  },
   "price_bands": [
     {"name": "under_30", "min": 0, "max": 30, "status": "LOW_RESERVE"},
     {"name": "30_to_35", "min": 30, "max": 35, "status": "RESERVE_C"},
