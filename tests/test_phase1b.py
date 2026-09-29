@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import zipfile
 from pathlib import Path
 
@@ -128,6 +129,11 @@ def test_folder_zip_idempotency_and_malformed_report(tmp_path):
         assert con.execute(
             "SELECT COUNT(*) FROM product_occurrences WHERE import_run_id IS NULL"
         ).fetchone()[0] == 0
+        raw_prices = {
+            json.loads(row["raw_json"])["price"]
+            for row in con.execute("SELECT raw_json FROM product_occurrences")
+        }
+        assert raw_prices == {35, 36}
         error = con.execute("SELECT error_code,source_file FROM import_errors").fetchone()
     assert error["error_code"] == "MALFORMED_JSON"
     assert error["source_file"] == "broken.json"
@@ -186,6 +192,21 @@ def test_scaling_indexes_exist(tmp_path):
         "idx_decisions_store_status", "idx_decisions_product", "idx_occurrence_job",
         "idx_occurrence_product", "idx_occurrence_import_run", "idx_import_errors_run",
     } <= indexes
+
+
+def test_existing_occurrence_table_gets_additive_raw_json_migration(tmp_path):
+    db = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(db) as con:
+        con.execute(
+            """CREATE TABLE product_occurrences (
+            id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL, import_run_id INTEGER,
+            job_id TEXT, source_file TEXT, collected_at TEXT, source_url TEXT, list_page INTEGER,
+            UNIQUE(product_id, job_id, source_file))"""
+        )
+    init_db(db)
+    with connect(db) as con:
+        columns = {row["name"] for row in con.execute("PRAGMA table_info(product_occurrences)")}
+    assert "raw_json" in columns
 
 
 @pytest.mark.skip(reason="Approved real Spark Data Import fixture has not been provided")

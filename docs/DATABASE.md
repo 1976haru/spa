@@ -4,7 +4,8 @@
 ASIN 당 1행. 최신 관측값과 raw JSON을 보존한다.
 
 ## product_occurrences
-동일 ASIN이 Spark의 여러 실행/파일에서 반복 등장한 이력을 보존한다. 따라서 재수집 중복량과 job별 통계를 계산할 수 있다.
+동일 ASIN이 Spark의 여러 실행/파일에서 반복 등장한 이력과 occurrence별 raw JSON을 보존한다. 따라서 재수집 중복량과 job별 통계를 계산하고 과거 관측 payload를 감사할 수 있다.
+기존 DB에는 nullable `raw_json` 열을 additive migration으로 추가하며, 이후 재import에서 비어 있는 과거 occurrence payload를 채울 수 있다.
 
 ## import_runs
 storage ZIP/폴더 단위 import 상태와 통계.

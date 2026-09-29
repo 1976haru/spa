@@ -141,13 +141,16 @@ def import_spark(source: str | Path, db=None, allow_reimport: bool = False) -> d
 
                 con.execute(
                     """
-                    INSERT OR IGNORE INTO product_occurrences(
-                      product_id,import_run_id,job_id,source_file,collected_at,source_url,list_page
-                    ) VALUES(?,?,?,?,?,?,?)
+                    INSERT INTO product_occurrences(
+                      product_id,import_run_id,job_id,source_file,collected_at,source_url,list_page,raw_json
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(product_id,job_id,source_file) DO UPDATE SET
+                      raw_json=COALESCE(product_occurrences.raw_json,excluded.raw_json)
                     """,
                     (
                         product_id, run_id, meta.get("job_id"), meta.get("source_file"),
-                        _normalize_epoch(meta.get("collected_at")), meta.get("source_url"), meta.get("list_page")
+                        _normalize_epoch(meta.get("collected_at")), meta.get("source_url"),
+                        meta.get("list_page"), raw,
                     ),
                 )
 

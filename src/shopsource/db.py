@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS product_occurrences (
     collected_at TEXT,
     source_url TEXT,
     list_page INTEGER,
+    raw_json TEXT,
     UNIQUE(product_id, job_id, source_file)
 );
 
@@ -144,6 +145,11 @@ def init_db(path: str | Path | None = None) -> Path:
     p = db_path(path)
     with connect(p) as con:
         con.executescript(SCHEMA)
+        occurrence_columns = {
+            row["name"] for row in con.execute("PRAGMA table_info(product_occurrences)")
+        }
+        if "raw_json" not in occurrence_columns:
+            con.execute("ALTER TABLE product_occurrences ADD COLUMN raw_json TEXT")
     return p
 
 
