@@ -19,20 +19,54 @@
 
 ## 2. 현재 로컬 데이터에서 확인된 것
 
-사용자가 제공한 `storage.zip`은 아래 형태다.
+사용자가 제공한 `storage.zip` 및 추가 샘플에서 아래 구조가 실제로 확인됐다.
 
 ```text
 storage/
   datasets/<job_id>/*.json
-  key_value_stores/<job_id>/SDK_*.json
+  key_value_stores/<job_id>/...
   request_queues/<job_id>/*.json
 ```
+
+실제 화면에서 `datasets`와 `request_queues`에 동일한 job id
+(`0929_071617_c102`)가 존재하는 것이 확인됐다.
+
+### datasets
 
 상품 JSON에는 ASIN, URL, title, brand, price, options, tags/category, overview/aboutThis,
 images, rating/reviewCount, `_sourceUrl`, `_listPage`, `_collectedAt` 등이 존재한다.
 
 v0.1은 `datasets`를 **읽기 전용**으로 import하며 Spark 파일을 수정하지 않는다.
 Malformed JSON은 해당 파일만 건너뛰고 `import_errors`에 기록한다. ZIP 입력은 경로 이탈 항목을 거부한다.
+
+### request_queues
+
+실제 request queue 샘플은 상품 payload가 아니라 Crawlee/Playwright의 요청 상태와 재시도/오류 메타데이터다.
+
+확인된 주요 필드:
+
+- id
+- url
+- uniqueKey
+- method
+- retryCount
+- errorMessages
+- userData.sourceUrl
+- userData.listPage
+- userData.label
+- userData.__crawlee 상태
+- handledAt
+
+샘플에는 `page.goto: net::ERR_ABORTED; maybe frame was detached?` 오류가 포함돼 있으며,
+Spark 내부 경로에 `@crawlee/playwright`가 나타난다.
+
+따라서 현재 증거상 `request_queues`는 **크롤링 실행/실패/재시도 상태 관리용 메타데이터**로 보는 것이 타당하며,
+Shopify 업로드용 상품 원본의 주 저장소는 `datasets`일 가능성이 높다.
+
+단, 이것만으로 `request_queues`가 Spark의 '데이터 불러오기'에 불필요하다고 확정하지 않는다.
+실제 round-trip 테스트 전까지는 계약 미확정 상태를 유지한다.
+
+### schema probe
 
 `shopsource probe-schema <파일|폴더|ZIP>`은 원본을 수정하지 않고 파일/JSON/상품 수,
 ASIN 중복, 키·필드 타입·누락률, Job ID, 가능한 버전 필드를 출력한다.
@@ -80,10 +114,11 @@ Spark/Spark Center 의존성을 낮출 필요가 생기면 별도 Connector로 �
 - 예: Cabin Tidy에서 현재 PRIMARY가 $40~100이어도 $35 상품은 RESERVE로 보존하며, 나중에 $30~120으로 변경하면 재수집 없이 승격될 수 있어야 한다.
 - 업로드용 Location은 Spark 매뉴얼에 따라 미국 주소지로 된 Shopify Location을 사용한다.
 - Spark가 자동 제외하는 약물성·규정 위반·재고 없음 등의 실패 결과와 ShopSource Studio의 위험 분류는 별개로 기록한다.
+- request queue 오류 메타데이터는 MASTER 상품 삭제 근거가 아니라 수집 상태/오류 이력으로 취급한다.
 
 ## 5. 아직 확인되지 않은 것
 
-다음은 현재 문서만으로 확정할 수 없다.
+다음은 현재 문서/샘플만으로 확정할 수 없다.
 
 - '데이터 불러오기'가 정확히 어떤 파일 확장자/폴더 구조를 요구하는지
 - datasets JSON만 있으면 되는지, key_value_stores/request_queues도 필요한지
