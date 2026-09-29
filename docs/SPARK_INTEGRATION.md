@@ -66,6 +66,32 @@ Shopify 업로드용 상품 원본의 주 저장소는 `datasets`일 가능성�
 단, 이것만으로 `request_queues`가 Spark의 '데이터 불러오기'에 불필요하다고 확정하지 않는다.
 실제 round-trip 테스트 전까지는 계약 미확정 상태를 유지한다.
 
+### key_value_stores
+
+실제 `key_value_stores/<job_id>` 샘플에서 최소 두 종류의 런타임 상태 파일이 확인됐다.
+
+1. `SDK_CRAWLER_STATISTICS_0.json`
+   - requestsFinished / requestsFailed / requestsRetries
+   - 요청 최소/최대/평균 시간
+   - crawlerStartedAt / crawlerFinishedAt / runtime
+   - HTTP status 통계
+   - navigation timeout, browser new page 실패, ERR_ABORTED 등 오류/재시도 통계
+2. `SDK_SESSION_POOL_STATE.json`
+   - usable / retired session 수
+   - 각 session id, usageCount, errorScore, expiresAt
+   - cookie jar 및 Amazon 세션 쿠키/토큰
+
+따라서 현재 증거상 `key_value_stores`는 **크롤러 통계와 브라우저/session-pool 런타임 상태 저장소**로 보는 것이 타당하다.
+특히 session pool 파일에는 세션 쿠키와 토큰이 포함될 수 있으므로 민감 런타임 데이터로 취급한다.
+
+ShopSource Studio 원칙:
+
+- `key_value_stores`를 상품 MASTER 원본으로 사용하지 않는다.
+- session cookie/token 값을 DB, 로그, export, manifest, Git에 복사하지 않는다.
+- 진단이 필요하면 통계/필드명만 읽고 cookie value는 redaction 한다.
+- Spark handoff export에 key_value/session 파일을 포함하지 않는 방향을 **우선 가설**로 둔다.
+- 단, 실제 Spark '데이터 불러오기' round-trip이 통과하기 전까지 datasets-only 계약으로 확정하지 않는다.
+
 ### schema probe
 
 `shopsource probe-schema <파일|폴더|ZIP>`은 원본을 수정하지 않고 파일/JSON/상품 수,
