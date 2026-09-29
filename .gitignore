@@ -21,3 +21,9 @@ exports/**/*.csv
 *.xlsx
 .DS_Store
 Thumbs.db
+
+# Spark/Crawlee runtime state may contain session cookies/tokens
+SDK_SESSION_POOL_STATE.json
+SDK_CRAWLER_STATISTICS_*.json
+**/SDK_SESSION_POOL_STATE.json
+**/SDK_CRAWLER_STATISTICS_*.json
