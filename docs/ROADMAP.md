@@ -22,12 +22,12 @@
 - [x] 읽기 전용 schema probe와 malformed import report
 
 ## v0.2 SPARK HANDOFF MVP
-- [ ] Spark '데이터 관리 > 데이터 불러오기'에 사용하는 실제 원본 샘플 확보
-- [ ] 원본 파일/폴더 스키마 분석
-- [ ] 원본 그대로 재불러오기 Round-trip PASS
-- [ ] 원본 중 상품 5개 subset Export 생성
-- [ ] Spark UI에서 subset 재불러오기 PASS
-- [ ] ASIN/제목/가격/이미지/옵션 보존 확인
+- [x] Spark '데이터 관리 > 데이터 불러오기'에 사용하는 실제 datasets 샘플 확보
+- [x] datasets/request_queues/key_value_stores 역할 분석
+- [x] datasets 작업폴더 선택 방식 확인
+- [x] 5개 상품 subset 테스트 폴더 생성
+- [x] Spark UI에서 5개 subset 재불러오기 PASS
+- [~] 이미지/ASIN/제목/옵션/브랜드 표시 확인; 가격/세부필드 추가 검증 필요
 - [ ] 미국 Shopify Location 선택 가능 확인
 - [ ] 테스트 Shopify 스토어 업로드 확인
 - [ ] Export manifest / validation report
