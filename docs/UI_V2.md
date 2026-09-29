@@ -1,5 +1,7 @@
 # Operator UI V2
 
+Sourcing now presents API-free Browser Capture before optional Keepa automation. Settings creates local pairing codes for the unpacked ShopSource Capture extension. The capture candidate list shows detail-completeness and status; operators can open candidate product pages, import detail-complete records, and use the regular Products/Packages pages. The extension is available for Edge and Chrome at `browser_extension/shopsource_capture`.
+
 Install the optional local UI dependency with `pip install -e ".[ui]"`, then run `run_ui_v2.bat` or
 `shopsource-ui-v2`. It binds to `127.0.0.1:8081`. The existing `shopsource-gui` Tkinter app remains
 available as the fallback.

@@ -1,5 +1,15 @@
 # ShopSource Studio v0.1
 
+## API-free browser sourcing (Phase 2.5)
+
+1. Start `run_ui_v2.bat`, choose a Store, and open Sourcing.
+2. Create a Browser Capture pairing code in Settings and install the unpacked extension from `browser_extension/shopsource_capture` (`edge://extensions` or `chrome://extensions` → Developer mode → Load unpacked).
+3. Configure extension URL `http://127.0.0.1:8081`, Store ID, and pairing code.
+4. Open a recommended Amazon search, capture the visible page, then open up to five candidate detail pages and click the extension button on each.
+5. Import detail-complete candidates to MASTER, review classifications, and create a Spark Center package. Upload only `ready/<package_id>`.
+
+This browser workflow does not need a Keepa API key. Keepa remains optional for automated sourcing. CAPTCHA/robot checks stop capture; the extension never reads cookies, browser storage, login data, or credentials and does not paginate automatically. BROWSER_CAPTURE Spark mapping remains unverified until a manual portal round-trip.
+
 100~200개 Shopify 자매몰 확장을 전제로 한 로컬 MASTER 소싱/상품관리 프로그램의 첫 버전입니다.
 
 ## v0.1에서 되는 것

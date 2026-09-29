@@ -13,7 +13,8 @@ from .manifest import build_manifest
 from ..classifier import ALLOWED_STATUSES
 from ..db import connect, get_store, init_db, utc_now
 from ..paths import EXPORT_DIR
-from ..sourcing.mapping import KEEPA_TO_SPARK_CAPABILITY, to_spark_product_payload
+from ..sourcing.mapping import (BROWSER_CAPTURE_TO_SPARK_CAPABILITY, KEEPA_TO_SPARK_CAPABILITY,
+                                browser_capture_to_spark_payload, to_spark_product_payload)
 
 CAPABILITY_STATUS = "DATASET_LOAD_VERIFIED"
 INTERNAL_FIELDS = {
@@ -191,7 +192,7 @@ class SparkHandoffConnector(ExportConnector):
         if not rows:
             raise ValueError("No products matched the requested Store Decision filters")
 
-        payloads, source_job_ids, preflight_errors, keepa_mapping = self._payloads(rows, db)
+        payloads, source_job_ids, preflight_errors, keepa_mapping, browser_mapping = self._payloads(rows, db)
         jobs_root.mkdir(parents=True, exist_ok=True)
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -214,14 +215,23 @@ class SparkHandoffConnector(ExportConnector):
             export_status="VALIDATION_PENDING",
             selected_statuses=list(selected_statuses),
             output_folder=str(job_folder),
-            capability_status=KEEPA_TO_SPARK_CAPABILITY if keepa_mapping else CAPABILITY_STATUS,
+            capability_status=(BROWSER_CAPTURE_TO_SPARK_CAPABILITY if browser_mapping else
+                               KEEPA_TO_SPARK_CAPABILITY if keepa_mapping else CAPABILITY_STATUS),
             shopify_upload_verified=False,
         )
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        manifest["source_kinds"] = {kind: sum(1 for row in rows if row["source_kind"] == kind)
+                                    for kind in sorted({row["source_kind"] for row in rows})}
+        if browser_mapping:
+            manifest["browser_capture_mapping_verified"] = False
         report = self._validate(job_folder, manifest, preflight_errors)
         if keepa_mapping:
             report["warnings"].append(
                 "Keepa canonical to Spark payload mapping has not completed a portal round-trip test"
+            )
+        if browser_mapping:
+            report["warnings"].append(
+                "Browser capture to Spark payload mapping has not completed a portal round-trip test"
             )
         manifest["export_status"] = report["status"]
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -282,6 +292,7 @@ class SparkHandoffConnector(ExportConnector):
         source_job_ids: set[str] = set()
         errors: list[str] = []
         keepa_mapping = False
+        browser_mapping = False
         for row in rows:
             payload = None
             source_job_id = None
@@ -290,6 +301,15 @@ class SparkHandoffConnector(ExportConnector):
                 if canonical is not None:
                     payload = to_spark_product_payload(canonical)
                     keepa_mapping = True
+            elif row["source_kind"] == "BROWSER_CAPTURE":
+                canonical = _parse_payload(row["raw_json"])
+                if canonical is not None:
+                    payload = browser_capture_to_spark_payload(canonical)
+                    browser_mapping = True
+                for occurrence in occurrences[row["id"]]:
+                    if payload is not None:
+                        source_job_id = occurrence["job_id"]
+                        break
             else:
                 for occurrence in occurrences[row["id"]]:
                     candidate = _parse_payload(occurrence["raw_json"])
@@ -319,7 +339,7 @@ class SparkHandoffConnector(ExportConnector):
             payloads.append(payload)
             if source_job_id:
                 source_job_ids.add(source_job_id)
-        return payloads, source_job_ids, errors, keepa_mapping
+        return payloads, source_job_ids, errors, keepa_mapping, browser_mapping
 
     @staticmethod
     def _validate(job_folder: Path, manifest: dict, preflight_errors: list[str]) -> dict:

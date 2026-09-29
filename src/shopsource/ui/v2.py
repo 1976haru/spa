@@ -5,9 +5,12 @@ import json
 import logging
 
 from ..connectors.spark_center_package import list_packages, mark_package
+from ..capture.service import CaptureService
+from ..classifier import classify_store
 from ..db import get_store, init_db, upsert_store
 from ..intelligence.keyword_engine import KeywordEngine
-from ..paths import STORE_DIR
+from ..paths import AMAZON_INBOX_DIR, STORE_DIR
+from ..importer import import_amazon_source
 from ..sourcing.credentials import delete_api_key, get_api_key, save_api_key
 from ..sourcing.engine import SourcingEngine, new_run_id
 from ..sourcing.providers.keepa import KeepaProvider
@@ -206,6 +209,15 @@ class OperatorUI:
                             "paginationPageSize": 20,
                             "defaultColDef": {"sortable": True, "filter": True, "resizable": True},
                         }, modules="community").classes("w-full h-[520px]")
+                async def open_amazon_selected():
+                    grid = recommendation_grid["element"]
+                    rows = await grid.get_selected_rows() if grid else []
+                    from urllib.parse import quote_plus
+                    urls = ["https://www.amazon.com/s?k=" + quote_plus(str(row.get("keyword", ""))) for row in rows[:5]]
+                    if not urls:
+                        ui.notify("Amazon 검색 주제어를 선택하세요.", type="warning"); return
+                    script = "(urls => urls.forEach((url, i) => setTimeout(() => window.open(url, '_blank', 'noopener'), i * 350)))"
+                    ui.run_javascript(script + "(" + json.dumps(urls) + ")")
                 async def add_selected():
                     grid = recommendation_grid["element"]
                     if not grid:
@@ -273,6 +285,7 @@ class OperatorUI:
                         ui.notify(_safe_error(exc), type="negative")
                 with ui.row():
                     ui.button("추천 검색 주제어 만들기", on_click=render_recommendations, icon="auto_awesome")
+                    ui.button("Amazon 검색 열기 (선택 최대 5)", on_click=open_amazon_selected, icon="open_in_new").props("outline")
                 ui.button("선택 주제어 검증", on_click=validate_selected, icon="fact_check").props("outline")
                 ui.button("선택 항목 recipe에 추가", on_click=add_selected, icon="add").props("outline")
                 ui.button("제외", on_click=exclude_selected, icon="block").props("flat")
@@ -285,6 +298,11 @@ class OperatorUI:
         ui = self.ui
         profile = get_store(self.current_store)
         config = profile.get("sourcing") or {}
+        ui.label("무료 브라우저 소싱 · API 필요 없음").classes("text-lg font-bold")
+        ui.label("Amazon 검색과 상품 페이지를 직접 열고, 현재 화면에 보이는 자료만 확장으로 가져옵니다.")
+        self._browser_capture_panel()
+        ui.separator()
+        ui.label("Keepa 자동 소싱 · 선택 유료 API").classes("text-lg font-semibold")
         self._heading("자동 소싱", "Recipe별 후보 탐색과 실행 상태를 관리합니다.")
         target = ui.number("Target candidates", value=int(get_app_setting("default_target", config.get("target_candidates", 5))), min=1, max=500)
         token_budget = ui.number("최대 token / 실행", value=int(get_app_setting("default_token_budget", config.get("max_tokens_per_run", 1000))), min=1)
@@ -364,6 +382,21 @@ class OperatorUI:
             ui.button("일시정지", on_click=pause_run, icon="pause").props("outline")
             ui.button("계속", on_click=resume_run, icon="resume").props("outline")
             ui.button("취소", on_click=cancel_run, icon="cancel").props("flat color=negative")
+        ui.separator()
+        with ui.card().classes("w-full border border-slate-200"):
+            ui.label("소싱 파일 가져오기 · API 필요 없음").classes("text-lg font-semibold")
+            ui.label(f"상품 JSON 폴더: {AMAZON_INBOX_DIR}")
+            async def import_source_files():
+                try:
+                    imported = await asyncio.to_thread(import_amazon_source)
+                    classified = await asyncio.to_thread(classify_store, self.current_store)
+                    ui.notify(f"MASTER import 완료: {imported['inserted']} 신규 · {imported['updated']} 갱신 · 분류 {classified['processed']}개", type="positive")
+                    ui.navigate.to("/products")
+                except Exception as exc:
+                    ui.notify(_safe_error(exc), type="negative")
+            with ui.row():
+                ui.button("소싱 폴더 열기", on_click=lambda: self._open_folder(str(AMAZON_INBOX_DIR)), icon="folder_open").props("outline")
+                ui.button("소싱 파일 가져오기", on_click=import_source_files, icon="drive_folder_upload")
         ui.label("상품 이미지 사용권/재사용 조건은 별도 확인이 필요합니다.").classes("text-xs text-amber-700")
         ui.separator()
         ui.label("최근 run history").classes("text-lg font-semibold")
@@ -562,9 +595,77 @@ class OperatorUI:
         else:
             ui.label("가져오기 오류가 없습니다.").classes("text-slate-500")
 
+    def _browser_capture_panel(self):
+        ui = self.ui
+        service = CaptureService()
+        profile = get_store(self.current_store)
+        recipes = profile.get("sourcing", {}).get("recipes", [])
+        keywords = [row.get("keyword", "") if isinstance(row, dict) else str(row) for row in recipes]
+        if keywords:
+            selected_keyword = ui.select(keywords, value=keywords[0], label="Amazon 검색 주제어").classes("w-72")
+            def open_search():
+                from urllib.parse import quote_plus
+                url = "https://www.amazon.com/s?k=" + quote_plus(selected_keyword.value or "")
+                ui.run_javascript("window.open(" + json.dumps(url) + ", '_blank', 'noopener')")
+            ui.button("Amazon 검색 열기", on_click=open_search, icon="open_in_new")
+        rows = service.list_candidates(self.current_store, 200)
+        ui.label(f"Candidates {len(rows)} · Needs Detail {sum(r['capture_status']=='NEEDS_DETAIL' for r in rows)} · Detail Complete {sum(r['capture_status']=='DETAIL_COMPLETE' for r in rows)} · MASTER Imported {sum(r['capture_status']=='MASTER_IMPORTED' for r in rows)}")
+        checks = {}
+        if rows:
+            for row in rows[:50]:
+                payload = row.get("detail_payload") or row.get("search_payload") or {}
+                with ui.row().classes("w-full items-center border-b py-1"):
+                    checks[row["asin"]] = ui.checkbox()
+                    ui.label(f"{row['asin']} · {payload.get('title') or ''} · {row['completeness_score']}% · {row['capture_status']}").classes("flex-1")
+                    ui.button("상세 열기", on_click=lambda url=payload.get("url"): ui.run_javascript("window.open(" + json.dumps(url or "") + ", '_blank', 'noopener')"), icon="open_in_new").props("flat dense")
+        async def refresh_capture():
+            ui.navigate.to("/sourcing")
+        def create_pairing():
+            code = service.create_pairing_code()
+            ui.notify("Pairing code (확장 Options에 복사): " + code, type="positive", timeout=30000)
+        def import_ready():
+            selected = [asin for asin, check in checks.items() if check.value]
+            if not selected:
+                ui.notify("MASTER로 보낼 상세 완료 상품을 먼저 선택하세요.", type="warning"); return
+            complete = [row["asin"] for row in rows if row["capture_status"] == "DETAIL_COMPLETE" and row["asin"] in selected]
+            if not complete:
+                ui.notify("MASTER로 보낼 DETAIL_COMPLETE 상품이 없습니다.", type="warning"); return
+            try:
+                result = service.import_candidates(self.current_store, complete[:100])
+                ui.notify(f"MASTER 반영 후 Store classify 완료: {result['inserted']} 신규, {result['updated']} 갱신", type="positive")
+                ui.navigate.to("/products")
+            except Exception as exc:
+                ui.notify(_safe_error(exc), type="negative")
+        with ui.row():
+            ui.button("확장 연결 확인 방법", on_click=lambda: ui.notify("Settings에서 Pairing code를 생성하고 확장 popup의 연결 상태를 확인하세요."), icon="link").props("outline")
+            ui.button("Pairing code 만들기", on_click=create_pairing, icon="vpn_key").props("outline")
+            ui.button("후보 새로고침", on_click=refresh_capture, icon="refresh").props("outline")
+            ui.button("상세 완료 상품 MASTER로 보내기", on_click=import_ready, icon="move_to_inbox")
+            def open_selected_detail():
+                urls = []
+                for row in rows:
+                    if row["asin"] in checks and checks[row["asin"]].value:
+                        url = (row.get("detail_payload") or row.get("search_payload") or {}).get("url")
+                        if url: urls.append(url)
+                        if len(urls) >= 5: break
+                if not urls:
+                    ui.notify("상세 보강할 후보를 선택하세요.", type="warning"); return
+                script = "(urls => urls.forEach((url, i) => setTimeout(() => window.open(url, '_blank', 'noopener'), i * 400)))"
+                ui.run_javascript(script + "(" + json.dumps(urls) + ")")
+            ui.button("선택 상세 보강 (최대 5)", on_click=open_selected_detail, icon="open_in_new").props("outline")
+        ui.label("상세 보강은 사용자가 상품 페이지에서 확장 버튼을 누릅니다. 자동 페이지 순회 및 CAPTCHA 우회는 하지 않습니다.").classes("text-xs text-amber-800")
+
     def _settings(self):
         ui = self.ui
         self._heading("설정", "Keepa 인증과 UI 기본값을 관리합니다.")
+        ui.label("Browser Capture · 확장 연결").classes("text-lg font-semibold")
+        pairing_status = ui.label("Pairing code를 생성한 뒤 확장 Options에 입력하세요.")
+        def make_capture_pairing():
+            pairing_status.set_text("Pairing code (로컬 전용): " + CaptureService().create_pairing_code())
+        ui.button("브라우저 캡처 연결 코드 만들기", on_click=make_capture_pairing, icon="link")
+        extension_dir = __import__("pathlib").Path(__file__).resolve().parents[3] / "browser_extension" / "shopsource_capture"
+        ui.button("확장 폴더 열기", on_click=lambda: self._open_folder(str(extension_dir)), icon="folder_open").props("outline")
+        ui.label("Edge: edge://extensions · Chrome: chrome://extensions → 개발자 모드 → 압축해제된 확장 로드 → browser_extension/shopsource_capture")
         _, key_source = get_api_key(self.session_api_key)
         key_status = ui.label(f"Keepa API key 상태: {key_source}")
         key_input = ui.input("Keepa API Key").props("type=password autocomplete=new-password").classes("w-96")
@@ -716,10 +817,18 @@ def main():
     parser.add_argument("--port", type=int, default=8081)
     parser.add_argument("--no-browser", action="store_true", help="do not open the browser automatically")
     args = parser.parse_args()
+    if args.host not in {"127.0.0.1", "localhost", "::1"}:
+        parser.error("Capture bridge는 보안상 loopback 주소에만 bind할 수 있습니다.")
     try:
-        from nicegui import ui
+        from nicegui import app, ui
     except ImportError as exc:
         raise RuntimeError('UI V2 needs the optional dependency: pip install -e ".[ui]"') from exc
+    from fastapi.middleware.cors import CORSMiddleware
+    from ..capture.bridge import install_capture_routes
+    app.add_middleware(CORSMiddleware, allow_origin_regex=r"chrome-extension://[a-p]{32}",
+                       allow_methods=["GET", "POST", "OPTIONS"],
+                       allow_headers=["Content-Type", "X-ShopSource-Pairing"])
+    install_capture_routes(app)
     OperatorUI(ui)
     ui.run(title="ShopSource Studio", host=args.host, port=args.port, reload=False, show=not args.no_browser)
 

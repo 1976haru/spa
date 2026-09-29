@@ -1,5 +1,12 @@
 # Roadmap
 
+## v0.2.5 API-free browser capture (implementation status)
+
+- [x] User-started Edge/Chrome MV3 capture extension and loopback pairing bridge
+- [x] Search candidate/detail capture queue, completeness score, existing MASTER importer and Store classifier reuse
+- [x] Source-aware Spark-compatible payload adapter (portal mapping still unverified)
+- [ ] Live Amazon selector verification and manual five-product Spark Center portal round-trip
+
 ## v0.1 MASTER FOUNDATION — 현재
 - [x] Spark storage ZIP/폴더 import
 - [x] ASIN MASTER dedupe

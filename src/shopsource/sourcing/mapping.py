@@ -9,6 +9,7 @@ LISTPRICE = 4
 COUNT_NEW = 11
 BUY_BOX_SHIPPING = 18
 KEEPA_TO_SPARK_CAPABILITY = "KEEPA_TO_SPARK_MAPPING_UNVERIFIED"
+BROWSER_CAPTURE_TO_SPARK_CAPABILITY = "BROWSER_CAPTURE_TO_SPARK_MAPPING_UNVERIFIED"
 
 
 def cents_to_dollars(value) -> float | None:
@@ -85,3 +86,14 @@ def to_spark_product_payload(canonical: dict) -> dict:
         "_sourceUrl", "_listPage", "_collectedAt",
     )
     return {key: canonical.get(key) for key in keys}
+
+
+def browser_capture_to_spark_payload(canonical: dict) -> dict:
+    """Browser records already use the canonical Spark field names; never invent values."""
+    keys = (
+        "url", "asin", "title", "brand", "price", "options", "quantity", "tags",
+        "category", "overview", "aboutThis", "images", "rating", "reviewCount",
+        "_sourceUrl", "_listPage", "_collectedAt",
+    )
+    defaults = {"options": {}, "tags": [], "overview": [], "aboutThis": [], "images": []}
+    return {key: (canonical.get(key) if canonical.get(key) is not None else defaults.get(key)) for key in keys}

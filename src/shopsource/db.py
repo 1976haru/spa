@@ -185,6 +185,44 @@ CREATE TABLE IF NOT EXISTS app_settings (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS browser_capture_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL UNIQUE,
+    store_id TEXT NOT NULL,
+    keyword TEXT NOT NULL DEFAULT '',
+    search_url TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'SEARCH_CAPTURED',
+    captured_at TEXT NOT NULL,
+    candidates INTEGER NOT NULL DEFAULT 0,
+    detailed INTEGER NOT NULL DEFAULT 0,
+    completed INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS browser_capture_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES browser_capture_runs(run_id) ON DELETE CASCADE,
+    asin TEXT NOT NULL,
+    search_payload_json TEXT NOT NULL,
+    detail_payload_json TEXT,
+    completeness_score INTEGER NOT NULL DEFAULT 0,
+    capture_status TEXT NOT NULL DEFAULT 'NEEDS_DETAIL',
+    selected INTEGER NOT NULL DEFAULT 0,
+    seen_count INTEGER NOT NULL DEFAULT 1,
+    keywords_json TEXT NOT NULL DEFAULT '[]',
+    search_urls_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(run_id, asin)
+);
+
+CREATE TABLE IF NOT EXISTS browser_capture_errors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    store_id TEXT,
+    action TEXT NOT NULL,
+    error_message TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_products_price ON products(price);
 CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);
 CREATE INDEX IF NOT EXISTS idx_decisions_store_status ON store_product_decisions(store_id, final_status);
@@ -198,6 +236,10 @@ CREATE INDEX IF NOT EXISTS idx_sourcing_runs_store_created ON sourcing_runs(stor
 CREATE INDEX IF NOT EXISTS idx_sourcing_runs_status ON sourcing_runs(status);
 CREATE INDEX IF NOT EXISTS idx_sourcing_candidates_run_asin ON sourcing_run_candidates(run_id, asin);
 CREATE INDEX IF NOT EXISTS idx_keyword_validation_store_keyword ON keyword_validation_results(store_id, keyword, checked_at);
+CREATE INDEX IF NOT EXISTS idx_capture_runs_store_time ON browser_capture_runs(store_id, captured_at DESC);
+CREATE INDEX IF NOT EXISTS idx_capture_candidates_run_status ON browser_capture_candidates(run_id, capture_status);
+CREATE INDEX IF NOT EXISTS idx_capture_candidates_asin ON browser_capture_candidates(asin);
+CREATE INDEX IF NOT EXISTS idx_capture_errors_created ON browser_capture_errors(created_at DESC);
 """
 
 EXPORT_RUN_ADDITIVE_COLUMNS = {

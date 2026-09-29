@@ -1,0 +1,3 @@
+const byId=id=>document.getElementById(id);chrome.storage.local.get(['bridgeUrl','pairingCode','storeId'],x=>{byId('url').value=x.bridgeUrl||'http://127.0.0.1:8081';byId('code').value=x.pairingCode||'';byId('store').value=x.storeId||'';});
+byId('save').onclick=()=>chrome.storage.local.set({bridgeUrl:byId('url').value.trim(),pairingCode:byId('code').value.trim(),storeId:byId('store').value.trim()},()=>byId('status').textContent='설정을 저장했습니다.');
+byId('test').onclick=()=>chrome.storage.local.set({bridgeUrl:byId('url').value.trim(),pairingCode:byId('code').value.trim(),storeId:byId('store').value.trim()},()=>chrome.runtime.sendMessage({type:'shopsource-health'},r=>byId('status').textContent=r?.ok?'연결: 정상':'연결 안 됨 · ShopSource UI V2와 Pairing code를 확인하세요.'));

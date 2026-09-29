@@ -1,5 +1,9 @@
 # Database
 
+## Browser capture additions
+
+Additive tables `browser_capture_runs` and `browser_capture_candidates` preserve Store, query/run, search JSON, detail JSON, completeness, status, and duplicate evidence. Candidate identity is unique by `(run_id, asin)`; products remain unique by ASIN and occurrences retain each imported detail payload. Pairing credentials are stored as a SHA-256 digest in `app_settings`, never plaintext. `BROWSER_CAPTURE` imports use existing `import_runs`, products, and occurrences.
+
 ## products
 ASIN 당 1행. 최신 관측값과 raw JSON을 보존한다.
 

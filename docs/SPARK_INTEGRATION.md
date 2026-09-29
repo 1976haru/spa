@@ -1,5 +1,7 @@
 # Spark / Spark Center Integration
 
+Browser-captured records now pass through the existing Spark dataset/package writer using a canonical field mapper. The manifest records `source_kinds` and `BROWSER_CAPTURE_TO_SPARK_MAPPING_UNVERIFIED`; this is not evidence of Spark Center portal or Shopify upload compatibility. A manual five-product portal round-trip is still required before changing that capability.
+
 ## 1. 공식 사용법에서 확인된 Spark 흐름
 
 사용자가 제공한 스파크 사용법 문서 기준으로 다음 흐름이 확인됐다.
