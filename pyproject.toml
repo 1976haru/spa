@@ -13,10 +13,15 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+ui = ["nicegui>=2.19,<4"]
+similarity = ["rapidfuzz>=3.9"]
+nlp = ["keybert>=0.9", "sentence-transformers>=3.0"]
+credentials = ["keyring>=25"]
 
 [project.scripts]
 shopsource = "shopsource.cli:main"
 shopsource-gui = "shopsource.ui.app:main"
+shopsource-ui-v2 = "shopsource.ui.v2:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

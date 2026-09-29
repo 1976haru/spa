@@ -86,6 +86,15 @@ class KeepaProvider(SourcingProvider):
             telemetry=_telemetry(response),
         )
 
+    def health(self) -> dict:
+        response = self._request("GET", "/token", {"domain": 1})
+        return {
+            "ok": "tokensLeft" in response,
+            "tokensLeft": response.get("tokensLeft"),
+            "refillIn": response.get("refillIn"),
+            "refillRate": response.get("refillRate"),
+        }
+
     def hydrate(self, asins: list[str]) -> HydrationBatch:
         if not asins or len(asins) > 100:
             raise ValueError("Keepa Product Request batch must contain 1-100 ASINs")

@@ -58,3 +58,15 @@ DONE / FAILED / CANCELLED`이다. `sourcing_run_candidates`는 ASIN별 recipe/pa
 `products.source_kind`와 `product_occurrences.source_kind`는 additive migration으로 추가된다.
 Keepa의 provider raw는 occurrence에, canonical payload는 MASTER `raw_json`에 저장하여 Spark 원본과
 혼동하지 않는다.
+
+## keyword_validation_results
+
+Keepa keyword validation을 실행했을 때 Store/keyword별 후보 수, 가격/품질 적합률, 위험률,
+MASTER 중복률, token 사용량을 append-only로 기록한다. validation 이력에서 최신 행을 추천 점수에
+반영한다. 이 테이블은 additive `CREATE TABLE IF NOT EXISTS` migration이며 API key나 상품 raw를
+저장하지 않는다.
+
+## app_settings
+
+작은 operator preference(default target/token budget, UI theme, log level)를 key/value로 저장한다.
+API credential은 명시적으로 제외하며 Windows Credential Manager, environment 또는 process memory에만 둔다.

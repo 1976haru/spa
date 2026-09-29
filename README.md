@@ -30,6 +30,17 @@
 2. 저장소 루트에서 `setup_windows.bat`를 실행합니다.
 3. 완료 후 `run_gui.bat`를 실행합니다.
 
+기존 Tkinter GUI와 CLI는 계속 지원됩니다. 브라우저형 운영 화면은 별도 설치 후 실행합니다.
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[ui,similarity,credentials]"
+shopsource-ui-v2
+```
+
+또는 저장소 루트에서 `run_ui_v2.bat`를 더블클릭합니다. UI V2는 로컬 `127.0.0.1`에서
+실행되며 Dashboard, Store, Sourcing, Products, Packages, History, Settings의 7개 화면을
+제공합니다. Tkinter 화면은 `run_gui.bat` / `shopsource-gui`로 언제든 사용할 수 있습니다.
+
 CLI 사용을 원하면 PowerShell에서:
 
 ```powershell
@@ -85,6 +96,17 @@ shopsource source-auto --store 001 --target 5 --dry-run
 API key를 CLI 인자로 전달하는 옵션은 제공하지 않습니다. Keepa 원본은 Spark 원본과 구분되며,
 Keepa→Spark payload mapping은 `KEEPA_TO_SPARK_MAPPING_UNVERIFIED` 상태입니다.
 수동 `source/amazon/inbox/` 가져오기는 fallback으로 계속 사용할 수 있습니다.
+
+## Keyword Studio / UI V2
+
+Store 화면의 `추천 주제어 만들기`는 Store Profile seed와 MASTER/Keepa 제목의 n-gram에서
+검색어 후보를 만듭니다. 점수와 추천 이유를 확인한 뒤 선택 항목을 recipe에 추가하거나 제외할
+수 있습니다. Keepa 검증은 API token을 사용하므로 사용자가 10개 이하씩 확인 후 실행합니다.
+추천/검증은 후보 탐색을 돕는 신호이며 판매 성과를 보장하지 않습니다.
+
+NLP 기능은 선택 사항입니다. 설치하지 않으면 deterministic n-gram 및 lexical scoring으로
+동작합니다. sentence-transformers는 모델이 이미 로컬에 있을 때만 사용하고 자동 다운로드하지
+않습니다. 자세한 내용은 `docs/KEYWORD_INTELLIGENCE.md`, `docs/UI_V2.md`를 참고하세요.
 
 ## 스토어별 가격 규칙 수정
 

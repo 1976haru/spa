@@ -48,6 +48,8 @@ def keepa_to_canonical(raw: dict) -> dict:
     asin = str(raw.get("asin") or "").strip().upper()
     title = str(raw.get("title") or "").strip()
     rating_raw = raw.get("rating")
+    if rating_raw is None:
+        rating_raw = _current(raw, 16)
     rating = rating_raw / 10.0 if isinstance(rating_raw, (int, float)) and rating_raw > 5 else rating_raw
     reviews = raw.get("reviewCount")
     if reviews is None:

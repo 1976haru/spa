@@ -3,6 +3,13 @@
   "store_name": "Cabin Tidy",
   "category": "auto_interior",
   "minimum_fit_score": 34,
+  "keyword_templates": {
+    "contexts": ["car"],
+    "places": ["trunk", "backseat", "seat back", "center console", "seat gap", "cargo area", "glove box", "visor", "under seat"],
+    "uses": ["storage", "organization", "travel", "protection"],
+    "product_terms": ["organizer", "storage", "tray", "filler", "hook", "trash can", "cup holder", "cable organizer", "tissue holder", "sunglass holder", "cargo net"],
+    "seed_templates": ["{context} {place} {product}", "{place} {product}", "{context} {use} {product}", "{product} for {place}"]
+  },
   "sourcing": {
     "provider": "keepa",
     "marketplace": "US",

@@ -41,6 +41,10 @@ Spark export는 source-aware하다. `SPARK_STORAGE`는 검증된 최신 Spark oc
 - `classifier.py`: 스토어 프로필별 판정 저장.
 - `exporter.py`: 외부 전달 형식 생성.
 - `ui/`: 사용자 작업 화면. 비즈니스 규칙을 직접 구현하지 않는다.
+- `intelligence/`: Store Profile 및 저장된 상품 텍스트에서 설명 가능한 keyword 추천/검증을 수행한다.
+- `ui/v2_service.py`: UI V2의 Store/product/package query와 action을 서비스 경계로 제공한다.
+- `ui/v2.py`: 선택 설치형 NiceGUI operator console; 기존 Tkinter entry point는 별도 유지한다.
+- `sourcing/credentials.py`: Keepa keyring/environment/session 조회. 평문 파일/DB 저장은 하지 않는다.
 
 Connector 하위 구조:
 
@@ -63,3 +67,13 @@ Spark handoff는 `store_product_decisions.final_status`로 상품을 선택하�
 `SparkCenterPackageService`는 별도 JSON writer를 구현하지 않고 `SparkHandoffConnector`의
 상품 선택, raw payload, 순차 파일명, validation을 재사용한다. API connector와 수동 package
 workflow는 명확히 분리하며 portal 자동 호출은 하지 않는다.
+
+Keyword recommendation is deterministic by default: Store Profile templates and locally stored product
+text mining. KeyBERT and sentence-transformers are optional, local-only accelerators; they never block
+application startup and models are not downloaded automatically. Keepa keyword validation is an explicit
+user action, capped at ten terms per batch. `keyword_validation_results` stores only aggregate metrics,
+not API credentials or Keepa raw response payloads.
+
+UI V2 routes business operations through the existing sourcing/classification/package services and
+`ui/v2_service.py`. Product rows are read with SQLite LIMIT/OFFSET and DB-side filtering; AG Grid only
+holds the current page. NiceGUI and AG Grid Community are optional; `shopsource-gui` remains the fallback.

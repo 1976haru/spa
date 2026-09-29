@@ -166,6 +166,25 @@ CREATE TABLE IF NOT EXISTS sourcing_run_candidates (
     UNIQUE(run_id, asin, recipe_id, finder_page)
 );
 
+CREATE TABLE IF NOT EXISTS keyword_validation_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    store_id TEXT NOT NULL,
+    keyword TEXT NOT NULL,
+    checked_at TEXT NOT NULL,
+    candidate_yield INTEGER NOT NULL DEFAULT 0,
+    price_fit REAL NOT NULL DEFAULT 0,
+    quality_fit REAL NOT NULL DEFAULT 0,
+    risk_rate REAL NOT NULL DEFAULT 0,
+    master_duplicate_rate REAL NOT NULL DEFAULT 0,
+    tokens_consumed INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    setting_key TEXT PRIMARY KEY,
+    setting_value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_products_price ON products(price);
 CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);
 CREATE INDEX IF NOT EXISTS idx_decisions_store_status ON store_product_decisions(store_id, final_status);
@@ -178,6 +197,7 @@ CREATE INDEX IF NOT EXISTS idx_export_runs_store_created ON export_runs(store_id
 CREATE INDEX IF NOT EXISTS idx_sourcing_runs_store_created ON sourcing_runs(store_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_sourcing_runs_status ON sourcing_runs(status);
 CREATE INDEX IF NOT EXISTS idx_sourcing_candidates_run_asin ON sourcing_run_candidates(run_id, asin);
+CREATE INDEX IF NOT EXISTS idx_keyword_validation_store_keyword ON keyword_validation_results(store_id, keyword, checked_at);
 """
 
 EXPORT_RUN_ADDITIVE_COLUMNS = {
