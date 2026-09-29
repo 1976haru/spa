@@ -1,0 +1,938 @@
+ShopSource Studio — Phase 2.3 / Automated Amazon Candidate Sourcing (Keepa-first)
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+
+==================================================
+0. 반드시 먼저 확인
+==================================================
+
+git status
+git branch --show-current
+git remote -v
+git pull --ff-only
+git log --oneline -10
+
+그리고 다음 문서를 읽는다.
+
+AGENTS.md
+CLAUDE.md
+README.md
+docs/MASTER_SPEC.md
+docs/ARCHITECTURE.md
+docs/DATABASE.md
+docs/STORE_PROFILE.md
+docs/ROADMAP.md
+docs/SPARK_INTEGRATION.md
+
+Phase 2.2 Amazon Source Inbox 구현이 아직 merge되지 않았다면,
+source/amazon/inbox 기반 기능을 깨뜨리지 않는 범위에서 필요한 최소 foundation을 함께 구현하거나,
+이미 존재하는 Phase 2.2 prompt/branch 상태를 확인하여 충돌 없이 통합하라.
+
+현재 Phase 2.1의 Spark Center package workflow는 절대 깨뜨리지 마라.
+
+==================================================
+1. 외부 조사 결과를 구현 원칙으로 반영
+==================================================
+
+Amazon Creators API / PA-API를 Shopify 재판매 상품 sourcing feed로 사용하지 마라.
+
+이유:
+Amazon Associates Program의 Product Advertising Content는 Amazon으로 트래픽과 판매를 보내는 용도로 제한되어 있고,
+Amazon 외 사이트의 상품 판매를 홍보하는 용도로 사용하면 안 되는 계약 구조다.
+
+따라서 ShopSource Studio의 자동 Amazon candidate sourcing 1차 provider는:
+KEEP A API (Keepa REST API)
+로 구현한다.
+
+Keepa는 Amazon product database에 대해:
+- Product Finder /query
+- Product Request /product
+- Best Sellers /bestsellers
+- Category Search / Lookup
+
+등을 제공한다.
+
+하지만 Keepa는 제3자 서비스다.
+실제 상업적 사용 조건/라이선스는 사용자가 Keepa 약관을 확인해야 한다.
+프로그램은 provider abstraction으로 만들어 특정 provider에 종속되지 않게 한다.
+
+==================================================
+2. 목표
+==================================================
+
+사용자가 매번 Amazon 검색 페이지를 열고 수동으로 상품을 찾지 않아도 되게 한다.
+
+운영 흐름:
+
+Store Profile
+→ Sourcing Recipe
+→ Keepa Product Finder
+→ 후보 ASIN
+→ Product Request로 상세 보강
+→ prefilter/risk filter
+→ canonical product JSON
+→ MASTER DB
+→ Store classify
+→ PRIMARY/RESERVE
+→ Spark Center package
+
+이번 Phase는 "candidate sourcing 자동화"다.
+
+Amazon 웹페이지 scraping은 하지 않는다.
+
+==================================================
+3. Provider abstraction
+==================================================
+
+새 구조 권장:
+
+src/shopsource/sourcing/
+    __init__.py
+    models.py
+    engine.py
+    recipes.py
+    providers/
+        __init__.py
+        base.py
+        keepa.py
+
+Provider interface 예:
+
+class SourcingProvider:
+    def health(self): ...
+    def estimate(self, recipe): ...
+    def discover(self, recipe, checkpoint=None): ...
+    def hydrate(self, asins): ...
+
+KeepaProvider는 이 interface를 구현한다.
+
+향후 다른 합법적 provider를 추가해도 engine/classifier/UI 변경이 최소가 되어야 한다.
+
+==================================================
+4. Keepa 공식 API 사용 범위
+==================================================
+
+기본 locale:
+Amazon US / domain=1
+
+사용 endpoint:
+
+A. Product Finder
+POST https://api.keepa.com/query
+- 후보 ASIN 검색
+- 최대 10,000 ASIN/query
+- paging/checkpoint
+- token cost 추적
+
+B. Product Request
+GET https://api.keepa.com/product
+- 최대 100 ASIN batch
+- 기본 상세 정보 hydrate
+
+권장 기본 params:
+domain=1
+stats=90
+history=0
+
+초기 대량 후보에는 offers= 사용하지 마라.
+offers는 token cost가 훨씬 높다.
+
+rating=1도 모든 후보에 무조건 적용하지 마라.
+필요한 finalist에 선택적으로 사용한다.
+
+C. Best Sellers
+선택적 보조 discovery source.
+기본 engine은 Product Finder를 우선한다.
+
+==================================================
+5. Keepa Credential
+==================================================
+
+API key는 절대:
+- Git
+- store profile JSON
+- manifest
+- logs
+- DB raw product JSON
+- screenshots
+에 저장하지 마라.
+
+Credential resolution 권장 순서:
+
+1. environment variable KEEPA_API_KEY
+2. Windows Credential Manager via keyring
+3. 현재 session에서 UI 입력
+
+가능하면 Python keyring 패키지를 사용하여 Windows Credential Manager에 저장한다.
+
+GUI:
+[API 설정]
+→ Keepa API Key 입력
+→ [연결 테스트]
+→ [Windows 자격 증명에 저장]
+
+API key는 화면에서 마스킹한다.
+
+keyring 사용이 불가능하면:
+- plaintext repo 파일 fallback 금지
+- session only 또는 환경변수 사용
+- 사용자에게 안내
+
+==================================================
+6. Keepa HTTP client
+==================================================
+
+requests 또는 httpx 중 프로젝트에 맞는 하나를 사용한다.
+
+필수:
+- HTTPS only
+- timeout
+- retry/backoff
+- 429/5xx handling
+- gzip 지원
+- token fields parse
+- no key logging
+- User-Agent는 정상 앱 식별 가능하게
+- max concurrency 제한
+
+Response에서:
+tokensLeft
+refillIn
+refillRate
+tokensConsumed
+processingTimeInMs
+
+를 읽어서 run telemetry에 기록한다.
+
+API key는 URL 전체 logging 시 반드시 redaction.
+
+==================================================
+7. Store Profile에 sourcing config
+==================================================
+
+Store Profile에 optional sourcing section을 추가한다.
+
+예:
+
+"sourcing": {
+  "provider": "keepa",
+  "marketplace": "US",
+  "target_candidates": 500,
+  "hydrate_multiplier": 2,
+  "min_rating": 4.0,
+  "min_reviews": 30,
+  "min_images": 2,
+  "max_out_of_stock_90": 40,
+  "single_variation": true,
+  "exclude_adult": true,
+  "exclude_hazmat": true,
+  "exclude_batteries_required": false,
+  "recipes": [...]
+}
+
+기존 profile은 sourcing이 없어도 정상 동작해야 한다.
+
+==================================================
+8. Cabin Tidy 1차 자동 sourcing recipe
+==================================================
+
+001 Cabin Tidy에 실제 실행 가능한 기본 recipe를 추가한다.
+
+카테고리:
+auto interior organization / convenience / storage
+
+keyword queries는 OR을 한 request에 억지로 넣지 말고
+여러 query recipe로 분리한다.
+
+예:
+
+- "trunk organizer"
+- "car seat organizer"
+- "backseat organizer"
+- "center console organizer"
+- "car trash can"
+- "headrest hook"
+- "car cup holder"
+- "car gap filler"
+- "car storage organizer"
+- "vehicle organizer"
+
+Store Profile의 include_keywords와 연계하되,
+exclude_keywords/risk_rules도 그대로 사용한다.
+
+가격 discovery 범위는 PRIMARY만 보지 말고 RESERVE까지 확보하기 위해:
+$30 ~ $120
+를 기본 candidate range로 사용한다.
+
+즉:
+PRIMARY $40~100
+주변 reserve $30~40 / $100~120
+까지 자동 소싱한다.
+
+$30 미만과 $120 초과를 시스템적으로 삭제하지 말고,
+이번 recipe에서 API query 범위 밖이라 discover되지 않을 뿐이라는 점을 명확히 한다.
+
+==================================================
+9. Product Finder query
+==================================================
+
+Keepa Product Finder query는 공식 필드명을 사용한다.
+
+기본 per keyword recipe 예:
+
+{
+  "title": "trunk organizer",
+  "productType": 0,
+  "singleVariation": true,
+  "isAdultProduct": false,
+  "isHazMat": false,
+  "hasReviews": true,
+  "current_NEW_gte": 3000,
+  "current_NEW_lte": 12000,
+  "current_RATING_gte": 40,
+  "current_COUNT_REVIEWS_gte": 30,
+  "imageCount_gte": 2,
+  "sort": [["current_SALES", "asc"]],
+  "perPage": 100,
+  "page": 0
+}
+
+단:
+- Keepa 실제 field semantics와 unit을 공식 docs 기준으로 구현하라.
+- cents ↔ dollars conversion 중앙화.
+- rating Keepa 값 40 = 4.0 stars임을 코드 상수/함수로 명시.
+- query filter가 너무 강해서 0건이면 자동으로 조건을 임의 완화하지 마라.
+- recipe preset에서 사용자가 조정할 수 있게 한다.
+
+월간 판매량 monthlySold는 데이터가 없는 ASIN이 많으므로 기본 hard filter로 강제하지 않는다.
+ranking signal로 사용하는 것은 가능하다.
+
+==================================================
+10. Candidate discovery / dedupe
+==================================================
+
+여러 recipe에서 나온 ASIN을 하나의 sourcing run 안에서 dedupe한다.
+
+ASIN마다 provenance 보존:
+
+- provider
+- recipe_id
+- keyword
+- finder_page
+- discovered_at
+- discovery_rank
+- query_hash
+
+동일 ASIN이 여러 recipe에 걸리면:
+- MASTER는 1개
+- sourcing evidence는 여러 개 보존 가능
+
+==================================================
+11. Product hydration
+==================================================
+
+Product Finder는 ASIN list만 반환하므로
+candidate ASIN을 Product Request로 상세 보강한다.
+
+최대 100 ASIN batch.
+
+기본:
+stats=90
+history=0
+
+1차 hydrate에서는 offers, stock, buybox를 강제로 쓰지 않는다.
+
+Keepa Product Object에서 canonical payload로 최소 매핑:
+
+asin
+title
+brand
+manufacturer
+price
+url
+category
+tags
+overview/aboutThis equivalent
+images
+rating
+reviewCount
+options
+quantity
+_sourceUrl
+_collectedAt
+
+단, 데이터가 없는 field를 꾸며내지 마라.
+
+==================================================
+12. 가격 선택 규칙
+==================================================
+
+Keepa statistics price type indices를 공식 docs 기준 상수화한다.
+
+최소:
+AMAZON = 0
+NEW = 1
+SALES = 3
+LISTPRICE = 4
+COUNT_NEW = 11
+BUY_BOX_SHIPPING = 18
+
+기본 candidate canonical price:
+
+1. stats.current[BUY_BOX_SHIPPING]이 유효하고 실제 데이터가 있을 때
+2. stats.current[AMAZON]
+3. stats.current[NEW]
+4. 유효 가격이 없으면 REVIEW / source incomplete
+
+단, BUY_BOX_SHIPPING은 buybox/offers parameter가 없으면 없을 수 있다.
+대량 hydrate에서는 2→3 fallback이 주 경로가 될 수 있다.
+
+가격은 smallest currency unit → USD float로 정확히 변환.
+
+-1 / null은 가격 없음.
+
+가격 없음 때문에 MASTER에서 삭제하지 않는다.
+REVIEW 또는 SOURCE_INCOMPLETE로 보존.
+
+==================================================
+13. 이미지 처리
+==================================================
+
+Keepa Product Object의 images metadata로 URL을 구성할 수 있다.
+
+하지만:
+- 이미지 binary download 금지
+- 로컬 cache 금지
+- 이미지 권리 문제를 프로그램이 자동으로 해결했다고 가정 금지
+
+canonical payload에는 provider가 반환한 image reference/URL만 보존할 수 있다.
+
+GUI/manifest에:
+"상품 이미지 사용권/재사용 조건은 별도 확인 필요"
+라는 운영 경고를 문서화한다.
+
+Spark Center 실제 업로드용 이미지 사용 방식은 round-trip 테스트 후 확정한다.
+
+==================================================
+14. Rating / review
+==================================================
+
+Product Finder filter 단계에서는:
+current_RATING
+current_COUNT_REVIEWS
+
+를 사용 가능.
+
+hydrated product 상세에서 rating/reviewCount가 필요하면:
+- finalist 대상만 rating=1 옵션 사용
+또는
+- stats/csv에 이미 존재하는 경우 사용
+
+전체 수만 개 후보에 rating=1을 무조건 쓰지 마라.
+token budget 보호.
+
+==================================================
+15. Risk / restricted prefilter
+==================================================
+
+Keepa query 자체에서:
+isAdultProduct=false
+isHazMat=false
+
+기본.
+
+추가 ShopSource risk rules:
+- battery
+- chemical/liquid
+- camera/GPS
+- safety critical
+- weapon/tactical
+- prohibited keywords
+
+는 기존 Store Profile classifier를 재사용한다.
+
+자동 sourcing 단계에서 위험상품을 영구 삭제하지 말고:
+- candidate reject reason
+- REVIEW/RESTRICTED
+를 기록한다.
+
+법적/정책성 금지 품목은 Spark Center package 기본 대상에서 계속 제외.
+
+==================================================
+16. Sourcing Run DB
+==================================================
+
+새 table 권장:
+
+sourcing_runs
+- id
+- run_id UNIQUE
+- provider
+- store_id
+- marketplace
+- recipe_snapshot_json
+- target_candidates
+- status
+- started_at
+- finished_at
+- finder_requests
+- product_requests
+- tokens_consumed
+- tokens_left
+- discovered_asins
+- hydrated_products
+- inserted
+- updated
+- duplicates
+- invalid
+- error
+
+sourcing_run_candidates
+- run_id
+- asin
+- recipe_id
+- discovery_rank
+- decision
+- reason_json
+
+대규모 중복행 폭증을 고려해서 적절한 index.
+
+MASTER product는 기존 products table 사용.
+
+==================================================
+17. checkpoint / resume
+==================================================
+
+필수.
+
+상태:
+PENDING
+RUNNING
+PAUSED
+DONE
+FAILED
+CANCELLED
+
+checkpoint 최소:
+- current recipe index
+- current page
+- discovered ASIN count
+- hydrated ASIN count
+- last successful batch
+- token state snapshot
+
+앱 종료/재실행 후:
+RUNNING이었던 run은 RECOVERABLE/PAUSED 상태로 보여주고
+[계속] 가능하게 한다.
+
+동일 batch 중복 hydrate를 피한다.
+
+==================================================
+18. token budget
+==================================================
+
+Keepa API는 token 기반이므로 비용 통제가 중요하다.
+
+Run 시작 전:
+estimate 보여준다.
+
+예:
+Target candidates 500
+Finder 예상 requests 5~20
+Product hydrate 최대 500 ASIN
+Estimated base tokens: 약 500 + finder cost
+
+실제 API가 반환하는:
+tokensLeft
+refillIn
+refillRate
+tokensConsumed
+
+를 계속 업데이트.
+
+사용자가 설정:
+
+max_tokens_per_run
+min_tokens_reserve
+
+예:
+max_tokens_per_run = 1000
+min_tokens_reserve = 100
+
+budget 도달 시:
+PAUSED_TOKEN_BUDGET
+
+무한 재시도 금지.
+
+==================================================
+19. DRY RUN
+==================================================
+
+API key 없이도 설정 검증 가능해야 한다.
+
+[자동 소싱 미리보기]
+
+- Store
+- recipes
+- keyword 수
+- price range
+- rating/review filters
+- target candidate
+- 예상 API request 구조
+- 예상 token 범위
+
+실제 network 요청 안 함.
+
+CLI:
+shopsource source-auto --store 001 --dry-run
+
+==================================================
+20. GUI
+==================================================
+
+기존 GUI를 파괴하지 말고,
+상단 또는 별도 "자동 소싱" 영역 추가.
+
+최소:
+
+[API 설정]
+Provider: Keepa
+Store
+Target candidates: 50
+[소싱 미리보기]
+[자동 소싱 시작]
+[일시정지]
+[계속]
+[취소]
+
+Progress:
+- Recipe x/y
+- Finder pages
+- Candidates
+- Hydrated
+- MASTER inserted/updated
+- Tokens consumed
+- Tokens left
+- Current status
+
+완료:
+자동으로 현재 Store classify.
+
+결과:
+MASTER
+PRIMARY
+RESERVE_A/B/C
+REVIEW
+RESTRICTED
+수량 요약.
+
+==================================================
+21. 첫 실제 테스트 안전장치
+==================================================
+
+초기 GUI 기본 target은 5 또는 10으로 한다.
+
+처음부터 500, 30,000 실행하지 마라.
+
+Live run 단계:
+
+Test A:
+5 candidates
+
+Test B:
+50 candidates
+
+Test C:
+500 candidates
+
+각 단계 수동 확인 후 대량 확대.
+
+30,000/store 기능은 benchmark와 token plan 확인 후 별도 Phase.
+
+==================================================
+22. Cabin Tidy 자동 소싱 후 자동 흐름
+==================================================
+
+성공 시:
+
+Keepa candidates
+→ canonical payload
+→ MASTER
+→ Cabin Tidy classify
+→ GUI에서 PRIMARY count 확인
+
+자동으로 Spark Center package까지 만들지는 마라.
+
+상품을 사람이 확인한 뒤:
+PRIMARY
+→ Spark Center 업로드 폴더 만들기
+
+를 누르는 현재 안전 게이트 유지.
+
+==================================================
+23. Canonical payload와 provider raw 분리
+==================================================
+
+Keepa raw Product Object 전체를 Spark payload라고 속이지 마라.
+
+DB에:
+provider_raw_json
+
+또는 occurrence raw metadata로 Keepa 원본을 보존할 수 있다.
+
+MASTER raw_json은 ShopSource canonical schema로 관리하거나,
+기존 구조와 충돌하지 않게 source_kind를 명확히 한다.
+
+Spark Center package 생성기가 기대하는 verified Spark JSON schema와
+Keepa canonical schema가 동일하지 않을 수 있다.
+
+따라서:
+- Keepa source → MASTER까지는 구현
+- Spark Center export 시 Keepa canonical을 기존 Spark-compatible JSON으로 mapping하는 layer를 별도 검증
+
+을 명시한다.
+
+처음에는 Keepa 5상품으로:
+MASTER import/classify
+까지 PASS한 후,
+Spark Center package schema compatibility를 별도 확인한다.
+
+==================================================
+24. 중요: Spark JSON compatibility
+==================================================
+
+기존 Spark handoff generator는 Spark source raw payload를 그대로 재사용하는 전략이었다.
+
+Keepa source는 raw payload 형식이 다르다.
+
+따라서 기존:
+latest occurrence raw_json → Spark handoff
+
+를 그대로 적용하면 안 된다.
+
+Phase 2.3에서 source-aware export를 구현하라.
+
+source_kind == SPARK_STORAGE:
+기존 raw payload 그대로.
+
+source_kind == KEEPA:
+Keepa → Spark-compatible canonical mapping 함수 사용.
+
+예:
+to_spark_product_payload(product)
+
+최소 Spark에서 이미 확인된 필드:
+url
+asin
+title
+brand
+price
+options
+quantity
+tags
+category
+overview
+aboutThis
+images
+rating
+reviewCount
+_sourceUrl
+_listPage
+_collectedAt
+
+Keepa에 없는 값은 안전한 empty/list/object/null로 처리하되
+값을 꾸며내지 않는다.
+
+5개 package를 Spark Desktop 또는 Spark Center에서 실제 테스트하기 전:
+capability:
+KEEPA_TO_SPARK_MAPPING_UNVERIFIED
+
+유지.
+
+==================================================
+25. Tests
+==================================================
+
+API network를 unit test에서 호출하지 않는다.
+
+responses / monkeypatch / fake provider 사용.
+
+필수:
+
+1. Keepa key redaction
+2. no key → friendly error
+3. dry run no network
+4. finder query build
+5. dollars to cents
+6. rating to Keepa units
+7. keyword recipes multiple queries
+8. pagination
+9. max 10k/query guard
+10. candidate dedupe
+11. hydration batches max 100
+12. token telemetry
+13. token budget pause
+14. 429 retry/backoff
+15. 5xx retry
+16. timeout handling
+17. checkpoint resume
+18. cancellation
+19. canonical mapping
+20. price fallback
+21. missing price REVIEW
+22. adult/hazmat excluded
+23. restricted keyword classification
+24. source_kind KEEPA
+25. Keepa raw not treated as Spark raw
+26. source-aware Spark mapping
+27. existing Spark storage handoff regression
+28. Spark Center package regression
+29. API key not in DB/log/files
+30. Windows 한글/공백 path
+
+==================================================
+26. CLI
+==================================================
+
+추가:
+
+shopsource source-auto --store 001 --dry-run
+
+shopsource source-auto --store 001 --target 5
+
+shopsource source-status --run <id>
+
+shopsource source-resume --run <id>
+
+shopsource source-cancel --run <id>
+
+필요 시:
+shopsource keepa-health
+
+API key는 command argument로 직접 받지 마라.
+shell history에 남기 때문이다.
+
+==================================================
+27. 문서
+==================================================
+
+README.md
+docs/ROADMAP.md
+docs/ARCHITECTURE.md
+docs/DATABASE.md
+docs/STORE_PROFILE.md
+docs/AUTO_SOURCING.md 신규 권장
+
+AUTO_SOURCING.md에는:
+
+- 왜 Creators API를 sourcing feed로 안 쓰는지
+- Keepa provider 구조
+- Keepa API key 설정
+- token model
+- dry-run
+- 5→50→500 검증
+- source-aware Spark mapping
+- 아직 미검증인 이미지/content 권리와 Spark Center portal compatibility
+
+를 명시한다.
+
+==================================================
+28. 절대 하지 말 것
+==================================================
+
+- Amazon.com browser scraping
+- CAPTCHA 우회
+- WAF token 재사용
+- stealth automation
+- proxy rotation
+- session cookie 수집
+- Creators API content를 Shopify 판매용 데이터로 사용
+- Keepa key commit/log
+- 무제한 token 소비
+- 처음부터 30,000개 live run
+- 자동 Spark Center upload
+- 자동 Shopify publish
+- 위험상품 자동 승인
+
+==================================================
+29. 테스트
+==================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+CLI:
+shopsource source-auto --help
+shopsource source-auto --store 001 --dry-run
+shopsource spark-center-package --help
+shopsource spark-handoff --help
+
+fake Keepa provider로:
+discover 20
+→ hydrate
+→ MASTER
+→ classify
+→ PRIMARY/RESERVE
+end-to-end smoke.
+
+실제 Keepa key가 환경에 없으면
+live API test는 SKIP하고 명확히 보고한다.
+실제 key를 테스트 코드/CI에 요구하지 않는다.
+
+==================================================
+30. 완료 보고
+==================================================
+
+[1] 시작 상태
+[2] 구현 요약
+[3] 왜 Keepa-first인지
+[4] Provider abstraction
+[5] Cabin Tidy recipes
+[6] Finder query
+[7] Hydration
+[8] Token control
+[9] Checkpoint/resume
+[10] GUI
+[11] Credential storage
+[12] canonical mapping
+[13] Keepa→Spark mapping 상태
+[14] DB migration
+[15] 테스트
+[16] 보안
+[17] 기존 기능 regression
+[18] live API 미검증 항목
+[19] 사용자가 다음에 할 테스트
+    - Keepa 계정/API plan 준비
+    - API key 설정
+    - connection test
+    - dry run
+    - 5 products
+    - MASTER/classification 확인
+    - 5-product Spark Center package
+[20] 다음 Phase
+[21] commit SHA
+
+==================================================
+31. Commit / Push
+==================================================
+
+모든 테스트 PASS 후:
+
+git commit -m "Add Keepa-first automated sourcing engine"
+git push origin main
+
+마지막:
+git status
+git log --oneline -5
+git rev-list --left-right --count main...origin/main
+
+working tree clean
+main...origin/main = 0 0
+
+확인.
+
+지금 바로 Phase 2.3 구현을 시작하라.
