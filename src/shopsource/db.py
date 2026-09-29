@@ -107,13 +107,21 @@ CREATE TABLE IF NOT EXISTS store_product_decisions (
 CREATE TABLE IF NOT EXISTS export_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id TEXT NOT NULL UNIQUE,
+    package_id TEXT,
+    target TEXT NOT NULL DEFAULT 'SPARK_DESKTOP',
     store_id TEXT NOT NULL,
+    store_name TEXT NOT NULL DEFAULT '',
     statuses_json TEXT NOT NULL,
     output_path TEXT NOT NULL,
+    requested_limit INTEGER,
     product_count INTEGER NOT NULL,
     asin_hash TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    validation_status TEXT NOT NULL
+    validation_status TEXT NOT NULL,
+    package_status TEXT NOT NULL DEFAULT 'CREATED',
+    uploaded_at TEXT,
+    note TEXT NOT NULL DEFAULT '',
+    portal_package_verified INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_products_price ON products(price);
@@ -126,6 +134,17 @@ CREATE INDEX IF NOT EXISTS idx_occurrence_import_run ON product_occurrences(impo
 CREATE INDEX IF NOT EXISTS idx_import_errors_run ON import_errors(import_run_id);
 CREATE INDEX IF NOT EXISTS idx_export_runs_store_created ON export_runs(store_id, created_at);
 """
+
+EXPORT_RUN_ADDITIVE_COLUMNS = {
+    "package_id": "TEXT",
+    "target": "TEXT NOT NULL DEFAULT 'SPARK_DESKTOP'",
+    "store_name": "TEXT NOT NULL DEFAULT ''",
+    "requested_limit": "INTEGER",
+    "package_status": "TEXT NOT NULL DEFAULT 'CREATED'",
+    "uploaded_at": "TEXT",
+    "note": "TEXT NOT NULL DEFAULT ''",
+    "portal_package_verified": "INTEGER NOT NULL DEFAULT 0",
+}
 
 
 def utc_now() -> str:
@@ -163,6 +182,17 @@ def init_db(path: str | Path | None = None) -> Path:
         }
         if "raw_json" not in occurrence_columns:
             con.execute("ALTER TABLE product_occurrences ADD COLUMN raw_json TEXT")
+        export_columns = {
+            row["name"] for row in con.execute("PRAGMA table_info(export_runs)")
+        }
+        for name, declaration in EXPORT_RUN_ADDITIVE_COLUMNS.items():
+            if name not in export_columns:
+                con.execute(f"ALTER TABLE export_runs ADD COLUMN {name} {declaration}")
+        con.execute("UPDATE export_runs SET package_id=job_id WHERE package_id IS NULL")
+        con.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_export_runs_package_id "
+            "ON export_runs(package_id) WHERE package_id IS NOT NULL"
+        )
     return p
 
 

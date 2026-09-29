@@ -35,3 +35,15 @@ override를 명시적으로 해제한 뒤 재분류하면 최신 자동 판정�
 Spark handoff의 job id, store, 선택 status, 출력 경로, 상품 수, ASIN hash, validation 결과를
 run 단위로 기록한다. 이번 단계에서는 수백만 행으로 커질 수 있는 상품별 export membership는
 추가하지 않고 manifest를 상세 감사 기록으로 사용한다.
+
+Phase 2.1 additive migration 필드:
+
+- `package_id`, `target`
+- 생성 당시 `store_name` snapshot
+- `requested_limit`
+- `package_status`: CREATED / UPLOADED / FAILED / ARCHIVED
+- `uploaded_at`, `note`
+- `portal_package_verified`
+
+기존 행은 `target=SPARK_DESKTOP`, `package_id=job_id`로 보존한다. `UPLOADED`는 사용자 수동
+표시이며 포털 또는 Shopify 성공 검증을 의미하지 않는다.

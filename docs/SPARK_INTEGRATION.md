@@ -143,6 +143,23 @@ Manifest와 validation report는 ShopSource Studio 내부 추적용으로 폴더
 단, Spark Center 포털이 현재 생성된 datasets JSON 폴더를 실제로 그대로 수용하는지는 다음 수동 round-trip에서 최종 확인한다.
 지원팀의 '외부 소싱 파일/폴더 업로드 가능' 안내와 '현재 JSON package가 포털에서 정상 수용됨'은 서로 다른 검증 단계로 기록한다.
 
+Phase 2.1 구현 상태:
+
+```text
+exports/spark_center/<store_id>_<safe_store_name>/
+  ready/<package_id>/000000001.json
+  manifests/<package_id>.manifest.json
+  reports/<package_id>.validation.json
+```
+
+- `ready/<package_id>` 하나만 사용자가 Spark Center에 업로드한다.
+- `SparkCenterPackageService`는 기존 dataset writer/validation을 재사용한다.
+- 생성 시 package history는 `CREATED`, validation 실패 시 `FAILED`로 기록한다.
+- 사용자는 업로드 수행 후 `UPLOADED`로 수동 표시할 수 있다.
+- `spark_center_manual_upload_allowed=true`는 지원 측 운영 허용 기록이다.
+- `portal_package_verified=false`는 실제 포털 round-trip이 아직 미검증임을 뜻한다.
+- 직접 API/네트워크 업로드는 구현하지 않는다.
+
 ### C. 차선 — Spark Center 공식 Import/API
 
 100~200개 샵 운영에서 Spark Center가 필수라면 다음 중 하나가 공식적으로 확인된 뒤 구현한다.
@@ -201,7 +218,7 @@ Spark 데이터 관리 화면에 **전체 5개 / 포함 5개 / 제외 0개**로 
 
 - Shopify 실제 업로드 단계에서도 datasets-only handoff가 충분한지
 - 파일명을 바꿔도 된다는 규칙이 어느 단위(작업파일/폴더)에 적용되는지
-- Spark Center가 Spark 로컬 파일을 직접 수용하는지
+- 현재 ShopSource JSON package가 Spark Center 포털에서 그대로 수용되는지
 - 100~200개 샵을 Spark/Spark Center에서 어떤 방식으로 계정 분할해야 하는지
 
 따라서 Codex는 이 부분을 추측해서 구현하면 안 된다.

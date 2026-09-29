@@ -6,6 +6,11 @@ from pathlib import Path
 
 from .classifier import classify_store, clear_manual_override, manual_override
 from .connectors.spark_handoff import SparkHandoffConnector
+from .connectors.spark_center_package import (
+    SparkCenterPackageService,
+    list_packages,
+    mark_package,
+)
 from .db import init_db, upsert_store
 from .exporter import export_store
 from .importer import import_spark
@@ -59,6 +64,24 @@ def main(argv=None) -> int:
     p.add_argument("--job-id")
     p.add_argument("--allow-restricted", action="store_true")
 
+    p = sub.add_parser("spark-center-package", help="Create a local Spark Center upload package")
+    p.add_argument("--store", required=True)
+    p.add_argument("--status", action="append", dest="statuses")
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--asin", action="append", dest="asins")
+    p.add_argument("--out-root", help="Package root (default: project exports/spark_center)")
+    p.add_argument("--package-id")
+    p.add_argument("--allow-restricted", action="store_true")
+
+    p = sub.add_parser("package-list", help="List recent Spark Center manual packages")
+    p.add_argument("--store")
+    p.add_argument("--limit", type=int, default=20)
+
+    p = sub.add_parser("package-mark", help="Manually update a Spark Center package status")
+    p.add_argument("--package-id", required=True)
+    p.add_argument("--status", required=True, choices=["CREATED", "UPLOADED", "FAILED", "ARCHIVED"])
+    p.add_argument("--note", default="")
+
     p = sub.add_parser("export")
     p.add_argument("--store", required=True)
     p.add_argument("--format", choices=["csv", "json"], default="csv")
@@ -103,6 +126,26 @@ def main(argv=None) -> int:
             allow_restricted=args.allow_restricted,
         )
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+    elif args.cmd == "spark-center-package":
+        result = SparkCenterPackageService().create(
+            store_id=args.store,
+            statuses=args.statuses,
+            limit=args.limit,
+            asins=args.asins,
+            out_root=args.out_root,
+            package_id=args.package_id,
+            db=db,
+            allow_restricted=args.allow_restricted,
+        )
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+    elif args.cmd == "package-list":
+        print(json.dumps(list_packages(args.store, args.limit, db), ensure_ascii=False, indent=2))
+    elif args.cmd == "package-mark":
+        print(json.dumps(
+            mark_package(args.package_id, args.status, args.note, db),
+            ensure_ascii=False,
+            indent=2,
+        ))
     elif args.cmd == "export":
         target = export_store(args.store, args.format, args.statuses, args.out, db)
         print(target)

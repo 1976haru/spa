@@ -35,15 +35,15 @@
 - [ ] 테스트 Shopify 스토어 업로드 확인
 - [ ] 재업로드 시 중복 동작 기록
 
-## v0.2.1 SPARK CENTER PACKAGE WORKFLOW — 다음
+## v0.2.1 SPARK CENTER PACKAGE WORKFLOW — 현재
 - [x] 운영자가 Spark Center 측에 외부 소싱 파일/폴더 업로드 가능 여부 확인
-- [ ] 기본 출력 위치를 프로젝트 로컬 `exports/spark_center/<store>/...`로 정리
-- [ ] 스토어/상태/상품수 기준 업로드 폴더 원클릭 생성
-- [ ] 업로드 폴더에는 상품 JSON만 포함
-- [ ] manifest/validation은 업로드 폴더 밖에 보관
-- [ ] GUI에 'Spark Center 업로드 폴더 만들기'와 '폴더 열기' 추가
-- [ ] package history / CREATED-UPLOADED 수동 상태 추적
-- [ ] 기존 Spark desktop handoff는 고급 호환 옵션으로 유지
+- [x] 기본 출력 위치를 프로젝트 로컬 `exports/spark_center/<store>/...`로 정리
+- [x] 스토어/상태/상품수 기준 업로드 폴더 원클릭 생성
+- [x] 업로드 폴더에는 상품 JSON만 포함
+- [x] manifest/validation은 업로드 폴더 밖에 보관
+- [x] GUI에 'Spark Center 업로드 폴더 만들기'와 '폴더 열기' 추가
+- [x] package history / CREATED-UPLOADED 수동 상태 추적
+- [x] 기존 Spark desktop handoff는 고급 호환 옵션으로 유지
 - [ ] 실제 Spark Center 포털에 생성 폴더 업로드 round-trip 검증
 
 ## v0.3 STORE ENGINE

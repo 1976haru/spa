@@ -24,14 +24,14 @@
 
 ## Windows 설치
 
-1. 이 폴더를 `D:\shop\shop-source-studio`에 둡니다.
-2. `setup_windows.bat` 실행
-3. 완료 후 `run_gui.bat` 실행
+1. 저장소를 원하는 로컬 작업 폴더에 둡니다.
+2. 저장소 루트에서 `setup_windows.bat`를 실행합니다.
+3. 완료 후 `run_gui.bat`를 실행합니다.
 
 CLI 사용을 원하면 PowerShell에서:
 
 ```powershell
-cd D:\shop\shop-source-studio
+cd <ShopSource Studio 저장소 경로>
 .\.venv\Scripts\Activate.ps1
 shopsource summary
 ```
@@ -49,6 +49,20 @@ shopsource spark-handoff --store 001 --status PRIMARY --limit 5
 Spark handoff 기본 출력은 `exports/spark_handoff/jobs/<job_id>/`이며 상품 JSON만 포함합니다.
 Manifest와 validation report는 job 폴더 밖에 생성됩니다. 실제 사용자 테스트에서 5개 상품
 dataset 폴더가 Spark UI에 정상 로드됐지만, Shopify 실제 업로드는 아직 검증되지 않았습니다.
+
+## 초보자용 Spark Center 수동 업로드 순서
+
+1. `run_gui.bat` 실행
+2. Store 선택 후 `Classify` 실행
+3. Status를 `PRIMARY`로 선택
+4. 상품 수 입력(기본 50)
+5. `Spark Center 업로드 폴더 만들기` 클릭
+6. Validation PASS 확인 후 `폴더 열기`
+7. 표시된 `ready/<package_id>` 폴더 하나만 Spark Center에 수동 업로드
+8. 업로드를 수행했다면 `업로드 완료 표시` 클릭
+
+기본 출력은 저장소 상대경로 `exports/spark_center/<store>/`입니다. `업로드 완료 표시`는
+사용자 운영 기록일 뿐 Spark Center 포털이나 Shopify 성공을 자동 검증하지 않습니다.
 
 ## 스토어별 가격 규칙 수정
 
@@ -72,5 +86,7 @@ shopsource classify --store 001
 Spark Center에는 쓰기 작업을 하지 않습니다. 공식 API 또는 Import 계약이 확인되기 전까지
 `connectors/spark_center`는 `CONTRACT_PENDING`을 유지합니다. 로컬 Spark dataset handoff의
 capability는 `DATASET_LOAD_VERIFIED`이며 Shopify 업로드 지원을 의미하지 않습니다.
+Spark Center 지원 측에서 외부 소싱 폴더의 수동 업로드 운영은 허용된다고 확인됐지만,
+ShopSource JSON package의 실제 포털 round-trip은 아직 검증 전입니다.
 
 자세한 내용은 `docs/MASTER_SPEC.md`, `docs/SPARK_INTEGRATION.md`, `docs/ROADMAP.md`를 참고하세요.

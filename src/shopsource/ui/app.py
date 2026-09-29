@@ -12,6 +12,12 @@ from shopsource.db import connect, init_db, upsert_store
 from shopsource.exporter import export_store
 from shopsource.importer import import_spark
 from shopsource.connectors.spark_center import capability as spark_center_capability
+from shopsource.connectors.spark_center_package import (
+    SparkCenterPackageResult,
+    SparkCenterPackageService,
+    list_packages,
+    mark_package,
+)
 from shopsource.connectors.spark_handoff import SparkHandoffConnector, SparkHandoffResult
 from shopsource.paths import EXPORT_DIR, STORE_DIR
 from shopsource.stats import master_summary, store_summary
@@ -21,8 +27,9 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ShopSource Studio v0.1")
-        self.geometry("1050x680")
-        self.minsize(900, 600)
+        self.geometry("1150x780")
+        self.minsize(1000, 680)
+        self.latest_package = None
         init_db()
         self._build()
         self._load_store_profiles()
@@ -40,7 +47,7 @@ class App(tk.Tk):
         ttk.Button(top, text="Classify", command=self.classify).pack(side="left", padx=4)
         ttk.Button(top, text="Export CSV", command=lambda: self.export("csv")).pack(side="left", padx=4)
         ttk.Button(top, text="Export JSON", command=lambda: self.export("json")).pack(side="left", padx=4)
-        ttk.Button(top, text="Spark Handoff", command=self.spark_handoff).pack(side="left", padx=4)
+        ttk.Button(top, text="Spark Desktop Handoff...", command=self.spark_handoff).pack(side="left", padx=4)
         cap = spark_center_capability()
         self.spark_button = ttk.Button(top, text=f"Spark Center: {cap.status}", state="disabled")
         self.spark_button.pack(side="left", padx=4)
@@ -59,6 +66,31 @@ class App(tk.Tk):
         self.status_combo.pack(side="left", padx=6)
         self.status_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_table())
         ttk.Button(filters, text="Refresh", command=self.refresh).pack(side="left", padx=4)
+
+        package = ttk.LabelFrame(self, text="Spark Center manual upload package", padding=10)
+        package.pack(fill="x", padx=10, pady=8)
+        ttk.Label(package, text="Product count").grid(row=0, column=0, sticky="w")
+        self.package_limit_var = tk.StringVar(value="50")
+        ttk.Entry(package, textvariable=self.package_limit_var, width=8).grid(
+            row=0, column=1, padx=6, sticky="w"
+        )
+        ttk.Button(
+            package,
+            text="Spark Center 업로드 폴더 만들기",
+            command=self.create_spark_center_package,
+        ).grid(row=0, column=2, padx=6, sticky="w")
+        self.open_package_button = ttk.Button(
+            package, text="폴더 열기", command=self.open_latest_package, state="disabled"
+        )
+        self.open_package_button.grid(row=0, column=3, padx=6)
+        self.mark_uploaded_button = ttk.Button(
+            package, text="업로드 완료 표시", command=self.mark_latest_uploaded, state="disabled"
+        )
+        self.mark_uploaded_button.grid(row=0, column=4, padx=6)
+        self.package_info_var = tk.StringVar(value="Recent package: none")
+        ttk.Label(
+            package, textvariable=self.package_info_var, justify="left", wraplength=1050
+        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
 
         cols = ("asin","price","title","fit","price_status","risk","final")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", height=20)
@@ -170,6 +202,101 @@ class App(tk.Tk):
         )
         self.refresh()
 
+    def create_spark_center_package(self):
+        try:
+            limit = int(self.package_limit_var.get().strip())
+        except ValueError:
+            messagebox.showerror("Invalid product count", "Product count must be a whole number.")
+            return
+        if limit < 1:
+            messagebox.showerror("Invalid product count", "Product count must be at least 1.")
+            return
+        status = self.status_var.get()
+        statuses = ["PRIMARY"] if status == "ALL" else [status]
+        service = SparkCenterPackageService()
+        self._run(
+            lambda: service.create(
+                store_id=self.store_id(), statuses=statuses, limit=limit
+            ),
+            self._package_done,
+        )
+
+    def _package_done(self, result: SparkCenterPackageResult):
+        self.progress.stop()
+        self.latest_package = result.to_dict()
+        self._show_latest_package()
+        self.msg.set(f"Spark Center package {result.validation_status}: {result.product_count} products")
+        messagebox.showinfo(
+            "Spark Center upload folder ready",
+            f"Store: {result.store_id} | {result.store_name}\n"
+            f"Package ID: {result.package_id}\nProducts: {result.product_count}\n"
+            f"Validation: {result.validation_status}\n\n"
+            f"Spark Center에는 아래 폴더만 업로드하세요:\n{result.folder}",
+        )
+        self.refresh()
+
+    def refresh_package_info(self):
+        try:
+            packages = list_packages(self.store_id(), 1)
+            self.latest_package = packages[0] if packages else None
+        except Exception:
+            self.latest_package = None
+        self._show_latest_package()
+
+    def _show_latest_package(self):
+        package = self.latest_package
+        if not package:
+            self.package_info_var.set("Recent package: none")
+            self.open_package_button.configure(state="disabled")
+            self.mark_uploaded_button.configure(state="disabled")
+            return
+        package_id = package.get("package_id", "")
+        folder = package.get("folder") or package.get("output_path", "")
+        status = package.get("package_status", "CREATED")
+        validation = package.get("validation_status", "")
+        count = package.get("product_count", 0)
+        self.package_info_var.set(
+            f"Recent: {package_id} | {count} products | Validation {validation} | Status {status}\n"
+            f"Spark Center에는 이 폴더만 업로드: {folder}"
+        )
+        self.open_package_button.configure(state="normal" if folder else "disabled")
+        self.mark_uploaded_button.configure(
+            state="normal" if status == "CREATED" else "disabled"
+        )
+
+    def open_latest_package(self):
+        package = self.latest_package or {}
+        folder = Path(package.get("folder") or package.get("output_path", ""))
+        if not folder.is_dir():
+            messagebox.showerror("Folder unavailable", f"Package folder not found:\n{folder}")
+            return
+        os.startfile(str(folder))
+
+    def mark_latest_uploaded(self):
+        package = self.latest_package or {}
+        package_id = package.get("package_id")
+        if not package_id:
+            return
+        if not messagebox.askyesno(
+            "Mark uploaded",
+            "이 표시는 사용자가 Spark Center에 폴더를 업로드했다는 수동 기록입니다.\n"
+            "포털 또는 Shopify 성공 검증을 의미하지 않습니다. 계속할까요?",
+        ):
+            return
+        self._run(
+            lambda: mark_package(package_id, "UPLOADED", "Marked uploaded in GUI"),
+            self._package_marked,
+        )
+
+    def _package_marked(self, result):
+        self.progress.stop()
+        self.msg.set(f"Package marked {result['package_status']}")
+        self.refresh_package_info()
+        messagebox.showinfo(
+            "Package status updated",
+            "사용자 수동 업로드 기록을 저장했습니다. 포털/Shopify 성공 검증은 별도입니다.",
+        )
+
     def refresh(self):
         try:
             master = master_summary()
@@ -181,6 +308,7 @@ class App(tk.Tk):
         except Exception as exc:
             self.summary_text.set(str(exc))
         self.refresh_table()
+        self.refresh_package_info()
 
     def refresh_table(self):
         for item in self.tree.get_children():

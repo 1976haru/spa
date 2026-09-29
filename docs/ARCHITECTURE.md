@@ -39,6 +39,7 @@ Connector 하위 구조:
 - `spark_storage`: 로컬 `datasets/` ZIP/폴더 읽기 전용 입력
 - `spark_handoff`: 검증된 `datasets/<job_id>` 상품 폴더 생성 및 자동 validation (`DATASET_LOAD_VERIFIED`)
 - `spark_center`: 공식 API/Import 계약 확인 전까지 `CONTRACT_PENDING`
+- `spark_center_package`: 프로젝트 로컬 Spark Center 수동 업로드 package 생성·history 관리
 - `manifest`: 향후 Connector가 공통으로 쓸 credential-free export 메타데이터
 
 `schema_probe.py`는 JSON/폴더/ZIP을 수정하지 않고 키, 타입, 누락률, ASIN/Job 통계만 분석한다.
@@ -50,3 +51,7 @@ Connector 하위 구조:
 
 Spark handoff는 `store_product_decisions.final_status`로 상품을 선택하고 ASIN 오름차순으로 쓴다.
 상품 job 폴더에는 9자리 JSON만 두며 manifest/report는 형제 디렉터리에 분리한다.
+
+`SparkCenterPackageService`는 별도 JSON writer를 구현하지 않고 `SparkHandoffConnector`의
+상품 선택, raw payload, 순차 파일명, validation을 재사용한다. API connector와 수동 package
+workflow는 명확히 분리하며 portal 자동 호출은 하지 않는다.

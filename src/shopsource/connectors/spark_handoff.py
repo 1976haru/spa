@@ -66,15 +66,19 @@ class HandoffValidationError(RuntimeError):
         self.result = result
 
 
+def validate_output_id(value: str, label: str = "job_id") -> str:
+    if (
+        not JOB_ID_PATTERN.fullmatch(value)
+        or ".." in value
+        or value.upper() in WINDOWS_RESERVED_NAMES
+    ):
+        raise ValueError(f"{label} must contain only letters, digits, underscore, or hyphen")
+    return value
+
+
 def _safe_job_id(store_id: str, requested: str | None) -> str:
     if requested is not None:
-        if (
-            not JOB_ID_PATTERN.fullmatch(requested)
-            or ".." in requested
-            or requested.upper() in WINDOWS_RESERVED_NAMES
-        ):
-            raise ValueError("job_id must contain only letters, digits, underscore, or hyphen")
-        return requested
+        return validate_output_id(requested)
     safe_store = re.sub(r"[^A-Za-z0-9_-]", "_", store_id).strip("_-") or "store"
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     return f"SS_{safe_store}_{stamp}_{secrets.token_hex(2)}"
@@ -137,6 +141,9 @@ class SparkHandoffConnector(ExportConnector):
         job_id: str | None = None,
         db: str | Path | None = None,
         allow_restricted: bool = False,
+        history_target: str = "SPARK_DESKTOP",
+        history_store_name: str | None = None,
+        history_package_status: str = "CREATED",
     ) -> SparkHandoffResult:
         init_db(db)
         profile = get_store(store_id, db)
@@ -159,6 +166,13 @@ class SparkHandoffConnector(ExportConnector):
         for target in (job_folder, manifest_path, report_path):
             if target.exists():
                 raise FileExistsError(f"Spark handoff output already exists: {target}")
+        with connect(db) as con:
+            recorded = con.execute(
+                "SELECT 1 FROM export_runs WHERE job_id=? OR package_id=?",
+                (job_id_value, job_id_value),
+            ).fetchone()
+        if recorded:
+            raise FileExistsError(f"Spark handoff id already exists in export history: {job_id_value}")
 
         rows = self._select_products(
             store_id, selected_statuses, requested_asins,
@@ -219,7 +233,10 @@ class SparkHandoffConnector(ExportConnector):
             validation_status=report["status"],
             warnings=tuple(report["warnings"]),
         )
-        self._record_export(store_id, result, manifest["asin_hash"], db)
+        self._record_export(
+            store_id, history_store_name or profile["store_name"], history_target,
+            history_package_status, limit, result, manifest["asin_hash"], db,
+        )
         if report["status"] != "PASS":
             raise HandoffValidationError("Spark handoff validation failed", result)
         return result
@@ -354,17 +371,30 @@ class SparkHandoffConnector(ExportConnector):
         }
 
     @staticmethod
-    def _record_export(store_id: str, result: SparkHandoffResult, asin_hash: str, db) -> None:
+    def _record_export(
+        store_id: str,
+        store_name: str,
+        target: str,
+        package_status: str,
+        requested_limit: int | None,
+        result: SparkHandoffResult,
+        asin_hash: str,
+        db,
+    ) -> None:
+        recorded_status = package_status if result.validation_status == "PASS" else "FAILED"
         with connect(db) as con:
             con.execute(
                 """
                 INSERT INTO export_runs(
-                  job_id,store_id,statuses_json,output_path,product_count,asin_hash,created_at,
-                  validation_status
-                ) VALUES(?,?,?,?,?,?,?,?)
+                  job_id,package_id,target,store_id,store_name,statuses_json,output_path,
+                  requested_limit,product_count,asin_hash,created_at,validation_status,
+                  package_status,portal_package_verified
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0)
                 """,
                 (
-                    result.job_id, store_id, json.dumps(result.statuses), str(result.folder),
+                    result.job_id, result.job_id, target, store_id, store_name,
+                    json.dumps(result.statuses), str(result.folder), requested_limit,
                     result.product_count, asin_hash, utc_now(), result.validation_status,
+                    recorded_status,
                 ),
             )
