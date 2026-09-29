@@ -1,0 +1,787 @@
+ShopSource Studio — Phase 2.1 / Spark Center Upload Package Workflow
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+
+==================================================
+0. 작업 시작 전
+==================================================
+
+반드시 아래를 실행한다.
+
+git status
+git branch --show-current
+git remote -v
+git pull --ff-only
+git log --oneline -10
+
+working tree가 clean인지 확인한다.
+
+다음 문서를 먼저 읽는다.
+
+AGENTS.md
+CLAUDE.md
+README.md
+docs/MASTER_SPEC.md
+docs/ARCHITECTURE.md
+docs/DATABASE.md
+docs/STORE_PROFILE.md
+docs/SPARK_INTEGRATION.md
+docs/ROADMAP.md
+docs/VALIDATION_STORAGE.md
+
+그리고 현재 구현을 확인한다.
+
+src/shopsource/connectors/spark_handoff.py
+src/shopsource/connectors/spark_center.py
+src/shopsource/connectors/manifest.py
+src/shopsource/db.py
+src/shopsource/cli.py
+src/shopsource/ui/app.py
+tests/test_spark_handoff.py
+tests/test_phase1b.py
+
+==================================================
+1. 사용자 운영 조건 — 매우 중요
+==================================================
+
+사용자가 Spark Center 측에 직접 문의했고 다음 답변을 받았다.
+
+- 상품 소싱은 사용자가 직접 해도 된다.
+- 소싱한 파일/폴더를 Spark Center에 올리는 방식으로 운영할 수 있다.
+- 따라서 C:\Users\...\AppData\Roaming\spark\storage\datasets 같은 Spark 데스크톱 내부 폴더에 굳이 생성할 필요가 없다.
+- 프로젝트 로컬 작업폴더에서 업로드용 폴더를 만들고, 그 폴더를 Spark Center에 업로드하는 방식으로 운영한다.
+
+이 사실을 이번 Phase의 기본 운영 전제로 사용한다.
+
+다만 다음 두 사실은 구분한다.
+
+A. Spark Center가 외부 소싱 파일/폴더 업로드를 허용한다고 지원 측에서 확인됨
+B. 현재 ShopSource Studio가 생성하는 JSON package가 Spark Center 포털에서 실제로 성공 업로드되는지는 아직 수동 round-trip 미검증
+
+따라서:
+- manual folder upload workflow는 구현한다.
+- 그러나 capability를 END_TO_END_VERIFIED 또는 PORTAL_UPLOAD_VERIFIED라고 표시하면 안 된다.
+- 실제 포털 테스트 전에는 portal_package_verified = false를 유지한다.
+
+==================================================
+2. Phase 2.1 목표
+==================================================
+
+현재 Phase 2의 SparkHandoffConnector를 기반으로
+100~200개 Store 운영에 적합한 "Spark Center 업로드 패키지 관리 흐름"을 구현한다.
+
+사용자 입장에서 원하는 흐름:
+
+Store 선택
+→ 상태 선택
+→ 상품 수 입력
+→ [Spark Center 업로드 폴더 만들기]
+→ 프로젝트 로컬 exports 아래에 업로드용 폴더 자동 생성
+→ Validation PASS
+→ [폴더 열기]
+→ 사용자가 그 폴더를 Spark Center에 수동 업로드
+→ 나중에 [업로드 완료 표시]
+
+이번 Phase는 네트워크/API 자동 업로드가 아니다.
+"업로드할 준비가 끝난 폴더를 정확하고 안전하게 만드는 것"이 목표다.
+
+==================================================
+3. 기본 저장 위치 변경
+==================================================
+
+운영 기본 output은 Spark desktop AppData가 아니다.
+
+기본 root:
+
+D:\shop\001_so_amazon\exports\spark_center
+
+실제 코드는 절대경로 하드코딩 대신 repository/project root 상대경로를 사용하라.
+
+권장 구조:
+
+exports/
+  spark_center/
+    001_Cabin_Tidy/
+      ready/
+        SC_001_20260929_201500_ab12/
+          000000001.json
+          000000002.json
+          ...
+      manifests/
+        SC_001_20260929_201500_ab12.manifest.json
+      reports/
+        SC_001_20260929_201500_ab12.validation.json
+
+스토어 폴더명 규칙:
+<store_id>_<safe_store_name>
+
+예:
+001_Cabin_Tidy
+002_The_Garage_Fix
+003_Bathroom_Sorted
+
+Windows 안전문자만 사용한다.
+
+업로드 대상은:
+
+ready/<package_id>
+
+폴더 하나다.
+
+그 안에는 상품 JSON만 존재해야 한다.
+
+manifest/report/index 파일을 upload folder 안에 넣지 마라.
+
+==================================================
+4. 기존 Spark desktop handoff 유지
+==================================================
+
+기존 Spark desktop handoff 기능을 삭제하지 마라.
+
+현재 검증된:
+datasets/<job_id>/
+000000001.json
+...
+
+생성 기능은 유지한다.
+
+다만 운영 UI에서는:
+
+기본:
+Spark Center 업로드 폴더
+
+고급:
+Spark Desktop 호환 폴더
+
+처럼 역할을 구분한다.
+
+가능하면 같은 low-level dataset writer를 재사용한다.
+
+raw payload 선택, validation, filename 규칙을 중복 구현하지 마라.
+
+==================================================
+5. 새 서비스/Connector 설계
+==================================================
+
+권장:
+
+SparkCenterPackageService
+또는
+SparkCenterPackageConnector
+
+를 새로 둔다.
+
+단, 기존 src/shopsource/connectors/spark_center.py의 CONTRACT_PENDING API connector와 개념이 섞이지 않게 주의한다.
+
+현재 spark_center.py가 "서버/API connector" 의미라면:
+
+- 기존 SparkCenterConnector = 공식 API/직접 연결, CONTRACT_PENDING 유지
+- 새 SparkCenterPackageService = 수동 업로드 package 생성
+
+처럼 분리한다.
+
+이름만 봐도 혼동되지 않아야 한다.
+
+새 서비스는 내부적으로 SparkHandoffConnector 또는 공통 dataset export core를 호출하여
+동일한 상품 JSON을 생성한다.
+
+중복 로직 금지.
+
+==================================================
+6. Package ID 규칙
+==================================================
+
+job_id보다 사용자 친화적인 package_id를 사용한다.
+
+예:
+
+SC_001_PRIMARY_0050_20260929_201500_ab12
+
+또는 너무 길면:
+
+SC_001_20260929_201500_ab12
+
+Manifest에:
+- store
+- selected statuses
+- count
+가 있으므로 폴더명은 간결해도 된다.
+
+조건:
+- store_id 포함
+- timestamp 포함
+- collision 방지 suffix
+- Windows safe
+- path traversal 방지
+- 기존 package folder 자동 overwrite 금지
+
+==================================================
+7. 상품 선택 정책
+==================================================
+
+기존 Store Decision 시스템을 그대로 사용한다.
+
+기본:
+PRIMARY
+
+복수 상태 가능:
+PRIMARY
+RESERVE_A
+RESERVE_B
+...
+
+RESTRICTED:
+기본 금지
+명시적 allow 없이는 package에 포함 금지
+
+상품 수:
+GUI에서 사용자가 직접 입력 가능
+
+예:
+5
+50
+100
+500
+1000
+
+0 이하 거부.
+
+기본값은 50으로 해도 된다.
+단, GUI에서 쉽게 수정 가능해야 한다.
+
+향후 수만 개 패키지 분할을 고려할 수 있게 구조화하되,
+이번 Phase에서 자동 30,000개 split 시스템까지 과도하게 만들지 마라.
+
+==================================================
+8. Package 생성 결과
+==================================================
+
+생성 성공 시 다음 정보를 반환한다.
+
+package_id
+store_id
+store_name
+statuses
+requested_limit
+product_count
+folder
+manifest_path
+validation_report_path
+validation_status
+package_status
+created_at
+
+package_status 초기값:
+CREATED
+
+portal_package_verified:
+false
+
+spark_center_manual_upload_allowed:
+true
+
+단, "manual_upload_allowed"는 사용자 지원 확인을 기록하는 metadata이고
+포털 round-trip 성공을 뜻하지 않는다.
+
+==================================================
+9. Package History
+==================================================
+
+100~200 Store 운영을 위해 package history가 필요하다.
+
+현재 export_runs table을 확장하거나 새 table을 추가할 수 있다.
+
+권장 최소 필드:
+
+id
+package_id UNIQUE
+target
+store_id
+statuses_json
+output_path
+product_count
+asin_hash
+created_at
+validation_status
+package_status
+uploaded_at
+note
+
+target 예:
+SPARK_CENTER_MANUAL
+SPARK_DESKTOP
+
+package_status:
+CREATED
+UPLOADED
+FAILED
+ARCHIVED
+
+이번 Phase에서는:
+- CREATED 자동 기록
+- 사용자가 GUI/CLI에서 UPLOADED로 수동 표시
+- 필요 시 FAILED/ARCHIVED 수동 상태 변경
+
+정도만 구현한다.
+
+실제 Spark Center 서버 상태를 자동 조회하지 마라.
+
+기존 export_runs schema와 backward compatibility를 유지한다.
+additive migration을 사용하라.
+
+==================================================
+10. CLI
+==================================================
+
+새 명령을 추가한다.
+
+예:
+
+shopsource spark-center-package \
+  --store 001 \
+  --status PRIMARY \
+  --limit 50
+
+기본 출력 root는:
+<repo>/exports/spark_center
+
+옵션:
+--store
+--status (repeatable)
+--limit
+--asin (repeatable 가능하면 기존 기능 재사용)
+--out-root
+--package-id
+--allow-restricted
+
+추가 history 명령도 구현을 검토한다.
+
+예:
+
+shopsource package-list --store 001
+
+shopsource package-mark \
+  --package-id SC_... \
+  --status UPLOADED
+
+필요하면:
+--note "Spark Center 업로드 완료"
+
+CLI 출력은 JSON summary가 좋다.
+
+==================================================
+11. GUI — 이번 Phase의 핵심
+==================================================
+
+현재 GUI를 전면 재설계하지 않는다.
+하지만 사용자는 코드를 모르는 운영자 관점에서도 쓸 수 있어야 한다.
+
+기존 "Spark Handoff" 버튼은 사용자 친화적으로 다음으로 바꾼다.
+
+"Spark Center 업로드 폴더 만들기"
+
+가능하면 GUI에 최소 다음 컨트롤을 추가한다.
+
+1. Store
+2. Status
+3. 상품 수
+4. [Spark Center 업로드 폴더 만들기]
+5. 최근 생성 package 정보
+6. [폴더 열기]
+7. [업로드 완료 표시]
+
+ALL status 선택 시:
+기본 PRIMARY로 안전 처리하거나 명확히 경고한다.
+
+상품 수:
+숫자 입력
+기본 50
+최소 1
+
+생성 성공 messagebox:
+- Store
+- Package ID
+- 상품 수
+- Validation PASS
+- Folder 경로
+
+그리고:
+"폴더 열기"
+
+를 제공한다.
+
+Windows explorer로 folder open 시:
+os.startfile 또는 안전한 platform helper 사용 가능.
+
+GUI에서 직접 SQL 작성하지 말고 service/repository layer를 호출한다.
+
+==================================================
+12. 기본 폴더는 C드라이브가 아님
+==================================================
+
+이번 Phase의 매우 중요한 UX 변경:
+
+기본 package output은 반드시 프로젝트 로컬:
+exports/spark_center
+
+이다.
+
+%APPDATA%\spark\storage\datasets
+를 기본 initialdir로 열지 마라.
+
+그 경로는 Spark Desktop 호환 기능에서만 고급 선택지로 남긴다.
+
+사용자가 아무 경로도 고르지 않아도
+프로젝트 로컬에 안전하게 package가 생성되어야 한다.
+
+==================================================
+13. 폴더 업로드 단위
+==================================================
+
+Spark Center에 사용자가 올릴 폴더는:
+
+ready/<package_id>
+
+하나다.
+
+사용자가 실수로 store root 전체,
+manifests,
+reports까지 올리지 않게 GUI에서 명확히 표시한다.
+
+예:
+
+"Spark Center에는 아래 폴더만 업로드하세요:
+D:\shop\001_so_amazon\exports\spark_center\001_Cabin_Tidy\ready\SC_..."
+
+가능하면:
+[경로 복사]
+버튼을 추가해도 좋다.
+
+==================================================
+14. Manifest
+==================================================
+
+Manifest에 기존 정보 외 다음을 추가한다.
+
+target = "SPARK_CENTER_MANUAL"
+package_id
+store_id
+store_name
+selected_statuses
+requested_limit
+product_count
+asin_count
+asin_hash
+created_at
+validation_status
+package_status = CREATED
+spark_center_manual_upload_allowed = true
+portal_package_verified = false
+
+절대 credential 포함 금지.
+
+==================================================
+15. Validation
+==================================================
+
+기존 Spark handoff validation을 재사용한다.
+
+추가 체크:
+
+- upload folder에는 *.json 상품파일만 존재
+- manifest/report는 upload folder 밖
+- JSON 수 == product_count
+- filename contiguous
+- duplicate ASIN 없음
+- sensitive field 없음
+- INTERNAL_FIELDS 없음
+- request_queues 없음
+- key_value_stores 없음
+- runtime/session file 없음
+- package folder가 store ready directory 아래에 있음
+- path traversal 없음
+
+Validation FAIL이면 package_status를 CREATED로 기록하면 안 된다.
+가능하면 FAILED로 기록하거나 export 자체를 실패시켜라.
+
+==================================================
+16. Store별 폴더 확장성
+==================================================
+
+100~200 Store를 고려한다.
+
+스토어별로:
+
+exports/spark_center/<store_id>_<slug>/
+
+가 분리되어야 한다.
+
+Store name 변경 시 과거 package 경로를 강제 이동하지 마라.
+package history는 생성 당시 store_name snapshot을 기록한다.
+
+향후 Store 200개가 있어도 같은 코드로 생성 가능해야 한다.
+
+특정 001 Cabin Tidy 이름을 코드에 하드코딩하지 마라.
+
+==================================================
+17. Package History UI
+==================================================
+
+가능하면 현재 GUI 하단 또는 별도 간단한 영역에 최근 package 10~20개를 표시한다.
+
+컬럼 예:
+Created
+Package ID
+Store
+Statuses
+Count
+Validation
+Status
+
+더블클릭 또는 버튼:
+Open Folder
+
+선택 row:
+Mark Uploaded
+
+이번 Phase에서 복잡한 dashboard까지 만들 필요는 없다.
+
+==================================================
+18. "업로드 완료" 의미
+==================================================
+
+Mark Uploaded는 사용자 수동 표시일 뿐이다.
+
+그 버튼을 눌렀다고:
+Spark Center API 확인
+Shopify 생성 확인
+성공 업로드 검증
+
+으로 간주하면 안 된다.
+
+의미:
+"사용자가 이 package를 Spark Center에 업로드했다고 표시함"
+
+uploaded_at 기록.
+
+향후 실제 portal verification과 별도다.
+
+==================================================
+19. 기존 AppData 직접 출력 옵션
+==================================================
+
+CLI의 기존:
+
+--out-root "%APPDATA%\spark\storage\datasets"
+
+는 계속 작동해야 한다.
+
+기존 spark-handoff command도 깨뜨리지 마라.
+
+Phase 2.1은 backward compatible해야 한다.
+
+==================================================
+20. 테스트
+==================================================
+
+새 테스트를 충분히 추가한다.
+
+필수:
+
+1. Store 001 package 생성
+2. project-local default root 사용
+3. store safe slug 생성
+4. PRIMARY 5개
+5. PRIMARY 50개 limit
+6. package folder에는 상품 JSON만 존재
+7. manifest/report는 외부
+8. duplicate ASIN 없음
+9. manual override 존중
+10. RESTRICTED 기본 차단
+11. package history CREATED 기록
+12. mark UPLOADED → uploaded_at 기록
+13. 잘못된 package status 거부
+14. path traversal 거부
+15. 기존 package collision 거부
+16. 한글/공백 project path
+17. store name 특수문자 safe slug
+18. 기존 spark-handoff command 회귀 테스트
+19. Spark Center API connector CONTRACT_PENDING 유지
+20. credential/session file 생성 안 함
+21. .gitignore로 generated package 추적 안 됨
+
+가능하면 GUI helper/service는 unit test 가능한 구조로 분리한다.
+
+==================================================
+21. 보안
+==================================================
+
+절대 Git에 들어가면 안 되는 것:
+
+실제 상품 JSON package
+SQLite DB
+storage.zip
+Amazon cookie
+session token
+Shopify AccessToken
+Spark credential
+.env
+SDK_SESSION_POOL_STATE
+crawler runtime
+
+generated package:
+exports/spark_center/
+는 Git ignore 상태여야 한다.
+
+==================================================
+22. README / 문서
+==================================================
+
+README.md를 실제 현재 경로 기준으로 정리한다.
+
+기존 문서의:
+D:\shop\shop-source-studio
+
+같은 오래된 예시는 현재 프로젝트가 실제:
+D:\shop\001_so_amazon
+
+에서 운영됨을 고려하되,
+가능하면 특정 절대경로에 종속되지 않는 설명으로 바꾼다.
+
+README에 초보자용 사용 순서를 추가한다.
+
+예:
+
+1. run_gui.bat
+2. Store 선택
+3. Classify
+4. Status PRIMARY
+5. 상품 수 50
+6. Spark Center 업로드 폴더 만들기
+7. 폴더 열기
+8. ready/<package_id> 폴더만 Spark Center 업로드
+9. 업로드 후 "업로드 완료 표시"
+
+docs/SPARK_INTEGRATION.md
+docs/ROADMAP.md
+docs/ARCHITECTURE.md
+docs/DATABASE.md
+도 필요한 범위만 업데이트한다.
+
+==================================================
+23. 이번 Phase에서 하지 말 것
+==================================================
+
+- Amazon 직접 crawler 개발 금지
+- Spark Center 네트워크/API 자동 업로드 금지
+- undocumented endpoint 금지
+- Shopify API 업로드 금지
+- C드라이브 강제 저장 금지
+- Spark 내부 DB 수정 금지
+- cookie/session 복제 금지
+- 200 Store dashboard 전체 구현 금지
+- 상품 원본을 가격 때문에 삭제 금지
+
+==================================================
+24. 테스트 명령
+==================================================
+
+완료 후 반드시:
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+CLI:
+shopsource --help
+shopsource spark-center-package --help
+기존 shopsource spark-handoff --help
+
+가능하면:
+temp SQLite
+temp project/output directory
+
+로 end-to-end package generation smoke를 수행한다.
+
+==================================================
+25. 완료 보고 형식
+==================================================
+
+완료 후 반드시 다음 형식으로 보고한다.
+
+[1] 작업 시작 상태
+- branch
+- origin
+- start commit
+
+[2] Phase 2.1 구현 요약
+
+[3] 기본 프로젝트 로컬 출력 구조
+
+[4] Spark Center Package 서비스 구조
+
+[5] 기존 SparkHandoff와 재사용 관계
+
+[6] CLI 사용 예시
+
+[7] GUI 변경 내용
+
+[8] Package History / Mark Uploaded
+
+[9] DB migration
+
+[10] Manifest / Validation
+
+[11] 추가/수정 파일
+
+[12] 테스트 결과
+- compileall
+- pytest
+- git diff --check
+- CLI smoke
+
+[13] 보안 점검
+
+[14] 기존 Phase 2 기능 회귀 여부
+
+[15] 100~200 Store 확장 시 다음 병목
+
+[16] 사용자가 다음에 실제로 할 테스트
+- GUI에서 PRIMARY 5개 package 생성
+- 프로젝트 local folder 확인
+- Spark Center에 ready/<package_id> 폴더 업로드
+- Spark Center에서 5개 상품 정상 인식 확인
+- 업로드 완료 표시
+
+[17] 아직 미검증인 항목
+
+[18] 다음 Phase 권장사항
+
+[19] commit SHA
+
+==================================================
+26. Commit / Push
+==================================================
+
+모든 테스트 통과 후 commit한다.
+
+권장 message:
+
+Add project-local Spark Center package workflow
+
+그 다음:
+git push origin main
+
+마지막:
+git status
+git log --oneline -5
+git rev-list --left-right --count main...origin/main
+
+working tree clean
+main...origin/main = 0 0
+확인.
+
+지금 바로 Phase 2.1 구현을 시작하라.
