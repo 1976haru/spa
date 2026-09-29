@@ -90,6 +90,24 @@
 - [ ] 실제 Keepa token을 이용한 1~3 keyword live 검증
 - [ ] 001 Cabin Tidy 전체 흐름과 Spark Center portal package round-trip 검증
 
+
+## v0.2.5 API-FREE BROWSER SOURCING + SPARK READY PIPELINE — 다음
+- [ ] Keepa 없이도 동작하는 브라우저 기반 무료 소싱 모드
+- [ ] Edge/Chrome Manifest V3 ShopSource Capture 확장
+- [ ] localhost-only Capture Bridge + pairing token
+- [ ] Amazon 검색결과 페이지에서 ASIN/title/price/image/url/rating/reviewCount 후보 수집
+- [ ] 상품 상세 페이지에서 brand/category/bullets/overview/options/images 등 상세 보강
+- [ ] cookie/session/localStorage/auth header를 절대 수집하지 않음
+- [ ] search capture → detail enrichment → completeness score → MASTER 흐름
+- [ ] source_kind=BROWSER_CAPTURE 및 원본 occurrence 보존
+- [ ] Spark-compatible payload builder + validation
+- [ ] 불완전 상품은 REVIEW/NEEDS_DETAIL로 보존하고 자동 삭제하지 않음
+- [ ] Keyword Studio 추천어 → Amazon 검색 열기 → 현재 결과 가져오기 연결
+- [ ] 5개 단위 사용자 시작형 상세 보강 queue
+- [ ] CAPTCHA/robot check 감지 시 즉시 중단하고 우회하지 않음
+- [ ] API-free 5상품 → MASTER → PRIMARY → Spark Center package 실제 round-trip 검증
+- [ ] 50상품 운영성 테스트 후 확장
+
 ## v0.3 STORE ENGINE
 - [ ] UI에서 가격구간 직접 편집
 - [ ] Store 추가/복제/비활성
