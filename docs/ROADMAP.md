@@ -60,6 +60,24 @@
 - [ ] 현재 Store 재분류 흐름 연결
 - [ ] source/amazon 실제 상품 데이터 Git 제외
 
+## v0.2.3 AUTOMATED AMAZON CANDIDATE SOURCING — 다음
+- [ ] Provider abstraction 기반 자동 소싱 엔진
+- [ ] 1차 provider: Keepa API (Product Finder / Product Request / Best Sellers)
+- [ ] Keepa API key를 Git 밖에서 안전하게 관리
+- [ ] Store Profile 기반 keyword/category/price/risk sourcing recipe
+- [ ] 후보 ASIN 대량 검색 및 checkpoint/resume
+- [ ] Keepa token budget / rate pacing / retry / backoff
+- [ ] Product Finder 결과 ASIN → 상세 Product Request 보강
+- [ ] Keepa raw 응답은 provider 원본으로 보존하고 ShopSource canonical payload로 별도 정규화
+- [ ] Amazon Creators API는 Shopify 재판매용 sourcing feed로 사용하지 않음
+- [ ] 위험/성인/HazMat/배터리/금지 키워드 prefilter
+- [ ] 동일 ASIN MASTER dedupe 및 Store별 classification 연결
+- [ ] Cabin Tidy 자동 소싱 recipe 1차 구현
+- [ ] GUI: 자동 소싱 시작/중지/진행률/예상 token cost/결과 요약
+- [ ] DRY RUN과 실제 API 실행 분리
+- [ ] 5개 → 50개 → 500개 단계별 live test
+- [ ] 30,000개/Store 확장 benchmark 전에는 대규모 실행 금지
+
 ## v0.3 STORE ENGINE
 - [ ] UI에서 가격구간 직접 편집
 - [ ] Store 추가/복제/비활성
