@@ -1,0 +1,703 @@
+ShopSource Studio — Phase 2 / Spark Dataset Handoff MVP
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+
+==================================================
+0. 작업 시작 전 필수 확인
+==================================================
+
+아래를 실행하고 결과를 확인하라.
+
+git status
+git branch --show-current
+git remote -v
+git pull --ff-only
+git log --oneline -10
+
+working tree가 clean인지 확인하라.
+사용자 로컬의 실제 상품 데이터, SQLite DB, Spark runtime 파일, credential은 절대 Git에 추가하지 마라.
+
+다음 문서를 반드시 먼저 읽어라.
+
+AGENTS.md
+CLAUDE.md
+README.md
+docs/MASTER_SPEC.md
+docs/ARCHITECTURE.md
+docs/DATABASE.md
+docs/STORE_PROFILE.md
+docs/SPARK_INTEGRATION.md
+docs/ROADMAP.md
+docs/VALIDATION_STORAGE.md
+
+그리고 현재 구현을 확인하라.
+
+src/shopsource/db.py
+src/shopsource/importer.py
+src/shopsource/classifier.py
+src/shopsource/exporter.py
+src/shopsource/cli.py
+src/shopsource/ui/app.py
+src/shopsource/connectors/base.py
+src/shopsource/connectors/manifest.py
+src/shopsource/connectors/spark_handoff.py
+tests/test_phase1b.py
+
+==================================================
+1. 이미 실제로 검증된 Spark 계약
+==================================================
+
+다음은 추측이 아니라 실제 사용자 PC에서 검증된 사실이다.
+
+Spark manual data import:
+- Windows 폴더 선택 UI가 열린다.
+- 기본 위치는
+  C:\Users\user\AppData\Roaming\spark\storage\datasets
+- 입력 단위는 개별 JSON 파일이 아니라 datasets/<job_id> 폴더다.
+
+실제 테스트:
+- TEST_5ITEMS_20260929_192255 폴더를 생성
+- 폴더 내부에 상품 JSON 5개만 저장
+- 파일명:
+  000000001.json
+  000000002.json
+  000000003.json
+  000000004.json
+  000000005.json
+- request_queues 없음
+- key_value_stores 없음
+- Spark 데이터 불러오기에서 해당 폴더 선택
+- 결과:
+  전체 5개
+  포함 5개
+  제외 0개
+- Spark UI에서 상품 이미지, ASIN, 상품명, 옵션 라벨, 브랜드가 정상 표시됨
+
+따라서 이번 Phase에서는
+datasets/<job_id> 폴더만 생성하는 Spark handoff를 구현할 수 있다.
+
+그러나 아직 Shopify 실제 업로드까지 검증되지 않았다.
+따라서 capability를 FULLY_SUPPORTED 또는 UPLOAD_VERIFIED 등으로 표시하면 안 된다.
+
+권장 capability 상태명:
+DATASET_LOAD_VERIFIED
+
+또는 의미가 동일한 명확한 상태명을 사용하라.
+
+==================================================
+2. 이번 Phase 2의 목표
+==================================================
+
+MASTER DB에 이미 저장된 상품 중
+현재 Store Profile에서 원하는 상태의 상품을 선택하여
+
+Spark가 실제로 읽을 수 있는
+
+datasets/<job_id>/
+    000000001.json
+    000000002.json
+    ...
+
+형태의 handoff 폴더를 자동 생성한다.
+
+이 기능은 Amazon을 다시 크롤링하지 않는다.
+MASTER DB의 원본 Spark payload를 재사용한다.
+
+핵심 흐름:
+
+Spark source
+→ ShopSource MASTER DB
+→ Store classify
+→ PRIMARY / RESERVE / REVIEW ...
+→ 선택 subset
+→ Spark Dataset Handoff Folder
+→ Spark 데이터 불러오기
+
+==================================================
+3. 가장 중요한 원칙
+==================================================
+
+1. 가격 때문에 MASTER 상품을 삭제하지 마라.
+2. $35 상품도 MASTER DB에 보존한다.
+3. export는 Store Decision의 final_status를 기준으로 한다.
+4. manual override가 있으면 final_status를 그대로 존중한다.
+5. 동일 ASIN은 하나의 handoff 폴더에 한 번만 내보낸다.
+6. Spark 상품 JSON에는 ShopSource 전용 내부 필드를 삽입하지 마라.
+7. 가능한 한 실제 Spark raw payload를 그대로 보존하여 내보낸다.
+8. request_queues를 만들지 마라.
+9. key_value_stores를 만들지 마라.
+10. session cookie/token을 읽거나 내보내지 마라.
+11. SDK_SESSION_POOL_STATE.json 또는 crawler runtime 파일을 생성하지 마라.
+12. 기존 Spark 작업폴더를 수정하거나 덮어쓰지 마라.
+13. 항상 새 job folder를 만든다.
+14. 기존 folder가 있으면 명시적 overwrite 옵션 없이는 실패시켜라.
+15. 실제 Shopify 업로드 API는 이번 Phase에서 구현하지 마라.
+
+==================================================
+4. Raw Payload 선택 규칙
+==================================================
+
+현재 DB에는:
+- products.raw_json
+- product_occurrences.raw_json
+이 존재한다.
+
+Spark handoff에 사용할 payload는 다음 우선순위로 정한다.
+
+1. 해당 product의 가장 최근 유효 product_occurrences.raw_json
+2. 없으면 products.raw_json
+
+"가장 최근" 기준은 가능한 경우:
+- collected_at
+- occurrence id
+순으로 안정적으로 정한다.
+
+payload가 JSON object가 아니거나,
+필수 식별정보가 없으면 해당 상품은 무조건 조용히 누락하지 말고 validation error로 기록하라.
+
+최소 필수:
+- asin
+- title
+
+가능하면 기존 Spark payload의 다음 필드는 그대로 유지:
+- url
+- asin
+- title
+- brand
+- price
+- options
+- quantity
+- tags
+- category
+- overview
+- aboutThis
+- images
+- rating
+- reviewCount
+- _sourceUrl
+- _listPage
+- _collectedAt
+
+필드 값을 임의로 정규화하거나 재작성하지 마라.
+이번 Phase는 "원본 payload 보존"이 우선이다.
+
+==================================================
+5. SparkHandoffConnector 구현
+==================================================
+
+현재 src/shopsource/connectors/spark_handoff.py는
+CONTRACT_PENDING으로 막혀 있다.
+
+이를 실제 verified dataset folder handoff로 구현하라.
+
+권장 API 예:
+
+SparkHandoffConnector.export(
+    store_id="001",
+    statuses=["PRIMARY"],
+    out_root=Path(...),
+    limit=None,
+    job_id=None,
+    db=None,
+)
+
+정확한 signature는 기존 architecture에 맞게 조정 가능하다.
+
+결과는 객체 또는 Path 하나로 끝내지 말고,
+호출자가 다음을 알 수 있게 구조화된 result를 반환하는 것을 권장한다.
+
+- job_id
+- folder
+- product_count
+- asin_count
+- statuses
+- manifest_path
+- validation_report_path
+- warnings
+
+기존 ExportConnector interface와 충돌한다면
+최소 변경으로 확장하라.
+
+==================================================
+6. Job ID / 폴더명 규칙
+==================================================
+
+사용자가 job_id를 지정하지 않으면
+충돌 가능성이 낮고 사람이 읽을 수 있는 값을 생성하라.
+
+예:
+SS_001_20260929_193000_ab12
+
+필수 조건:
+- Windows 파일명 안전
+- store_id 포함
+- timestamp 포함
+- 충돌 방지 suffix 가능
+- 기존 폴더와 충돌하면 덮어쓰지 않음
+
+사용자가 job_id를 지정한 경우에도
+path traversal:
+..
+/
+\
+등을 이용해 out_root 밖으로 탈출할 수 없도록 검증하라.
+
+==================================================
+7. 파일명 규칙
+==================================================
+
+Spark에서 실제 정상 동작한 규칙을 사용하라.
+
+000000001.json
+000000002.json
+...
+9자리 zero padding
+
+정렬은 재현 가능해야 한다.
+
+권장:
+- ASIN 오름차순
+또는
+- decision/product id 안정 정렬
+
+어떤 순서를 선택했는지 문서화하라.
+
+동일 조건으로 다시 export할 경우
+내용 순서가 불필요하게 바뀌지 않아야 한다.
+
+==================================================
+8. Status 선택
+==================================================
+
+기본값은 PRIMARY만 export하도록 한다.
+
+CLI에서 복수 status를 허용하라.
+
+예:
+
+shopsource spark-handoff --store 001 --status PRIMARY
+
+shopsource spark-handoff --store 001 --status PRIMARY --status RESERVE_A
+
+RESTRICTED는 기본 export에 절대 포함하지 않는다.
+
+사용자가 명시적으로 RESTRICTED를 요청할 경우에도
+경고 또는 별도 allow flag를 요구하는 방향을 검토하라.
+
+예:
+--allow-restricted
+
+단, 불필요하게 복잡하게 만들지 말고 안전한 기본값을 우선한다.
+
+==================================================
+9. limit / ASIN 선택
+==================================================
+
+테스트와 실제 운영을 위해 아래 기능을 지원하라.
+
+- --limit N
+- optional --asin ASIN (복수 가능)
+
+예:
+
+shopsource spark-handoff --store 001 --status PRIMARY --limit 5
+
+또는:
+
+shopsource spark-handoff --store 001 --asin B0XXXX --asin B0YYYY
+
+ASIN 직접 지정 시에도 해당 Store에 decision이 존재해야 하는지,
+아니면 MASTER에 존재하면 허용할지 명확히 정하고 문서화하라.
+
+권장:
+Store Decision이 존재하는 상품만 허용.
+왜냐하면 Store별 판정을 통과한 상품을 handoff하는 것이 목적이기 때문이다.
+
+==================================================
+10. Output 위치
+==================================================
+
+기본 output은 repository 내부 실제 데이터가 Git에 걸리지 않는 위치를 사용하라.
+
+예:
+exports/spark_handoff/<job_id>/
+
+하지만 GUI와 CLI에서 사용자가 output parent를 지정할 수 있어야 한다.
+
+Windows에서 Spark datasets 경로가 존재하면
+GUI 폴더 선택 dialog의 initial directory 후보로 다음을 사용할 수 있다.
+
+%APPDATA%\spark\storage\datasets
+
+단:
+- 자동으로 AppData를 수정하지 마라.
+- 사용자가 명시적으로 output root를 선택해야 한다.
+- 기존 Spark job folder를 덮어쓰지 마라.
+
+==================================================
+11. Manifest / Validation Report
+==================================================
+
+중요:
+Spark가 선택하는 job folder 안에는 상품 JSON만 넣어라.
+
+즉 아래처럼 하지 마라.
+
+job_folder/
+  000000001.json
+  manifest.json   <-- 금지
+
+Spark가 manifest를 상품으로 읽을 위험이 있다.
+
+Manifest와 validation report는 job folder 바깥에 둬라.
+
+권장 구조:
+
+exports/
+  spark_handoff/
+    jobs/
+      <job_id>/
+        000000001.json
+        000000002.json
+    manifests/
+      <job_id>.manifest.json
+    reports/
+      <job_id>.validation.json
+
+또는 architecture에 더 적합한 sibling 구조를 사용하라.
+
+Manifest 최소:
+- schema_version
+- job_id
+- store_id
+- store_name
+- created_at
+- selected_statuses
+- product_count
+- asin_count
+- asin_hash
+- source_job_ids
+- output_folder
+- capability_status = DATASET_LOAD_VERIFIED
+- shopify_upload_verified = false
+
+Credential:
+- AccessToken
+- cookie
+- session-token
+- aws-waf-token
+등은 절대 manifest에 넣지 마라.
+
+==================================================
+12. Validation
+==================================================
+
+export 완료 후 자동 validation을 수행하라.
+
+최소 검증:
+
+- job folder 존재
+- JSON 파일 수
+- 순차 filename
+- 각 파일 JSON parse PASS
+- asin 존재
+- title 존재
+- duplicate ASIN 없음
+- product_count == file_count
+- manifest asin_count 일치
+- 내부 ShopSource field가 product JSON에 추가되지 않았는지
+- credential/session 관련 key가 새로 추가되지 않았는지
+
+가능하면 기존 probe_schema를 재사용하되,
+Spark handoff validation에 필요한 별도 검증 layer가 있으면 최소 모듈로 분리한다.
+
+validation 실패 시
+"export 성공"으로 표시하지 마라.
+
+==================================================
+13. DB 이력
+==================================================
+
+향후 100~200개 Store 운영을 위해
+handoff export 이력을 DB에 남길지 검토하라.
+
+이번 Phase에서 additive migration으로 부담이 크지 않다면
+아래 정도의 export_runs table을 추가해도 된다.
+
+예:
+- id
+- job_id UNIQUE
+- store_id
+- statuses_json
+- output_path
+- product_count
+- asin_hash
+- created_at
+- validation_status
+
+단:
+- 제품별 export membership까지 수천만 행로 늘어나는 구조는 이번 Phase에서 과도하게 만들지 마라.
+- manifest 파일만으로 충분하면 DB table 추가를 생략해도 된다.
+
+선택 이유를 완료 보고에 설명하라.
+
+==================================================
+14. CLI 구현
+==================================================
+
+새 명령을 추가하라.
+
+예:
+
+shopsource spark-handoff \
+  --store 001 \
+  --status PRIMARY \
+  --limit 5 \
+  --out-root "C:\Users\user\AppData\Roaming\spark\storage\datasets"
+
+필요 옵션:
+
+--store
+--status (repeatable)
+--limit
+--asin (repeatable)
+--out-root
+--job-id
+--allow-restricted (필요 시)
+
+실행 후 JSON 형태의 summary 또는 명확한 human-readable report를 출력하라.
+
+최소 출력:
+- job_id
+- folder
+- count
+- statuses
+- manifest
+- validation PASS/FAIL
+
+==================================================
+15. GUI 최소 기능
+==================================================
+
+이번 Phase에서 GUI를 대규모 재설계하지 마라.
+
+현재 src/shopsource/ui/app.py에 최소 기능만 추가한다.
+
+권장:
+- "Spark Handoff" 버튼 추가
+- 현재 Store 사용
+- 현재 Status filter가 ALL이면 기본 PRIMARY로 처리하거나 status 선택 dialog 제공
+- output parent folder 선택
+- 가능하면 %APPDATA%\spark\storage\datasets 를 initialdir로 사용
+- 생성 완료 후:
+  job id
+  상품 개수
+  생성 폴더
+  validation PASS
+  를 messagebox에 표시
+
+중요:
+GUI가 자체 SQL/자체 export 로직을 다시 구현하지 마라.
+SparkHandoffConnector/service를 호출해야 한다.
+
+==================================================
+16. 실제 사용 시나리오 테스트
+==================================================
+
+Synthetic test뿐 아니라
+현재 DB 구조를 이용한 integration test를 작성한다.
+
+반드시 테스트할 항목:
+
+1. PRIMARY 5개 → 5 JSON files
+2. filename 000000001~000000005
+3. duplicate ASIN 없음
+4. latest occurrence raw_json 선택
+5. occurrence raw_json 없으면 products.raw_json fallback
+6. manual override PRIMARY 상품 export 가능
+7. RESERVE_B는 PRIMARY-only export에 미포함
+8. --status RESERVE_B 지정 시 포함
+9. RESTRICTED 기본 미포함
+10. limit 5 정확히 적용
+11. job id traversal 방어
+12. 기존 output folder collision 방어
+13. manifest가 job folder 내부에 생성되지 않음
+14. product JSON에 ShopSource 내부 필드 삽입 없음
+15. validation report PASS
+16. 한글/공백 output path
+17. 실제 credential/session runtime file을 생성하지 않음
+
+가능하면 사용자에게서 이미 검증된 5개 Spark JSON 구조와 동일한 필드 형태를 synthetic fixture로 반영하되,
+실제 Amazon 사용자 데이터/쿠키/token을 Git에 넣지 마라.
+
+==================================================
+17. Capability 상태
+==================================================
+
+기존 CONTRACT_PENDING은 이제 "folder load 계약"에 대해서는 해제 가능하다.
+
+그러나 실제 Shopify 업로드가 아직 검증되지 않았으므로
+다음처럼 구분하라.
+
+dataset_folder_load_verified = true
+shopify_upload_verified = false
+
+또는 capability status:
+DATASET_LOAD_VERIFIED
+
+message 예:
+"Spark datasets/<job_id> folder import was verified manually with a five-product subset. Shopify upload remains unverified."
+
+절대로:
+FULLY_SUPPORTED
+END_TO_END_VERIFIED
+UPLOAD_VERIFIED
+라고 표시하지 마라.
+
+==================================================
+18. 문서 업데이트
+==================================================
+
+다음을 업데이트하라.
+
+README.md
+docs/SPARK_INTEGRATION.md
+docs/ROADMAP.md
+필요 시 docs/ARCHITECTURE.md
+
+문서에 실제로 검증된 사실과 아직 미검증인 사실을 구분한다.
+
+v0.2 상태:
+- 5-item datasets folder load: VERIFIED
+- automatic handoff folder generator: 구현 대상
+- Shopify upload: NOT YET VERIFIED
+- Spark Center API: NOT IMPLEMENTED
+
+==================================================
+19. 보안
+==================================================
+
+다음을 다시 확인하라.
+
+.gitignore
+- storage/
+- *.zip
+- DB
+- exports/*
+- session pool
+- crawler statistics
+- env
+- credentials
+
+실제 generated handoff folder도 Git에 올라가면 안 된다.
+
+Git history에 실제 session token/cookie를 넣지 마라.
+
+==================================================
+20. 테스트 명령
+==================================================
+
+완료 후 반드시 실행:
+
+python -m compileall -q src tests
+
+python -m pytest -q
+
+git diff --check
+
+추가로 CLI smoke:
+
+shopsource --help
+shopsource spark-handoff --help
+
+가능하면 temp SQLite + temp output directory로
+end-to-end generator smoke test를 실행하라.
+
+==================================================
+21. 이번 Phase에서 하지 말 것
+==================================================
+
+- Amazon 직접 crawler 개발 금지
+- CAPTCHA 우회 금지
+- stealth browser 금지
+- proxy rotation 금지
+- Spark 내부 DB 조작 금지
+- request_queues 생성 금지
+- key_value_stores 생성 금지
+- Amazon cookie/session token 복제 금지
+- Shopify 실제 API 업로드 구현 금지
+- Spark Center undocumented endpoint 구현 금지
+- 200 Store 전체 UI 구현 금지
+
+==================================================
+22. 완료 보고 형식
+==================================================
+
+완료 후 반드시 아래 형식으로 보고하라.
+
+[1] 작업 시작 상태
+- branch
+- origin
+- start commit
+
+[2] 구현 요약
+
+[3] SparkHandoffConnector 최종 capability 상태
+
+[4] Raw payload 선택 규칙
+
+[5] 생성 폴더 예시
+
+[6] CLI 사용 예시
+
+[7] GUI 변경 내용
+
+[8] Manifest / Validation 내용
+
+[9] 추가/수정 파일
+
+[10] 테스트 결과
+- compileall
+- pytest
+- git diff --check
+- CLI smoke
+
+[11] 보안 점검 결과
+
+[12] 100~200 Store 확장 시 다음 병목
+
+[13] 사용자가 다음에 직접 할 실제 Spark 테스트
+- handoff 5개 생성
+- Spark 데이터 불러오기
+- 표시 검증
+- 미국 Shopify Location 준비
+- 실제 업로드 테스트
+
+[14] 아직 미검증인 항목
+
+[15] 다음 Phase 권장사항
+
+[16] commit SHA
+
+==================================================
+23. Commit / Push
+==================================================
+
+모든 테스트 통과 후 commit하고 origin/main까지 push하라.
+
+권장 commit message:
+Implement verified Spark dataset handoff generator
+
+마지막으로:
+
+git status
+git log --oneline -5
+git rev-list --left-right --count main...origin/main
+
+를 실행하여
+working tree clean 및 0 / 0 동기화를 확인하라.
+
+지금 바로 Phase 2 구현을 시작하라.
