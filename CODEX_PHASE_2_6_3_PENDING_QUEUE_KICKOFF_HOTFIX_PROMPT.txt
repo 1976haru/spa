@@ -1,0 +1,413 @@
+ShopSource Studio — Phase 2.6.3
+Pending Queue Kickoff + Misleading Toast Hotfix
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+
+==================================================
+0. 실제 사용자 테스트에서 확인된 현상
+==================================================
+
+Phase 2.6.2 이후 실제 UI 상태:
+
+- 수집된 후보 5
+- 상품 상세 1/5
+- MASTER 1/5
+- Store 분류 1/5
+- 현재 Batch 상품 4
+- Batch 상세 대기 4
+- Batch 상태 RUNNING
+- Batch 실패 0
+
+사용자가 [미완료 상품 자동 처리]를 누르면:
+
+"처리할 미완료 상품이 없습니다."
+
+toast가 뜬다.
+
+하지만 실제로는 현재 Batch에 DETAIL_PENDING 4개가 이미 존재한다.
+
+즉:
+"미완료 상품이 없음"이 아니라
+"이미 Queue에 들어가 있지만 첫 상세 탭을 시작하지 못한 상태"다.
+
+==================================================
+1. 코드상 정확한 원인
+==================================================
+
+src/shopsource/ui/v2.py의 process_unfinished()은:
+
+result = batch_service.process_existing_candidates(...)
+
+이후:
+
+if result.get("queued"):
+    ...
+    open_queued_item(result["run_id"])
+elif result.get("existing_imported"):
+    ...
+else:
+    ui.notify("처리할 미완료 상품이 없습니다.")
+
+로 동작한다.
+
+현재 실제 상태에서는:
+- NEEDS_DETAIL 4개가 이미 current Batch item으로 존재
+- queue_existing_candidates()가 새로 추가한 queued = 0
+- 기존 DETAIL_COMPLETE 1개는 이미 MASTER_IMPORTED라 existing_imported = 0
+- result.detail_pending = 4
+
+따라서 실제 처리할 pending item이 4개인데도
+else로 떨어져 "처리할 미완료 상품이 없습니다."라고 잘못 표시된다.
+
+그리고 queued > 0일 때만 open_queued_item()을 호출하므로,
+이미 Queue에 들어 있는 DETAIL_PENDING 4개는 첫 상세 탭이 시작되지 않는다.
+
+이것이 이번 Hotfix의 핵심이다.
+
+==================================================
+2. 목표
+==================================================
+
+[미완료 상품 자동 처리]를 누르면:
+
+A. 새 Queue item이 추가된 경우
+B. 이미 Queue에 DETAIL_PENDING item이 있는 경우
+C. stale DETAIL_OPENED item을 회수할 수 있는 경우
+
+모두 첫/다음 상세 처리를 실제로 시작해야 한다.
+
+현재 실전 상태:
+
+Batch RUNNING
+DETAIL_PENDING 4
+queued = 0
+
+에서도
+첫 상품 상세 탭이 자동으로 열려야 한다.
+
+==================================================
+3. process_unfinished() 수정
+==================================================
+
+process_existing_candidates() 결과 이후:
+
+queued 값만 보지 마라.
+
+다음 기준으로 판단:
+
+if result["detail_pending"] > 0:
+    open_queued_item(result["run_id"])
+
+그리고 사용자 메시지는 상태에 맞게 구분.
+
+예:
+
+queued > 0:
+"미완료 N개를 Batch에 연결하고 자동 처리를 시작합니다."
+
+queued == 0 and detail_pending > 0:
+"이미 Queue에 있는 미완료 N개 처리를 계속합니다."
+
+existing_imported > 0 and detail_pending == 0:
+"상세 완료 N개를 MASTER에 반영했습니다."
+
+detail_pending == 0 and existing_imported == 0:
+정말 처리할 것이 없을 때만
+"처리할 미완료 상품이 없습니다."
+
+==================================================
+4. Queue kickoff helper
+==================================================
+
+UI 내부에서 중복 로직을 줄이기 위해
+가능하면 helper를 만든다.
+
+예:
+
+def kick_batch(run_id):
+    run = batch_service.get(run_id)
+    if run["status"] == "RUNNING" and run["detail_pending"] > 0:
+        open_queued_item(run_id)
+
+단:
+이미 DETAIL_OPENED item이 있으면
+BatchSourcingService.next_item()이 None을 반환하므로
+중복 탭은 열리지 않는다.
+
+DB state를 source of truth로 유지.
+
+==================================================
+5. 현재 RUNNING 상태에서 "계속" 버튼 UX
+==================================================
+
+현재 batch_action("RESUME")은 RUNNING 상태에서:
+"Batch is not paused."
+오류가 난다.
+
+UI에서 RUNNING일 때:
+[계속] 버튼을 disabled 처리하거나
+클릭 시 RESUME 대신 kick_batch()를 수행.
+
+권장:
+- PAUSED / PAUSED_NEEDS_USER / PENDING → RESUME
+- RUNNING + detail_pending > 0 → "다음 처리 시작" 역할
+- DONE_WITH_ERRORS → 실패 재시도 버튼 사용
+- DONE → disabled
+
+버튼 label을 동적으로:
+RUNNING이면 "다음 처리"
+PAUSED면 "계속"
+으로 바꿔도 된다.
+
+==================================================
+6. "고급 NEEDS_DETAIL 전체 QUEUE"도 일관성 수정
+==================================================
+
+queue_existing()은 현재 queue_existing_candidates() 후
+open_queued_item()을 호출한다.
+
+이 동작은 맞다.
+
+다만 새로 queued=0이더라도 기존 detail_pending >0이면
+"이미 Queue에 있는 상품 처리를 시작합니다."
+라고 표시.
+
+새 Batch 생성 금지.
+
+==================================================
+7. 자동 kickoff 상태 진단
+==================================================
+
+render_batch() 또는 render_capture_summary()에서:
+
+RUNNING
+detail_pending > 0
+DETAIL_OPENED = 0
+
+이면:
+
+"대기 중인 상품이 있습니다. 자동 처리를 시작할 수 있습니다."
+
+표시 가능.
+
+가능하면 페이지 최초 로드 시 무조건 자동으로 탭을 열지는 말고,
+사용자의 [미완료 상품 자동 처리] 클릭을 kickoff로 유지한다.
+
+브라우저 popup 차단 방지를 위해 user gesture 기반 window.open을 유지.
+
+==================================================
+8. Browser popup 제한 고려
+==================================================
+
+NiceGUI ui.run_javascript(window.open(...))는
+사용자 클릭 이벤트에서 호출될 때 성공 가능성이 높다.
+
+따라서:
+- timer/poll에서 새 탭 시작 금지
+- 페이지 load에서 자동 새 탭 금지
+- 사용자가 [미완료 상품 자동 처리] 또는 [다음 처리]를 클릭했을 때 첫 탭 open
+
+그 이후 다음 상품은 Chrome extension background.js의 chrome.tabs.create()가 처리한다.
+
+==================================================
+9. 현재 실전 DB 상태를 기준으로 회귀 테스트
+==================================================
+
+fixture:
+
+Candidates 5
+MASTER_IMPORTED 1
+Batch:
+  status RUNNING
+  item_count 4
+  detail_pending 4
+  failed 0
+  DETAIL_OPENED 0
+
+process_existing_candidates() 재호출:
+
+queued == 0
+existing_imported == 0
+detail_pending == 4
+
+UI/controller helper는 반드시:
+kickoff = true
+
+next_item():
+첫 ASIN 반환
+
+==================================================
+10. 이미 DETAIL_OPENED가 있는 경우
+==================================================
+
+fixture:
+
+RUNNING
+DETAIL_OPENED 1
+DETAIL_PENDING 3
+
+[미완료 상품 자동 처리] 다시 클릭
+
+기대:
+두 번째 상품을 열지 않는다.
+
+next_item() == None
+
+toast:
+"현재 상품 상세 처리가 진행 중입니다."
+
+가능하면 이 상태를 별도 반환/helper로 구분.
+
+==================================================
+11. stale opened item
+==================================================
+
+DETAIL_OPENED가 45초 이상 stale이면
+기존 next_item() recovery 규칙 유지.
+
+user click kickoff 시:
+stale item 회수
+→ 재시도 또는 FAILED
+→ 다음 가능한 item 반환
+
+새 로직이 기존 recovery를 깨뜨리면 안 된다.
+
+==================================================
+12. 테스트 추가
+==================================================
+
+필수:
+
+test_process_unfinished_kicks_existing_pending_queue
+test_existing_pending_queued_zero_is_not_empty
+test_running_pending_opens_first_item
+test_running_opened_does_not_duplicate_tab
+test_resume_button_running_behavior
+test_true_empty_state_message_only_when_no_pending
+test_queue_existing_kicks_already_queued_items
+test_popup_kickoff_requires_user_action_contract
+
+기존 전체 테스트 PASS.
+
+==================================================
+13. 실제 5상품 성공 조건
+==================================================
+
+현재 실제 상태에서:
+
+1. ShopSource 재시작
+2. chrome://extensions에서 v0.1.2 Reload
+3. [미완료 상품 자동 처리] 클릭
+
+기대:
+- "처리할 미완료 상품이 없습니다"가 나오지 않음
+- 첫 canonical Amazon /dp/<ASIN> 탭이 열림
+- extension 자동 상세 capture
+- 4초 후 다음 item
+- 4개 순차 처리
+- MASTER 5/5
+- Store 분류 5/5
+- 실패 0
+- Batch DONE
+
+==================================================
+14. UI 메시지
+==================================================
+
+사용자용 한국어를 명확히.
+
+상태별:
+
+1) 새로 Queue 추가:
+"미완료 4개를 Batch에 연결하고 자동 처리를 시작합니다."
+
+2) 이미 Queue에 있음:
+"이미 Queue에 있는 미완료 4개 처리를 시작합니다."
+
+3) 상품 처리 중:
+"현재 상품 상세 처리가 진행 중입니다."
+
+4) 정말 없음:
+"현재 처리할 미완료 상품이 없습니다."
+
+==================================================
+15. Extension 변경 여부
+==================================================
+
+이번 Hotfix가 UI/Python만으로 해결되면
+manifest version 0.1.2 유지.
+
+Extension JS를 수정하면
+version을 0.1.3으로 올리고 Reload 안내.
+
+불필요하게 version bump하지 마라.
+
+==================================================
+16. 사용자 dirty file
+==================================================
+
+stores/001_cabin_tidy.json
+
+기존 사용자 수정 유지.
+절대 stage/commit/reset/restore하지 마라.
+
+==================================================
+17. Quality Gate
+==================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+JS를 수정했다면:
+node --check browser_extension/shopsource_capture/background.js
+node --check browser_extension/shopsource_capture/content_search.js
+node --check browser_extension/shopsource_capture/content_product.js
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+==================================================
+18. Commit / Push
+==================================================
+
+Phase 2.6.3 변경 파일만 stage.
+
+commit:
+
+git commit -m "Fix pending batch kickoff"
+
+push origin main
+
+마지막:
+
+git status --short
+git log --oneline -7
+git rev-list --left-right --count main...origin/main
+
+main...origin/main = 0 0
+
+사용자 Store Profile dirty file이 남아 있으면
+working tree clean이라고 보고하지 마라.
+
+==================================================
+19. 완료 보고
+==================================================
+
+[1] 원인
+[2] queued=0/detail_pending>0 처리
+[3] 첫 상세 탭 kickoff
+[4] 중복 탭 방지
+[5] RUNNING 상태 계속 버튼 처리
+[6] UI 메시지
+[7] tests
+[8] extension 변경 여부/version
+[9] 사용자 dirty file
+[10] 실제 5상품 재테스트 단계
+[11] commit SHA
+
+지금 구현을 시작하라.
