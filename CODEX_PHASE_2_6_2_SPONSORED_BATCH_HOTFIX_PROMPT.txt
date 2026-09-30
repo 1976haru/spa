@@ -1,0 +1,517 @@
+ShopSource Studio — Phase 2.6.2
+Sponsored URL Canonicalization + Failed Batch Recovery Hotfix
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+
+==================================================
+0. 실제 사용자 테스트에서 확인된 현상
+==================================================
+
+현재 실제 화면:
+
+Batch: DONE
+목표 5
+상세 완료 0
+MASTER 0 (Batch row 기준)
+실패 4
+
+전체 pipeline:
+수집된 후보 5
+MASTER 1
+Store 분류 1
+상품 상세 1/5
+
+후보:
+1) B0CM6KVCSX · HOTO Trunk Organizer · DETAIL_COMPLETE
+2) B0H8SFR4GT · Sponsored · NEEDS_DETAIL
+3) B0GFD1WBP9 · Sponsored · NEEDS_DETAIL
+4) B0F7QTD5SV · Sponsored · NEEDS_DETAIL
+5) B09YXYSSLL · Sponsored · NEEDS_DETAIL
+
+즉 기존 DETAIL_COMPLETE 1개는 MASTER까지 정상 반영됐지만,
+Sponsored 후보 4개의 Batch 자동 상세보강은 모두 실패했다.
+
+이번 Hotfix 목표:
+- 실패 원인을 코드상 추적 가능하게 표시
+- Sponsored/search tracking URL을 직접 열지 않고 ASIN 기반 canonical product URL을 사용
+- 기존 실패 4개를 재캡처 없이 재시도 가능
+- 실제 5개 MASTER까지 이어지게 함
+
+==================================================
+1. 작업 시작 전
+==================================================
+
+반드시:
+
+git status
+git diff -- stores/001_cabin_tidy.json
+git log --oneline -10
+
+사용자 기존 dirty file:
+stores/001_cabin_tidy.json
+
+절대 reset/restore/checkout/clean 하지 마라.
+이번 commit에도 포함하지 마라.
+
+최신 구현 commit이 다음인지 확인:
+e49afec Fix existing-candidate batch workflow
+
+==================================================
+2. 실제 코드 기반 1차 원인
+==================================================
+
+현재 browser_extension/shopsource_capture/content_search.js는
+검색 카드에서 href가 존재하면 그대로 candidate.url로 저장한다.
+
+현재 코드 패턴:
+
+const href = ...
+const match = href.match(...)
+const url = href ? new URL(href, location.origin).href
+                 : (match ? canonical : null)
+
+Sponsored 카드의 href는 종종 실제 /dp/<ASIN> 직접 URL이 아니라
+Amazon tracking/redirect URL일 수 있다.
+
+그 결과 Batch가 tracking URL을 열고,
+product content script의 다음 조건:
+
+/\/(?:dp|gp\/product)\/[A-Z0-9]{10}/
+
+을 만족하지 않거나,
+redirect 과정에서 #shopsource_capture marker가 사라져
+자동 상세 capture가 실행되지 않을 수 있다.
+
+실제 테스트에서도:
+- 직접 상품 후보 1개는 성공
+- Sponsored 후보 4개는 모두 실패
+
+라는 패턴이므로
+이 가설을 우선 검증/수정한다.
+
+단 원인을 단정하지 말고
+현재 DB의 browser_batch_items.last_error / event log도 함께 확인한다.
+
+==================================================
+3. 실패 원인 진단을 먼저 추가
+==================================================
+
+UI에 Batch 실패 상품의 실제 last_error를 표시한다.
+
+Batch status 영역 하단:
+
+최근 실패
+ASIN | state | retry_count | last_error
+
+최대 10개.
+
+예:
+B0H8SFR4GT | FAILED | 2 | Detail page capture timed out
+
+현재처럼 "실패 4"만 표시해서는 디버깅이 불가능하다.
+
+browser_batch_events 최근 이벤트도 필요시 펼쳐보기 제공.
+
+민감정보는 표시하지 않는다.
+
+==================================================
+4. Canonical Amazon Product URL helper
+==================================================
+
+Python과 JS 양쪽에 ASIN 기반 canonical URL 원칙을 적용한다.
+
+US marketplace 기준:
+
+https://www.amazon.com/dp/<ASIN>
+
+Python helper 권장:
+
+def canonical_product_url(asin: str) -> str:
+    validate ASIN
+    return f"https://www.amazon.com/dp/{asin.upper()}"
+
+위치는:
+src/shopsource/capture/validation.py
+또는 적절한 공용 모듈.
+
+==================================================
+5. Search capture URL 수정
+==================================================
+
+content_search.js에서 product.url은
+검색 카드의 tracking href를 그대로 사용하지 않는다.
+
+ASIN이 유효하면 기본 product.url은 반드시:
+
+https://www.amazon.com/dp/ + asin
+
+으로 저장한다.
+
+원래 클릭 href가 필요하면
+진단 metadata로만 별도 보존할 수 있으나,
+Spark payload나 detail open URL로 사용하지 않는다.
+
+검색 결과 source evidence는 이미:
+_sourceUrl = search page URL
+로 남으므로 tracking href 보존은 필수가 아니다.
+
+==================================================
+6. Server-side defense
+==================================================
+
+Extension만 믿지 말고
+CaptureService.capture_search()에서도
+accepted candidate의 url을 ASIN canonical URL로 정규화한다.
+
+즉 과거/다른 client에서 tracking URL이 들어와도
+DB의 search payload detail-open URL은 canonical로 저장.
+
+단:
+_sourceUrl은 실제 검색 페이지 URL 유지.
+
+==================================================
+7. 기존 DB 후보 복구
+==================================================
+
+이미 저장된 4개 후보는
+search_payload_json에 tracking URL이 남아 있을 수 있다.
+
+사용자가 다시 Amazon 검색 캡처를 할 필요가 없도록 한다.
+
+BatchSourcingService.next_item()에서
+detail open URL은 저장된 payload.url보다
+item.asin을 기준으로 canonical_product_url(asin)을 우선 사용한다.
+
+즉 기존 DB의 잘못된 URL도 자동 복구.
+
+반환:
+
+{
+  "asin": "...",
+  "url": "https://www.amazon.com/dp/<ASIN>",
+  "batch_run_id": "..."
+}
+
+==================================================
+8. FAILED 4개 재시도
+==================================================
+
+현재 실제 Batch는 DONE + FAILED 4 상태다.
+
+"실패만 재시도" 클릭 시:
+- FAILED 4개를 DETAIL_PENDING으로 reset
+- retry_count=0
+- status=RUNNING
+- finished_at=NULL
+- canonical URL로 첫 상품 다시 시작
+
+되어야 한다.
+
+DONE_WITH_ERRORS를 도입하면
+RETRY 가능 상태로 유지.
+
+기존 DONE run에서도 실패가 있으면 Retry 버튼이 동작해야 한다.
+
+==================================================
+9. DONE 상태 의미 수정
+==================================================
+
+현재 4개 실패가 있어도 Batch가 DONE으로 표시된다.
+
+운영자에게 오해를 준다.
+
+다음 상태 추가 권장:
+
+DONE_WITH_ERRORS
+
+조건:
+pending == 0
+failed > 0
+target processing 종료
+
+이면:
+
+DONE_WITH_ERRORS
+
+로 표시.
+
+성공 완료:
+DONE
+
+CAPTCHA:
+PAUSED_NEEDS_USER
+
+UI:
+DONE_WITH_ERRORS = 경고
+
+"4개 실패 · 실패만 재시도 가능"
+
+표시.
+
+==================================================
+10. Product page readiness
+==================================================
+
+현재 content_product.js auto capture는 marker 감지 후
+setTimeout(..., 900) 한 번으로 실행한다.
+
+실제 Amazon 페이지에서 DOM/JSON-LD가 늦게 준비될 수 있다.
+
+자동 capture 전에 bounded readiness wait 추가.
+
+예:
+최대 10~15초
+500ms 간격
+
+ready 조건:
+- #productTitle text 존재
+OR
+- Product JSON-LD name 존재
+
+CAPTCHA가 나타나면 즉시 중단.
+
+15초 내 ready 안 되면:
+DETAIL_CAPTURE_FAILED
+reason = "Product detail DOM did not become ready"
+
+무한 대기 금지.
+
+새 네트워크 요청 금지.
+
+==================================================
+11. ASIN mismatch 방어
+==================================================
+
+Batch item ASIN과 실제 product page에서 capture한 ASIN이 다르면
+MASTER에 잘못 연결되면 안 된다.
+
+server에서 batch_run_id + payload asin이
+해당 DETAIL_OPENED item과 일치하는지 검증한다.
+
+불일치:
+FAILED 또는 RETRY
+last_error="Opened product ASIN did not match queued ASIN"
+
+==================================================
+12. Extension version
+==================================================
+
+browser_extension/shopsource_capture/manifest.json
+
+version:
+0.1.1 → 0.1.2
+
+README와 UI에:
+
+"Phase 2.6.2 적용 후 chrome://extensions에서
+ShopSource Capture 새로고침"
+
+안내.
+
+==================================================
+13. 현재 실제 4개 Sponsored fixture 테스트
+==================================================
+
+Synthetic test를 실제 현상과 유사하게 만든다.
+
+4개 후보:
+
+ASIN은 유효
+title=""
+sponsored=true
+
+href examples:
+https://www.amazon.com/sspa/click?...
+https://www.amazon.com/gp/slredirect/...
+
+기대:
+capture된 product.url은 모두:
+
+https://www.amazon.com/dp/<ASIN>
+
+Batch next_item도 canonical URL 반환.
+
+tracking href는 detail open에 절대 사용하지 않음.
+
+==================================================
+14. 기존 실패 Batch recovery test
+==================================================
+
+상태:
+
+Batch DONE 또는 DONE_WITH_ERRORS
+items 4개 FAILED
+retry_count=2
+
+RETRY 실행.
+
+기대:
+
+status RUNNING
+4개 DETAIL_PENDING
+retry_count 0
+
+next_item:
+첫 ASIN canonical /dp/ URL 반환.
+
+fake detail complete 4개 순차 입력.
+
+최종:
+
+failed 0
+MASTER 총 5
+classified 5
+DONE
+
+==================================================
+15. 실제 UI 결과 목표
+==================================================
+
+현재 실제 사용자 상태:
+
+수집 후보 5
+MASTER 1
+Store 분류 1
+실패 4
+
+Hotfix 후:
+
+1. chrome://extensions → ShopSource Capture reload
+2. ShopSource 재시작
+3. "실패만 재시도" 한 번
+
+예상:
+
+실패 4 → 0
+상세 완료/MASTER가 순차 증가
+
+최종:
+
+수집 후보 5
+상품 상세 5/5
+MASTER 5/5
+Store 분류 5/5
+Spark Package 0
+실패 0
+Batch DONE
+
+==================================================
+16. Spark Center 기준 진척 표시
+==================================================
+
+계속 실제 DB 기준 표시.
+
+후보 수집 완료
+상품 상세 N/5
+MASTER N/5
+Store 분류 N/5
+Spark Package N
+실제 Spark Center 업로드: 사용자 확인 필요
+
+실패가 있으면:
+"상품 상세 1/5 · 실패 4"
+처럼 명확하게 표시.
+
+==================================================
+17. 테스트
+==================================================
+
+필수:
+
+test_canonical_product_url
+test_search_tracking_url_becomes_canonical
+test_sponsored_tracking_url_becomes_canonical
+test_existing_bad_url_next_item_uses_canonical
+test_done_with_errors_status
+test_retry_done_with_errors
+test_retry_failed_items_uses_canonical_url
+test_product_readiness_timeout_contract
+test_asin_mismatch_rejected
+test_four_failed_items_recover_to_master
+test_pipeline_summary_5_of_5
+
+기존 전체 테스트도 PASS.
+
+실제 Amazon network는 pytest에서 호출 금지.
+
+==================================================
+18. Quality Gate
+==================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+node --check browser_extension/shopsource_capture/background.js
+node --check browser_extension/shopsource_capture/content_search.js
+node --check browser_extension/shopsource_capture/content_product.js
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+==================================================
+19. 사용자 dirty file
+==================================================
+
+stores/001_cabin_tidy.json
+
+기존 사용자 변경 그대로 보존.
+
+stage/commit 금지.
+
+git status --short
+git diff --cached --name-only
+
+반드시 확인.
+
+==================================================
+20. Commit / Push
+==================================================
+
+Phase 2.6.2 파일만 stage.
+
+commit:
+
+git commit -m "Fix sponsored batch detail capture"
+
+push:
+
+git push origin main
+
+최종:
+
+git status --short
+git log --oneline -7
+git rev-list --left-right --count main...origin/main
+
+main...origin/main = 0 0
+
+working tree에는 기존 사용자 Store file만 남을 수 있다.
+
+==================================================
+21. 완료 보고
+==================================================
+
+[1] 실제 실패 원인
+[2] DB last_error 확인 결과
+[3] Sponsored tracking URL 문제 여부
+[4] Canonical URL 처리
+[5] 기존 후보 복구 방식
+[6] Detail readiness 개선
+[7] DONE_WITH_ERRORS
+[8] Failed retry
+[9] ASIN mismatch 방어
+[10] UI 실패 원인 표시
+[11] Extension version
+[12] 4개 Sponsored fixture
+[13] 5상품 recovery fixture
+[14] tests
+[15] 사용자 dirty file
+[16] 실제 Amazon live에서 다시 확인할 단계
+[17] commit SHA
+
+지금 구현을 시작하라.
