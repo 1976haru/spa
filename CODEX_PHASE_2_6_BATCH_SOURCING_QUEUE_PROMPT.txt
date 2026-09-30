@@ -1,0 +1,925 @@
+ShopSource Studio — Phase 2.6 / Batch Sourcing Queue
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+
+==================================================
+0. 현재 상태와 이번 Phase 목적
+==================================================
+
+Phase 2.5 API-free browser sourcing은 구현되었고,
+실제 사용자 테스트에서 Amazon 검색결과 후보 capture가 성공했다.
+상품 상세 1개도 DETAIL_COMPLETE까지 실제 성공했다.
+
+현재 문제:
+- 검색결과 capture가 화면에 보이는 소수 상품 중심
+- 사용자가 후보를 일일이 체크해야 함
+- 상세 페이지마다 사용자가 확장 버튼을 눌러야 함
+- 수백/수천 상품 운영에는 비현실적
+
+이번 Phase의 목적:
+
+"사용자는 검색어/목표수량을 정하고 Batch 시작만 한다.
+ShopSource가 현재 수집된 후보를 자동 선별하고,
+상세 보강이 필요한 후보는 안전한 소규모 batch queue로 처리하며,
+완료 상품은 자동으로 MASTER/분류까지 보낸다."
+
+단,
+완전 무인 Amazon 페이지네이션 crawler를 만들지 않는다.
+
+금지:
+- CAPTCHA 우회
+- WAF 우회
+- stealth
+- proxy rotation
+- Amazon cookie/session 재사용
+- undocumented endpoint
+- 로그인/인증 정보 수집
+- 수백 탭 동시 생성
+
+==================================================
+1. 작업 시작 전 — 사용자 로컬 변경 보존
+==================================================
+
+반드시 먼저:
+
+git status
+git diff -- stores/001_cabin_tidy.json
+
+중요:
+stores/001_cabin_tidy.json에 사용자의 로컬 수정이 남아 있을 수 있다.
+
+절대:
+git reset --hard
+git checkout -- stores/001_cabin_tidy.json
+git restore stores/001_cabin_tidy.json
+git clean -fd
+
+하지 마라.
+
+사용자 수정은 그대로 보존한다.
+
+그 다음:
+
+git pull --ff-only
+git log --oneline -10
+
+remote의 다음 문서 커밋이 포함되어야 한다:
+"Add batch sourcing queue phase"
+
+==================================================
+2. 먼저 읽기
+==================================================
+
+AGENTS.md
+CLAUDE.md
+README.md
+docs/API_FREE_SOURCING.md
+docs/KEYWORD_INTELLIGENCE.md
+docs/UI_V2.md
+docs/SPARK_INTEGRATION.md
+docs/ROADMAP.md
+
+핵심 코드:
+
+src/shopsource/ui/v2.py
+src/shopsource/capture/
+src/shopsource/db.py
+src/shopsource/classifier.py
+src/shopsource/connectors/spark_handoff.py
+src/shopsource/connectors/spark_center_package.py
+
+browser_extension/shopsource_capture/
+  manifest.json
+  background.js
+  content_search.js
+  content_product.js
+  popup.js
+
+기존 Phase 2.5 기능을 삭제하거나 우회하지 마라.
+
+==================================================
+3. 최종 사용자 UX
+==================================================
+
+Sourcing > 무료 브라우저 소싱 화면을 다음처럼 개선한다.
+
+[검색어]
+trunk organizer
+
+[목표 후보]
+100
+
+[자동 MASTER 반영]
+ON/OFF
+
+[소싱 Batch 시작]
+
+상태:
+
+목표 후보       100
+수집 후보        63
+중복 제외        12
+선필터 통과      44
+상세 완료        21
+상세 대기        23
+MASTER 반영      21
+PRIMARY           9
+REVIEW            2
+실패              0
+
+Status:
+RUNNING / PAUSED / PAUSED_NEEDS_USER / DONE / CANCELLED
+
+버튼:
+[일시정지]
+[계속]
+[취소]
+[실패만 재시도]
+
+사용자가 ASIN마다 체크할 필요가 없어야 한다.
+
+==================================================
+4. 검색결과 Capture 개선
+==================================================
+
+현재 content_search.js의 viewport 제한을 제거한다.
+
+현재 Amazon 검색 결과 DOM에 렌더된
+유효한 모든:
+
+[data-component-type="s-search-result"][data-asin]
+
+카드를 capture한다.
+
+주의:
+- 현재 페이지 DOM만
+- 자동 다음 페이지 이동 금지
+- 숨겨진 비상품 카드 제외
+- 빈 ASIN 제외
+- 같은 ASIN 중복 제거
+
+현재 화면 스크롤 위치와 관계없이
+이미 DOM에 존재하는 검색 상품은 가져온다.
+
+검색 결과가 lazy render라 일부만 DOM에 있으면
+없는 상품을 억지로 추정하지 않는다.
+
+==================================================
+5. 검색 결과 parser 품질 개선
+==================================================
+
+실제 사용자 테스트에서 Sponsored 카드 일부는
+ASIN은 잡혔지만 title이 비어 있었다.
+
+다음 selector fallback을 강화한다.
+
+title:
+- h2 span
+- h2 a span
+- [data-cy="title-recipe"] span
+- [data-cy="title-recipe"] h2
+- a.a-link-normal.s-line-clamp-2
+- aria-label/title attribute fallback
+
+url:
+- h2 a[href]
+- a.a-link-normal[href*="/dp/"]
+- data-cy title link
+
+price:
+- .a-price .a-offscreen
+- price-whole + fraction fallback
+
+rating/review:
+aria-label fallback 강화.
+
+Sponsored 구조도 동일 ASIN이면 후보로 보존한다.
+
+title이 search page에서 누락돼도
+ASIN/url이 유효하면 NEEDS_DETAIL로 후보 저장 가능하게 한다.
+단 MASTER import에는 title 필수.
+
+==================================================
+6. Batch Queue DB
+==================================================
+
+새 테이블 또는 기존 capture table 확장:
+
+browser_batch_runs
+
+권장 fields:
+- run_id
+- store_id
+- keyword
+- target_candidates
+- status
+- auto_import_master
+- created_at
+- started_at
+- paused_at
+- finished_at
+- total_seen
+- deduped
+- prefiltered
+- detail_pending
+- detail_complete
+- master_imported
+- primary_count
+- review_count
+- failed_count
+- checkpoint_json
+- error
+
+browser_batch_items
+
+- id
+- batch_run_id
+- asin
+- capture_run_id
+- priority
+- state
+- retry_count
+- last_error
+- completeness_score
+- created_at
+- updated_at
+
+state:
+
+DISCOVERED
+DUPLICATE
+PREFILTER_REJECTED
+READY_FROM_SEARCH
+DETAIL_PENDING
+DETAIL_OPENED
+DETAIL_COMPLETE
+MASTER_IMPORTED
+FAILED
+SKIPPED
+
+UNIQUE(batch_run_id, asin)
+
+==================================================
+7. Candidate 자동 선별
+==================================================
+
+검색결과 capture 이후 사용자 체크 없이 자동 판단.
+
+순서:
+
+1. ASIN valid
+2. 현재 batch 중복 제거
+3. MASTER 기존 ASIN 확인
+4. Store profile exclude/risk prefilter
+5. 가격이 있으면 Store sourcing price 범위 참고
+6. title이 있으면 Store fit lexical check
+7. completeness 판단
+
+중요:
+가격 범위 밖이라고 삭제하지 마라.
+
+MASTER 원칙 유지:
+가격은 상태 분류 기준이지 영구 삭제 기준이 아니다.
+
+위험:
+RESTRICTED/REVIEW 후보는 보존 가능.
+
+==================================================
+8. Search 정보만으로 충분한 후보
+==================================================
+
+모든 후보가 반드시 상세페이지를 거칠 필요는 없다.
+
+설정값:
+
+search_import_min_completeness
+
+기본값은 보수적으로 높게 설정.
+
+단 Spark Center 실제 5상품 round-trip이 아직 검증 전이므로
+초기 기본값에서는 DETAIL_COMPLETE를 MASTER 자동반영 기준으로 유지하는 것이 안전하다.
+
+향후 실제 portal 검증 후 search-only import 기준을 낮출 수 있도록
+configurable하게 설계.
+
+==================================================
+9. Batch Detail Queue
+==================================================
+
+사용자 시작형 batch detail enrichment 구현.
+
+기본:
+- batch size: 20
+- concurrency: 1
+- 최대 concurrency: 3
+- 상세 페이지 하나 성공 후 다음 항목 진행
+- 실패 시 queue 계속
+- CAPTCHA 감지 시 전체 batch PAUSED_NEEDS_USER
+
+UI에서:
+Batch 20 / 50 / 100 선택 가능.
+
+1000을 입력해도 내부적으로 20개 chunk로 나눠 처리.
+
+절대 1000개 탭을 동시에 열지 마라.
+
+==================================================
+10. 상품별 클릭 제거
+==================================================
+
+현재 상품 페이지에서 사용자가
+"이 상품 ShopSource로 가져오기"를 일일이 누르는 과정을 제거한다.
+
+방법:
+
+ShopSource가 상세 보강용 URL을 열 때
+URL fragment marker 사용:
+
+#shopsource_capture=<batch_run_id>
+
+fragment는 서버 request로 전송되지 않으므로
+Amazon request query를 변경하지 않는다.
+
+content_product.js는:
+- 해당 marker가 있고
+- extension pairing이 정상이며
+- 현재 page가 product detail이면
+
+DOM 준비 완료 후
+자동으로 captureDetail()을 1회 실행한다.
+
+자동 capture 성공:
+bridge에 저장
+→ 화면에 작은 성공 badge/toast
+→ batch controller가 다음 item 진행
+
+중복 자동 capture 방지:
+session flag / marker processed state 사용.
+
+==================================================
+11. 자동 탭 처리
+==================================================
+
+안전한 방식으로만 구현.
+
+우선순위:
+
+A.
+ShopSource UI가 window.open으로 1개 탭 열기
+→ extension auto capture
+→ bridge heartbeat/status로 완료 감지
+→ 다음 탭 열기
+
+B.
+필요하면 Manifest V3 "tabs" 권한을 추가할 수 있으나
+그 경우 왜 필요한지 문서화하고
+Amazon/ShopSource 탭에만 사용.
+
+기본은 A 우선.
+
+자동 탭 닫기가 브라우저 제약 때문에 불안정하면
+성공 탭을 유지해도 된다.
+대신 동시에 열린 상세 탭 수를 최대 3으로 제한.
+
+==================================================
+12. Rate / Load Control
+==================================================
+
+목적은 서비스 우회가 아니라
+사용자 브라우저 안정성과 과도한 요청 방지다.
+
+상세 페이지 open 간격:
+기본 4초 이상.
+
+설정:
+detail_open_interval_seconds
+기본 4
+최소 3
+
+concurrency:
+기본 1
+최대 3
+
+고속/무제한 모드 금지.
+
+==================================================
+13. CAPTCHA / Robot Check
+==================================================
+
+기존 감지를 강화.
+
+감지되면:
+- capture 시도 중단
+- 해당 item state 보존
+- batch status = PAUSED_NEEDS_USER
+- 새 탭 열기 중단
+
+UI 메시지:
+
+"Amazon 확인 화면이 감지되어 Batch를 일시정지했습니다.
+브라우저에서 직접 확인한 뒤 '계속'을 누르세요."
+
+자동 해결/우회 절대 금지.
+
+==================================================
+14. Pause / Resume / Cancel
+==================================================
+
+반드시 checkpoint 가능.
+
+PAUSE:
+새 item 시작 금지.
+진행 중 item은 결과 기록 후 정지.
+
+RESUME:
+DETAIL_PENDING/FAILED retry 대상부터 계속.
+
+CANCEL:
+현재 상태 보존하고 종료.
+MASTER에 이미 들어간 상품은 삭제하지 않음.
+
+앱 재시작 후에도
+진행 중 batch를 조회하고 Resume 가능.
+
+==================================================
+15. Retry
+==================================================
+
+FAILED item:
+
+기본 retry_count 최대 2.
+
+재시도 대상:
+- page load timeout
+- parser incomplete
+- bridge temporary error
+
+재시도 금지:
+- invalid ASIN
+- explicit RESTRICTED policy error
+- user SKIPPED
+
+CAPTCHA는 FAILED가 아니라
+PAUSED_NEEDS_USER.
+
+==================================================
+16. 자동 MASTER 반영
+==================================================
+
+설정:
+
+[상세 완료 시 MASTER 자동 반영]
+
+기본 ON으로 제안.
+
+DETAIL_COMPLETE + 필수 asin/title 충족 시
+소규모 batch transaction으로 MASTER upsert.
+
+100개 단위 또는 20개 chunk 완료 시 commit 가능.
+
+MASTER 반영 후:
+현재 Store classify 자동 실행.
+
+사용자가 상품마다 "MASTER로 보내기" 클릭하지 않게 한다.
+
+기존 수동 버튼은 유지한다.
+
+==================================================
+17. Progress
+==================================================
+
+Batch UI에 progress bar.
+
+표시:
+
+Run ID
+Status
+Keyword
+Target
+Seen
+Deduped
+Prefiltered
+Detail pending
+Detail complete
+Imported
+PRIMARY
+RESERVE
+REVIEW
+RESTRICTED
+Failed
+Elapsed
+
+최근 item 20개:
+ASIN / title / state / completeness / error
+
+==================================================
+18. 목표 방식
+==================================================
+
+Target 의미를 명확히 분리.
+
+A. 후보 목표:
+"후보 500개 확보"
+
+B. PRIMARY 목표:
+"PRIMARY 100개 확보"
+
+이번 Phase에서는 둘 다 지원 가능하게 설계.
+
+UI:
+목표 기준
+○ 전체 후보 수
+○ PRIMARY 수
+
+PRIMARY 목표 모드에서는
+현재 수집된 후보/상세완료/분류 결과를 보고
+목표 달성 여부를 표시.
+
+단 자동 Amazon 다음 페이지 순회는 하지 않으므로
+현재 capture된 후보가 부족하면:
+
+"후보가 부족합니다. Amazon 다음 검색 페이지를 캡처하세요."
+
+라고 안내.
+
+==================================================
+19. Keyword 운영
+==================================================
+
+Keyword Studio 추천어 여러 개를 Batch에 넣을 수 있게 한다.
+
+최대 동시 선택 10 keyword.
+
+하지만 Amazon 검색 페이지는 사용자가 직접 연다.
+
+각 keyword마다:
+- capture pages
+- unique candidates
+- duplicate rate
+- PRIMARY yield
+- detail success rate
+
+통계를 기록.
+
+나중에 keyword score 개선에 재사용 가능.
+
+==================================================
+20. Search page workflow
+==================================================
+
+무료 모드에서:
+
+[Amazon 검색 열기]
+→ 사용자가 search page 확인
+→ extension의 [현재 페이지 전체 후보 가져오기]
+→ ShopSource batch에 자동 merge
+
+페이지 하단에:
+
+"현재 페이지 후보 23개 추가 · 중복 4개"
+
+표시.
+
+그리고:
+
+[Amazon 다음 페이지 열기]
+
+버튼은 단순히 next page URL을 사용자가 열게 하는 수준은 가능.
+
+자동으로 페이지를 계속 순회하지 마라.
+
+==================================================
+21. Select All UX
+==================================================
+
+현재 per-row checkbox는 유지하되
+기본 운영은 selection 없는 자동 queue.
+
+추가:
+
+[현재 후보 전체 Queue에 추가]
+[NEEDS_DETAIL 전체 Queue에 추가]
+[상위 Fit 후보 Queue에 추가]
+
+사용자 checkbox는 예외 처리용.
+
+==================================================
+22. Spark Center Gate
+==================================================
+
+중요:
+
+Batch가 수백/수천 MASTER를 만들어도
+Spark Center package를 무조건 자동 생성하지 마라.
+
+실제 portal round-trip이 아직 미검증.
+
+Package 화면에는:
+
+"Browser Capture → Spark Center 실제 portal 5상품 검증 전"
+
+경고 badge 유지.
+
+실제 5상품 검증 전에는
+대규모 package 생성 시 확인 dialog.
+
+예:
+100개 초과 package 생성:
+"실제 Spark Center round-trip 검증 전입니다. 계속하시겠습니까?"
+
+==================================================
+23. 현재 5상품 실전 검증 보조
+==================================================
+
+Phase 2.6 구현 후
+기존 5개 후보 테스트를 마무리하기 쉽게:
+
+[미완료 4개 자동 상세 보강]
+
+버튼 또는 Batch 생성.
+
+현재 실제 테스트에서:
+Candidates 5
+Detail Complete 1
+Needs Detail 4
+
+상태라면
+남은 4개를 자동 queue로 넣고
+사용자가 상품마다 확장 버튼을 누르지 않아도
+DETAIL_COMPLETE까지 진행 가능한 구조여야 한다.
+
+==================================================
+24. 브라우저 확장 상태
+==================================================
+
+Extension popup에:
+
+연결 정상
+Store 001
+Batch: RUNNING/IDLE
+Pending: N
+Last capture: ASIN
+
+가능하면 표시.
+
+민감정보 표시 금지.
+
+==================================================
+25. Parser robustness
+==================================================
+
+실제 Amazon DOM 변화에 대비:
+
+selectors.js 또는 parser helper로
+selector map 중앙화.
+
+search/product parser를
+DOM reading과 payload mapping으로 분리.
+
+실제 Amazon HTML 전체를 repo에 저장하지 마라.
+
+synthetic fixture 사용.
+
+==================================================
+26. 실패/상태 기록
+==================================================
+
+browser_batch_events table 또는 event log 권장.
+
+event:
+RUN_CREATED
+SEARCH_CAPTURE
+ITEM_QUEUED
+DETAIL_OPENED
+DETAIL_COMPLETE
+MASTER_IMPORTED
+CAPTCHA_PAUSE
+USER_PAUSE
+RESUME
+RETRY
+FAIL
+DONE
+CANCEL
+
+payload에는 민감정보 저장 금지.
+
+==================================================
+27. Safety / Privacy regression
+==================================================
+
+반드시 계속 보장:
+
+- cookies permission 없음
+- document.cookie 읽지 않음
+- localStorage/sessionStorage 읽지 않음
+- Authorization header 읽지 않음
+- 계정/주소/order 정보 읽지 않음
+- 외부 telemetry 없음
+- localhost bridge만 사용
+- pairing token required
+- CAPTCHA 우회 없음
+
+==================================================
+28. 기존 기능 보존
+==================================================
+
+절대 깨뜨리지 말 것:
+
+Tkinter GUI
+UI V2
+Keyword Studio
+Keepa optional sourcing
+Source Inbox
+browser manual capture
+MASTER
+classifier
+manual override
+Spark Desktop handoff
+Spark Center package
+CLI
+package history
+
+==================================================
+29. 테스트
+==================================================
+
+Python:
+
+- batch create
+- batch item dedupe
+- auto prefilter
+- queue order
+- pause
+- resume
+- cancel
+- restart resume
+- retry max
+- CAPTCHA pause
+- DETAIL_COMPLETE transition
+- auto MASTER import
+- classifier after import
+- target candidate progress
+- target PRIMARY progress
+- existing capture regression
+- Spark package regression
+
+JS/synthetic:
+
+- search full DOM capture
+- sponsored title fallback
+- non-visible but rendered result capture
+- duplicate ASIN
+- detail marker auto capture
+- marker one-shot
+- CAPTCHA marker page no capture
+- missing title search → NEEDS_DETAIL
+- detail title enrichment
+
+network:
+unit test에서 실제 Amazon 접속 금지.
+
+==================================================
+30. 단계별 실제 운영 기준
+==================================================
+
+실제 live 확대는:
+
+Stage A:
+현재 남은 4개 상세 자동화
+→ 총 5개 DETAIL_COMPLETE
+
+Stage B:
+5개 MASTER
+→ classify
+→ Spark Center package 5개
+→ 사용자 portal 수동 upload
+
+Stage C:
+portal 5개 성공 후
+20개 batch
+
+Stage D:
+50개
+
+Stage E:
+100개
+
+그 이후 실제 안정성 확인 후
+500+ 후보 운영 검토.
+
+처음부터 1000 detail page 자동화하지 마라.
+
+==================================================
+31. 문서
+==================================================
+
+추가:
+
+docs/BATCH_SOURCING.md
+
+업데이트:
+
+README.md
+docs/API_FREE_SOURCING.md
+docs/ARCHITECTURE.md
+docs/DATABASE.md
+docs/ROADMAP.md
+docs/UI_V2.md
+browser_extension/shopsource_capture/README.md
+
+==================================================
+32. 로컬 dirty 파일 처리
+==================================================
+
+stores/001_cabin_tidy.json의 기존 사용자 수정은
+이번 commit에 섞지 마라.
+
+단 Phase 2.6 구현에 profile schema 변경이 꼭 필요하면:
+
+1. 기존 diff를 먼저 별도 파일/patch로 보존
+2. 사용자 변경 내용과 자동 변경을 명확히 구분
+3. 기존 사용자 값을 덮어쓰지 말 것
+4. 완료 보고에 정확히 설명
+
+가능하면 해당 파일 수정 없이 구현.
+
+==================================================
+33. 테스트 명령
+==================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+확장 JS:
+node --check browser_extension/shopsource_capture/background.js
+node --check browser_extension/shopsource_capture/content_search.js
+node --check browser_extension/shopsource_capture/content_product.js
+
+CLI:
+shopsource --help
+shopsource source-auto --store 001 --dry-run
+shopsource spark-center-package --help
+
+UI:
+shopsource-ui-v2 --help
+
+==================================================
+34. Commit / Push
+==================================================
+
+이번 Phase 변경만 stage한다.
+
+사용자 dirty store file을 실수로 포함하지 마라.
+
+git status
+git diff --name-only
+
+검토 후:
+
+git add <Phase 2.6 files only>
+git commit -m "Add batch sourcing queue"
+git push origin main
+
+마지막:
+
+git status
+git log --oneline -7
+git rev-list --left-right --count main...origin/main
+
+main...origin/main = 0 0 확인.
+
+working tree에는
+기존 사용자 변경 stores/001_cabin_tidy.json만 남아 있을 수 있다.
+
+그 경우 clean이라고 거짓 보고하지 마라.
+
+==================================================
+35. 완료 보고
+==================================================
+
+[1] 구현 개요
+[2] 검색결과 일괄 capture
+[3] 자동 후보 선별
+[4] Batch DB/checkpoint
+[5] 상세 자동 보강
+[6] 상품별 클릭 제거 여부
+[7] pause/resume/cancel
+[8] CAPTCHA pause
+[9] 자동 MASTER 반영
+[10] Store 자동 classify
+[11] 목표 후보/PRIMARY 진행률
+[12] Keyword별 통계
+[13] 실패/retry
+[14] Spark Center 안전 gate
+[15] 테스트
+[16] 실제 Amazon live 검증 여부
+[17] 기존 5개 후보에서 남은 4개 자동 처리 가능 여부
+[18] 사용자 dirty file 보존 상태
+[19] 아직 미검증
+[20] commit SHA
+
+지금 Phase 2.6 구현을 시작하라.
