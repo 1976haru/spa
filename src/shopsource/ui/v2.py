@@ -750,6 +750,18 @@ class OperatorUI:
                     try: render_capture_summary()
                     except Exception: pass
 
+            def worker_action(action, force=False):
+                run_id = active_batch.get("run_id")
+                if not run_id:
+                    ui.notify("활성 Batch가 없습니다.", type="warning")
+                    return
+                message = {"source": "shopsource-studio-ui", "type": f"worker-{action}", "runId": run_id, "force": force}
+                ui.run_javascript("window.postMessage(" + json.dumps(message) + ", window.location.origin)")
+                if action == "show":
+                    ui.notify("ShopSource Amazon 작업 탭 보기를 요청했습니다.", type="info")
+                else:
+                    ui.notify("캡처 진행 중이면 작업 탭을 닫지 않습니다.", type="info")
+
             def start_batch():
                 try:
                     run = batch_service.ensure_active_batch(self.current_store, selected_keyword.value or "", int(target_count.value), bool(auto_import.value))
@@ -824,6 +836,8 @@ class OperatorUI:
                         return
                     result = batch_service.action(run_id, action)
                     render_batch(result)
+                    if action == "CANCEL":
+                        worker_action("close", force=True)
                     if action in {"RESUME", "RETRY"}:
                         outcome = kick_batch(run_id)
                         if outcome["state"] == "IN_PROGRESS":
@@ -862,12 +876,15 @@ class OperatorUI:
                 continue_button["button"] = ui.button("계속", on_click=continue_batch, icon="play_arrow").props("outline")
                 recovery_button["button"] = ui.button("현재 상품 다시 시도", on_click=recover_open_item, icon="refresh").props("outline")
                 recovery_button["button"].set_enabled(False)
+                ui.button("작업 탭 보기", on_click=lambda: worker_action("show"), icon="visibility").props("outline")
+                ui.button("작업 탭 정리", on_click=lambda: worker_action("close"), icon="close").props("outline")
                 ui.button("취소", on_click=lambda: batch_action("CANCEL"), icon="stop").props("outline color=negative")
                 ui.button("실패만 재시도", on_click=lambda: batch_action("RETRY"), icon="replay").props("outline")
             ui.label("상세 탭은 한 번에 하나씩, 최소 4초 간격으로 엽니다. 검색 페이지 이동은 사용자가 직접 합니다.").classes("text-xs text-amber-800")
             ui.timer(2.0, poll_batch)
             ui.label("상세 완료 상품은 MASTER에 반영하고, 상세 필요 상품은 같은 Batch에 자동 연결합니다.").classes("text-xs text-slate-600")
-            ui.label("Phase 2.6.4 적용 후 chrome://extensions에서 ShopSource Capture v0.1.3을 새로고침하고, ShopSource 화면도 한 번 새로고침하세요.").classes("text-xs text-slate-500")
+            ui.label("Amazon 작업 탭: Batch당 최대 1개를 백그라운드에서 재사용합니다.").classes("text-xs text-amber-800")
+            ui.label("Phase 2.6.5 적용 후 chrome://extensions에서 ShopSource Capture v0.1.4를 새로고침하고, ShopSource 화면도 한 번 새로고침하세요.").classes("text-xs text-slate-500")
             with ui.expansion("최근 실패 및 Batch 이벤트", icon="bug_report").classes("w-full"):
                 batch_failures_label = ui.label("최근 실패: 없음").classes("text-xs text-red-700")
                 batch_events_label = ui.label("최근 이벤트: 없음").classes("text-xs text-slate-600")

@@ -468,7 +468,10 @@ class BatchSourcingService:
                     (run_id, event_type, json.dumps(payload or {}, separators=(",", ":")), utc_now()))
 
     def record_extension_event(self, run_id: str, event_name: str, asin: str = "", reason: str = "", tab_id: int | None = None) -> dict:
-        allowed = {"TAB_CREATED", "AUTO_CAPTURE_TRIGGERED", "AUTO_CAPTURE_ACK", "AUTO_CAPTURE_ERROR"}
+        allowed = {
+            "TAB_CREATED", "AUTO_CAPTURE_TRIGGERED", "AUTO_CAPTURE_ACK", "AUTO_CAPTURE_ERROR",
+            "WORKER_TAB_CREATED", "WORKER_TAB_REUSED", "WORKER_TAB_CLOSED", "WORKER_TAB_MISSING",
+        }
         event_name = str(event_name or "").upper()
         if event_name not in allowed:
             raise ValueError("Unsupported extension event.")

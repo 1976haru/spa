@@ -97,5 +97,5 @@ def test_extension_version_and_reload_guidance():
     import json
 
     manifest = json.loads((EXTENSION / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["version"] == "0.1.3"
-    assert "v0.1.3" in (ROOT / "src" / "shopsource" / "ui" / "v2.py").read_text(encoding="utf-8")
+    assert manifest["version"] == "0.1.4"
+    assert "v0.1.4" in (ROOT / "src" / "shopsource" / "ui" / "v2.py").read_text(encoding="utf-8")

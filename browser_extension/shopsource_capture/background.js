@@ -1,7 +1,9 @@
 const API_DEFAULT = 'http://127.0.0.1:8081';
 const openingRuns = new Set();
 const pendingTabs = new Map();
+const workerTabs = new Map();
 const PENDING_PREFIX = 'shopsource.pending.';
+const WORKER_PREFIX = 'shopsource.worker.';
 const OPEN_TIMEOUT_MS = 45000;
 const HANDSHAKE_ATTEMPTS = 10;
 const HANDSHAKE_INTERVAL_MS = 500;
@@ -28,6 +30,37 @@ async function sendCapture(kind, payload) {
 }
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const pendingKey = runId => PENDING_PREFIX + runId;
+const workerKey = runId => WORKER_PREFIX + runId;
+
+async function saveWorker(runId, tabId, createdAt = Date.now()) {
+  const record = {runId,tabId,createdAt};
+  workerTabs.set(runId,record);
+  await chrome.storage.session.set({[workerKey(runId)]:record});
+  return record;
+}
+async function clearWorker(runId) {
+  workerTabs.delete(runId);
+  try { await chrome.storage.session.remove(workerKey(runId)); } catch (_error) {}
+}
+async function validWorker(runId) {
+  const record = workerTabs.get(runId);
+  if (!record) return null;
+  try { await chrome.tabs.get(record.tabId); return record; }
+  catch (_error) {
+    await clearWorker(runId);
+    await extensionEvent(runId,'WORKER_TAB_MISSING','', '', record.tabId);
+    return null;
+  }
+}
+async function closeWorker(runId) {
+  const record = workerTabs.get(runId);
+  if (!record) return false;
+  await clearPending(runId);
+  await clearWorker(runId);
+  try { await chrome.tabs.remove(record.tabId); } catch (_error) {}
+  await extensionEvent(runId,'WORKER_TAB_CLOSED','', '', record.tabId);
+  return true;
+}
 
 function armTimeout(runId, record, remainingMs = OPEN_TIMEOUT_MS) {
   if (record.timer) clearTimeout(record.timer);
@@ -42,10 +75,7 @@ function armTimeout(runId, record, remainingMs = OPEN_TIMEOUT_MS) {
 }
 async function savePending(runId, record) {
   const current = pendingTabs.get(runId);
-  if (current?.tabId === record.tabId) {
-    if (!current.timer) armTimeout(runId,current,Math.max(0,OPEN_TIMEOUT_MS-(Date.now()-current.createdAt)));
-    return current;
-  }
+  // Reused workers keep their tabId, but pending state belongs to the new ASIN.
   if (current?.timer) clearTimeout(current.timer);
   pendingTabs.set(runId, record);
   await chrome.storage.session.set({[pendingKey(runId)]:{runId,tabId:record.tabId,asin:record.asin,createdAt:record.createdAt}});
@@ -87,6 +117,21 @@ async function restorePendingTabs() {
     }
   } catch (_error) { /* storage.session is scoped to this browser session */ }
 }
+async function restoreWorkerTabs() {
+  try {
+    const values = await chrome.storage.session.get(null);
+    for (const [key,value] of Object.entries(values)) {
+      if (!key.startsWith(WORKER_PREFIX) || !value?.runId || !Number.isInteger(value.tabId)) continue;
+      try {
+        await chrome.tabs.get(value.tabId);
+        workerTabs.set(value.runId,{runId:value.runId,tabId:value.tabId,createdAt:Number(value.createdAt)||Date.now()});
+      } catch (_error) {
+        await chrome.storage.session.remove(key);
+        await extensionEvent(value.runId,'WORKER_TAB_MISSING','', '', value.tabId);
+      }
+    }
+  } catch (_error) { /* storage.session is scoped to this browser session */ }
+}
 async function extensionEvent(runId, eventName, asin, reason = '', tabId) {
   try { await api('/api/capture/heartbeat',{event:'EXTENSION_EVENT',batch_run_id:runId,event_name:eventName,asin,reason,tab_id:tabId}); }
   catch (_error) { /* event logging must not break the capture handshake */ }
@@ -100,15 +145,12 @@ async function trackMarkedTab(tab) {
   const asin = parsed.pathname.match(/^\/(?:dp|gp\/product)\/([A-Z0-9]{10})(?:\/|$)/i)?.[1]?.toUpperCase();
   const runId = new URLSearchParams(parsed.hash.slice(1)).get('shopsource_capture');
   if (!asin || !runId) return;
+  const owned = workerTabs.get(runId);
+  if (!owned || owned.tabId !== tab.id) return;
   const prior = pendingTabs.get(runId);
-  if (prior?.tabId === tab.id) return;
-  if (prior) {
-    await clearPending(runId);
-    try { await chrome.tabs.remove(prior.tabId); } catch (_error) { /* old/recovered tab may already be closed */ }
-  }
+  if (prior?.tabId === tab.id && prior.asin === asin) return;
   const record = {tabId:tab.id,asin,createdAt:Date.now(),triggering:false,timer:null};
   await savePending(runId,record);
-  await extensionEvent(runId,'TAB_CREATED',asin,'',tab.id);
 }
 async function failDetail(runId, record, reasonCode, message) {
   await extensionEvent(runId,'AUTO_CAPTURE_ERROR',record.asin,reasonCode,record.tabId);
@@ -141,6 +183,7 @@ async function triggerAutoCapture(tabId, runId, asin, record) {
       if (message === 'CAPTCHA_DETECTED') {
         await clearPending(runId);
         try { await api('/api/capture/heartbeat',{event:'CAPTCHA_DETECTED',batch_run_id:runId,asin}); } catch (_error) {}
+        try { await chrome.tabs.update(tabId,{active:true}); } catch (_error) {}
         return;
       }
       const reasonCode = 'CONTENT_CAPTURE_FAILED';
@@ -164,6 +207,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (/captcha|robot.?check|validatecaptcha|validate-captcha/i.test(`${url} ${title}`)) {
       clearPending(pending.runId);
       api('/api/capture/heartbeat',{event:'CAPTCHA_DETECTED',batch_run_id:pending.runId,asin:pending.asin}).catch(()=>{});
+      chrome.tabs.update(tabId,{active:true}).catch(()=>{});
       return;
     }
     if (changeInfo.status !== 'complete') return;
@@ -177,23 +221,43 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   }).catch(()=>{});
 });
 chrome.tabs.onCreated.addListener(tab => { trackMarkedTab(tab).catch(()=>{}); });
+chrome.tabs.onRemoved.addListener(tabId => {
+  for (const [runId,record] of workerTabs.entries()) {
+    if (record.tabId !== tabId) continue;
+    clearPending(runId).then(() => clearWorker(runId)).then(() => extensionEvent(runId,'WORKER_TAB_MISSING','', '', tabId)).catch(()=>{});
+    break;
+  }
+});
 
 async function openNext(runId) {
   if (!runId || openingRuns.has(runId)) return;
   openingRuns.add(runId);
   let reserved = null;
   try {
+    await restorePromise;
     const result = await api('/api/capture/heartbeat',{event:'NEXT_ITEM',batch_run_id:runId});
     const item = result.item;
     reserved = item;
     if (item?.url && /^https:\/\/(?:www\.)?amazon\.com\//i.test(item.url)) {
       const target = new URL(item.url);
       target.hash = `shopsource_capture=${encodeURIComponent(runId)}`; // fallback/debug marker only
-      const tab = await chrome.tabs.create({url:target.href,active:true});
-      const alreadyTracked = pendingTabs.get(runId)?.tabId === tab.id;
+      let worker = await validWorker(runId);
+      let tab;
+      if (worker) {
+        tab = await chrome.tabs.update(worker.tabId,{url:target.href,active:false});
+        await extensionEvent(runId,'WORKER_TAB_REUSED',item.asin,'',worker.tabId);
+      } else {
+        tab = await chrome.tabs.create({url:target.href,active:false});
+        worker = await saveWorker(runId,tab.id,Date.now());
+        await extensionEvent(runId,'WORKER_TAB_CREATED',item.asin,'',tab.id);
+      }
       const record = {tabId:tab.id,asin:item.asin,createdAt:Date.now(),triggering:false,timer:null};
       await savePending(runId,record);
-      if (!alreadyTracked) await extensionEvent(runId,'TAB_CREATED',item.asin,'',tab.id);
+    } else if (!item) {
+      try {
+        const batch = await api(`/api/capture/batches/${encodeURIComponent(runId)}`,undefined,'GET');
+        if (batch.status === 'DONE' || batch.status === 'CANCELLED') await closeWorker(runId);
+      } catch (_error) {}
     }
   } catch (_error) {
     if (reserved?.asin) {
@@ -222,8 +286,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     openNext(message.runId).then(() => sendResponse({ok:true})).catch(() => sendResponse({ok:false}));
     return true;
   }
+  if (message?.type === 'shopsource-worker-command') {
+    const runId = message.runId;
+    Promise.resolve().then(async () => {
+      await restorePromise;
+      const worker = await validWorker(runId);
+      if (message.action === 'status') return {ok:true,exists:Boolean(worker),tabId:worker?.tabId};
+      if (message.action === 'show') {
+        if (!worker) return {ok:false,error:'WORKER_TAB_MISSING'};
+        await chrome.tabs.update(worker.tabId,{active:true});
+        return {ok:true,exists:true,tabId:worker.tabId};
+      }
+      if (message.action === 'close') {
+        if (pendingTabs.has(runId) && !message.force) return {ok:false,error:'CAPTURE_IN_PROGRESS'};
+        return {ok:true,closed:await closeWorker(runId)};
+      }
+      return {ok:false,error:'UNSUPPORTED_ACTION'};
+    }).then(sendResponse).catch(error => sendResponse({ok:false,error:error.message}));
+    return true;
+  }
   if (message?.type === 'shopsource-batch-captcha' || message?.type === 'shopsource-batch-failed') {
     const event = message.type === 'shopsource-batch-captcha' ? 'CAPTCHA_DETECTED' : 'DETAIL_CAPTURE_FAILED';
+    if (event === 'CAPTCHA_DETECTED' && message.runId) {
+      validWorker(message.runId).then(worker => worker && chrome.tabs.update(worker.tabId,{active:true})).catch(()=>{});
+    }
     if (message.runId) clearPending(message.runId);
     config().then(settings => api('/api/capture/heartbeat',{event,batch_run_id:message.runId || '',store_id:settings.storeId,asin:message.asin || '',keyword:message.keyword || '',reason:message.reason || ''})).then(() => {
       if (event === 'DETAIL_CAPTURE_FAILED' && message.runId) setTimeout(() => openNext(message.runId),4000);
@@ -236,4 +322,4 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
-restorePendingTabs();
+const restorePromise = Promise.all([restoreWorkerTabs(),restorePendingTabs()]);
