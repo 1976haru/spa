@@ -60,6 +60,7 @@ def test_capture_dedupe_detail_master_classify_and_spark_package(tmp_path):
     db = make_db(tmp_path)
     service = CaptureService(db)
     search = {"store_id": "001", "keyword": "trunk organizer", "search_url": "https://www.amazon.com/s?k=trunk",
+              "page_number": 1,
               "captured_at": "2026-09-30T00:00:00Z", "products": [
                   {"asin": f"B00000000{i}", "title": f"Candidate {i}", "url": f"https://www.amazon.com/dp/B00000000{i}",
                        "price": 50, "images": ["https://m.media-amazon.com/images/I/synthetic.jpg"], "sponsored": None}

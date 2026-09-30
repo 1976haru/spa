@@ -578,6 +578,10 @@ class OperatorUI:
                            multiple=True, label="Status").classes("w-64")
         limit = ui.number("상품 수", value=50, min=1, max=5000).classes("w-32")
         ui.label("업로드 대상은 exports/spark_center/<store>/ready/<package_id> 폴더 하나입니다.").classes("text-amber-800")
+        package_validation_status = ui.label(
+            "Local JSON validation: 대기 · Observed Spark schema compatibility: 대기 · Actual Spark load: NOT VERIFIED"
+        ).classes("text-sm text-slate-700")
+        ui.label("로컬 JSON/schema 검사는 Spark Desktop의 실제 dataset load 성공을 의미하지 않습니다.").classes("text-xs text-amber-800")
         if self.package_selected_asins:
             ui.label(f"상품 페이지에서 선택한 {len(self.package_selected_asins)}개 ASIN 사용 예정")
         table_slot = ui.column().classes("w-full")
@@ -604,6 +608,11 @@ class OperatorUI:
                     selected_statuses = ["PRIMARY"]
                 result = create_spark_package(self.current_store, selected_statuses,
                                               int(limit.value), self.package_selected_asins or None)
+                compatibility = "PASS" if result.observed_spark_schema_compatible else "FAIL"
+                package_validation_status.set_text(
+                    f"Local JSON validation: {result.validation_status} · "
+                    f"Observed Spark schema compatibility: {compatibility} · Actual Spark load: NOT VERIFIED"
+                )
                 self.package_selected_asins = []
                 self.package_selected_statuses = []
                 ui.notify(f"{result.package_id} · {result.product_count}개 · {result.validation_status}", type="positive")

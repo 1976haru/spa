@@ -48,6 +48,9 @@ class SparkCenterPackageResult:
     created_at: str
     portal_package_verified: bool = False
     spark_center_manual_upload_allowed: bool = True
+    browser_capture_mapping_verified: bool = False
+    observed_spark_schema_compatible: bool | None = None
+    spark_desktop_roundtrip_verified: bool = False
 
     def to_dict(self) -> dict:
         result = asdict(self)
@@ -115,12 +118,21 @@ class SparkCenterPackageService:
             "package_status": "CREATED",
             "spark_center_manual_upload_allowed": True,
             "portal_package_verified": False,
+            "browser_capture_mapping_verified": manifest.get("browser_capture_mapping_verified", False),
+            "observed_spark_schema_compatible": manifest.get("observed_spark_schema_compatible"),
+            "spark_desktop_roundtrip_verified": False,
+            "shopify_upload_verified": False,
         })
         handoff.manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
         report = json.loads(handoff.validation_report_path.read_text(encoding="utf-8"))
+        report["browser_capture_mapping_verified"] = manifest.get("browser_capture_mapping_verified")
+        report["observed_spark_schema_compatible"] = manifest.get("observed_spark_schema_compatible")
+        report["spark_desktop_roundtrip_verified"] = False
+        report["shopify_upload_verified"] = False
+        report["portal_package_verified"] = False
         children = list(handoff.folder.iterdir())
         json_only = all(path.is_file() and path.suffix.lower() == ".json" for path in children)
         report["checks"].update({
@@ -154,6 +166,9 @@ class SparkCenterPackageService:
             validation_status=handoff.validation_status,
             package_status="CREATED",
             created_at=created_at,
+            browser_capture_mapping_verified=bool(manifest.get("browser_capture_mapping_verified")),
+            observed_spark_schema_compatible=manifest.get("observed_spark_schema_compatible"),
+            spark_desktop_roundtrip_verified=False,
         )
 
     @staticmethod

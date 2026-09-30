@@ -27,10 +27,16 @@
     }
     const offer = product?.offers && (Array.isArray(product.offers) ? product.offers[0] : product.offers);
     const rawImages = product?.image ? (Array.isArray(product.image) ? product.image : [product.image]) : [];
+    const imageDimensions = {};
     const domImage = document.querySelector('#landingImage');
     if (domImage?.dataset?.oldHires) rawImages.unshift(domImage.dataset.oldHires);
     try {
       const dynamicImages = JSON.parse(domImage?.getAttribute('data-a-dynamic-image') || '{}');
+      for (const [url, size] of Object.entries(dynamicImages)) {
+        if (Array.isArray(size) && size.length >= 2 && size.slice(0,2).every(value => Number.isInteger(value) && value > 0)) {
+          imageDimensions[url] = size.slice(0,2);
+        }
+      }
       const highest = Object.entries(dynamicImages).sort((a,b) => (b[1]?.[0] || 0) * (b[1]?.[1] || 0) - (a[1]?.[0] || 0) * (a[1]?.[1] || 0))[0]?.[0];
       if (highest) rawImages.unshift(highest);
     } catch (_error) { /* keep other observed image URLs */ }
@@ -54,7 +60,8 @@
       overview:bullets, aboutThis:[], images:[...new Set(rawImages.filter(x => typeof x === 'string'))],
       rating:Number((String(ratingText || '').match(/[0-9]+(?:\.[0-9]+)?/) || [])[0]) || null,
       reviewCount:Number((String(reviewText || '').replace(/,/g, '').match(/[0-9]+/) || [])[0]) || null,
-      options, quantity:null, tags:[], _sourceUrl:location.href.split('#')[0], _listPage:null, _collectedAt:new Date().toISOString()};
+      options, quantity:null, tags:[], _imageDimensions:imageDimensions,
+      _sourceUrl:location.href.split('#')[0], _listPage:null, _collectedAt:new Date().toISOString()};
   }
   function productDataReady() {
     if ((document.querySelector('#productTitle')?.textContent || '').trim()) return true;

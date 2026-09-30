@@ -25,6 +25,7 @@ source/amazon/inbox/*
 tests/fixtures/spark_handoff/*
 !tests/fixtures/spark_handoff/README.md
 !tests/fixtures/spark_handoff/.gitkeep
+!tests/fixtures/spark_handoff/observed_spark_schema.synthetic.json
 exports/**/*.json
 exports/**/*.csv
 *.xlsx

@@ -14,7 +14,8 @@ from ..classifier import ALLOWED_STATUSES
 from ..db import connect, get_store, init_db, utc_now
 from ..paths import EXPORT_DIR
 from ..sourcing.mapping import (BROWSER_CAPTURE_TO_SPARK_CAPABILITY, KEEPA_TO_SPARK_CAPABILITY,
-                                browser_capture_to_spark_payload, to_spark_product_payload)
+                                browser_capture_to_spark_payload, observed_spark_schema_issues,
+                                to_spark_product_payload)
 
 CAPABILITY_STATUS = "DATASET_LOAD_VERIFIED"
 INTERNAL_FIELDS = {
@@ -192,7 +193,7 @@ class SparkHandoffConnector(ExportConnector):
         if not rows:
             raise ValueError("No products matched the requested Store Decision filters")
 
-        payloads, source_job_ids, preflight_errors, keepa_mapping, browser_mapping = self._payloads(rows, db)
+        payloads, source_job_ids, preflight_errors, keepa_mapping, browser_mapping = self._payloads(rows, db, store_id)
         jobs_root.mkdir(parents=True, exist_ok=True)
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -224,6 +225,12 @@ class SparkHandoffConnector(ExportConnector):
                                     for kind in sorted({row["source_kind"] for row in rows})}
         if browser_mapping:
             manifest["browser_capture_mapping_verified"] = False
+            manifest["observed_spark_schema_compatible"] = not any(
+                error.startswith("Observed Spark schema incompatibility:") for error in preflight_errors
+            )
+            manifest["spark_desktop_roundtrip_verified"] = False
+            manifest["shopify_upload_verified"] = False
+            manifest["portal_package_verified"] = False
         report = self._validate(job_folder, manifest, preflight_errors)
         if keepa_mapping:
             report["warnings"].append(
@@ -233,6 +240,9 @@ class SparkHandoffConnector(ExportConnector):
             report["warnings"].append(
                 "Browser capture to Spark payload mapping has not completed a portal round-trip test"
             )
+            manifest["observed_spark_schema_compatible"] = report["observed_spark_schema_compatible"]
+            manifest["spark_desktop_roundtrip_verified"] = False
+            manifest["browser_capture_mapping_verified"] = False
         manifest["export_status"] = report["status"]
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -275,7 +285,7 @@ class SparkHandoffConnector(ExportConnector):
             return con.execute(sql, params).fetchall()
 
     @staticmethod
-    def _payloads(rows, db):
+    def _payloads(rows, db, store_id: str = ""):
         product_ids = [row["id"] for row in rows]
         occurrences: dict[int, list] = {product_id: [] for product_id in product_ids}
         with connect(db) as con:
@@ -287,6 +297,20 @@ class SparkHandoffConnector(ExportConnector):
                 """
                 for occurrence in con.execute(sql, chunk):
                     occurrences[occurrence["product_id"]].append(occurrence)
+            search_metadata: dict[str, dict] = {}
+            asins = [row["asin"] for row in rows if row["source_kind"] == "BROWSER_CAPTURE"]
+            for chunk in _chunks(asins):
+                if not chunk:
+                    continue
+                sql = f"""SELECT c.asin,c.search_payload_json FROM browser_capture_candidates c
+                    JOIN browser_capture_runs r ON r.run_id=c.run_id
+                    WHERE r.store_id=? AND c.asin IN ({','.join('?' for _ in chunk)})
+                    ORDER BY c.updated_at DESC,c.id DESC"""
+                for candidate in con.execute(sql, [store_id, *chunk]):
+                    if candidate["asin"] not in search_metadata:
+                        parsed = _parse_payload(candidate["search_payload_json"])
+                        if parsed is not None:
+                            search_metadata[candidate["asin"]] = parsed
 
         payloads: list[dict] = []
         source_job_ids: set[str] = set()
@@ -304,8 +328,20 @@ class SparkHandoffConnector(ExportConnector):
             elif row["source_kind"] == "BROWSER_CAPTURE":
                 canonical = _parse_payload(row["raw_json"])
                 if canonical is not None:
-                    payload = browser_capture_to_spark_payload(canonical)
                     browser_mapping = True
+                    metadata = search_metadata.get(row["asin"], {})
+                    if not metadata:
+                        for occurrence in occurrences[row["id"]]:
+                            candidate = _parse_payload(occurrence["raw_json"])
+                            if candidate and isinstance(candidate.get("_listPage"), int):
+                                metadata = candidate
+                                break
+                    try:
+                        payload = browser_capture_to_spark_payload(
+                            {**canonical, "_searchMetadata": metadata}
+                        )
+                    except ValueError as exc:
+                        errors.append(f"{row['asin']}: {exc}")
                 for occurrence in occurrences[row["id"]]:
                     if payload is not None:
                         source_job_id = occurrence["job_id"]
@@ -336,6 +372,9 @@ class SparkHandoffConnector(ExportConnector):
             sensitive = _sensitive_paths(payload)
             if sensitive:
                 errors.append(f"{row['asin']}: sensitive fields present: {', '.join(sensitive[:5])}")
+            if row["source_kind"] == "BROWSER_CAPTURE":
+                for issue in observed_spark_schema_issues(payload):
+                    errors.append(f"Observed Spark schema incompatibility: {row['asin']} {issue}")
             payloads.append(payload)
             if source_job_id:
                 source_job_ids.add(source_job_id)
@@ -345,6 +384,7 @@ class SparkHandoffConnector(ExportConnector):
     def _validate(job_folder: Path, manifest: dict, preflight_errors: list[str]) -> dict:
         errors = list(preflight_errors)
         warnings: list[str] = []
+        browser_mapping = bool(manifest.get("source_kinds", {}).get("BROWSER_CAPTURE", 0))
         files = sorted(job_folder.glob("*.json"))
         expected_names = [f"{index:09}.json" for index in range(1, len(files) + 1)]
         children = list(job_folder.iterdir())
@@ -377,12 +417,26 @@ class SparkHandoffConnector(ExportConnector):
                 errors.append(f"{file.name}: internal fields present: {', '.join(internal)}")
             if payload.get("asin"):
                 asins.append(str(payload["asin"]).strip().upper())
+            if browser_mapping:
+                for issue in observed_spark_schema_issues(payload):
+                    schema_error = f"Observed Spark schema incompatibility: {file.name} {issue}"
+                    if schema_error not in errors:
+                        errors.append(schema_error)
+                if payload.get("quantity") is None:
+                    warnings.append(f"{file.name}: quantity is null in captured source; nullability was not observed in Spark samples")
+                for image_index, image in enumerate(payload.get("images", [])):
+                    main = image.get("main") if isinstance(image, dict) else None
+                    if isinstance(main, dict) and any(not sizes for sizes in main.values()):
+                        warnings.append(f"{file.name}: image dimensions were not captured; no dimensions were guessed")
         if len(asins) != len(set(asins)):
             errors.append("Duplicate ASIN detected")
         if manifest["product_count"] != len(files):
             errors.append("Manifest product_count does not match JSON file count")
         if manifest["asin_count"] != len(set(asins)):
             errors.append("Manifest asin_count does not match unique ASIN count")
+        schema_compatible = browser_mapping and not any(
+            error.startswith("Observed Spark schema incompatibility:") for error in errors
+        )
         return {
             "schema_version": "1",
             "job_id": manifest["job_id"],
@@ -396,7 +450,13 @@ class SparkHandoffConnector(ExportConnector):
                 "request_queues_created": (job_folder / "request_queues").exists(),
                 "key_value_stores_created": (job_folder / "key_value_stores").exists(),
                 "runtime_files_created": runtime_created,
+                "observed_spark_schema_compatible": schema_compatible if browser_mapping else None,
             },
+            "browser_capture_mapping_verified": False if browser_mapping else None,
+            "observed_spark_schema_compatible": schema_compatible if browser_mapping else None,
+            "spark_desktop_roundtrip_verified": False,
+            "shopify_upload_verified": False,
+            "portal_package_verified": False,
             "errors": errors,
             "warnings": warnings,
             "validated_at": utc_now(),

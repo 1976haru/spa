@@ -1,0 +1,32 @@
+{
+  "url": "https://www.amazon.com/dp/SYNTHETIC01?th=1",
+  "asin": "SYNTHETIC01",
+  "title": "Synthetic schema-only product",
+  "brand": "Synthetic Brand",
+  "price": 20.5,
+  "options": {
+    "selectedVariations": {},
+    "variationDisplayLabels": {"color_name": "Synthetic color"}
+  },
+  "quantity": 1,
+  "tags": ["Synthetic tag"],
+  "category": "Synthetic category",
+  "overview": ["Synthetic overview"],
+  "aboutThis": ["Synthetic detail"],
+  "images": [
+    {
+      "hiRes": "https://example.invalid/synthetic-image.jpg",
+      "thumb": "https://example.invalid/synthetic-image.jpg",
+      "large": "https://example.invalid/synthetic-image.jpg",
+      "main": {"https://example.invalid/synthetic-image.jpg": [1200, 800]},
+      "variant": "SYNTHETIC",
+      "lowRes": null,
+      "shoppableScene": null
+    }
+  ],
+  "rating": 4.5,
+  "reviewCount": 25,
+  "_sourceUrl": "https://www.amazon.com/s?k=synthetic",
+  "_listPage": 1,
+  "_collectedAt": 1790798400000
+}
