@@ -60,6 +60,18 @@ def install_capture_routes(app, service: CaptureService | None = None) -> None:
             return {"status": "paused", "batch": batch}
         if body.get("event") == "DETAIL_CAPTURE_FAILED" and run_id:
             return {"status": "recorded", "batch": batches.record_detail(run_id, body.get("asin", ""), "FAILED", body.get("reason", "capture failed"))}
+        if body.get("event") == "EXTENSION_EVENT" and run_id:
+            try:
+                batch = batches.record_extension_event(
+                    run_id,
+                    body.get("event_name", ""),
+                    body.get("asin", ""),
+                    body.get("reason", ""),
+                    body.get("tab_id"),
+                )
+                return {"status": "recorded", "batch": batch}
+            except (KeyError, ValueError) as exc:
+                return JSONResponse({"error": str(exc)}, status_code=422)
         if run_id and body.get("event") == "NEXT_ITEM":
             return {"status": "ok", "item": batches.next_item(run_id)}
         return {"status": "ok"}

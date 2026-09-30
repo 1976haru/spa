@@ -1,12 +1,15 @@
 {
   "manifest_version": 3,
   "name": "ShopSource Capture",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Capture user-visible Amazon product information to local ShopSource Studio.",
   "permissions": ["storage", "activeTab", "tabs"],
   "host_permissions": ["https://www.amazon.com/*", "http://127.0.0.1/*"],
   "background": {"service_worker": "background.js"},
   "action": {"default_popup": "popup.html"},
   "options_page": "options.html",
-  "content_scripts": [{"matches": ["https://www.amazon.com/*"], "js": ["content_search.js", "content_product.js"], "run_at": "document_idle"}]
+  "content_scripts": [
+    {"matches": ["https://www.amazon.com/*"], "js": ["content_search.js", "content_product.js"], "run_at": "document_idle"},
+    {"matches": ["http://127.0.0.1:8081/*"], "js": ["content_local_bridge.js"], "run_at": "document_idle"}
+  ]
 }

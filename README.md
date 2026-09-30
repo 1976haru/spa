@@ -4,7 +4,7 @@
 
 From UI V2 → Sourcing → API-free browser sourcing, choose a Store keyword and target count, then start a Batch. Review the Amazon search page and use the extension to capture its current DOM results. ShopSource queues unique candidates and opens detail pages sequentially (one tab at a time, with a minimum four-second interval); completed details can flow into MASTER and Store classification automatically. Search pagination remains manual. Resolve any Amazon confirmation screen yourself; the queue pauses without bypassing it. Start with five products and verify the Spark Center portal round-trip before scaling. See [docs/BATCH_SOURCING.md](docs/BATCH_SOURCING.md).
 
-Phase 2.6.1 adds **미완료 상품 자동 처리**: completed captures are imported/classified first, remaining detail candidates are attached to the existing Store/keyword Batch, and the first detail page is opened. Phase 2.6.2 canonicalizes sponsored search URLs by ASIN and allows failed items to be retried. After updating the project, open `chrome://extensions` (or `edge://extensions`) and press Reload for ShopSource Capture version 0.1.2.
+Phase 2.6.1 adds **미완료 상품 자동 처리**: completed captures are imported/classified first, remaining detail candidates are attached to the existing Store/keyword Batch, and the first detail page is opened. Phase 2.6.2 canonicalizes sponsored search URLs by ASIN and allows failed items to be retried. Phase 2.6.4 adds a background-driven detail-capture handshake and explicit recovery for a stuck opened item. After updating the project, open `chrome://extensions` (or `edge://extensions`) and press Reload for ShopSource Capture version 0.1.3, then refresh the open ShopSource UI tab once.
 
 ## API-free browser sourcing (Phase 2.5)
 

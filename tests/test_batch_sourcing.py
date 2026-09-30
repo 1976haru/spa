@@ -137,9 +137,9 @@ def test_extension_batch_marker_and_all_rendered_dom_policy():
     assert "getBoundingClientRect" not in search
     assert "data-component-type=\"s-search-result\"" in search and "[data-asin]" in search
     assert "h2 a[aria-label]" in search and "sponsored" in search
-    assert "shopsource_capture" in detail_script and "autoStarted" in detail_script
+    assert "shopsource_capture" in detail_script and "autoCapturePromise" in detail_script
     assert "tabs" in manifest["permissions"]
-    assert manifest["version"] == "0.1.2"
+    assert manifest["version"] == "0.1.3"
     assert not set(manifest["permissions"]).intersection({"cookies", "webRequest", "history", "downloads", "proxy", "nativeMessaging"})
     assert "document.cookie" not in search + detail_script
     assert "localStorage" not in search + detail_script and "sessionStorage" not in search + detail_script
@@ -392,6 +392,88 @@ def test_true_empty_state_message_only_when_no_pending(tmp_path):
     assert outcome["run"]["detail_pending"] == 0
 
 
+def test_operator_open_item_recovery(tmp_path):
+    db, _capture, batches, run_id = prepared_batch(tmp_path, auto_import=False)
+    first = batches.next_item(run_id)
+    recovered = batches.recover_open_item(run_id)
+    assert recovered["opened_count"] == 0
+    assert recovered["detail_pending"] == 5
+    assert any(event["event_type"] == "OPEN_ITEM_RECOVERED" for event in recovered["events"])
+    opened_again = batches.kickoff(run_id)
+    assert opened_again["state"] == "OPENED"
+    assert opened_again["item"]["asin"] == first["asin"]
+    with connect(db) as con:
+        row = con.execute("SELECT state,last_error FROM browser_batch_items WHERE batch_run_id=? AND asin=?", (run_id, first["asin"])).fetchone()
+    assert row["state"] == "DETAIL_OPENED"
+    assert row["last_error"] == "Operator requested open-item recovery"
+
+
+def test_recovery_requires_explicit_action(tmp_path):
+    _db, _capture, batches, run_id = prepared_batch(tmp_path, auto_import=False)
+    opened = batches.next_item(run_id)
+    assert batches.kickoff(run_id)["state"] == "IN_PROGRESS"
+    # Read-only status checks/kickoff do not reset or reserve a second item.
+    assert batches.get(run_id)["opened_count"] == 1
+    assert any(item["asin"] == opened["asin"] and item["state"] == "DETAIL_OPENED" for item in batches.get(run_id)["items"])
+    source = (Path(__file__).parents[1] / "src" / "shopsource" / "ui" / "v2.py").read_text(encoding="utf-8")
+    polling = source.split("def poll_batch():", 1)[1].split("def start_batch():", 1)[0]
+    assert "recover_open_item(" not in polling
+    assert "batch_service.recover_open_item(run_id)" in source
+
+
+def test_recovery_does_not_create_duplicate_batch(tmp_path):
+    db, _capture, batches, run_id, _capture_run_id = _existing_five_candidate_state(tmp_path)
+    batches.process_existing_candidates("001", "trunk organizer", 5, True)
+    batches.kickoff(run_id)
+    batches.recover_open_item(run_id)
+    batches.kickoff(run_id)
+    assert batches.ensure_active_batch("001", "trunk organizer", 5, True)["run_id"] == run_id
+    with connect(db) as con:
+        assert con.execute("SELECT COUNT(*) FROM browser_batch_runs WHERE store_id='001' AND lower(keyword)=lower('trunk organizer')").fetchone()[0] == 1
+
+
+def test_five_product_flow_after_handshake(tmp_path):
+    db, capture, batches, run_id, _capture_run_id = _existing_five_candidate_state(tmp_path)
+    result = batches.process_existing_candidates("001", "trunk organizer", 5, True)
+    assert result["existing_imported"] == 1 and result["detail_pending"] == 4
+    for index in range(4):
+        if index:
+            with connect(db) as con:
+                con.execute("UPDATE browser_batch_runs SET checkpoint_json=json_set(checkpoint_json,'$.next_open_after','2000-01-01T00:00:00+00:00') WHERE run_id=?", (run_id,))
+        kickoff = batches.kickoff(run_id)
+        assert kickoff["state"] == "OPENED"
+        response = capture.capture_detail({"store_id": "001", "batch_run_id": run_id, "product": detail(kickoff["item"]["asin"])})
+        assert response["status"] == "DETAIL_COMPLETE"
+    final = batches.get(run_id)
+    summary = batches.pipeline_summary("001")
+    assert final["status"] == "DONE"
+    assert summary["candidates"] == summary["master_count"] == summary["classified_count"] == 5
+
+
+def test_replayed_successful_handshake_is_idempotent(tmp_path):
+    db, capture, batches, run_id = prepared_batch(tmp_path, auto_import=True)
+    opened = batches.next_item(run_id)
+    payload = detail(opened["asin"])
+    first = capture.capture_detail({"store_id": "001", "batch_run_id": run_id, "product": payload})
+    second = capture.capture_detail({"store_id": "001", "batch_run_id": run_id, "product": payload})
+    assert first["status"] == second["status"] == "DETAIL_COMPLETE"
+    assert second["duplicate"] is True
+    with connect(db) as con:
+        assert con.execute("SELECT COUNT(*) FROM product_occurrences WHERE product_id=(SELECT id FROM products WHERE asin=?)", (opened["asin"],)).fetchone()[0] == 1
+
+
+def test_extension_event_allowlist_and_diagnostics(tmp_path):
+    db, _capture, batches, run_id = prepared_batch(tmp_path, auto_import=False)
+    event_run = batches.record_extension_event(run_id, "AUTO_CAPTURE_TRIGGERED", "BATCH00001", "", 42)
+    event = event_run["events"][0]
+    assert event["event_type"] == "AUTO_CAPTURE_TRIGGERED"
+    assert '"tab_id":42' in event["payload_json"]
+    with pytest.raises(ValueError, match="Unsupported extension event"):
+        batches.record_extension_event(run_id, "UNTRUSTED_EVENT", "BATCH00001", "raw free text")
+    with connect(db) as con:
+        assert con.execute("SELECT COUNT(*) FROM browser_batch_events WHERE batch_run_id=? AND event_type='UNTRUSTED_EVENT'", (run_id,)).fetchone()[0] == 0
+
+
 def test_queue_existing_kicks_already_queued_items(tmp_path):
     _db, _capture, batches, run_id, _capture_run_id = _existing_five_candidate_state(tmp_path)
     queued = batches.process_existing_candidates("001", "trunk organizer", 5, True)
@@ -407,6 +489,9 @@ def test_popup_kickoff_requires_user_action_contract():
     assert "def process_unfinished():" in source and "outcome = kick_batch(result[\"run_id\"])" in source
     poll = source.split("def poll_batch():", 1)[1].split("def start_batch():", 1)[0]
     assert "kick_batch(" not in poll
+    kickoff = source.split("def kick_batch(run_id):", 1)[1].split("def continue_batch():", 1)[0]
+    assert "window.postMessage(" in kickoff
+    assert "next_item(" not in kickoff and "window.open(" not in kickoff
 
 
 def test_existing_bad_url_next_item_uses_canonical(tmp_path):

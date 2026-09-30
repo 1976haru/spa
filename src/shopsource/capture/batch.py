@@ -296,6 +296,27 @@ class BatchSourcingService:
             state = "NO_PENDING"
         return {"state": state, "run": run, "item": None}
 
+    def recover_open_item(self, run_id: str) -> dict:
+        """Requeue the sole opened item after an explicit operator request."""
+        now = utc_now()
+        with connect(self.db) as con:
+            con.execute("BEGIN IMMEDIATE")
+            run = con.execute("SELECT status,checkpoint_json FROM browser_batch_runs WHERE run_id=?", (run_id,)).fetchone()
+            if not run:
+                raise KeyError(run_id)
+            if run["status"] != "RUNNING":
+                raise ValueError("Only a running batch can recover an opened item.")
+            opened = con.execute("SELECT id,asin FROM browser_batch_items WHERE batch_run_id=? AND state='DETAIL_OPENED' ORDER BY id", (run_id,)).fetchall()
+            if len(opened) != 1:
+                raise ValueError("Exactly one opened detail item is required for recovery.")
+            con.execute("UPDATE browser_batch_items SET state='DETAIL_PENDING',last_error='Operator requested open-item recovery',updated_at=? WHERE id=?", (now, opened[0]["id"]))
+            checkpoint = json.loads(run["checkpoint_json"] or "{}")
+            checkpoint.pop("next_open_after", None)
+            con.execute("UPDATE browser_batch_runs SET checkpoint_json=? WHERE run_id=?", (json.dumps(checkpoint, separators=(",", ":")), run_id))
+            self._event(con, run_id, "OPEN_ITEM_RECOVERED", {"asin": opened[0]["asin"]})
+        self._refresh(run_id)
+        return self.get(run_id)
+
     def record_detail(self, run_id: str, asin: str, status: str, error: str = "", interval_seconds: int = 4) -> dict:
         asin = str(asin or "").upper()
         if not ASIN_RE.fullmatch(asin):
@@ -397,6 +418,17 @@ class BatchSourcingService:
             result["auto_import_master"] = bool(result["auto_import_master"])
             result["checkpoint"] = json.loads(result.pop("checkpoint_json") or "{}")
             result["item_count"] = int(con.execute("SELECT COUNT(*) FROM browser_batch_items WHERE batch_run_id=?", (run_id,)).fetchone()[0])
+            result["opened_count"] = int(con.execute("SELECT COUNT(*) FROM browser_batch_items WHERE batch_run_id=? AND state='DETAIL_OPENED'", (run_id,)).fetchone()[0])
+            opened = con.execute("SELECT asin,updated_at FROM browser_batch_items WHERE batch_run_id=? AND state='DETAIL_OPENED' ORDER BY id LIMIT 1", (run_id,)).fetchone()
+            result["opened_item"] = dict(opened) if opened else None
+            if opened:
+                try:
+                    opened_at = datetime.fromisoformat(opened["updated_at"].replace("Z", "+00:00"))
+                    result["opened_age_seconds"] = max(0, int((datetime.now(timezone.utc) - opened_at).total_seconds()))
+                except (TypeError, ValueError):
+                    result["opened_age_seconds"] = 0
+            else:
+                result["opened_age_seconds"] = 0
             result["items"] = [dict(x) for x in con.execute("SELECT * FROM browser_batch_items WHERE batch_run_id=? ORDER BY updated_at DESC,id DESC LIMIT 20", (run_id,)).fetchall()]
             result["failed_items"] = [dict(x) for x in con.execute("SELECT asin,state,retry_count,last_error,updated_at FROM browser_batch_items WHERE batch_run_id=? AND state='FAILED' ORDER BY updated_at DESC,id DESC LIMIT 10", (run_id,)).fetchall()]
             result["events"] = [dict(x) for x in con.execute("SELECT * FROM browser_batch_events WHERE batch_run_id=? ORDER BY id DESC LIMIT 50", (run_id,)).fetchall()]
@@ -434,6 +466,28 @@ class BatchSourcingService:
     def _event(con, run_id: str, event_type: str, payload: dict | None = None):
         con.execute("INSERT INTO browser_batch_events(batch_run_id,event_type,payload_json,created_at) VALUES(?,?,?,?)",
                     (run_id, event_type, json.dumps(payload or {}, separators=(",", ":")), utc_now()))
+
+    def record_extension_event(self, run_id: str, event_name: str, asin: str = "", reason: str = "", tab_id: int | None = None) -> dict:
+        allowed = {"TAB_CREATED", "AUTO_CAPTURE_TRIGGERED", "AUTO_CAPTURE_ACK", "AUTO_CAPTURE_ERROR"}
+        event_name = str(event_name or "").upper()
+        if event_name not in allowed:
+            raise ValueError("Unsupported extension event.")
+        asin = str(asin or "").upper()
+        if asin and not ASIN_RE.fullmatch(asin):
+            raise ValueError("Invalid ASIN in extension event.")
+        reason_codes = {"", "RECEIVER_NOT_READY", "CONTENT_CAPTURE_FAILED", "NON_PRODUCT_PAGE", "TAB_CREATE_FAILED", "CAPTURE_ACKNOWLEDGED"}
+        reason = str(reason or "").upper()
+        if reason not in reason_codes:
+            reason = "CONTENT_CAPTURE_FAILED"
+        payload = {"asin": asin, "reason": reason}
+        if isinstance(tab_id, int) and not isinstance(tab_id, bool) and tab_id >= 0:
+            payload["tab_id"] = tab_id
+        with connect(self.db) as con:
+            exists = con.execute("SELECT 1 FROM browser_batch_runs WHERE run_id=?", (run_id,)).fetchone()
+            if not exists:
+                raise KeyError(run_id)
+            self._event(con, run_id, event_name, payload)
+        return self.get(run_id)
 
     def _refresh(self, run_id: str) -> None:
         with connect(self.db) as con:

@@ -7,7 +7,9 @@
     return;
   }
   if (!isProduct) return;
-  let autoStarted = false;
+  let autoCapturePromise = null;
+  let autoCaptureContext = {};
+  let handshakeRequested = false;
   const text = selector => document.querySelector(selector)?.textContent?.trim() || null;
   const first = selectors => { for (const s of selectors) { const value = text(s); if (value) return value; } return null; };
   function captureDetail() {
@@ -78,39 +80,56 @@
     if (isCaptcha()) throw new Error('CAPTCHA_DETECTED');
     throw new Error('Product detail DOM did not become ready');
   }
-  async function submit(auto = false) {
+  async function submit({auto = false, batchRunId = null, expectedAsin = null} = {}) {
     if (isCaptcha()) {
-      if (marker) chrome.runtime.sendMessage({type:'shopsource-batch-captcha',runId:marker,asin:location.pathname.match(/\/([A-Z0-9]{10})/i)?.[1] || ''});
+      const runId = batchRunId || marker;
+      if (runId) chrome.runtime.sendMessage({type:'shopsource-batch-captcha',runId,asin:location.pathname.match(/\/([A-Z0-9]{10})/i)?.[1] || ''});
       throw new Error('CAPTCHA_DETECTED');
     }
     const product = captureDetail();
-    const response = await chrome.runtime.sendMessage({type:'shopsource-capture',kind:'detail',payload:{product,batch_run_id:marker || undefined}});
+    if (expectedAsin && String(product.asin || '').toUpperCase() !== String(expectedAsin).toUpperCase()) {
+      throw new Error('Opened product ASIN did not match queued ASIN');
+    }
+    const response = await chrome.runtime.sendMessage({type:'shopsource-capture',kind:'detail',payload:{product,batch_run_id:batchRunId || marker || undefined}});
     if (!response?.ok) throw new Error(response?.error || 'ShopSource connection failed.');
     const badge = document.createElement('div');
     badge.textContent = `ShopSource: 상세 저장 완료 (${response.result.completeness_score}%)`;
     Object.assign(badge.style,{position:'fixed',right:'16px',bottom:'16px',zIndex:2147483647,padding:'10px 14px',background:'#0f766e',color:'white',borderRadius:'8px',font:'14px sans-serif'});
     document.documentElement.appendChild(badge);
-    if (marker) {
+    if (batchRunId || marker) {
       history.replaceState(null, '', location.pathname + location.search);
     }
+    void auto;
     return response.result;
+  }
+  function runAutoCapture(context = {}) {
+    autoCaptureContext = {...autoCaptureContext,...context};
+    if (autoCapturePromise) return autoCapturePromise;
+    autoCapturePromise = (async () => {
+      await waitForProductReadiness(15000, 500);
+      return submit({auto:true,...autoCaptureContext});
+    })();
+    return autoCapturePromise;
   }
   const button = document.createElement('button'); button.textContent='이 상품 ShopSource로 가져오기';
   Object.assign(button.style,{position:'fixed',right:'16px',bottom:'16px',zIndex:2147483646,padding:'12px 16px',background:'#0f766e',color:'white',border:0,borderRadius:'8px',cursor:'pointer'});
-  button.addEventListener('click',async()=>{button.disabled=true;try{const r=await submit(false);alert(`상세 저장 완료 · 준비도 ${r.completeness_score}%`);}catch(e){alert(e.message==='CAPTCHA_DETECTED'?'Amazon 확인 화면이 감지되었습니다. 직접 확인한 뒤 다시 시도하세요.':e.message);}finally{button.disabled=false;}});
+  button.addEventListener('click',async()=>{button.disabled=true;try{const r=await submit();alert(`상세 저장 완료 · 준비도 ${r.completeness_score}%`);}catch(e){alert(e.message==='CAPTCHA_DETECTED'?'Amazon 확인 화면이 감지되었습니다. 직접 확인한 뒤 다시 시도하세요.':e.message);}finally{button.disabled=false;}});
   document.documentElement.appendChild(button);
-  chrome.runtime.onMessage.addListener((message,_sender,sendResponse)=>{if(message?.type==='shopsource-page-info')sendResponse({kind:'product'});if(message?.type==='shopsource-capture-now'){submit(false).then(result=>sendResponse({ok:true,result})).catch(error=>sendResponse({ok:false,error:error.message}));return true;}});
-  if (marker && !autoStarted) {
-    autoStarted = true;
-    setTimeout(async () => {
-      try {
-        await waitForProductReadiness(15000, 500);
-        await submit(true);
-      } catch (error) {
-        const asin = location.pathname.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i)?.[1] || '';
-        if (error.message === 'CAPTCHA_DETECTED') chrome.runtime.sendMessage({type:'shopsource-batch-captcha',runId:marker,asin});
-        else chrome.runtime.sendMessage({type:'shopsource-batch-failed',runId:marker,asin,reason:error.message});
-      }
-    }, 0);
+  chrome.runtime.onMessage.addListener((message,_sender,sendResponse)=>{
+    if(message?.type==='shopsource-page-info') sendResponse({kind:'product'});
+    if(message?.type==='shopsource-capture-now'){submit().then(result=>sendResponse({ok:true,result})).catch(error=>sendResponse({ok:false,error:error.message}));return true;}
+    if(message?.type==='shopsource-batch-auto-capture'){
+      if (!isProduct) { sendResponse({ok:false,error:'NON_PRODUCT_PAGE'}); return false; }
+      handshakeRequested = true;
+      runAutoCapture({batchRunId:message.runId,expectedAsin:message.expectedAsin}).then(result=>sendResponse({ok:true,result})).catch(error=>sendResponse({ok:false,error:error.message}));
+      return true;
+    }
+  });
+  if (marker) {
+    setTimeout(() => runAutoCapture({batchRunId:marker}).catch(error => {
+      const asin = location.pathname.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i)?.[1] || '';
+      if (error.message === 'CAPTCHA_DETECTED') chrome.runtime.sendMessage({type:'shopsource-batch-captcha',runId:marker,asin});
+      else if (!handshakeRequested) chrome.runtime.sendMessage({type:'shopsource-batch-failed',runId:marker,asin,reason:error.message});
+    }), 0);
   }
 })();

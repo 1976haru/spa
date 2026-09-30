@@ -87,9 +87,17 @@ class CaptureService:
         batch_run_id = str(body.get("batch_run_id") or "").strip()
         if batch_run_id:
             with connect(self.db) as con:
-                queued = con.execute("""SELECT i.state,r.store_id FROM browser_batch_items i
+                queued = con.execute("""SELECT i.state,i.capture_run_id,r.store_id FROM browser_batch_items i
                     JOIN browser_batch_runs r ON r.run_id=i.batch_run_id
                     WHERE i.batch_run_id=? AND i.asin=?""", (batch_run_id, payload["asin"])).fetchone()
+            if queued and queued["store_id"] == store_id and queued["state"] in {"DETAIL_COMPLETE", "MASTER_IMPORTED"}:
+                # A service-worker restart can replay a successful message before its
+                # session pending record is cleared. Treat that exact run/ASIN as an
+                # idempotent acknowledgement rather than reopening or reimporting it.
+                from .batch import BatchSourcingService
+                return {"run_id": queued["capture_run_id"], "asin": payload["asin"],
+                        "completeness_score": completeness_score(payload), "status": "DETAIL_COMPLETE",
+                        "duplicate": True, "batch": BatchSourcingService(self.db).get(batch_run_id)}
             if not queued or queued["store_id"] != store_id or queued["state"] != "DETAIL_OPENED":
                 with connect(self.db) as con:
                     opened = con.execute("SELECT asin FROM browser_batch_items WHERE batch_run_id=? AND state='DETAIL_OPENED' ORDER BY id LIMIT 1", (batch_run_id,)).fetchone()

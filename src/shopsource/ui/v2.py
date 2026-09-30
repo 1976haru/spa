@@ -633,6 +633,8 @@ class OperatorUI:
             pipeline_label = ui.label("").classes("text-sm text-slate-600")
             active_batch = {"run_id": None}
             continue_button = {"button": None}
+            recovery_button = {"button": None}
+            handshake_label = ui.label("").classes("text-xs text-amber-800")
             active_runs = batch_service.active(self.current_store)
             if active_runs: active_batch["run_id"] = active_runs[0]["run_id"]
 
@@ -664,6 +666,17 @@ class OperatorUI:
                     is_running = result["status"] == "RUNNING"
                     continue_button["button"].set_text("다음 처리" if is_running else "계속")
                     continue_button["button"].set_enabled(result["status"] not in {"DONE", "DONE_WITH_ERRORS", "CANCELLED"})
+                opened = result.get("opened_item")
+                if recovery_button["button"]:
+                    recovery_button["button"].set_enabled(bool(opened) and result["status"] == "RUNNING")
+                if opened:
+                    age = int(result.get("opened_age_seconds", 0))
+                    text = "Amazon 상세 탭은 열렸지만 ShopSource 상세 응답을 기다리는 중입니다."
+                    if age >= 15:
+                        text += " 상세 캡처 응답이 없습니다. '현재 상품 다시 시도'를 누를 수 있습니다."
+                    handshake_label.set_text(text)
+                else:
+                    handshake_label.set_text("")
                 target = max(1, int(result["target_candidates"]))
                 completed = result["master_imported"] + result["detail_complete"]
                 batch_progress.value = min(1, completed / target)
@@ -675,12 +688,18 @@ class OperatorUI:
                 render_capture_summary()
 
             def kick_batch(run_id):
-                outcome = batch_service.kickoff(run_id)
-                item = outcome.get("item")
-                if item:
-                    url = item["url"] + "#shopsource_capture=" + run_id
-                    ui.run_javascript("window.open(" + json.dumps(url) + ", '_blank', 'noopener')")
-                return outcome
+                run = batch_service.get(run_id)
+                if run["status"] != "RUNNING":
+                    return {"state": "NOT_RUNNING", "run": run}
+                if run.get("opened_count", 0):
+                    return {"state": "IN_PROGRESS", "run": run}
+                if not run.get("detail_pending", 0):
+                    return {"state": "NO_PENDING", "run": run}
+                # The localhost extension content bridge relays this user action to
+                # the MV3 worker, which reserves NEXT_ITEM and creates/tracks the tab.
+                message = {"source": "shopsource-studio-ui", "type": "batch-open-next", "runId": run_id}
+                ui.run_javascript("window.postMessage(" + json.dumps(message) + ", window.location.origin)")
+                return {"state": "REQUESTED", "run": run}
 
             def continue_batch():
                 run_id = active_batch.get("run_id")
@@ -696,10 +715,29 @@ class OperatorUI:
                     render_batch(batch_service.get(run_id))
                     if outcome["state"] == "IN_PROGRESS":
                         ui.notify("현재 상품 상세 처리가 진행 중입니다.", type="info")
+                    elif outcome["state"] == "REQUESTED":
+                        ui.notify("브라우저 확장에 다음 상품 상세 열기를 요청했습니다.", type="positive")
                     elif outcome["state"] == "WAITING":
                         ui.notify("다음 상품 처리 간격을 기다리고 있습니다. 잠시 후 '다음 처리'를 눌러주세요.", type="info")
                     elif outcome["state"] == "NO_PENDING":
                         ui.notify("현재 처리할 미완료 상품이 없습니다.", type="info")
+                except Exception as exc:
+                    ui.notify(_safe_error(exc), type="negative")
+
+            def recover_open_item():
+                run_id = active_batch.get("run_id")
+                if not run_id:
+                    return
+                try:
+                    result = batch_service.recover_open_item(run_id)
+                    render_batch(result)
+                    outcome = kick_batch(run_id)
+                    if outcome["state"] == "OPENED":
+                        ui.notify("현재 열린 상품을 다시 예약하고 상세 탭을 열었습니다.", type="positive")
+                    elif outcome["state"] == "REQUESTED":
+                        ui.notify("현재 상품을 다시 Queue에 넣고 브라우저 확장에 재시도를 요청했습니다.", type="positive")
+                    else:
+                        ui.notify("현재 상품 다시 시도를 시작하지 못했습니다. Batch 상태를 확인하세요.", type="warning")
                 except Exception as exc:
                     ui.notify(_safe_error(exc), type="negative")
 
@@ -749,10 +787,14 @@ class OperatorUI:
                         outcome = kick_batch(result["run_id"])
                         if outcome["state"] == "IN_PROGRESS":
                             ui.notify("현재 상품 상세 처리가 진행 중입니다.", type="info")
+                        elif outcome["state"] == "REQUESTED":
+                            ui.notify("이미 Queue에 있는 미완료 상품 처리를 브라우저 확장에 요청했습니다.", type="positive")
                     elif result.get("detail_pending", 0) > 0:
                         outcome = kick_batch(result["run_id"])
                         if outcome["state"] == "OPENED":
                             ui.notify(f"이미 Queue에 있는 미완료 {result['detail_pending']}개 처리를 시작합니다.", type="positive")
+                        elif outcome["state"] == "REQUESTED":
+                            ui.notify(f"이미 Queue에 있는 미완료 {result['detail_pending']}개 처리를 브라우저 확장에 요청했습니다.", type="positive")
                         elif outcome["state"] == "IN_PROGRESS":
                             ui.notify("현재 상품 상세 처리가 진행 중입니다.", type="info")
                         elif outcome["state"] == "WAITING":
@@ -775,6 +817,8 @@ class OperatorUI:
                         render_batch(batch_service.get(run_id))
                         if outcome["state"] == "IN_PROGRESS":
                             ui.notify("현재 상품 상세 처리가 진행 중입니다.", type="info")
+                        elif outcome["state"] == "REQUESTED":
+                            ui.notify("브라우저 확장에 다음 상품 상세 열기를 요청했습니다.", type="positive")
                         elif outcome["state"] == "NO_PENDING":
                             ui.notify("현재 처리할 미완료 상품이 없습니다.", type="info")
                         return
@@ -784,6 +828,8 @@ class OperatorUI:
                         outcome = kick_batch(run_id)
                         if outcome["state"] == "IN_PROGRESS":
                             ui.notify("현재 상품 상세 처리가 진행 중입니다.", type="info")
+                        elif outcome["state"] == "REQUESTED":
+                            ui.notify("브라우저 확장에 다음 상품 상세 열기를 요청했습니다.", type="positive")
                 except Exception as exc: ui.notify(_safe_error(exc), type="negative")
 
             def queue_existing():
@@ -804,6 +850,8 @@ class OperatorUI:
                     outcome = kick_batch(run["run_id"])
                     if outcome["state"] == "IN_PROGRESS":
                         ui.notify("현재 상품 상세 처리가 진행 중입니다.", type="info")
+                    elif outcome["state"] == "REQUESTED":
+                        ui.notify("브라우저 확장에 Queue 처리를 요청했습니다.", type="positive")
                 except Exception as exc: ui.notify(_safe_error(exc), type="negative")
 
             with ui.row():
@@ -812,12 +860,14 @@ class OperatorUI:
                 ui.button("고급: NEEDS_DETAIL 전체 Queue", on_click=queue_existing, icon="queue_play_next").props("outline")
                 ui.button("일시정지", on_click=lambda: batch_action("PAUSE"), icon="pause").props("outline")
                 continue_button["button"] = ui.button("계속", on_click=continue_batch, icon="play_arrow").props("outline")
+                recovery_button["button"] = ui.button("현재 상품 다시 시도", on_click=recover_open_item, icon="refresh").props("outline")
+                recovery_button["button"].set_enabled(False)
                 ui.button("취소", on_click=lambda: batch_action("CANCEL"), icon="stop").props("outline color=negative")
                 ui.button("실패만 재시도", on_click=lambda: batch_action("RETRY"), icon="replay").props("outline")
             ui.label("상세 탭은 한 번에 하나씩, 최소 4초 간격으로 엽니다. 검색 페이지 이동은 사용자가 직접 합니다.").classes("text-xs text-amber-800")
             ui.timer(2.0, poll_batch)
             ui.label("상세 완료 상품은 MASTER에 반영하고, 상세 필요 상품은 같은 Batch에 자동 연결합니다.").classes("text-xs text-slate-600")
-            ui.label("Phase 2.6.2 적용 후 chrome://extensions에서 ShopSource Capture 새로고침이 필요합니다.").classes("text-xs text-slate-500")
+            ui.label("Phase 2.6.4 적용 후 chrome://extensions에서 ShopSource Capture v0.1.3을 새로고침하고, ShopSource 화면도 한 번 새로고침하세요.").classes("text-xs text-slate-500")
             with ui.expansion("최근 실패 및 Batch 이벤트", icon="bug_report").classes("w-full"):
                 batch_failures_label = ui.label("최근 실패: 없음").classes("text-xs text-red-700")
                 batch_events_label = ui.label("최근 이벤트: 없음").classes("text-xs text-slate-600")
