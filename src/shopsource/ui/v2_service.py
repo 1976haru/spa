@@ -53,10 +53,9 @@ def product_page(*, store_id: str, page: int = 0, page_size: int = 100,
     order = PRODUCT_SORTS.get(sort)
     if not order:
         raise ValueError("Unsupported product sort field")
+    # The JOIN is already scoped to the selected store. Decision-less MASTER
+    # products must remain visible when the status filter is ALL.
     clauses, params = ["1=1"], []
-    if store_id:
-        clauses.append("(d.store_id=? OR d.store_id IS NULL)")
-        params.append(store_id)
     if search.strip():
         term = f"%{search.strip()}%"
         clauses.append("(p.asin LIKE ? OR p.title LIKE ? OR p.brand LIKE ?)")

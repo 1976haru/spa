@@ -32,10 +32,23 @@ NAV_ITEMS = [
 ]
 STATUS_OPTIONS = ["ALL", "PRIMARY", "RESERVE_A", "RESERVE_B", "RESERVE_C", "LOW_RESERVE",
                   "HIGH_RESERVE", "REVIEW", "RESTRICTED", "ARCHIVED"]
+PRODUCT_SOURCE_OPTIONS = ["ALL", "BROWSER_CAPTURE", "SPARK_STORAGE", "AMAZON_SOURCE_FOLDER", "KEEPA"]
 
 
 def _safe_error(exc: Exception) -> str:
     return str(exc)
+
+
+def product_row_from_event_args(args) -> dict:
+    payload = args or {}
+    if not isinstance(payload, dict):
+        return {}
+    row = payload.get("data", payload)
+    return row if isinstance(row, dict) else {}
+
+
+def selected_product_asins(rows: list[dict]) -> list[str]:
+    return [str(row["asin"]) for row in rows if row.get("asin")]
 
 
 class OperatorUI:
@@ -424,8 +437,9 @@ class OperatorUI:
         state = {"page": 0, "page_size": 100, "sort": "asin", "descending": False, "rows": []}
         search = ui.input("ASIN / 상품명 / 브랜드 검색").classes("w-96")
         status_filter = ui.select(STATUS_OPTIONS, value="ALL", label="Status").classes("w-44")
-        source_filter = ui.select(["ALL", "SPARK_STORAGE", "AMAZON_SOURCE_FOLDER", "KEEPA"], value="ALL", label="Source").classes("w-52")
+        source_filter = ui.select(PRODUCT_SOURCE_OPTIONS, value="ALL", label="Source").classes("w-52")
         selected_asins = ui.label("선택 0개")
+        products_status = ui.label("상품 목록을 불러오는 중입니다.").classes("text-sm text-slate-600")
         grid_container = ui.column().classes("w-full")
         grid_ref = {"grid": None}
         footer = ui.label("")
@@ -451,14 +465,24 @@ class OperatorUI:
                             {"field": "price_status", "headerName": "Price Status"}, {"field": "risk_status", "headerName": "Risk"},
                             {"field": "final_status", "headerName": "Final"}, {"field": "first_seen", "headerName": "First Seen"},
                             {"field": "last_seen", "headerName": "Last Seen"},
-                        ], "rowData": rows, "rowSelection": {"mode": "multiRow"},
+                        ], "rowData": rows, "rowSelection": "multiple",
                         "pagination": False, "defaultColDef": {"sortable": True, "filter": True, "resizable": True},
                         "getRowId": "params => params.data.asin",
                     }, modules="community").classes("w-full h-[620px]")
-                    grid_ref["grid"].on("rowClicked", lambda event: self._show_product_detail(int(event.args["id"])), ["data"])
+                    def on_product_row_clicked(event):
+                        row = product_row_from_event_args(event.args)
+                        product_id = row.get("id")
+                        if product_id is not None:
+                            self._show_product_detail(int(product_id))
+                    grid_ref["grid"].on("rowClicked", on_product_row_clicked, ["data"])
                 pages = max(1, (data["total"] + data["page_size"] - 1) // data["page_size"])
                 footer.set_text(f"총 {data['total']:,}개 · 페이지 {data['page'] + 1}/{pages} · 한 페이지 {data['page_size']}개")
+                if data["total"]:
+                    products_status.set_text(f"상품 {data['total']}개 불러옴 · Source {source_filter.value or 'ALL'} · Status {status_filter.value or 'ALL'}")
+                else:
+                    products_status.set_text("현재 필터에 해당하는 상품이 없습니다.")
             except Exception as exc:
+                products_status.set_text(f"상품 목록을 불러오지 못했습니다: {_safe_error(exc)}")
                 ui.notify(_safe_error(exc), type="negative")
         async def get_selected():
             grid = grid_ref["grid"]
@@ -482,7 +506,7 @@ class OperatorUI:
             rows = await get_selected()
             if not rows:
                 ui.notify("Spark Center package로 보낼 상품을 선택하세요.", type="warning"); return
-            self.package_selected_asins = [row["asin"] for row in rows]
+            self.package_selected_asins = selected_product_asins(rows)
             self.package_selected_statuses = sorted({row.get("final_status") for row in rows if row.get("final_status")})
             ui.navigate.to("/packages")
         with ui.row().classes("items-center flex-wrap"):
