@@ -319,6 +319,7 @@ OCCURRENCE_ADDITIVE_COLUMNS = {
 BATCH_RUN_ADDITIVE_COLUMNS = {
     "reserve_count": "INTEGER NOT NULL DEFAULT 0",
     "restricted_count": "INTEGER NOT NULL DEFAULT 0",
+    "precompleted_count": "INTEGER NOT NULL DEFAULT 0",
 }
 
 

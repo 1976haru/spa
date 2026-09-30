@@ -177,3 +177,83 @@ def test_resume_does_not_duplicate_open_tab_and_recovers_stale_checkpoint(tmp_pa
     with connect(db) as con:
         retries = con.execute("SELECT retry_count FROM browser_batch_items WHERE batch_run_id=? AND asin=?", (run_id, first["asin"])).fetchone()["retry_count"]
     assert retries == 1
+
+
+def _existing_five_candidate_state(tmp_path):
+    db = setup_db(tmp_path)
+    capture = CaptureService(db)
+    batches = BatchSourcingService(db)
+    captured = capture.capture_search({"store_id": "001", "keyword": "trunk organizer",
+        "search_url": "https://www.amazon.com/s?k=trunk+organizer", "products": search_products(5)})
+    # Candidate A is already detail-complete but has not yet entered MASTER.
+    capture.capture_detail({"store_id": "001", "product": detail("BATCH00001")})
+    # Reproduce the operator-visible RUNNING-but-empty batch from the real incident.
+    batch = batches.create("001", "trunk organizer", 5, True)
+    batches.action(batch["run_id"], "RESUME")
+    return db, capture, batches, batch["run_id"], captured["run_id"]
+
+
+def test_reuse_active_batch_and_running_empty_reconcile(tmp_path):
+    db, _capture, batches, run_id, _capture_run_id = _existing_five_candidate_state(tmp_path)
+    reused = batches.ensure_active_batch("001", "trunk organizer", 5, True)
+    assert reused["run_id"] == run_id
+    result = batches.process_existing_candidates("001", "trunk organizer", 5, True)
+    assert result["run_id"] == run_id
+    assert result["queued"] == 4
+    assert result["status"] == "RUNNING"
+    with connect(db) as con:
+        assert con.execute("SELECT COUNT(*) FROM browser_batch_runs WHERE store_id='001' AND keyword='trunk organizer' AND status IN ('PENDING','RUNNING','PAUSED','PAUSED_NEEDS_USER')").fetchone()[0] == 1
+        assert con.execute("SELECT COUNT(*) FROM browser_batch_items WHERE batch_run_id=?", (run_id,)).fetchone()[0] == 4
+
+
+def test_five_product_realistic_flow_auto_imports_and_classifies(tmp_path):
+    db, capture, batches, run_id, _capture_run_id = _existing_five_candidate_state(tmp_path)
+    result = batches.process_existing_candidates("001", "trunk organizer", 5, True)
+    assert result["run_id"] == run_id and result["existing_imported"] == 1
+    assert result["queued"] == 4
+    assert result["precompleted_count"] == 1
+    assert result["detail_pending"] == 4
+    for _ in range(4):
+        with connect(db) as con:
+            con.execute("UPDATE browser_batch_runs SET checkpoint_json=json_set(checkpoint_json,'$.next_open_after','2000-01-01T00:00:00+00:00') WHERE run_id=?", (run_id,))
+        item = batches.next_item(run_id)
+        assert item is not None
+        capture.capture_detail({"store_id": "001", "batch_run_id": run_id, "product": detail(item["asin"])})
+    final = batches.get(run_id)
+    with connect(db) as con:
+        assert con.execute("SELECT COUNT(*) FROM products WHERE source_kind='BROWSER_CAPTURE'").fetchone()[0] == 5
+        assert con.execute("SELECT COUNT(*) FROM store_product_decisions WHERE store_id='001' AND product_id IN (SELECT id FROM products WHERE source_kind='BROWSER_CAPTURE')").fetchone()[0] == 5
+        assert con.execute("SELECT COUNT(*) FROM browser_batch_items WHERE batch_run_id=? AND state='MASTER_IMPORTED'", (run_id,)).fetchone()[0] == 4
+    assert final["status"] == "DONE"
+    assert final["master_imported"] == 4
+    assert batches.pipeline_summary("001")["master_count"] == 5
+
+
+def test_no_duplicate_batch_or_items_after_repeated_process(tmp_path):
+    db, _capture, batches, run_id, _capture_run_id = _existing_five_candidate_state(tmp_path)
+    for _ in range(10):
+        result = batches.process_existing_candidates("001", "trunk organizer", 5, True)
+        assert result["run_id"] == run_id
+    with connect(db) as con:
+        assert con.execute("SELECT COUNT(*) FROM browser_batch_runs WHERE store_id='001' AND keyword='trunk organizer' AND status IN ('PENDING','RUNNING','PAUSED','PAUSED_NEEDS_USER')").fetchone()[0] == 1
+        assert con.execute("SELECT COUNT(*) FROM browser_batch_items WHERE batch_run_id=?", (run_id,)).fetchone()[0] == 4
+        assert con.execute("SELECT COUNT(DISTINCT asin) FROM browser_batch_items WHERE batch_run_id=?", (run_id,)).fetchone()[0] == 4
+        assert con.execute("SELECT COUNT(*) FROM products WHERE source_kind='BROWSER_CAPTURE'").fetchone()[0] == 1
+
+
+def test_restart_does_not_duplicate_open_item(tmp_path):
+    db, _capture, batches, run_id = prepared_batch(tmp_path, auto_import=False)
+    item = batches.next_item(run_id)
+    restarted = BatchSourcingService(db)
+    assert restarted.next_item(run_id) is None
+    assert restarted.get(run_id)["items"][0]["asin"] == item["asin"] or any(x["asin"] == item["asin"] for x in restarted.get(run_id)["items"])
+
+
+def test_capture_counts_remain_distinct_from_batch_item_counts(tmp_path):
+    db, _capture, batches, run_id, _capture_run_id = _existing_five_candidate_state(tmp_path)
+    result = batches.process_existing_candidates("001", "trunk organizer", 5, True)
+    assert result["capture_candidate_count"] == 5
+    with connect(db) as con:
+        batch_items = con.execute("SELECT COUNT(*) FROM browser_batch_items WHERE batch_run_id=?", (run_id,)).fetchone()[0]
+    assert batch_items == 4
+    assert batches.pipeline_summary("001")["candidates"] == 5

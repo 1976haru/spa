@@ -34,6 +34,101 @@ class BatchSourcingService:
             self._event(con, run_id, "RUN_CREATED", {"target": int(target_candidates), "mode": target_mode})
         return self.get(run_id)
 
+    def ensure_active_batch(self, store_id: str, keyword: str, target_candidates: int = 50,
+                            auto_import_master: bool = True) -> dict:
+        """Reuse the newest open Store/keyword batch, creating one atomically if absent."""
+        keyword = str(keyword or "").strip()[:300]
+        if not keyword:
+            raise ValueError("A search keyword is required.")
+        if isinstance(target_candidates, bool) or int(target_candidates) < 1 or int(target_candidates) > 10000:
+            raise ValueError("Target must be between 1 and 10,000.")
+        get_store(store_id, self.db)
+        active_statuses = ("PENDING", "RUNNING", "PAUSED", "PAUSED_NEEDS_USER")
+        with connect(self.db) as con:
+            # Serialize check-and-create so repeated clicks cannot create parallel batches.
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute("""SELECT run_id FROM browser_batch_runs
+                WHERE store_id=? AND lower(keyword)=lower(?) AND status IN (?,?,?,?)
+                ORDER BY created_at DESC,id DESC LIMIT 1""", (str(store_id), keyword, *active_statuses)).fetchone()
+            if row:
+                run_id = row["run_id"]
+            else:
+                run_id = "BB_" + secrets.token_hex(10)
+                now = utc_now()
+                con.execute("""INSERT INTO browser_batch_runs
+                    (run_id,store_id,keyword,target_candidates,target_mode,status,auto_import_master,created_at)
+                    VALUES(?,?,?,?,?,'PAUSED_NEEDS_USER',?,?)""",
+                    (run_id, str(store_id), keyword, int(target_candidates), "CANDIDATES", int(bool(auto_import_master)), now))
+                self._event(con, run_id, "RUN_CREATED", {"target": int(target_candidates), "mode": "CANDIDATES"})
+        return self.get(run_id)
+
+    def process_existing_candidates(self, store_id: str, keyword: str, target_candidates: int = 50,
+                                    auto_import_master: bool = True) -> dict:
+        """Import completed captures, reuse/create a batch, and queue outstanding details."""
+        from .service import CaptureService
+
+        capture = CaptureService(self.db)
+        with connect(self.db) as con:
+            completed = con.execute("""SELECT c.asin FROM browser_capture_candidates c
+                JOIN browser_capture_runs r ON r.run_id=c.run_id
+                WHERE r.store_id=? AND c.capture_status='DETAIL_COMPLETE'
+                  AND c.id=(SELECT c2.id FROM browser_capture_candidates c2
+                    JOIN browser_capture_runs r2 ON r2.run_id=c2.run_id
+                    WHERE r2.store_id=r.store_id AND c2.asin=c.asin
+                    ORDER BY c2.updated_at DESC,c2.id DESC LIMIT 1)
+                ORDER BY c.asin LIMIT 100""", (str(store_id),)).fetchall()
+        completed_asins = [row["asin"] for row in completed]
+        import_asins = completed_asins if auto_import_master else []
+        imported_now = 0
+        if import_asins:
+            # CaptureService uses the normal importer and Store classifier.
+            capture.import_candidates(str(store_id), import_asins)
+            imported_now = len(import_asins)
+
+        run = self.ensure_active_batch(store_id, keyword, target_candidates, auto_import_master)
+        run_id = run["run_id"]
+        now = utc_now()
+        with connect(self.db) as con:
+            run_row = con.execute("SELECT * FROM browser_batch_runs WHERE run_id=?", (run_id,)).fetchone()
+            checkpoint = json.loads(run_row["checkpoint_json"] or "{}")
+            previously_credited = set(checkpoint.get("precompleted_asins", []))
+            credit_asins = [asin for asin in completed_asins
+                            if asin not in previously_credited
+                            and not con.execute("SELECT 1 FROM browser_batch_items WHERE batch_run_id=? AND asin=?", (run_id, asin)).fetchone()]
+            if credit_asins:
+                checkpoint["precompleted_asins"] = sorted(previously_credited.union(credit_asins))
+                con.execute("UPDATE browser_batch_runs SET precompleted_count=?,checkpoint_json=? WHERE run_id=?",
+                            (len(checkpoint["precompleted_asins"]), json.dumps(checkpoint, separators=(",", ":")), run_id))
+                self._event(con, run_id, "MASTER_IMPORTED" if auto_import_master else "DETAIL_COMPLETE",
+                            {"count": len(credit_asins), "source": "existing_detail_complete"})
+            if run_row["status"] in {"PENDING", "PAUSED"} or (run_row["status"] == "PAUSED_NEEDS_USER" and "confirmation" not in run_row["error"].lower()):
+                con.execute("UPDATE browser_batch_runs SET status='RUNNING',started_at=COALESCE(started_at,?),paused_at=NULL,error='' WHERE run_id=?", (now, run_id))
+                self._event(con, run_id, "RESUME", {"source": "existing_candidates"})
+        result = self.queue_existing_candidates(run_id)
+        result["existing_imported"] = imported_now
+        result["queued"] = result.get("queued", 0)
+        result["capture_candidate_count"] = self.capture_candidate_count(str(store_id))
+        return result
+
+    def capture_candidate_count(self, store_id: str) -> int:
+        with connect(self.db) as con:
+            return int(con.execute("SELECT COUNT(DISTINCT c.asin) FROM browser_capture_candidates c JOIN browser_capture_runs r ON r.run_id=c.run_id WHERE r.store_id=?", (str(store_id),)).fetchone()[0])
+
+    def pipeline_summary(self, store_id: str) -> dict:
+        with connect(self.db) as con:
+            row = con.execute("""SELECT COUNT(DISTINCT c.asin) candidates,
+                COUNT(DISTINCT CASE WHEN c.capture_status IN ('DETAIL_COMPLETE','MASTER_IMPORTED') THEN c.asin END) detail_complete,
+                COUNT(DISTINCT CASE WHEN c.capture_status='NEEDS_DETAIL' THEN c.asin END) needs_detail,
+                COUNT(DISTINCT CASE WHEN c.capture_status='MASTER_IMPORTED' THEN c.asin END) capture_imported,
+                COUNT(DISTINCT CASE WHEN p.id IS NOT NULL THEN c.asin END) master_count,
+                COUNT(DISTINCT CASE WHEN d.product_id IS NOT NULL THEN c.asin END) classified_count
+                FROM browser_capture_candidates c JOIN browser_capture_runs r ON r.run_id=c.run_id
+                LEFT JOIN products p ON p.asin=c.asin
+                LEFT JOIN store_product_decisions d ON d.product_id=p.id AND d.store_id=r.store_id
+                WHERE r.store_id=?""", (str(store_id),)).fetchone()
+            package_count = con.execute("SELECT COUNT(*) FROM export_runs WHERE store_id=? AND target='SPARK_CENTER_MANUAL'", (str(store_id),)).fetchone()[0]
+        return {**dict(row), "package_count": int(package_count)}
+
     def add_search_capture(self, batch_run_id: str, capture_run_id: str) -> dict:
         now = utc_now()
         with connect(self.db) as con:
@@ -107,24 +202,36 @@ class BatchSourcingService:
             if not run: raise KeyError(batch_run_id)
             params: list = [run["store_id"]]
             sql = """SELECT c.run_id,c.asin,c.completeness_score,c.search_payload_json FROM browser_capture_candidates c
-                JOIN browser_capture_runs r ON r.run_id=c.run_id WHERE r.store_id=? AND c.capture_status='NEEDS_DETAIL'"""
+                JOIN browser_capture_runs r ON r.run_id=c.run_id WHERE r.store_id=? AND c.capture_status='NEEDS_DETAIL'
+                AND c.id=(SELECT c2.id FROM browser_capture_candidates c2 JOIN browser_capture_runs r2 ON r2.run_id=c2.run_id
+                    WHERE r2.store_id=r.store_id AND c2.asin=c.asin ORDER BY c2.updated_at DESC,c2.id DESC LIMIT 1)"""
             if asins:
                 sql += " AND c.asin IN (" + ",".join("?" for _ in asins) + ")"
                 params.extend([str(a).upper() for a in asins])
+            existing_count = int(con.execute("SELECT COUNT(*) FROM browser_batch_items WHERE batch_run_id=?", (batch_run_id,)).fetchone()[0])
+            available = max(0, int(run["target_candidates"]) - existing_count)
+            sql += " AND NOT EXISTS(SELECT 1 FROM browser_batch_items i WHERE i.batch_run_id=? AND i.asin=c.asin)"
+            params.append(batch_run_id)
             sql += " ORDER BY c.completeness_score DESC,c.updated_at DESC LIMIT ?"
-            params.append(int(run["target_candidates"]))
+            params.append(available)
             rows = con.execute(sql, params).fetchall()
             now = utc_now()
+            queued = 0
             for row in rows:
                 payload = json.loads(row["search_payload_json"])
                 state = "DETAIL_PENDING" if _amazon_url(payload.get("url")) else "FAILED"
-                con.execute("""INSERT OR IGNORE INTO browser_batch_items
+                inserted = con.execute("""INSERT OR IGNORE INTO browser_batch_items
                     (batch_run_id,asin,capture_run_id,priority,state,last_error,completeness_score,created_at,updated_at)
                     VALUES(?,?,?,?,?,?,?,?,?)""", (batch_run_id,row["asin"],row["run_id"],10,state,
-                    "Missing valid Amazon product URL" if state == "FAILED" else "",row["completeness_score"],now,now))
-            self._event(con,batch_run_id,"ITEM_QUEUED",{"count":len(rows),"source":"existing_candidates"})
+                    "Missing valid Amazon product URL" if state == "FAILED" else "",row["completeness_score"],now,now)).rowcount
+                queued += int(inserted > 0)
+            if queued:
+                con.execute("UPDATE browser_batch_runs SET status='RUNNING',started_at=COALESCE(started_at,?),error='' WHERE run_id=? AND status IN ('PENDING','PAUSED')", (now, batch_run_id))
+            self._event(con,batch_run_id,"ITEM_QUEUED",{"count":queued,"source":"existing_candidates"})
         self._refresh(batch_run_id)
-        return self.get(batch_run_id)
+        result = self.get(batch_run_id)
+        result["queued"] = queued
+        return result
 
     def next_item(self, run_id: str, interval_seconds: int = 4) -> dict | None:
         """Reserve one item; callers must open it only after explicit batch start."""
@@ -248,6 +355,7 @@ class BatchSourcingService:
             result = dict(row)
             result["auto_import_master"] = bool(result["auto_import_master"])
             result["checkpoint"] = json.loads(result.pop("checkpoint_json") or "{}")
+            result["item_count"] = int(con.execute("SELECT COUNT(*) FROM browser_batch_items WHERE batch_run_id=?", (run_id,)).fetchone()[0])
             result["items"] = [dict(x) for x in con.execute("SELECT * FROM browser_batch_items WHERE batch_run_id=? ORDER BY updated_at DESC,id DESC LIMIT 20", (run_id,)).fetchall()]
             result["events"] = [dict(x) for x in con.execute("SELECT * FROM browser_batch_events WHERE batch_run_id=? ORDER BY id DESC LIMIT 50", (run_id,)).fetchall()]
         return result
@@ -309,10 +417,11 @@ class BatchSourcingService:
             checkpoint = json.loads(run["checkpoint_json"] or "{}")
             has_work = item_count > 0 or bool(checkpoint.get("last_capture_run_id"))
             goal_met = run["target_mode"] == "PRIMARY" and primary >= run["target_candidates"]
-            terminal = goal_met or (has_work and pending == 0 and complete + failed + states.get("PREFILTER_REJECTED", 0) + states.get("DUPLICATE", 0) >= run["target_candidates"])
+            precompleted = int(run["precompleted_count"] or 0)
+            terminal = goal_met or (has_work and pending == 0 and complete + precompleted + failed + states.get("PREFILTER_REJECTED", 0) + states.get("DUPLICATE", 0) >= run["target_candidates"])
             if has_work and not terminal and pending == 0 and not con.execute("SELECT 1 FROM browser_batch_items WHERE batch_run_id=? AND state='DETAIL_PENDING'", (run_id,)).fetchone() and run["status"] == "RUNNING":
                 terminal = True
-            processed = complete + failed + states.get("PREFILTER_REJECTED", 0) + states.get("DUPLICATE", 0)
+            processed = complete + precompleted + failed + states.get("PREFILTER_REJECTED", 0) + states.get("DUPLICATE", 0)
             shortage = has_work and pending == 0 and not goal_met and (
                 (run["target_mode"] == "PRIMARY" and primary < run["target_candidates"]) or
                 (run["target_mode"] == "CANDIDATES" and processed < run["target_candidates"]))
