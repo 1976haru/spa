@@ -98,22 +98,44 @@
 - [ ] 001 Cabin Tidy 전체 흐름과 Spark Center portal package round-trip 검증
 
 
-## v0.2.5 API-FREE BROWSER SOURCING + SPARK READY PIPELINE — 다음
-- [ ] Keepa 없이도 동작하는 브라우저 기반 무료 소싱 모드
-- [ ] Edge/Chrome Manifest V3 ShopSource Capture 확장
-- [ ] localhost-only Capture Bridge + pairing token
-- [ ] Amazon 검색결과 페이지에서 ASIN/title/price/image/url/rating/reviewCount 후보 수집
-- [ ] 상품 상세 페이지에서 brand/category/bullets/overview/options/images 등 상세 보강
-- [ ] cookie/session/localStorage/auth header를 절대 수집하지 않음
-- [ ] search capture → detail enrichment → completeness score → MASTER 흐름
-- [ ] source_kind=BROWSER_CAPTURE 및 원본 occurrence 보존
-- [ ] Spark-compatible payload builder + validation
-- [ ] 불완전 상품은 REVIEW/NEEDS_DETAIL로 보존하고 자동 삭제하지 않음
-- [ ] Keyword Studio 추천어 → Amazon 검색 열기 → 현재 결과 가져오기 연결
-- [ ] 5개 단위 사용자 시작형 상세 보강 queue
-- [ ] CAPTCHA/robot check 감지 시 즉시 중단하고 우회하지 않음
-- [ ] API-free 5상품 → MASTER → PRIMARY → Spark Center package 실제 round-trip 검증
-- [ ] 50상품 운영성 테스트 후 확장
+## v0.2.5 API-FREE BROWSER SOURCING + SPARK READY PIPELINE — 구현 완료, live 검증 진행 중
+- [x] Keepa 없이도 동작하는 브라우저 기반 무료 소싱 모드
+- [x] Edge/Chrome Manifest V3 ShopSource Capture 확장
+- [x] localhost-only Capture Bridge + pairing token
+- [x] Amazon 검색결과 페이지에서 ASIN/title/price/image/url/rating/reviewCount 후보 수집
+- [x] 상품 상세 페이지에서 brand/category/bullets/overview/options/images 등 상세 보강
+- [x] cookie/session/localStorage/auth header를 수집하지 않도록 제한
+- [x] search capture → detail enrichment → completeness score → MASTER 흐름
+- [x] source_kind=BROWSER_CAPTURE 및 원본 occurrence 보존
+- [x] Spark-compatible payload builder + validation
+- [x] 불완전 상품은 NEEDS_DETAIL로 보존하고 자동 삭제하지 않음
+- [x] Keyword Studio 추천어 → Amazon 검색 열기 → 현재 결과 가져오기 연결
+- [x] 5개 단위 사용자 시작형 상세 보강
+- [x] CAPTCHA/robot check 감지 시 중단하고 우회하지 않음
+- [x] 실제 Amazon 검색 결과 후보 capture 성공
+- [x] 실제 Amazon 상품 상세 1개 DETAIL_COMPLETE 성공
+- [ ] 실제 상세 5개 → MASTER → 분류 → Spark Center package 완료
+- [ ] 실제 Spark Center 포털 5상품 round-trip 검증
+
+
+## v0.2.6 BATCH SOURCING QUEUE — 다음
+- [ ] 검색결과 현재 DOM 전체 상품 일괄 capture (viewport 5개 제한 제거)
+- [ ] 후보 자동선택/중복제거/가격·위험·Store fit 선필터
+- [ ] DETAIL_COMPLETE 불필요 후보와 NEEDS_DETAIL 후보 자동 분리
+- [ ] 사용자 시작형 상세보강 batch queue
+- [ ] 기본 동시 처리 1, 최대 3, batch 20개 안전 제한
+- [ ] 상세 페이지 marker 기반 자동 capture로 상품별 클릭 제거
+- [ ] CAPTCHA/Robot Check 감지 시 queue 즉시 PAUSED_NEEDS_USER
+- [ ] pause/resume/cancel/checkpoint
+- [ ] 상세 성공 시 다음 후보 자동 진행
+- [ ] 준비도 기준 자동 MASTER 반영 옵션
+- [ ] MASTER 반영 후 Store 자동 classify
+- [ ] 목표 PRIMARY 수량/전체 후보 수량 진행률 표시
+- [ ] 검색어별/페이지별/ASIN별 중복률·성공률 통계
+- [ ] 실패 queue와 재시도
+- [ ] 20 → 50 → 100 상품 단계별 운영성 테스트
+- [ ] 실제 Spark Center 5상품 round-trip 성공 전 대규모 package 자동 생성 금지
+- [ ] 완전 무인 페이지네이션/CAPTCHA 우회/stealth/proxy 기능은 구현하지 않음
 
 ## v0.3 STORE ENGINE
 - [ ] UI에서 가격구간 직접 편집
