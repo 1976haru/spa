@@ -1,0 +1,495 @@
+ShopSource Studio — Phase 2.6.5
+Single Reusable Amazon Worker Tab + No Tab Accumulation
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+
+==================================================
+0. 실제 사용자 테스트 결과
+==================================================
+
+Phase 2.6.4 실제 live test는 성공했다.
+
+실제 UI에서 확인:
+- 후보 5
+- 상품 상세 5/5
+- MASTER 반영 5/5
+- Store 분류 5/5
+- 실패 0
+- Batch DONE
+
+즉:
+Amazon 실제 상품 상세 → Extension handshake → DETAIL_COMPLETE → MASTER → Store classify
+실전 5상품 end-to-end가 통과했다.
+
+하지만 새 UX 문제가 확인되었다.
+
+각 상품 처리 때마다 Amazon 새 탭이 생성되어
+상품 수만큼 탭이 계속 누적된다.
+
+향후 50개, 100개, 수백개 소싱에서는 사용할 수 없는 UX다.
+
+이번 Phase의 목표:
+"상품마다 새 탭 생성"을 없애고,
+ShopSource가 소유한 Amazon 작업 탭 1개만 재사용한다.
+
+==================================================
+1. 핵심 원칙
+==================================================
+
+Concurrency는 계속 1개 유지.
+
+기존:
+item 1 → chrome.tabs.create()
+item 2 → chrome.tabs.create()
+item 3 → chrome.tabs.create()
+...
+
+변경:
+첫 item → ShopSource Worker Tab 1개 생성
+item 2 → 같은 tabId에 chrome.tabs.update(url)
+item 3 → 같은 tabId에 chrome.tabs.update(url)
+...
+Batch 종료 → ShopSource가 만든 Worker Tab만 닫기
+
+사용자가 직접 연 Amazon 탭은 절대 닫거나 재사용하지 않는다.
+
+==================================================
+2. ShopSource-owned worker tab
+==================================================
+
+background.js에 worker tab abstraction 추가.
+
+예:
+
+workerTabs:
+runId -> {
+  tabId,
+  ownedByShopSource: true,
+  createdAt
+}
+
+chrome.storage.session에도 최소 metadata 저장.
+
+절대 저장 금지:
+- cookies
+- Amazon auth/session
+- account info
+- page content
+
+허용:
+- runId
+- tabId
+- createdAt
+
+==================================================
+3. openNext() 변경
+==================================================
+
+현재 openNext()는 매 item마다:
+
+chrome.tabs.create({
+  url: target.href,
+  active: true
+})
+
+를 호출한다.
+
+이를 다음으로 변경:
+
+A. 해당 runId의 유효한 ShopSource worker tab이 없음
+→ chrome.tabs.create({url, active:false})
+→ worker tab으로 등록
+
+B. worker tab이 살아 있음
+→ chrome.tabs.update(tabId, {url, active:false})
+→ 같은 tabId 재사용
+
+C. 사용자가 worker tab을 직접 닫음
+→ tab 조회 실패 시 metadata 제거
+→ 다음 item에서 새 worker tab 1개 생성
+
+==================================================
+4. 기본은 background/inactive tab
+==================================================
+
+대량 소싱 중 사용자의 ShopSource 화면을 뺏지 않도록
+worker tab 기본 생성/업데이트:
+
+active:false
+
+즉 사용자는 ShopSource UI에 계속 머물 수 있어야 한다.
+
+Content script와 background handshake는
+inactive tab에서도 정상 작동해야 한다.
+
+단 CAPTCHA / Amazon confirmation이 감지되면:
+
+chrome.tabs.update(tabId, {active:true})
+
+로 해당 작업 탭을 사용자에게 보여준다.
+
+사용자가 직접 확인한 뒤 재개할 수 있게 한다.
+
+==================================================
+5. 한 Batch에서 탭 최대 1개
+==================================================
+
+정상 동작 중:
+
+100개 상품 처리
+→ Amazon worker tab 생성 횟수 1
+→ 같은 tabId update 99회
+
+이어야 한다.
+
+다음과 같은 tab explosion 금지:
+
+100 products
+→ 100 tabs
+
+==================================================
+6. Batch 종료 시 Worker Tab 정리
+==================================================
+
+Batch가 다음 상태가 되면:
+
+DONE
+CANCELLED
+
+ShopSource가 생성한 worker tab을 닫는다.
+
+DONE_WITH_ERRORS는 사용자가 오류를 볼 수 있으므로
+즉시 닫지 않거나,
+상품 처리 페이지가 필요 없으면 닫아도 되지만 정책을 명확히 한다.
+
+권장:
+DONE / CANCELLED → close
+DONE_WITH_ERRORS → keep one worker tab, UI에 "작업 탭 정리" 제공
+PAUSED_NEEDS_USER(CAPTCHA) → keep + active
+
+중요:
+ShopSource가 ownedByShopSource로 추적한 tab만 close.
+사용자 기존 Amazon tab은 절대 close 금지.
+
+==================================================
+7. 기존 pendingTabs와 workerTabs 통합
+==================================================
+
+현재:
+pendingTabs = runId → {tabId, asin, timer}
+
+이 구조와 worker tab tracking을 충돌 없이 통합한다.
+
+권장:
+
+runSessions[runId] = {
+  workerTabId,
+  currentAsin,
+  timeoutId,
+  ...
+}
+
+또는 pendingTabs + workerTabs 별도 유지 가능.
+
+중요한 invariant:
+
+runId당 active worker tab 최대 1
+runId당 DETAIL_OPENED item 최대 1
+
+==================================================
+8. 다음 상품 이동
+==================================================
+
+DETAIL_COMPLETE 성공:
+
+1. clear current pending capture metadata
+2. 4초 대기
+3. openNext(runId)
+4. 기존 worker tabId 조회
+5. chrome.tabs.update(workerTabId, nextProductUrl)
+6. load complete
+7. Phase 2.6.4 handshake 실행
+8. 다음 DETAIL_COMPLETE
+
+새 탭 생성 금지.
+
+==================================================
+9. Fragment / handshake
+==================================================
+
+Phase 2.6.4 background-driven handshake는 그대로 유지한다.
+
+worker tab URL에도 fragment marker를 fallback으로 붙여도 된다.
+
+하지만 auto capture는 계속:
+background → content message
+
+가 primary.
+
+탭 재사용이 handshake를 깨뜨리면 안 된다.
+
+==================================================
+10. 사용자 UI
+==================================================
+
+Sourcing 화면에 간단하게 표시:
+
+"Amazon 작업 탭: 1개 사용 중"
+또는
+"Amazon 작업 탭: 없음"
+
+버튼 선택 사항:
+
+[작업 탭 보기]
+[작업 탭 정리]
+
+작업 탭 보기:
+- ShopSource-owned worker tab이 있으면 active:true
+
+작업 탭 정리:
+- 현재 capture가 진행 중이면 경고 후 금지 또는 pause 요구
+- 안전한 상태에서 ShopSource-owned worker tab만 close
+
+일반 사용자는 탭 관리를 신경 쓰지 않아도 되게 한다.
+
+==================================================
+11. 기존에 이미 많이 열린 탭 정리
+==================================================
+
+Phase 2.6.4 이전에 이미 열린 Amazon 탭들을
+무작정 자동으로 닫지 마라.
+
+어떤 탭이 ShopSource 소유인지 확실한 증거가 없는 기존 탭은
+사용자 탭으로 취급한다.
+
+새 버전부터 생성된 owned worker tab만 자동 관리한다.
+
+==================================================
+12. CAPTCHA 동작
+==================================================
+
+CAPTCHA/Robot Check 발생:
+
+- Batch → PAUSED_NEEDS_USER
+- worker tab 유지
+- worker tab active:true
+- UI에 사용자 확인 필요 표시
+
+CAPTCHA 해결 후 [계속]:
+- 같은 worker tab 재사용
+- 새 tab 생성하지 않음
+
+CAPTCHA 우회 구현 금지.
+
+==================================================
+13. Worker tab이 닫힌 경우
+==================================================
+
+사용자가 실수로 worker tab을 닫으면:
+
+chrome.tabs.onRemoved에서 worker metadata 제거.
+
+Batch DB state가 DETAIL_OPENED라면
+바로 새 탭을 자동 생성하지 말고
+현재 기존 recovery 정책을 사용.
+
+사용자 explicit:
+[현재 상품 다시 시도]
+또는
+[미완료 상품 자동 처리]
+
+에서 새 worker tab 생성.
+
+무한 reopen 금지.
+
+==================================================
+14. Browser/service worker restart
+==================================================
+
+chrome.storage.session에 worker metadata를 저장해
+service worker suspend/restart에는 대응한다.
+
+브라우저 완전 종료 후 session storage가 사라지는 것은 정상.
+
+브라우저 재시작 후에는
+유효하지 않은 old tabId를 신뢰하지 말고
+다음 explicit kickoff에서 새 worker tab 생성.
+
+==================================================
+15. 이벤트 진단
+==================================================
+
+기존 events에 가능하면:
+
+WORKER_TAB_CREATED
+WORKER_TAB_REUSED
+WORKER_TAB_CLOSED
+WORKER_TAB_MISSING
+
+추가.
+
+100상품 처리에서:
+WORKER_TAB_CREATED 1회
+WORKER_TAB_REUSED 최대 99회
+
+확인 가능해야 한다.
+
+==================================================
+16. Extension version
+==================================================
+
+background.js가 변경되므로:
+
+0.1.3 → 0.1.4
+
+README / UI 안내:
+
+"Phase 2.6.5 적용 후 chrome://extensions에서
+ShopSource Capture v0.1.4를 새로고침하세요."
+
+==================================================
+17. 테스트
+==================================================
+
+필수:
+
+test_single_worker_tab_created_for_batch
+test_second_item_reuses_existing_worker_tab
+test_100_products_do_not_create_100_tabs
+test_worker_tab_default_inactive
+test_captcha_activates_worker_tab
+test_done_closes_owned_worker_tab
+test_cancel_closes_owned_worker_tab
+test_user_amazon_tab_is_never_closed
+test_user_amazon_tab_is_never_repurposed
+test_worker_tab_manual_close_clears_metadata
+test_worker_tab_recreated_only_after_explicit_kickoff
+test_worker_metadata_uses_session_storage_only
+test_worker_reuse_preserves_auto_capture_handshake
+test_one_batch_one_worker_tab_invariant
+test_no_parallel_detail_tabs
+test_existing_5_product_flow_still_reaches_master_5
+
+JS contract test에서
+chrome.tabs.create 호출이 item마다 무조건 발생하는 구조가 아닌지 확인.
+
+==================================================
+18. 실제 live acceptance
+==================================================
+
+5상품 새 Batch 테스트:
+
+기대:
+- Amazon 작업 탭 최대 1개
+- 5상품이 같은 탭에서 순차 이동
+- 사용자는 ShopSource 화면에 계속 머물 수 있음
+- 최종:
+  상품 상세 5/5
+  MASTER 5/5
+  Store 분류 5/5
+  실패 0
+  Batch DONE
+- 종료 후 worker tab 자동 close
+
+다음으로 20상품 테스트:
+- 탭 최대 1개
+- MASTER 20/20
+- 실패/중단 시 복구 가능
+
+==================================================
+19. 기존 성공 flow 보존
+==================================================
+
+Phase 2.6.4에서 실제로 성공한:
+background handshake
+explicit expected ASIN
+one-shot capture
+DETAIL_COMPLETE
+auto MASTER import
+Store classify
+
+절대 깨뜨리지 마라.
+
+이번 Phase는 "탭 lifecycle/재사용" 문제만 해결한다.
+
+==================================================
+20. 사용자 dirty file
+==================================================
+
+stores/001_cabin_tidy.json
+
+기존 사용자 변경이다.
+
+절대:
+reset
+restore
+checkout
+clean
+stage
+commit
+
+하지 마라.
+
+==================================================
+21. Quality Gate
+==================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+node --check browser_extension/shopsource_capture/background.js
+node --check browser_extension/shopsource_capture/content_search.js
+node --check browser_extension/shopsource_capture/content_product.js
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+==================================================
+22. Commit / Push
+==================================================
+
+Phase 2.6.5 파일만 stage.
+
+commit:
+
+git commit -m "Reuse one Amazon worker tab"
+
+push origin main
+
+최종:
+
+git status --short
+git log --oneline -7
+git rev-list --left-right --count main...origin/main
+
+main...origin/main = 0 0
+
+사용자 Store Profile dirty file이 남아 있으면
+working tree clean이라고 보고하지 마라.
+
+==================================================
+23. 완료 보고
+==================================================
+
+[1] worker tab 설계
+[2] tab 생성/재사용 방식
+[3] inactive background 처리
+[4] CAPTCHA 활성화 처리
+[5] Batch 종료 cleanup
+[6] user tab 보호
+[7] manual close recovery
+[8] session storage
+[9] event diagnostics
+[10] extension version
+[11] tests
+[12] 실제 5상품 acceptance
+[13] 20상품 다음 테스트
+[14] 사용자 dirty file
+[15] commit SHA
+
+지금 구현을 시작하라.
