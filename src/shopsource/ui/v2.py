@@ -632,6 +632,7 @@ class OperatorUI:
             batch_item_counts_label = ui.label("").classes("text-sm font-medium")
             pipeline_label = ui.label("").classes("text-sm text-slate-600")
             active_batch = {"run_id": None}
+            continue_button = {"button": None}
             active_runs = batch_service.active(self.current_store)
             if active_runs: active_batch["run_id"] = active_runs[0]["run_id"]
 
@@ -659,6 +660,10 @@ class OperatorUI:
             def render_batch(result):
                 failure_hint = f" · 실패 {result['failed_count']}개 — 실패만 재시도 가능" if result["status"] == "DONE_WITH_ERRORS" else ""
                 batch_status_label.set_text(f"Batch {result['run_id']} · {result['status']}{failure_hint}")
+                if continue_button["button"]:
+                    is_running = result["status"] == "RUNNING"
+                    continue_button["button"].set_text("다음 처리" if is_running else "계속")
+                    continue_button["button"].set_enabled(result["status"] not in {"DONE", "DONE_WITH_ERRORS", "CANCELLED"})
                 target = max(1, int(result["target_candidates"]))
                 completed = result["master_imported"] + result["detail_complete"]
                 batch_progress.value = min(1, completed / target)
@@ -669,11 +674,34 @@ class OperatorUI:
 
                 render_capture_summary()
 
-            def open_queued_item(run_id):
-                item = batch_service.next_item(run_id, 4)
+            def kick_batch(run_id):
+                outcome = batch_service.kickoff(run_id)
+                item = outcome.get("item")
                 if item:
                     url = item["url"] + "#shopsource_capture=" + run_id
                     ui.run_javascript("window.open(" + json.dumps(url) + ", '_blank', 'noopener')")
+                return outcome
+
+            def continue_batch():
+                run_id = active_batch.get("run_id")
+                if not run_id:
+                    return
+                try:
+                    run = batch_service.get(run_id)
+                    if run["status"] == "RUNNING":
+                        outcome = kick_batch(run_id)
+                    else:
+                        run = batch_service.action(run_id, "RESUME")
+                        outcome = kick_batch(run_id)
+                    render_batch(batch_service.get(run_id))
+                    if outcome["state"] == "IN_PROGRESS":
+                        ui.notify("현재 상품 상세 처리가 진행 중입니다.", type="info")
+                    elif outcome["state"] == "WAITING":
+                        ui.notify("다음 상품 처리 간격을 기다리고 있습니다. 잠시 후 '다음 처리'를 눌러주세요.", type="info")
+                    elif outcome["state"] == "NO_PENDING":
+                        ui.notify("현재 처리할 미완료 상품이 없습니다.", type="info")
+                except Exception as exc:
+                    ui.notify(_safe_error(exc), type="negative")
 
             def poll_batch():
                 run_id = active_batch.get("run_id")
@@ -717,12 +745,24 @@ class OperatorUI:
                     active_batch["run_id"] = result["run_id"]
                     render_batch(result)
                     if result.get("queued"):
-                        ui.notify(f"상세 완료 {result.get('existing_imported', 0)}개를 MASTER에 반영하고 미완료 {result['queued']}개를 같은 Batch에 연결했습니다.", type="positive")
-                        open_queued_item(result["run_id"])
+                        ui.notify(f"미완료 {result['queued']}개를 Batch에 연결하고 자동 처리를 시작합니다.", type="positive")
+                        outcome = kick_batch(result["run_id"])
+                        if outcome["state"] == "IN_PROGRESS":
+                            ui.notify("현재 상품 상세 처리가 진행 중입니다.", type="info")
+                    elif result.get("detail_pending", 0) > 0:
+                        outcome = kick_batch(result["run_id"])
+                        if outcome["state"] == "OPENED":
+                            ui.notify(f"이미 Queue에 있는 미완료 {result['detail_pending']}개 처리를 시작합니다.", type="positive")
+                        elif outcome["state"] == "IN_PROGRESS":
+                            ui.notify("현재 상품 상세 처리가 진행 중입니다.", type="info")
+                        elif outcome["state"] == "WAITING":
+                            ui.notify("다음 상품 처리 간격을 기다리고 있습니다. 잠시 후 '다음 처리'를 눌러주세요.", type="info")
+                        else:
+                            ui.notify("Batch가 실행 중이 아닙니다. 상태를 확인한 뒤 '계속'을 눌러주세요.", type="warning")
                     elif result.get("existing_imported"):
                         ui.notify(f"상세 완료 {result['existing_imported']}개를 MASTER에 반영했습니다. 상세 대기 상품은 없습니다.", type="positive")
                     else:
-                        ui.notify("처리할 미완료 상품이 없습니다.", type="info")
+                        ui.notify("현재 처리할 미완료 상품이 없습니다.", type="info")
                 except Exception as exc:
                     ui.notify(_safe_error(exc), type="negative")
 
@@ -730,9 +770,20 @@ class OperatorUI:
                 run_id = active_batch.get("run_id")
                 if not run_id: return
                 try:
+                    if action == "RESUME" and batch_service.get(run_id)["status"] == "RUNNING":
+                        outcome = kick_batch(run_id)
+                        render_batch(batch_service.get(run_id))
+                        if outcome["state"] == "IN_PROGRESS":
+                            ui.notify("현재 상품 상세 처리가 진행 중입니다.", type="info")
+                        elif outcome["state"] == "NO_PENDING":
+                            ui.notify("현재 처리할 미완료 상품이 없습니다.", type="info")
+                        return
                     result = batch_service.action(run_id, action)
                     render_batch(result)
-                    if action in {"RESUME", "RETRY"}: open_queued_item(run_id)
+                    if action in {"RESUME", "RETRY"}:
+                        outcome = kick_batch(run_id)
+                        if outcome["state"] == "IN_PROGRESS":
+                            ui.notify("현재 상품 상세 처리가 진행 중입니다.", type="info")
                 except Exception as exc: ui.notify(_safe_error(exc), type="negative")
 
             def queue_existing():
@@ -746,7 +797,13 @@ class OperatorUI:
                         batch_service.action(run["run_id"], "RESUME")
                     result = batch_service.queue_existing_candidates(run["run_id"], [r["asin"] for r in pending])
                     render_batch(result)
-                    open_queued_item(run["run_id"])
+                    if result.get("queued"):
+                        ui.notify(f"미완료 {result['queued']}개를 현재 Batch에 연결하고 처리를 시작합니다.", type="positive")
+                    elif result.get("detail_pending", 0) > 0:
+                        ui.notify("이미 Queue에 있는 상품 처리를 시작합니다.", type="info")
+                    outcome = kick_batch(run["run_id"])
+                    if outcome["state"] == "IN_PROGRESS":
+                        ui.notify("현재 상품 상세 처리가 진행 중입니다.", type="info")
                 except Exception as exc: ui.notify(_safe_error(exc), type="negative")
 
             with ui.row():
@@ -754,7 +811,7 @@ class OperatorUI:
                 ui.button("고급: Amazon 검색 Batch 시작", on_click=start_batch, icon="playlist_add").props("outline")
                 ui.button("고급: NEEDS_DETAIL 전체 Queue", on_click=queue_existing, icon="queue_play_next").props("outline")
                 ui.button("일시정지", on_click=lambda: batch_action("PAUSE"), icon="pause").props("outline")
-                ui.button("계속", on_click=lambda: batch_action("RESUME"), icon="play_arrow").props("outline")
+                continue_button["button"] = ui.button("계속", on_click=continue_batch, icon="play_arrow").props("outline")
                 ui.button("취소", on_click=lambda: batch_action("CANCEL"), icon="stop").props("outline color=negative")
                 ui.button("실패만 재시도", on_click=lambda: batch_action("RETRY"), icon="replay").props("outline")
             ui.label("상세 탭은 한 번에 하나씩, 최소 4초 간격으로 엽니다. 검색 페이지 이동은 사용자가 직접 합니다.").classes("text-xs text-amber-800")

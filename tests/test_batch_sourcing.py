@@ -332,6 +332,83 @@ def test_capture_counts_remain_distinct_from_batch_item_counts(tmp_path):
     assert batches.pipeline_summary("001")["candidates"] == 5
 
 
+def test_process_unfinished_kicks_existing_pending_queue(tmp_path):
+    _db, _capture, batches, run_id, _capture_run_id = _existing_five_candidate_state(tmp_path)
+    first = batches.process_existing_candidates("001", "trunk organizer", 5, True)
+    assert first["queued"] == 4 and first["detail_pending"] == 4
+    # This is the second operator click / retry of the unfinished workflow.
+    second = batches.process_existing_candidates("001", "trunk organizer", 5, True)
+    assert second["queued"] == 0 and second["existing_imported"] == 0
+    assert second["detail_pending"] == 4 and second["run_id"] == run_id
+    kickoff = batches.kickoff(run_id)
+    assert kickoff["state"] == "OPENED"
+    assert kickoff["item"]["url"] == f"https://www.amazon.com/dp/{kickoff['item']['asin']}"
+
+
+def test_existing_pending_queued_zero_is_not_empty(tmp_path):
+    _db, _capture, batches, run_id, _capture_run_id = _existing_five_candidate_state(tmp_path)
+    batches.process_existing_candidates("001", "trunk organizer", 5, True)
+    result = batches.process_existing_candidates("001", "trunk organizer", 5, True)
+    assert result["queued"] == 0
+    assert result["detail_pending"] > 0
+    assert batches.kickoff(run_id)["state"] == "OPENED"
+
+
+def test_running_pending_opens_first_item(tmp_path):
+    _db, _capture, batches, run_id, _capture_run_id = _existing_five_candidate_state(tmp_path)
+    batches.process_existing_candidates("001", "trunk organizer", 5, True)
+    result = batches.kickoff(run_id)
+    assert result["state"] == "OPENED"
+    assert result["item"]["asin"]
+
+
+def test_running_opened_does_not_duplicate_tab(tmp_path):
+    _db, _capture, batches, run_id, _capture_run_id = _existing_five_candidate_state(tmp_path)
+    batches.process_existing_candidates("001", "trunk organizer", 5, True)
+    first = batches.kickoff(run_id)
+    second = batches.kickoff(run_id)
+    assert first["state"] == "OPENED"
+    assert second["state"] == "IN_PROGRESS" and second["item"] is None
+    assert batches.next_item(run_id) is None
+
+
+def test_resume_button_running_behavior(tmp_path):
+    _db, _capture, batches, run_id, _capture_run_id = _existing_five_candidate_state(tmp_path)
+    batches.process_existing_candidates("001", "trunk organizer", 5, True)
+    # RUNNING uses kickoff (not RESUME, which correctly rejects RUNNING).
+    assert batches.get(run_id)["status"] == "RUNNING"
+    assert batches.kickoff(run_id)["state"] == "OPENED"
+    with pytest.raises(ValueError, match="Batch is not paused"):
+        batches.action(run_id, "RESUME")
+
+
+def test_true_empty_state_message_only_when_no_pending(tmp_path):
+    db = setup_db(tmp_path)
+    batches = BatchSourcingService(db)
+    run = batches.create("001", "trunk organizer", 5)
+    batches.action(run["run_id"], "RESUME")
+    outcome = batches.kickoff(run["run_id"])
+    assert outcome["state"] == "NO_PENDING"
+    assert outcome["run"]["detail_pending"] == 0
+
+
+def test_queue_existing_kicks_already_queued_items(tmp_path):
+    _db, _capture, batches, run_id, _capture_run_id = _existing_five_candidate_state(tmp_path)
+    queued = batches.process_existing_candidates("001", "trunk organizer", 5, True)
+    assert queued["queued"] == 4
+    already_queued = batches.queue_existing_candidates(run_id)
+    assert already_queued["queued"] == 0 and already_queued["detail_pending"] == 4
+    assert batches.kickoff(run_id)["state"] == "OPENED"
+
+
+def test_popup_kickoff_requires_user_action_contract():
+    source = (Path(__file__).parents[1] / "src" / "shopsource" / "ui" / "v2.py").read_text(encoding="utf-8")
+    assert "def kick_batch(run_id):" in source
+    assert "def process_unfinished():" in source and "outcome = kick_batch(result[\"run_id\"])" in source
+    poll = source.split("def poll_batch():", 1)[1].split("def start_batch():", 1)[0]
+    assert "kick_batch(" not in poll
+
+
 def test_existing_bad_url_next_item_uses_canonical(tmp_path):
     db = setup_db(tmp_path)
     capture = CaptureService(db)

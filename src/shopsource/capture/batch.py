@@ -268,6 +268,34 @@ class BatchSourcingService:
             self._event(con, run_id, "DETAIL_OPENED", {"asin": row["asin"]})
             return {"asin": row["asin"], "url": url, "batch_run_id": run_id}
 
+    def kickoff(self, run_id: str) -> dict:
+        """Reserve the next detail item after an explicit operator action.
+
+        ``next_item`` remains the source of truth for the single-open-item rule and
+        stale-item recovery. This wrapper distinguishes an already-open item from
+        an empty queue so the UI can report the correct state without opening a
+        duplicate tab.
+        """
+        run = self.get(run_id)
+        if run["status"] != "RUNNING":
+            return {"state": "NOT_RUNNING", "run": run, "item": None}
+        item = self.next_item(run_id, 4)
+        if item:
+            return {"state": "OPENED", "run": self.get(run_id), "item": item}
+        with connect(self.db) as con:
+            opened = int(con.execute(
+                "SELECT COUNT(*) FROM browser_batch_items WHERE batch_run_id=? AND state='DETAIL_OPENED'",
+                (run_id,),
+            ).fetchone()[0])
+        run = self.get(run_id)
+        if opened:
+            state = "IN_PROGRESS"
+        elif run["detail_pending"]:
+            state = "WAITING"
+        else:
+            state = "NO_PENDING"
+        return {"state": state, "run": run, "item": None}
+
     def record_detail(self, run_id: str, asin: str, status: str, error: str = "", interval_seconds: int = 4) -> dict:
         asin = str(asin or "").upper()
         if not ASIN_RE.fullmatch(asin):
