@@ -5,7 +5,7 @@ import json
 import secrets
 from datetime import datetime, timedelta, timezone
 from ..db import connect, get_store, init_db, utc_now
-from .validation import ASIN_RE, _amazon_url
+from .validation import ASIN_RE, _amazon_url, canonical_product_url
 
 class BatchSourcingService:
     def __init__(self, db=None):
@@ -127,7 +127,8 @@ class BatchSourcingService:
                 LEFT JOIN store_product_decisions d ON d.product_id=p.id AND d.store_id=r.store_id
                 WHERE r.store_id=?""", (str(store_id),)).fetchone()
             package_count = con.execute("SELECT COUNT(*) FROM export_runs WHERE store_id=? AND target='SPARK_CENTER_MANUAL'", (str(store_id),)).fetchone()[0]
-        return {**dict(row), "package_count": int(package_count)}
+            latest_batch = con.execute("SELECT failed_count FROM browser_batch_runs WHERE store_id=? ORDER BY id DESC LIMIT 1", (str(store_id),)).fetchone()
+        return {**dict(row), "package_count": int(package_count), "failed_count": int(latest_batch["failed_count"] if latest_batch else 0)}
 
     def add_search_capture(self, batch_run_id: str, capture_run_id: str) -> dict:
         now = utc_now()
@@ -218,12 +219,11 @@ class BatchSourcingService:
             now = utc_now()
             queued = 0
             for row in rows:
-                payload = json.loads(row["search_payload_json"])
-                state = "DETAIL_PENDING" if _amazon_url(payload.get("url")) else "FAILED"
+                state = "DETAIL_PENDING" if ASIN_RE.fullmatch(str(row["asin"] or "")) else "FAILED"
                 inserted = con.execute("""INSERT OR IGNORE INTO browser_batch_items
                     (batch_run_id,asin,capture_run_id,priority,state,last_error,completeness_score,created_at,updated_at)
                     VALUES(?,?,?,?,?,?,?,?,?)""", (batch_run_id,row["asin"],row["run_id"],10,state,
-                    "Missing valid Amazon product URL" if state == "FAILED" else "",row["completeness_score"],now,now)).rowcount
+                    "Invalid ASIN" if state == "FAILED" else "",row["completeness_score"],now,now)).rowcount
                 queued += int(inserted > 0)
             if queued:
                 con.execute("UPDATE browser_batch_runs SET status='RUNNING',started_at=COALESCE(started_at,?),error='' WHERE run_id=? AND status IN ('PENDING','PAUSED')", (now, batch_run_id))
@@ -260,12 +260,8 @@ class BatchSourcingService:
                 WHERE i.batch_run_id=? AND i.state='DETAIL_PENDING' ORDER BY i.priority,i.id LIMIT 1""", (run_id,)).fetchone()
             if not row:
                 return None
-            payload = json.loads(row["search_payload_json"])
-            url = payload.get("url")
-            if not _amazon_url(url):
-                con.execute("UPDATE browser_batch_items SET state='FAILED',last_error='Invalid Amazon product URL',updated_at=? WHERE id=?", (now, row["id"]))
-                self._event(con, run_id, "FAIL", {"asin": row["asin"], "reason": "invalid_url"})
-                return None
+            # Ignore persisted hrefs: old candidates may contain redirects, null, or stale URLs.
+            url = canonical_product_url(row["asin"])
             cp["next_open_after"] = now  # next slot is set on completion below
             con.execute("UPDATE browser_batch_items SET state='DETAIL_OPENED',updated_at=? WHERE id=?", (now, row["id"]))
             con.execute("UPDATE browser_batch_runs SET checkpoint_json=? WHERE run_id=?", (json.dumps(cp), run_id))
@@ -327,9 +323,26 @@ class BatchSourcingService:
                 con.execute("UPDATE browser_batch_runs SET status='CANCELLED',finished_at=? WHERE run_id=?", (now, run_id))
                 self._event(con, run_id, "CANCEL")
             elif action == "RETRY":
+                failed = int(con.execute("SELECT COUNT(*) FROM browser_batch_items WHERE batch_run_id=? AND state='FAILED'", (run_id,)).fetchone()[0])
+                if not failed:
+                    raise ValueError("This batch has no failed items to retry.")
+                # Older batches predate precompleted_count. Credit imported candidates from
+                # the same keyword that are not represented by a batch item (e.g. detail A).
+                checkpoint_row = con.execute("SELECT store_id,keyword,checkpoint_json FROM browser_batch_runs WHERE run_id=?", (run_id,)).fetchone()
+                checkpoint = json.loads(checkpoint_row["checkpoint_json"] or "{}")
+                credited = set(checkpoint.get("precompleted_asins", []))
+                prior = con.execute("""SELECT DISTINCT c.asin FROM browser_capture_candidates c
+                    JOIN browser_capture_runs r ON r.run_id=c.run_id
+                    JOIN products p ON p.asin=c.asin
+                    WHERE r.store_id=? AND lower(r.keyword)=lower(?) AND c.capture_status='MASTER_IMPORTED'
+                    AND NOT EXISTS(SELECT 1 FROM browser_batch_items i WHERE i.batch_run_id=? AND i.asin=c.asin)""",
+                    (checkpoint_row["store_id"], checkpoint_row["keyword"], run_id)).fetchall()
+                credited.update(row["asin"] for row in prior)
+                con.execute("UPDATE browser_batch_runs SET precompleted_count=?,checkpoint_json=? WHERE run_id=?",
+                            (len(credited), json.dumps({**checkpoint, "precompleted_asins": sorted(credited)}, separators=(",", ":")), run_id))
                 con.execute("UPDATE browser_batch_items SET state='DETAIL_PENDING',retry_count=0,last_error='',updated_at=? WHERE batch_run_id=? AND state='FAILED'", (now, run_id))
                 con.execute("UPDATE browser_batch_runs SET status='RUNNING',finished_at=NULL,error='' WHERE run_id=?", (run_id,))
-                self._event(con, run_id, "RETRY", {"scope": "failed"})
+                self._event(con, run_id, "RETRY", {"scope": "failed", "count": failed})
             else:
                 raise ValueError("Unsupported batch action.")
         self._refresh(run_id)
@@ -357,15 +370,16 @@ class BatchSourcingService:
             result["checkpoint"] = json.loads(result.pop("checkpoint_json") or "{}")
             result["item_count"] = int(con.execute("SELECT COUNT(*) FROM browser_batch_items WHERE batch_run_id=?", (run_id,)).fetchone()[0])
             result["items"] = [dict(x) for x in con.execute("SELECT * FROM browser_batch_items WHERE batch_run_id=? ORDER BY updated_at DESC,id DESC LIMIT 20", (run_id,)).fetchall()]
+            result["failed_items"] = [dict(x) for x in con.execute("SELECT asin,state,retry_count,last_error,updated_at FROM browser_batch_items WHERE batch_run_id=? AND state='FAILED' ORDER BY updated_at DESC,id DESC LIMIT 10", (run_id,)).fetchall()]
             result["events"] = [dict(x) for x in con.execute("SELECT * FROM browser_batch_events WHERE batch_run_id=? ORDER BY id DESC LIMIT 50", (run_id,)).fetchall()]
         return result
 
     def active(self, store_id: str | None = None) -> list[dict]:
         with connect(self.db) as con:
             if store_id:
-                rows = con.execute("SELECT run_id FROM browser_batch_runs WHERE store_id=? AND status IN ('PENDING','RUNNING','PAUSED','PAUSED_NEEDS_USER') ORDER BY created_at DESC", (store_id,)).fetchall()
+                rows = con.execute("SELECT run_id FROM browser_batch_runs WHERE store_id=? AND (status IN ('PENDING','RUNNING','PAUSED','PAUSED_NEEDS_USER','DONE_WITH_ERRORS') OR (status='DONE' AND failed_count>0)) ORDER BY created_at DESC", (store_id,)).fetchall()
             else:
-                rows = con.execute("SELECT run_id FROM browser_batch_runs WHERE status IN ('PENDING','RUNNING','PAUSED','PAUSED_NEEDS_USER') ORDER BY created_at DESC").fetchall()
+                rows = con.execute("SELECT run_id FROM browser_batch_runs WHERE status IN ('PENDING','RUNNING','PAUSED','PAUSED_NEEDS_USER','DONE_WITH_ERRORS') OR (status='DONE' AND failed_count>0) ORDER BY created_at DESC").fetchall()
         return [self.get(row["run_id"]) for row in rows]
 
     def _import_ready(self, run_id: str) -> None:
@@ -425,10 +439,11 @@ class BatchSourcingService:
             shortage = has_work and pending == 0 and not goal_met and (
                 (run["target_mode"] == "PRIMARY" and primary < run["target_candidates"]) or
                 (run["target_mode"] == "CANDIDATES" and processed < run["target_candidates"]))
-            status = "PAUSED_NEEDS_USER" if shortage and run["status"] == "RUNNING" else "DONE" if terminal and run["status"] == "RUNNING" else run["status"]
-            finished = utc_now() if status == "DONE" else run["finished_at"]
+            status = "PAUSED_NEEDS_USER" if shortage and run["status"] == "RUNNING" else ("DONE_WITH_ERRORS" if failed else "DONE") if terminal and run["status"] == "RUNNING" else run["status"]
+            finished = utc_now() if status in {"DONE", "DONE_WITH_ERRORS"} else run["finished_at"]
             error = "Current captured candidates were insufficient; capture another Amazon search page." if shortage else ("" if status == "DONE" else run["error"])
             con.execute("""UPDATE browser_batch_runs SET detail_pending=?,detail_complete=?,master_imported=?,
                 primary_count=?,reserve_count=?,review_count=?,restricted_count=?,failed_count=?,status=?,finished_at=?,error=? WHERE run_id=?""",
                 (pending, complete, imported, primary, reserve, review, restricted, failed, status, finished, error, run_id))
-            if status == "DONE" and run["status"] != "DONE": self._event(con, run_id, "DONE")
+            if status in {"DONE", "DONE_WITH_ERRORS"} and run["status"] != status:
+                self._event(con, run_id, status)

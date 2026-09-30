@@ -27,6 +27,13 @@ def sensitive_paths(value, prefix="") -> list[str]:
     return found
 
 
+def canonical_product_url(asin: str) -> str:
+    normalized = str(asin or "").strip().upper()
+    if not ASIN_RE.fullmatch(normalized):
+        raise ValueError("ASIN을 확인할 수 없습니다.")
+    return f"https://www.amazon.com/dp/{normalized}"
+
+
 def validate_product(payload: dict, *, detail: bool = False, allow_missing_title: bool = False) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("상품 자료는 JSON object여야 합니다.")

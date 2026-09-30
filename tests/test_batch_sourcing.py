@@ -5,6 +5,7 @@ import pytest
 from shopsource.capture.batch import BatchSourcingService
 from shopsource.capture.service import CaptureService
 from shopsource.db import connect, init_db, upsert_store
+from shopsource.capture.validation import canonical_product_url
 
 
 def setup_db(tmp_path):
@@ -138,9 +139,81 @@ def test_extension_batch_marker_and_all_rendered_dom_policy():
     assert "h2 a[aria-label]" in search and "sponsored" in search
     assert "shopsource_capture" in detail_script and "autoStarted" in detail_script
     assert "tabs" in manifest["permissions"]
+    assert manifest["version"] == "0.1.2"
     assert not set(manifest["permissions"]).intersection({"cookies", "webRequest", "history", "downloads", "proxy", "nativeMessaging"})
     assert "document.cookie" not in search + detail_script
     assert "localStorage" not in search + detail_script and "sessionStorage" not in search + detail_script
+    assert "https://www.amazon.com/dp/${asin}" in search
+    assert "waitForProductReadiness(15000, 500)" in detail_script
+    assert "Product detail DOM did not become ready" in detail_script
+
+
+def test_canonical_product_url():
+    assert canonical_product_url("b0h8sfr4gt") == "https://www.amazon.com/dp/B0H8SFR4GT"
+    with pytest.raises(ValueError, match="ASIN"):
+        canonical_product_url("bad")
+
+
+@pytest.mark.parametrize("tracking_url", [
+    "https://www.amazon.com/sspa/click?ie=UTF8&asin=B0H8SFR4GT",
+    "https://www.amazon.com/gp/slredirect/picassoRedirect.html?asin=B0H8SFR4GT",
+])
+def test_sponsored_tracking_url_becomes_canonical(tmp_path, tracking_url):
+    db = setup_db(tmp_path)
+    capture = CaptureService(db)
+    result = capture.capture_search({"store_id": "001", "keyword": "trunk organizer",
+        "search_url": "https://www.amazon.com/s?k=trunk+organizer", "products": [{
+            "asin": "B0H8SFR4GT", "title": "", "url": tracking_url, "sponsored": True
+        }]})
+    with connect(db) as con:
+        import json as json_module
+        row = con.execute("SELECT search_payload_json FROM browser_capture_candidates WHERE run_id=?", (result["run_id"],)).fetchone()
+    payload = json_module.loads(row["search_payload_json"])
+    assert payload["url"] == "https://www.amazon.com/dp/B0H8SFR4GT"
+    assert payload["_sourceUrl"] == "https://www.amazon.com/s?k=trunk+organizer"
+    assert payload["title"] == ""
+
+
+def test_search_tracking_url_becomes_canonical(tmp_path):
+    db = setup_db(tmp_path)
+    capture = CaptureService(db)
+    captured = capture.capture_search({"store_id": "001", "keyword": "trunk organizer",
+        "search_url": "https://www.amazon.com/s?k=trunk", "products": [{
+            "asin": "B0GFD1WBP9", "title": "Organizer", "url": "https://www.amazon.com/gp/slredirect/ref=abc", "sponsored": False
+        }]})
+    row = capture.list_candidates("001")[0]
+    assert row["run_id"] == captured["run_id"]
+    assert row["search_payload"]["url"] == "https://www.amazon.com/dp/B0GFD1WBP9"
+
+
+def test_four_sponsored_tracking_candidates_queue_as_canonical_products(tmp_path):
+    db = setup_db(tmp_path)
+    capture = CaptureService(db)
+    batches = BatchSourcingService(db)
+    asins = ["B0H8SFR4GT", "B0GFD1WBP9", "B0F7QTD5SV", "B09YXYSSLL"]
+    products = [{"asin": asin, "title": "", "url": f"https://www.amazon.com/sspa/click?ref={index}", "sponsored": True}
+                for index, asin in enumerate(asins)]
+    captured = capture.capture_search({"store_id": "001", "keyword": "trunk organizer",
+        "search_url": "https://www.amazon.com/s?k=trunk", "products": products})
+    run = batches.create("001", "trunk organizer", 4, False)
+    batches.action(run["run_id"], "RESUME")
+    batches.add_search_capture(run["run_id"], captured["run_id"])
+    urls = []
+    for index, asin in enumerate(asins):
+        with connect(db) as con:
+            con.execute("UPDATE browser_batch_runs SET checkpoint_json=json_set(checkpoint_json,'$.next_open_after','2000-01-01T00:00:00+00:00') WHERE run_id=?", (run["run_id"],))
+        item = batches.next_item(run["run_id"])
+        assert item and item["asin"] == asin
+        urls.append(item["url"])
+        capture.capture_detail({"store_id": "001", "batch_run_id": run["run_id"], "product": detail(asin)})
+    assert urls == [f"https://www.amazon.com/dp/{asin}" for asin in asins]
+
+
+def test_product_readiness_timeout_contract():
+    script = (Path(__file__).parents[1] / "browser_extension" / "shopsource_capture" / "content_product.js").read_text(encoding="utf-8")
+    assert "waitForProductReadiness(15000, 500)" in script
+    assert "Product detail DOM did not become ready" in script
+    assert "if (isCaptcha()) throw new Error('CAPTCHA_DETECTED')" in script
 
 
 def test_candidate_shortage_waits_for_manual_next_page_capture(tmp_path):
@@ -257,3 +330,109 @@ def test_capture_counts_remain_distinct_from_batch_item_counts(tmp_path):
         batch_items = con.execute("SELECT COUNT(*) FROM browser_batch_items WHERE batch_run_id=?", (run_id,)).fetchone()[0]
     assert batch_items == 4
     assert batches.pipeline_summary("001")["candidates"] == 5
+
+
+def test_existing_bad_url_next_item_uses_canonical(tmp_path):
+    db = setup_db(tmp_path)
+    capture = CaptureService(db)
+    batches = BatchSourcingService(db)
+    run = batches.create("001", "trunk organizer", 1, False)
+    batches.action(run["run_id"], "RESUME")
+    captured = capture.capture_search({"store_id": "001", "keyword": "trunk organizer",
+        "search_url": "https://www.amazon.com/s?k=trunk", "products": search_products(1)})
+    batches.add_search_capture(run["run_id"], captured["run_id"])
+    with connect(db) as con:
+        con.execute("UPDATE browser_capture_candidates SET search_payload_json=json_set(search_payload_json,'$.url',NULL) WHERE run_id=?", (captured["run_id"],))
+        con.execute("UPDATE browser_batch_items SET state='FAILED',retry_count=2,last_error='Detail page capture timed out' WHERE batch_run_id=?", (run["run_id"],))
+        con.execute("UPDATE browser_batch_runs SET status='DONE',failed_count=1 WHERE run_id=?", (run["run_id"],))
+    retried = batches.action(run["run_id"], "RETRY")
+    item = batches.next_item(run["run_id"])
+    assert retried["status"] == "RUNNING"
+    assert item["url"] == "https://www.amazon.com/dp/BATCH00001"
+
+
+def test_done_with_errors_status_and_retry(tmp_path):
+    db = setup_db(tmp_path)
+    capture = CaptureService(db)
+    batches = BatchSourcingService(db)
+    run = batches.create("001", "trunk organizer", 1, False)
+    batches.action(run["run_id"], "RESUME")
+    captured = capture.capture_search({"store_id": "001", "keyword": "trunk organizer",
+        "search_url": "https://www.amazon.com/s?k=trunk", "products": search_products(1)})
+    batches.add_search_capture(run["run_id"], captured["run_id"])
+    with connect(db) as con:
+        con.execute("UPDATE browser_batch_items SET state='FAILED',retry_count=2,last_error='Synthetic detail timeout' WHERE batch_run_id=?", (run["run_id"],))
+    batches._refresh(run["run_id"])
+    failed_run = batches.get(run["run_id"])
+    assert failed_run["status"] == "DONE_WITH_ERRORS"
+    assert failed_run["failed_items"][0]["last_error"] == "Synthetic detail timeout"
+    assert BatchSourcingService(db).active("001")[0]["run_id"] == run["run_id"]
+    retried = batches.action(run["run_id"], "RETRY")
+    assert retried["status"] == "RUNNING"
+    assert retried["failed_count"] == 0
+    assert retried["items"][0]["retry_count"] == 0
+
+
+def test_asin_mismatch_rejected_and_recorded(tmp_path):
+    db = setup_db(tmp_path)
+    capture = CaptureService(db)
+    batches = BatchSourcingService(db)
+    run = batches.create("001", "trunk organizer", 1, False)
+    batches.action(run["run_id"], "RESUME")
+    captured = capture.capture_search({"store_id": "001", "keyword": "trunk organizer",
+        "search_url": "https://www.amazon.com/s?k=trunk", "products": search_products(1)})
+    batches.add_search_capture(run["run_id"], captured["run_id"])
+    batches.next_item(run["run_id"])
+    wrong = detail("BATCH00002")
+    with pytest.raises(ValueError, match="Opened product ASIN did not match queued ASIN"):
+        capture.capture_detail({"store_id": "001", "batch_run_id": run["run_id"], "product": wrong})
+    item = batches.get(run["run_id"])["failed_items"][0]
+    assert item["asin"] == "BATCH00001"
+    assert item["last_error"] == "Opened product ASIN did not match queued ASIN"
+    with connect(db) as con:
+        assert con.execute("SELECT COUNT(*) FROM products WHERE asin='BATCH00002'").fetchone()[0] == 0
+
+
+def test_four_failed_items_recover_to_master(tmp_path):
+    db = setup_db(tmp_path)
+    capture = CaptureService(db)
+    batches = BatchSourcingService(db)
+    capture.capture_search({"store_id": "001", "keyword": "trunk organizer",
+        "search_url": "https://www.amazon.com/s?k=trunk", "products": search_products(5)})
+    capture.capture_detail({"store_id": "001", "product": detail("BATCH00001")})
+    run = batches.create("001", "trunk organizer", 5, True)
+    batches.action(run["run_id"], "RESUME")
+    queued = batches.process_existing_candidates("001", "trunk organizer", 5, True)
+    assert queued["existing_imported"] == 1 and queued["queued"] == 4
+    with connect(db) as con:
+        con.execute("UPDATE browser_capture_candidates SET search_payload_json=json_set(search_payload_json,'$.url',NULL) WHERE asin!='BATCH00001'")
+        con.execute("UPDATE browser_batch_items SET state='FAILED',retry_count=2,last_error='Missing valid Amazon product URL' WHERE batch_run_id=?", (run["run_id"],))
+        con.execute("UPDATE browser_batch_runs SET status='DONE',failed_count=4 WHERE run_id=?", (run["run_id"],))
+    retried = batches.action(run["run_id"], "RETRY")
+    assert retried["status"] == "RUNNING"
+    assert retried["precompleted_count"] == 1
+    for _ in range(4):
+        with connect(db) as con:
+            con.execute("UPDATE browser_batch_runs SET checkpoint_json=json_set(checkpoint_json,'$.next_open_after','2000-01-01T00:00:00+00:00') WHERE run_id=?", (run["run_id"],))
+        item = batches.next_item(run["run_id"])
+        assert item and item["url"] == f"https://www.amazon.com/dp/{item['asin']}"
+        capture.capture_detail({"store_id": "001", "batch_run_id": run["run_id"], "product": detail(item["asin"])})
+    final = batches.get(run["run_id"])
+    summary = batches.pipeline_summary("001")
+    assert final["status"] == "DONE" and final["failed_count"] == 0
+    assert summary["candidates"] == summary["detail_complete"] == summary["master_count"] == summary["classified_count"] == 5
+    assert summary["failed_count"] == 0
+
+
+def test_pipeline_summary_5_of_5(tmp_path):
+    db = setup_db(tmp_path)
+    capture = CaptureService(db)
+    batches = BatchSourcingService(db)
+    capture.capture_search({"store_id": "001", "keyword": "trunk organizer",
+        "search_url": "https://www.amazon.com/s?k=trunk", "products": search_products(5)})
+    for product in search_products(5):
+        capture.capture_detail({"store_id": "001", "product": detail(product["asin"])})
+    capture.import_candidates("001", [product["asin"] for product in search_products(5)])
+    summary = batches.pipeline_summary("001")
+    assert summary["candidates"] == 5
+    assert summary["detail_complete"] == summary["master_count"] == summary["classified_count"] == 5

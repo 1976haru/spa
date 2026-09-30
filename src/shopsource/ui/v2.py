@@ -652,16 +652,20 @@ class OperatorUI:
                 pipeline_label.set_text(
                     f"Spark Center 실전 준비 — 후보 수집 {'완료' if total else '대기'} · "
                     f"상품 상세 {summary['detail_complete']}/{total} · MASTER 반영 {summary['master_count']}/{total} · "
-                    f"Store 분류 {summary['classified_count']}/{total} · Spark Package {summary['package_count']}개 · "
+                    f"Store 분류 {summary['classified_count']}/{total} · 실패 {summary['failed_count']} · Spark Package {summary['package_count']}개 · "
                     "실제 Spark Center 업로드: 사용자 확인 필요"
                 )
 
             def render_batch(result):
-                batch_status_label.set_text(f"Batch {result['run_id']} · {result['status']}")
+                failure_hint = f" · 실패 {result['failed_count']}개 — 실패만 재시도 가능" if result["status"] == "DONE_WITH_ERRORS" else ""
+                batch_status_label.set_text(f"Batch {result['run_id']} · {result['status']}{failure_hint}")
                 target = max(1, int(result["target_candidates"]))
                 completed = result["master_imported"] + result["detail_complete"]
                 batch_progress.value = min(1, completed / target)
                 batch_details.set_text(f"목표 {target} · 후보 {result['total_seen']} · 중복 {result['deduped']} · 선필터 제외 {result['prefiltered']} · 상세 대기 {result['detail_pending']} · 상세 완료 {result['detail_complete']} · MASTER {result['master_imported']} · PRIMARY {result['primary_count']} · RESERVE {result['reserve_count']} · REVIEW {result['review_count']} · RESTRICTED {result['restricted_count']} · 실패 {result['failed_count']}" + (f" · {result['error']}" if result.get("error") else ""))
+                failures = result.get("failed_items", [])
+                batch_failures_label.set_text("최근 실패: " + (" | ".join(f"{item['asin']} · {item['state']} · 재시도 {item['retry_count']} · {item['last_error']}" for item in failures) if failures else "없음"))
+                batch_events_label.set_text("최근 이벤트: " + (" | ".join(f"{event['created_at']} {event['event_type']}" for event in result.get("events", [])[:10]) if result.get("events") else "없음"))
 
                 render_capture_summary()
 
@@ -756,9 +760,12 @@ class OperatorUI:
             ui.label("상세 탭은 한 번에 하나씩, 최소 4초 간격으로 엽니다. 검색 페이지 이동은 사용자가 직접 합니다.").classes("text-xs text-amber-800")
             ui.timer(2.0, poll_batch)
             ui.label("상세 완료 상품은 MASTER에 반영하고, 상세 필요 상품은 같은 Batch에 자동 연결합니다.").classes("text-xs text-slate-600")
-            ui.label("Phase 2.6.1 적용 후 chrome://extensions에서 ShopSource Capture 새로고침이 필요합니다.").classes("text-xs text-slate-500")
+            ui.label("Phase 2.6.2 적용 후 chrome://extensions에서 ShopSource Capture 새로고침이 필요합니다.").classes("text-xs text-slate-500")
+            with ui.expansion("최근 실패 및 Batch 이벤트", icon="bug_report").classes("w-full"):
+                batch_failures_label = ui.label("최근 실패: 없음").classes("text-xs text-red-700")
+                batch_events_label = ui.label("최근 이벤트: 없음").classes("text-xs text-slate-600")
         summary = BatchSourcingService().pipeline_summary(self.current_store)
-        ui.label(f"수집된 후보 {summary['candidates']} · 상세 완료 {summary['detail_complete']} · 상세 대기 {summary['needs_detail']} · MASTER 반영 {summary['master_count']}")
+        ui.label(f"수집된 후보 {summary['candidates']} · 상품 상세 {summary['detail_complete']}/{summary['candidates']} · 실패 {summary['failed_count']} · 상세 대기 {summary['needs_detail']} · MASTER 반영 {summary['master_count']}/{summary['candidates']}")
         ui.label("Spark Center 실전 준비: Amazon 후보 수집 → 상세 보강 → MASTER → Store 분류 → Package → 실제 업로드(사용자 확인 필요)").classes("text-sm text-slate-600")
         checks = {}
         if rows:

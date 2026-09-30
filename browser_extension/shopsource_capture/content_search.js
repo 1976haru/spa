@@ -29,10 +29,8 @@
         '[data-cy="title-recipe"] h2', 'a.a-link-normal.s-line-clamp-2',
         'h2 a[aria-label]', 'h2 a[title]',
       ]);
-      const link = card.querySelector('h2 a[href], a.a-link-normal[href*="/dp/"], [data-cy="title-recipe"] a[href]');
-      const href = link?.getAttribute('href') || '';
-      const match = href.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i);
-      const url = href ? new URL(href, location.origin).href : (match ? `https://www.amazon.com/dp/${match[1]}` : null);
+      // Never use sponsored/search tracking hrefs for detail navigation.
+      const url = `https://www.amazon.com/dp/${asin}`;
       const priceText = card.querySelector('.a-price .a-offscreen')?.textContent?.trim() || (() => {
         const whole = card.querySelector('.a-price-whole')?.textContent || '';
         const fraction = card.querySelector('.a-price-fraction')?.textContent || '';

@@ -13,7 +13,7 @@ from ..importer import import_products
 from ..connectors.amazon_source_folder import AmazonSourceFolderConnector
 from ..sourcing.mapping import browser_capture_to_spark_payload
 from .models import completeness_score
-from .validation import _amazon_url, sensitive_paths, validate_product
+from .validation import _amazon_url, canonical_product_url, sensitive_paths, validate_product
 
 
 class CaptureService:
@@ -58,6 +58,9 @@ class CaptureService:
                         (run_id, store_id, keyword, search_url, "SEARCH_CAPTURED", now))
             for index, item in enumerate(products):
                 product = validate_product(item, allow_missing_title=True)
+                # Search-card hrefs (especially sponsored placements) may be redirects or absent.
+                # The ASIN is the identity; always persist a direct product URL for detail opening.
+                product["url"] = canonical_product_url(product["asin"])
                 product.setdefault("_sourceUrl", search_url)
                 product.setdefault("_listPage", body.get("page_number"))
                 product.setdefault("_collectedAt", body.get("captured_at") or now)
@@ -82,6 +85,25 @@ class CaptureService:
         payload = validate_product(body.get("product"), detail=True)
         payload.setdefault("_collectedAt", utc_now())
         batch_run_id = str(body.get("batch_run_id") or "").strip()
+        if batch_run_id:
+            with connect(self.db) as con:
+                queued = con.execute("""SELECT i.state,r.store_id FROM browser_batch_items i
+                    JOIN browser_batch_runs r ON r.run_id=i.batch_run_id
+                    WHERE i.batch_run_id=? AND i.asin=?""", (batch_run_id, payload["asin"])).fetchone()
+            if not queued or queued["store_id"] != store_id or queued["state"] != "DETAIL_OPENED":
+                with connect(self.db) as con:
+                    opened = con.execute("SELECT asin FROM browser_batch_items WHERE batch_run_id=? AND state='DETAIL_OPENED' ORDER BY id LIMIT 1", (batch_run_id,)).fetchone()
+                    if opened:
+                        now = utc_now()
+                        reason = "Opened product ASIN did not match queued ASIN"
+                        con.execute("UPDATE browser_batch_items SET state='FAILED',last_error=?,updated_at=? WHERE batch_run_id=? AND asin=?",
+                                    (reason, now, batch_run_id, opened["asin"]))
+                        from .batch import BatchSourcingService
+                        BatchSourcingService._event(con, batch_run_id, "FAIL", {"asin": opened["asin"], "reason": "asin_mismatch"})
+                if opened:
+                    from .batch import BatchSourcingService
+                    BatchSourcingService(self.db)._refresh(batch_run_id)
+                raise ValueError("Opened product ASIN did not match queued ASIN")
         with connect(self.db) as con:
             preferred = con.execute("SELECT capture_run_id FROM browser_batch_items WHERE batch_run_id=? AND asin=?", (batch_run_id, payload["asin"])).fetchone() if batch_run_id else None
             if preferred:

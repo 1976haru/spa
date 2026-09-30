@@ -54,6 +54,30 @@
       reviewCount:Number((String(reviewText || '').replace(/,/g, '').match(/[0-9]+/) || [])[0]) || null,
       options, quantity:null, tags:[], _sourceUrl:location.href.split('#')[0], _listPage:null, _collectedAt:new Date().toISOString()};
   }
+  function productDataReady() {
+    if ((document.querySelector('#productTitle')?.textContent || '').trim()) return true;
+    for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
+      try {
+        const value = JSON.parse(script.textContent);
+        const nodes = Array.isArray(value) ? value : [value];
+        if (nodes.some(node => {
+          const candidates = [...(Array.isArray(node?.['@graph']) ? node['@graph'] : []), node];
+          return candidates.some(item => item && String(item['@type']).includes('Product') && String(item.name || '').trim());
+        })) return true;
+      } catch (_error) { /* malformed or still-loading JSON-LD; keep waiting */ }
+    }
+    return false;
+  }
+  async function waitForProductReadiness(timeoutMs = 15000, intervalMs = 500) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (isCaptcha()) throw new Error('CAPTCHA_DETECTED');
+      if (productDataReady()) return;
+      await new Promise(resolve => setTimeout(resolve, intervalMs));
+    }
+    if (isCaptcha()) throw new Error('CAPTCHA_DETECTED');
+    throw new Error('Product detail DOM did not become ready');
+  }
   async function submit(auto = false) {
     if (isCaptcha()) {
       if (marker) chrome.runtime.sendMessage({type:'shopsource-batch-captcha',runId:marker,asin:location.pathname.match(/\/([A-Z0-9]{10})/i)?.[1] || ''});
@@ -78,8 +102,15 @@
   chrome.runtime.onMessage.addListener((message,_sender,sendResponse)=>{if(message?.type==='shopsource-page-info')sendResponse({kind:'product'});if(message?.type==='shopsource-capture-now'){submit(false).then(result=>sendResponse({ok:true,result})).catch(error=>sendResponse({ok:false,error:error.message}));return true;}});
   if (marker && !autoStarted) {
     autoStarted = true;
-    setTimeout(() => submit(true).catch(error => {
-      if (error.message !== 'CAPTCHA_DETECTED') chrome.runtime.sendMessage({type:'shopsource-batch-failed',runId:marker,asin:location.pathname.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i)?.[1] || '',reason:error.message});
-    }), 900);
+    setTimeout(async () => {
+      try {
+        await waitForProductReadiness(15000, 500);
+        await submit(true);
+      } catch (error) {
+        const asin = location.pathname.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i)?.[1] || '';
+        if (error.message === 'CAPTCHA_DETECTED') chrome.runtime.sendMessage({type:'shopsource-batch-captcha',runId:marker,asin});
+        else chrome.runtime.sendMessage({type:'shopsource-batch-failed',runId:marker,asin,reason:error.message});
+      }
+    }, 0);
   }
 })();
