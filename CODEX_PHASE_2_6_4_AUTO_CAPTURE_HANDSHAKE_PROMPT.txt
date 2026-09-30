@@ -1,0 +1,592 @@
+ShopSource Studio — Phase 2.6.4
+Background-Driven Auto Capture Handshake + Opened Item Recovery
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+
+==================================================
+0. 실제 사용자 테스트에서 확인된 현상
+==================================================
+
+최신 실제 상태:
+
+- Candidates 5
+- MASTER 1/5
+- Store classify 1/5
+- 남은 Batch item 4
+- 첫 "실패만 재시도"에서 Amazon 상품 상세 탭은 실제로 자동으로 열림
+- 그러나 DETAIL_COMPLETE / MASTER_IMPORTED가 이어지지 않음
+- 최근 이벤트:
+  RETRY
+  DETAIL_OPENED
+  그 이후 DETAIL_COMPLETE 없음
+- 사용자가 다시 "실패만 재시도"를 누르면 새 탭이 열리지 않음
+
+이 두 번째 현상은 현재 코드상 DETAIL_OPENED 단일 항목 보호 때문에 자연스럽다.
+즉 queue/open은 성공했고,
+실패 구간은 정확히:
+
+DETAIL_OPENED
+→ Amazon 탭 실제 로드
+→ extension auto capture
+→ /api/capture/product-detail
+→ DETAIL_COMPLETE
+
+사이다.
+
+이번 Phase는 이 구간만 확실히 고친다.
+
+==================================================
+1. 작업 시작 전
+==================================================
+
+반드시:
+
+git status
+git diff -- stores/001_cabin_tidy.json
+git log --oneline -10
+
+최신 구현 commit 확인:
+ce4c2a66cff07cbb46dd4cf10a089146c8b26f90
+Fix pending batch kickoff
+
+사용자 dirty file:
+stores/001_cabin_tidy.json
+
+절대:
+git reset --hard
+git restore stores/001_cabin_tidy.json
+git checkout -- stores/001_cabin_tidy.json
+git clean -fd
+
+하지 마라.
+
+이 파일은 stage/commit하지 마라.
+
+==================================================
+2. 현재 코드의 구조적 취약점
+==================================================
+
+현재 자동 상세 캡처는 URL fragment marker에 의존한다.
+
+background.js:
+
+target.hash = shopsource_capture=<runId>
+chrome.tabs.create(...)
+
+content_product.js:
+
+const marker = new URLSearchParams(location.hash.slice(1)).get('shopsource_capture')
+
+if (marker) {
+  waitForProductReadiness(...)
+  submit(true)
+}
+
+문제:
+Amazon redirect/navigation/history 과정에서 fragment가 사라지거나,
+content script가 최종 product document에서 marker를 받지 못하면
+탭은 열렸지만 auto capture가 시작되지 않는다.
+
+현재 실제 사용자 현상이 정확히:
+탭은 열림
+DETAIL_OPENED 기록됨
+DETAIL_COMPLETE 없음
+
+이므로 URL fragment를 유일한 auto-capture trigger로 사용하면 안 된다.
+
+==================================================
+3. 해결 원칙
+==================================================
+
+Background Service Worker가 이미 알고 있는:
+
+- runId
+- expected ASIN
+- opened tabId
+
+를 source of truth로 사용한다.
+
+즉:
+
+ShopSource reserve next item
+→ background chrome.tabs.create
+→ background가 tabId + runId + asin 추적
+→ 최종 Amazon product tab load complete
+→ background가 content script에 명시적 메시지 전송
+→ content script가 runId + expectedAsin으로 자동 상세 캡처
+→ bridge 저장
+→ DETAIL_COMPLETE
+→ MASTER
+→ background가 다음 item open
+
+URL fragment는 fallback/debug용으로만 남겨도 되지만
+자동 처리 성공 여부가 fragment에 의존하면 안 된다.
+
+==================================================
+4. Background → Content Script 명시적 handshake
+==================================================
+
+새 message type:
+
+shopsource-batch-auto-capture
+
+payload:
+
+{
+  type: "shopsource-batch-auto-capture",
+  runId: "...",
+  expectedAsin: "B0..."
+}
+
+background.js는 pending tab의 load complete를 감지한 뒤
+chrome.tabs.sendMessage(tabId, message)를 호출한다.
+
+content_product.js는 이 message를 받으면:
+
+1. Amazon product page인지 확인
+2. CAPTCHA 확인
+3. waitForProductReadiness()
+4. captureDetail()
+5. 실제 ASIN과 expectedAsin 비교
+6. batch_run_id = runId로 submit
+7. success response 반환
+
+==================================================
+5. sendMessage race 방어
+==================================================
+
+tabs.onUpdated status=complete 시점에도
+content script listener 준비가 아주 약간 늦을 수 있다.
+
+background helper 권장:
+
+async function triggerAutoCapture(tabId, runId, asin)
+
+- 최대 10회
+- 500ms 간격
+- chrome.tabs.sendMessage
+- "Receiving end does not exist"면 bounded retry
+- success 응답을 받으면 종료
+- CAPTCHA면 pause
+- 그 외 명시적 capture error면 DETAIL_CAPTURE_FAILED
+- 무한 retry 금지
+
+총 handshake retry window는 약 5초 내외.
+
+기존 45초 overall timeout은 마지막 safety net으로 유지.
+
+==================================================
+6. content_product.js submit 구조 개선
+==================================================
+
+현재 submit(auto=false)는 module-level marker를 사용한다.
+
+다음처럼 explicit context를 받을 수 있게 변경:
+
+async function submit({
+  auto = false,
+  batchRunId = null,
+  expectedAsin = null
+} = {})
+
+또는 동등 구조.
+
+detail payload:
+
+{
+  product,
+  batch_run_id: batchRunId || marker || undefined
+}
+
+expectedAsin이 있으면:
+captureDetail().asin과 정확히 일치해야 한다.
+
+불일치:
+throw Error("Opened product ASIN did not match queued ASIN")
+
+server-side ASIN mismatch defense도 그대로 유지.
+
+==================================================
+7. 기존 fragment 자동실행과 중복 방지
+==================================================
+
+background handshake를 primary로 만들되,
+기존 fragment fallback을 완전히 제거할 필요는 없다.
+
+하지만 같은 페이지에서:
+
+- fragment auto start
+- background message auto start
+
+가 동시에 실행되면 안 된다.
+
+content_product.js에 page-level one-shot guard:
+
+let autoCapturePromise = null
+
+function runAutoCapture(context) {
+  if (autoCapturePromise) return autoCapturePromise
+  autoCapturePromise = ...
+  return autoCapturePromise
+}
+
+fragment path와 message path 둘 다 이 함수 사용.
+
+따라서 동일 상품 상세 capture는 1회만 실행.
+
+==================================================
+8. Pending tab 상태를 service worker restart에도 견디게
+==================================================
+
+현재 pendingTabs = new Map()은
+Manifest V3 service worker가 suspend/restart되면 사라질 수 있다.
+
+이것은 수백개 batch에서 불안정하다.
+
+chrome.storage.session을 사용해 pending tab metadata를 보조 저장.
+
+저장:
+
+runId
+tabId
+asin
+createdAt
+
+절대 저장하지 말 것:
+cookie
+Amazon session
+auth
+page content
+user account data
+
+helper 예:
+
+savePending(runId, record)
+getPendingByTab(tabId)
+clearPending(runId)
+
+in-memory Map + chrome.storage.session 병행 가능.
+
+extension restart 후에도 현재 browser session 동안 pending state 복구 가능.
+
+==================================================
+9. tabs.onUpdated 동작
+==================================================
+
+현재 onUpdated는 CAPTCHA만 검사한다.
+
+수정:
+
+pending tab이고:
+
+A. CAPTCHA/robot page
+→ clear pending
+→ heartbeat CAPTCHA_DETECTED
+
+B. status == complete
+→ final URL이 amazon.com인지 확인
+→ triggerAutoCapture(tabId, runId, asin)
+
+C. Amazon product path가 아닌 redirect/intermediate page
+→ 바로 실패 처리하지 말고 다음 onUpdated를 기다림
+→ 45초 timeout safety net 유지
+
+==================================================
+10. 성공 handshake
+==================================================
+
+content script auto capture 성공 시
+기존 shopsource-capture message path를 재사용 가능.
+
+성공 결과에 batch.run_id가 있으면:
+
+background:
+- clearPending(runId)
+- 4초 뒤 openNext(runId)
+
+기존 흐름 유지.
+
+단 clearPending이 storage.session도 함께 삭제해야 한다.
+
+==================================================
+11. 상세 탭이 열렸는데 marker가 없는 실제 케이스 지원
+==================================================
+
+fixture:
+
+pendingTabs:
+runId = BB_TEST
+tabId = 123
+asin = B0H8SFR4GT
+
+tab URL:
+https://www.amazon.com/dp/B0H8SFR4GT
+
+fragment 없음.
+
+status complete.
+
+기대:
+background가 content script에
+shopsource-batch-auto-capture
+message 전송.
+
+content script가:
+batchRunId = BB_TEST
+expectedAsin = B0H8SFR4GT
+로 상세 캡처.
+
+즉 marker 없이도 성공해야 한다.
+
+==================================================
+12. 기존 DETAIL_OPENED stuck item 복구
+==================================================
+
+현재 실제 DB에는 첫 retry 후 DETAIL_OPENED item이 남을 수 있다.
+
+사용자가 Hotfix 적용 후 45초 기다리도록 강요하지 마라.
+
+새 explicit user action:
+
+[현재 열린 상세 다시 시도]
+
+또는 기존 [다음 처리]에 recovery 동작 통합.
+
+권장 service method:
+
+recover_open_item(run_id)
+
+조건:
+- Batch RUNNING
+- DETAIL_OPENED exactly 1
+
+사용자가 명시적으로 클릭했을 때만:
+- 해당 item → DETAIL_PENDING
+- last_error = "Operator requested open-item recovery"
+- checkpoint next_open_after reset
+- event OPEN_ITEM_RECOVERED
+- kickoff()으로 동일 상품 canonical URL 다시 open
+
+자동 polling에서 reset 금지.
+중복 탭 위험 때문에 user gesture에서만 사용.
+
+==================================================
+13. UI 버튼 단순화
+==================================================
+
+일반 운영자에게 필요한 버튼:
+
+[미완료 상품 자동 처리]
+[현재 상품 다시 시도]   ← DETAIL_OPENED가 있을 때만 활성
+[일시정지]
+[실패만 재시도]
+
+고급 버튼은 유지 가능.
+
+현재 DETAIL_OPENED인데 응답이 없으면 UI에:
+
+"Amazon 상세 탭은 열렸지만 ShopSource 상세 응답을 기다리는 중입니다."
+
+그리고 15초 이상이면:
+
+"상세 캡처 응답이 없습니다. '현재 상품 다시 시도'를 누를 수 있습니다."
+
+표시.
+
+==================================================
+14. Extension 진단 이벤트
+==================================================
+
+앞으로 추측하지 않도록
+Batch event에 handshake 단계가 보이게 한다.
+
+권장 event:
+
+TAB_CREATED
+AUTO_CAPTURE_TRIGGERED
+AUTO_CAPTURE_ACK
+AUTO_CAPTURE_ERROR
+
+단 민감정보 없음.
+
+필드:
+asin
+tab_id(optional)
+reason
+
+필요하면 heartbeat에
+EXTENSION_EVENT를 추가하고 허용 event whitelist 사용.
+
+DB event log에서 사용자가 볼 수 있게 한다.
+
+최소한 다음을 구분 가능해야 한다:
+
+DETAIL_OPENED
+TAB_CREATED
+AUTO_CAPTURE_TRIGGERED
+AUTO_CAPTURE_ACK
+DETAIL_COMPLETE
+MASTER_IMPORTED
+
+==================================================
+15. 브리지/서버 변경
+==================================================
+
+기존 /api/capture/product-detail 재사용.
+
+필요한 경우 heartbeat에:
+
+event = EXTENSION_EVENT
+
+를 추가.
+
+서버는 허용된 event name만 기록.
+
+임의 문자열 event_type 삽입 금지.
+
+==================================================
+16. Extension version
+==================================================
+
+이번에는 extension JS가 실제 변경되므로:
+
+0.1.2 → 0.1.3
+
+README와 UI 안내도:
+
+"Phase 2.6.4 적용 후 chrome://extensions에서
+ShopSource Capture 새로고침이 필요합니다."
+
+로 갱신.
+
+==================================================
+17. 실제 사용자 상태 recovery 목표
+==================================================
+
+현재:
+
+Candidates 5
+MASTER 1
+Store classify 1
+DETAIL_OPENED 1 가능
+나머지 pending/failed
+
+Hotfix 설치 후:
+
+1. ShopSource 재시작
+2. chrome://extensions에서 v0.1.3 Reload
+3. 소싱 화면
+4. "현재 상품 다시 시도" 또는 "미완료 상품 자동 처리" 클릭
+5. Amazon 상세 탭 open
+6. marker 유무와 관계없이 background handshake
+7. ShopSource 상세 저장
+8. MASTER 2/5
+9. 4초 후 다음 상품
+10. 최종 MASTER 5/5, classify 5/5
+
+==================================================
+18. 테스트
+==================================================
+
+필수 JS/Python contract tests:
+
+test_background_has_auto_capture_handshake
+test_auto_capture_does_not_require_fragment
+test_content_message_uses_explicit_run_id
+test_content_expected_asin_guard
+test_fragment_and_message_are_one_shot
+test_pending_tab_session_storage_contract
+test_tab_complete_triggers_auto_capture
+test_intermediate_redirect_does_not_fail_immediately
+test_handshake_receiver_retry_is_bounded
+test_handshake_success_clears_pending
+test_handshake_failure_records_reason
+test_operator_open_item_recovery
+test_recovery_requires_explicit_action
+test_recovery_does_not_create_duplicate_batch
+test_five_product_flow_after_handshake
+
+기존 전체 tests PASS.
+
+실제 Amazon network는 unit test에서 호출 금지.
+
+==================================================
+19. JS syntax / Quality Gate
+==================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+node --check browser_extension/shopsource_capture/background.js
+node --check browser_extension/shopsource_capture/content_search.js
+node --check browser_extension/shopsource_capture/content_product.js
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+==================================================
+20. 사용자 dirty file 보호
+==================================================
+
+stores/001_cabin_tidy.json
+
+사용자 기존 수정이다.
+
+절대 stage/commit/reset/restore 금지.
+
+커밋 전:
+git status --short
+git diff --cached --name-only
+
+확인.
+
+==================================================
+21. Commit / Push
+==================================================
+
+Phase 2.6.4 변경 파일만 stage.
+
+commit:
+
+git commit -m "Fix browser auto capture handshake"
+
+push:
+
+git push origin main
+
+마지막:
+
+git status --short
+git log --oneline -7
+git rev-list --left-right --count main...origin/main
+
+main...origin/main = 0 0
+
+working tree에 사용자 Store Profile 수정만 남으면
+clean이라고 거짓 보고하지 마라.
+
+==================================================
+22. 완료 보고
+==================================================
+
+[1] 실제 failure boundary
+[2] fragment 의존 문제
+[3] background-driven handshake
+[4] sendMessage retry
+[5] content explicit runId
+[6] one-shot guard
+[7] service worker restart 대응
+[8] DETAIL_OPENED recovery
+[9] diagnostic events
+[10] extension version
+[11] tests
+[12] 사용자 dirty file
+[13] 실제 5상품 재테스트 순서
+[14] commit SHA
+
+지금 구현을 시작하라.
