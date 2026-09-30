@@ -323,4 +323,3 @@ class BatchSourcingService:
                 primary_count=?,reserve_count=?,review_count=?,restricted_count=?,failed_count=?,status=?,finished_at=?,error=? WHERE run_id=?""",
                 (pending, complete, imported, primary, reserve, review, restricted, failed, status, finished, error, run_id))
             if status == "DONE" and run["status"] != "DONE": self._event(con, run_id, "DONE")
-        
