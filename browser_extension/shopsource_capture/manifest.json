@@ -3,7 +3,7 @@
   "name": "ShopSource Capture",
   "version": "0.1.0",
   "description": "Capture user-visible Amazon product information to local ShopSource Studio.",
-  "permissions": ["storage", "activeTab"],
+  "permissions": ["storage", "activeTab", "tabs"],
   "host_permissions": ["https://www.amazon.com/*", "http://127.0.0.1/*"],
   "background": {"service_worker": "background.js"},
   "action": {"default_popup": "popup.html"},

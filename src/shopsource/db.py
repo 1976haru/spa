@@ -223,6 +223,57 @@ CREATE TABLE IF NOT EXISTS browser_capture_errors (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS browser_batch_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL UNIQUE,
+    store_id TEXT NOT NULL,
+    keyword TEXT NOT NULL,
+    target_candidates INTEGER NOT NULL,
+    target_mode TEXT NOT NULL DEFAULT 'CANDIDATES',
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    auto_import_master INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    paused_at TEXT,
+    finished_at TEXT,
+    total_seen INTEGER NOT NULL DEFAULT 0,
+    deduped INTEGER NOT NULL DEFAULT 0,
+    prefiltered INTEGER NOT NULL DEFAULT 0,
+    detail_pending INTEGER NOT NULL DEFAULT 0,
+    detail_complete INTEGER NOT NULL DEFAULT 0,
+    master_imported INTEGER NOT NULL DEFAULT 0,
+    primary_count INTEGER NOT NULL DEFAULT 0,
+    reserve_count INTEGER NOT NULL DEFAULT 0,
+    review_count INTEGER NOT NULL DEFAULT 0,
+    restricted_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    checkpoint_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS browser_batch_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_run_id TEXT NOT NULL REFERENCES browser_batch_runs(run_id) ON DELETE CASCADE,
+    asin TEXT NOT NULL,
+    capture_run_id TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 100,
+    state TEXT NOT NULL DEFAULT 'DISCOVERED',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    completeness_score INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(batch_run_id, asin)
+);
+
+CREATE TABLE IF NOT EXISTS browser_batch_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_run_id TEXT NOT NULL REFERENCES browser_batch_runs(run_id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_products_price ON products(price);
 CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);
 CREATE INDEX IF NOT EXISTS idx_decisions_store_status ON store_product_decisions(store_id, final_status);
@@ -240,6 +291,9 @@ CREATE INDEX IF NOT EXISTS idx_capture_runs_store_time ON browser_capture_runs(s
 CREATE INDEX IF NOT EXISTS idx_capture_candidates_run_status ON browser_capture_candidates(run_id, capture_status);
 CREATE INDEX IF NOT EXISTS idx_capture_candidates_asin ON browser_capture_candidates(asin);
 CREATE INDEX IF NOT EXISTS idx_capture_errors_created ON browser_capture_errors(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_batch_runs_store_status ON browser_batch_runs(store_id,status,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_batch_items_queue ON browser_batch_items(batch_run_id,state,priority,id);
+CREATE INDEX IF NOT EXISTS idx_batch_events_run ON browser_batch_events(batch_run_id,created_at);
 """
 
 EXPORT_RUN_ADDITIVE_COLUMNS = {
@@ -260,6 +314,11 @@ PRODUCT_ADDITIVE_COLUMNS = {
 OCCURRENCE_ADDITIVE_COLUMNS = {
     "raw_json": "TEXT",
     "source_kind": "TEXT NOT NULL DEFAULT 'SPARK_STORAGE'",
+}
+
+BATCH_RUN_ADDITIVE_COLUMNS = {
+    "reserve_count": "INTEGER NOT NULL DEFAULT 0",
+    "restricted_count": "INTEGER NOT NULL DEFAULT 0",
 }
 
 
@@ -305,6 +364,10 @@ def init_db(path: str | Path | None = None) -> Path:
         for name, declaration in OCCURRENCE_ADDITIVE_COLUMNS.items():
             if name not in occurrence_columns:
                 con.execute(f"ALTER TABLE product_occurrences ADD COLUMN {name} {declaration}")
+        batch_columns = {row["name"] for row in con.execute("PRAGMA table_info(browser_batch_runs)")}
+        for name, declaration in BATCH_RUN_ADDITIVE_COLUMNS.items():
+            if name not in batch_columns:
+                con.execute(f"ALTER TABLE browser_batch_runs ADD COLUMN {name} {declaration}")
         export_columns = {
             row["name"] for row in con.execute("PRAGMA table_info(export_runs)")
         }

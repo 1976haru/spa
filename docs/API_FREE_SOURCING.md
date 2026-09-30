@@ -1,5 +1,7 @@
 # API-free browser sourcing
 
+Phase 2.6 adds persistent batches for candidate dedupe, sequential detail enrichment, optional automatic MASTER import/classification, and pause/resume/cancel/retry. It captures all qualifying product cards currently rendered in the active search page DOM, not only cards inside the viewport; it never auto-paginates. Batch operation and safety limits are documented in [BATCH_SOURCING.md](BATCH_SOURCING.md).
+
 ShopSource Capture is a user-started Chrome/Edge Manifest V3 extension for recording Amazon.com product information visible in the active browser page. It has no Keepa dependency and sends captured page fields only to the local ShopSource UI at `127.0.0.1:8081`.
 
 ## Workflow

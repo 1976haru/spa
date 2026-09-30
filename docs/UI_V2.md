@@ -1,5 +1,7 @@
 # Operator UI V2
 
+The API-free Sourcing page includes a candidate-count batch panel with target, automatic MASTER import toggle, current run/progress, and pause/resume/cancel/retry controls. `NEEDS_DETAIL` candidates can be queued together. Batch controls call `BatchSourcingService`; UI callbacks do not issue batch SQL. Product detail tabs are opened by the paired extension one at a time.
+
 Sourcing now presents API-free Browser Capture before optional Keepa automation. Settings creates local pairing codes for the unpacked ShopSource Capture extension. The capture candidate list shows detail-completeness and status; operators can open candidate product pages, import detail-complete records, and use the regular Products/Packages pages. The extension is available for Edge and Chrome at `browser_extension/shopsource_capture`.
 
 Install the optional local UI dependency with `pip install -e ".[ui]"`, then run `run_ui_v2.bat` or

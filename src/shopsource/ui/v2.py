@@ -6,6 +6,7 @@ import logging
 
 from ..connectors.spark_center_package import list_packages, mark_package
 from ..capture.service import CaptureService
+from ..capture.batch import BatchSourcingService
 from ..classifier import classify_store
 from ..db import get_store, init_db, upsert_store
 from ..intelligence.keyword_engine import KeywordEngine
@@ -533,6 +534,7 @@ class OperatorUI:
 
     def _packages(self):
         ui = self.ui
+        ui.label("Browser Capture to Spark Center mapping is not portal-verified. Start with a 5-product round-trip; packages over 100 require confirmation.").classes("text-amber-800")
         self._heading("Spark Center packages", "사용자가 Spark Center에 올릴 ready/package 폴더만 관리합니다.")
         status = ui.select(STATUS_OPTIONS, value=self.package_selected_statuses or ["PRIMARY"],
                            multiple=True, label="Status").classes("w-64")
@@ -557,7 +559,7 @@ class OperatorUI:
                         if row["package_status"] == "CREATED":
                             ui.button("업로드 완료 표시", on_click=lambda pid=row["package_id"]: (mark_package(pid, "UPLOADED", "Marked in UI V2"), refresh_packages(), ui.notify("사용자 수동 업로드 기록 저장"))).props("dense")
                         ui.button("보관", on_click=lambda pid=row["package_id"]: (mark_package(pid, "ARCHIVED", "Archived in UI V2"), refresh_packages())).props("flat dense")
-        def make_package():
+        def generate_package():
             try:
                 selected_statuses = status.value or ["PRIMARY"]
                 if "ALL" in selected_statuses:
@@ -570,6 +572,16 @@ class OperatorUI:
                 refresh_packages()
             except Exception as exc:
                 ui.notify(_safe_error(exc), type="negative")
+        def make_package():
+            if int(limit.value) > 100:
+                with ui.dialog() as confirm_dialog, ui.card():
+                    ui.label("Browser Capture Spark Center portal round-trip is not verified. Continue with a package over 100 products?")
+                    with ui.row():
+                        ui.button("Cancel", on_click=confirm_dialog.close).props("flat")
+                        ui.button("Continue", on_click=lambda: (confirm_dialog.close(), generate_package())).props("color=warning")
+                confirm_dialog.open()
+                return
+            generate_package()
         with ui.row():
             ui.button("Spark Center 폴더 만들기", on_click=make_package, icon="create_new_folder")
             ui.button("목록 새로고침", on_click=refresh_packages, icon="refresh").props("outline")
@@ -609,6 +621,79 @@ class OperatorUI:
                 ui.run_javascript("window.open(" + json.dumps(url) + ", '_blank', 'noopener')")
             ui.button("Amazon 검색 열기", on_click=open_search, icon="open_in_new")
         rows = service.list_candidates(self.current_store, 200)
+        batch_service = BatchSourcingService()
+        if keywords:
+            target_count = ui.number("Batch target candidates", value=5, min=1, max=10000).classes("w-48")
+            auto_import = ui.checkbox("DETAIL_COMPLETE 후 MASTER 자동 반영", value=True)
+            batch_status_label = ui.label("Batch: IDLE").classes("font-medium")
+            batch_progress = ui.linear_progress(value=0, show_value=False).classes("w-full")
+            batch_details = ui.label("").classes("text-sm text-slate-600")
+            active_batch = {"run_id": None}
+            active_runs = batch_service.active(self.current_store)
+            if active_runs: active_batch["run_id"] = active_runs[0]["run_id"]
+
+            def render_batch(result):
+                batch_status_label.set_text(f"Batch {result['run_id']} · {result['status']}")
+                target = max(1, int(result["target_candidates"]))
+                completed = result["master_imported"] + result["detail_complete"]
+                batch_progress.value = min(1, completed / target)
+                batch_details.set_text(f"목표 {target} · 후보 {result['total_seen']} · 중복 {result['deduped']} · 선필터 제외 {result['prefiltered']} · 상세 대기 {result['detail_pending']} · 상세 완료 {result['detail_complete']} · MASTER {result['master_imported']} · PRIMARY {result['primary_count']} · RESERVE {result['reserve_count']} · REVIEW {result['review_count']} · RESTRICTED {result['restricted_count']} · 실패 {result['failed_count']}" + (f" · {result['error']}" if result.get("error") else ""))
+
+            def open_queued_item(run_id):
+                item = batch_service.next_item(run_id, 4)
+                if item:
+                    url = item["url"] + "#shopsource_capture=" + run_id
+                    ui.run_javascript("window.open(" + json.dumps(url) + ", '_blank', 'noopener')")
+
+            def poll_batch():
+                run_id = active_batch.get("run_id")
+                if run_id:
+                    try: render_batch(batch_service.get(run_id))
+                    except Exception: pass
+
+            def start_batch():
+                try:
+                    run = batch_service.create(self.current_store, selected_keyword.value or "", int(target_count.value), bool(auto_import.value))
+                    active_batch["run_id"] = run["run_id"]
+                    batch_service.action(run["run_id"], "RESUME")
+                    from urllib.parse import quote_plus
+                    url = "https://www.amazon.com/s?k=" + quote_plus(selected_keyword.value or "")
+                    ui.run_javascript("window.open(" + json.dumps(url) + ", '_blank', 'noopener')")
+                    ui.notify("Batch를 시작했습니다. 검색 페이지에서 현재 페이지 후보 가져오기를 누르세요.", type="positive")
+                    poll_batch()
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            def batch_action(action):
+                run_id = active_batch.get("run_id")
+                if not run_id: return
+                try:
+                    result = batch_service.action(run_id, action)
+                    render_batch(result)
+                    if action in {"RESUME", "RETRY"}: open_queued_item(run_id)
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            def queue_existing():
+                pending = [r for r in rows if r["capture_status"] == "NEEDS_DETAIL"]
+                if not pending:
+                    ui.notify("상세 보강이 필요한 후보가 없습니다.", type="warning"); return
+                try:
+                    run = batch_service.create(self.current_store, pending[0].get("keyword") or selected_keyword.value or "existing candidates", min(len(pending), int(target_count.value)), bool(auto_import.value))
+                    active_batch["run_id"] = run["run_id"]
+                    batch_service.action(run["run_id"], "RESUME")
+                    result = batch_service.queue_existing_candidates(run["run_id"], [r["asin"] for r in pending])
+                    render_batch(result)
+                    open_queued_item(run["run_id"])
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            with ui.row():
+                ui.button("소싱 Batch 시작", on_click=start_batch, icon="playlist_add").props("color=primary")
+                ui.button("NEEDS_DETAIL 전체 Queue", on_click=queue_existing, icon="queue_play_next").props("outline")
+                ui.button("일시정지", on_click=lambda: batch_action("PAUSE"), icon="pause").props("outline")
+                ui.button("계속", on_click=lambda: batch_action("RESUME"), icon="play_arrow").props("outline")
+                ui.button("취소", on_click=lambda: batch_action("CANCEL"), icon="stop").props("outline color=negative")
+                ui.button("실패만 재시도", on_click=lambda: batch_action("RETRY"), icon="replay").props("outline")
+            ui.label("상세 탭은 한 번에 하나씩, 최소 4초 간격으로 엽니다. 검색 페이지 이동은 사용자가 직접 합니다.").classes("text-xs text-amber-800")
+            ui.timer(2.0, poll_batch)
         ui.label(f"Candidates {len(rows)} · Needs Detail {sum(r['capture_status']=='NEEDS_DETAIL' for r in rows)} · Detail Complete {sum(r['capture_status']=='DETAIL_COMPLETE' for r in rows)} · MASTER Imported {sum(r['capture_status']=='MASTER_IMPORTED' for r in rows)}")
         checks = {}
         if rows:

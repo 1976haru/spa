@@ -1,5 +1,9 @@
 # ShopSource Studio v0.1
 
+## Batch sourcing (Phase 2.6)
+
+From UI V2 → Sourcing → API-free browser sourcing, choose a Store keyword and target count, then start a Batch. Review the Amazon search page and use the extension to capture its current DOM results. ShopSource queues unique candidates and opens detail pages sequentially (one tab at a time, with a minimum four-second interval); completed details can flow into MASTER and Store classification automatically. Search pagination remains manual. Resolve any Amazon confirmation screen yourself; the queue pauses without bypassing it. Start with five products and verify the Spark Center portal round-trip before scaling. See [docs/BATCH_SOURCING.md](docs/BATCH_SOURCING.md).
+
 ## API-free browser sourcing (Phase 2.5)
 
 1. Start `run_ui_v2.bat`, choose a Store, and open Sourcing.

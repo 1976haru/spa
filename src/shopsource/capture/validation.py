@@ -27,7 +27,7 @@ def sensitive_paths(value, prefix="") -> list[str]:
     return found
 
 
-def validate_product(payload: dict, *, detail: bool = False) -> dict:
+def validate_product(payload: dict, *, detail: bool = False, allow_missing_title: bool = False) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("상품 자료는 JSON object여야 합니다.")
     bad = sensitive_paths(payload)
@@ -37,7 +37,7 @@ def validate_product(payload: dict, *, detail: bool = False) -> dict:
     title = str(payload.get("title") or "").strip()
     if not ASIN_RE.fullmatch(asin):
         raise ValueError("ASIN을 확인할 수 없습니다.")
-    if not title:
+    if not title and not allow_missing_title:
         raise ValueError("상품명이 없습니다.")
     if detail and not payload.get("url"):
         raise ValueError("상품 상세 URL이 없습니다.")
@@ -54,6 +54,8 @@ def validate_product(payload: dict, *, detail: bool = False) -> dict:
         raise ValueError("Amazon 상품 이미지 주소가 올바르지 않습니다.")
     result = dict(payload)
     result["asin"] = asin
+    if allow_missing_title:
+        result["title"] = title
     return result
 
 

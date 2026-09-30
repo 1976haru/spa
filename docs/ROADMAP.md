@@ -137,6 +137,10 @@
 - [ ] 실제 Spark Center 5상품 round-trip 성공 전 대규모 package 자동 생성 금지
 - [ ] 완전 무인 페이지네이션/CAPTCHA 우회/stealth/proxy 기능은 구현하지 않음
 
+## v0.2.6 implementation update
+
+Batch candidate queue, sequential detail capture, checkpointed lifecycle, automatic MASTER import/classify option, and UI controls are implemented. Manual Amazon search-page pagination and five-product Spark Center portal verification remain operator tasks. Primary-count targeting, multi-keyword batch statistics, selectable 20/50/100 chunks, and concurrency above one remain future work.
+
 ## v0.3 STORE ENGINE
 - [ ] UI에서 가격구간 직접 편집
 - [ ] Store 추가/복제/비활성

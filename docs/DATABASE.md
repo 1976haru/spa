@@ -2,6 +2,8 @@
 
 ## Browser capture additions
 
+Phase 2.6 adds `browser_batch_runs` (run target/status/checkpoint and aggregate progress), `browser_batch_items` (unique ASIN per run, queue/retry states), and `browser_batch_events` (small state-transition summaries). These are created additively by the existing schema initializer. Event payloads contain only bounded operational identifiers/counts, never browser credentials or submitted raw payloads. Detail and capture evidence remain in the pre-existing browser capture candidate tables; product history remains in MASTER/occurrences.
+
 Additive tables `browser_capture_runs` and `browser_capture_candidates` preserve Store, query/run, search JSON, detail JSON, completeness, status, and duplicate evidence. Candidate identity is unique by `(run_id, asin)`; products remain unique by ASIN and occurrences retain each imported detail payload. Pairing credentials are stored as a SHA-256 digest in `app_settings`, never plaintext. `BROWSER_CAPTURE` imports use existing `import_runs`, products, and occurrences.
 
 ## products

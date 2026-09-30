@@ -1,8 +1,12 @@
 # Architecture
 
+## Batch sourcing
+
+`capture.batch.BatchSourcingService` owns persistent queue state and candidate selection. It delegates raw search/detail capture to `CaptureService`, MASTER ingestion to the existing importer, and Store decisions to the existing classifier. The browser extension's localhost bridge is pairing-protected; it can request only a single next item after an operator-started batch and the extension opens one Amazon detail tab at a time. No search-page traversal is performed.
+
 ## API-free browser capture
 
-`browser_extension/shopsource_capture` reads only visible Amazon DOM/JSON-LD fields and sends them to the loopback capture routes mounted by UI V2. `capture/bridge.py` authenticates a local pairing code; `capture/service.py` validates and stores candidate evidence, then sends detail-complete canonical payloads through the existing importer transaction and Store classifier. Spark export reuses the existing handoff writer and applies the BROWSER_CAPTURE canonical mapper. No Amazon session state or external API is used.
+`browser_extension/shopsource_capture` reads only rendered Amazon DOM/JSON-LD fields present in the current page and sends them to the loopback capture routes mounted by UI V2. `capture/bridge.py` authenticates a local pairing code; `capture/service.py` validates and stores candidate evidence, then sends detail-complete canonical payloads through the existing importer transaction and Store classifier. Spark export reuses the existing handoff writer and applies the BROWSER_CAPTURE canonical mapper. No Amazon session state or external API is used.
 
 ```text
 Spark storage.zip / storage/

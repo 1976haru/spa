@@ -57,7 +57,7 @@ class CaptureService:
             con.execute("INSERT INTO browser_capture_runs(run_id,store_id,keyword,search_url,status,captured_at,candidates) VALUES(?,?,?,?,?,?,0)",
                         (run_id, store_id, keyword, search_url, "SEARCH_CAPTURED", now))
             for index, item in enumerate(products):
-                product = validate_product(item)
+                product = validate_product(item, allow_missing_title=True)
                 product.setdefault("_sourceUrl", search_url)
                 product.setdefault("_listPage", body.get("page_number"))
                 product.setdefault("_collectedAt", body.get("captured_at") or now)
@@ -81,8 +81,13 @@ class CaptureService:
         get_store(store_id, self.db)
         payload = validate_product(body.get("product"), detail=True)
         payload.setdefault("_collectedAt", utc_now())
+        batch_run_id = str(body.get("batch_run_id") or "").strip()
         with connect(self.db) as con:
-            row = con.execute("SELECT c.id,c.search_payload_json,c.run_id FROM browser_capture_candidates c JOIN browser_capture_runs r ON r.run_id=c.run_id WHERE r.store_id=? AND c.asin=? ORDER BY c.updated_at DESC LIMIT 1", (store_id, payload["asin"])).fetchone()
+            preferred = con.execute("SELECT capture_run_id FROM browser_batch_items WHERE batch_run_id=? AND asin=?", (batch_run_id, payload["asin"])).fetchone() if batch_run_id else None
+            if preferred:
+                row = con.execute("SELECT c.id,c.search_payload_json,c.run_id FROM browser_capture_candidates c WHERE c.run_id=? AND c.asin=?", (preferred["capture_run_id"], payload["asin"])).fetchone()
+            else:
+                row = con.execute("SELECT c.id,c.search_payload_json,c.run_id FROM browser_capture_candidates c JOIN browser_capture_runs r ON r.run_id=c.run_id WHERE r.store_id=? AND c.asin=? ORDER BY c.updated_at DESC LIMIT 1", (store_id, payload["asin"])).fetchone()
             if not row:
                 # A user may open a detail page directly; preserve it as a small capture run.
                 run_id = "BC_" + secrets.token_hex(10)
@@ -97,7 +102,11 @@ class CaptureService:
             con.execute("UPDATE browser_capture_candidates SET detail_payload_json=?,completeness_score=?,capture_status='DETAIL_COMPLETE',updated_at=? WHERE id=?",
                         (json.dumps(payload, ensure_ascii=False, separators=(",", ":")), score, utc_now(), candidate_id))
             con.execute("UPDATE browser_capture_runs SET detailed=(SELECT COUNT(*) FROM browser_capture_candidates WHERE run_id=? AND capture_status='DETAIL_COMPLETE'),status='DETAIL_CAPTURED' WHERE run_id=?", (run_id, run_id))
-        return {"run_id": run_id, "asin": payload["asin"], "completeness_score": score, "status": "DETAIL_COMPLETE"}
+        result = {"run_id": run_id, "asin": payload["asin"], "completeness_score": score, "status": "DETAIL_COMPLETE"}
+        if batch_run_id:
+            from .batch import BatchSourcingService
+            result["batch"] = BatchSourcingService(self.db).record_detail(batch_run_id, payload["asin"], "DETAIL_COMPLETE")
+        return result
 
     def list_candidates(self, store_id: str, limit: int = 100) -> list[dict]:
         with connect(self.db) as con:
@@ -115,7 +124,14 @@ class CaptureService:
             raise ValueError("MASTER로 보낼 상품을 1~100개 선택하세요.")
         placeholders = ",".join("?" for _ in asins)
         with connect(self.db) as con:
-            rows = con.execute(f"SELECT c.id,c.run_id,c.asin,c.detail_payload_json FROM browser_capture_candidates c JOIN browser_capture_runs r ON r.run_id=c.run_id WHERE r.store_id=? AND c.asin IN ({placeholders}) AND c.capture_status='DETAIL_COMPLETE' ORDER BY c.asin,c.updated_at ASC,c.id ASC", (store_id, *[a.upper() for a in asins])).fetchall()
+            rows = con.execute(f"""SELECT c.id,c.run_id,c.asin,c.detail_payload_json
+                FROM browser_capture_candidates c JOIN browser_capture_runs r ON r.run_id=c.run_id
+                WHERE r.store_id=? AND c.asin IN ({placeholders}) AND c.capture_status='DETAIL_COMPLETE'
+                  AND c.id=(SELECT c2.id FROM browser_capture_candidates c2
+                    JOIN browser_capture_runs r2 ON r2.run_id=c2.run_id
+                    WHERE r2.store_id=r.store_id AND c2.asin=c.asin AND c2.capture_status='DETAIL_COMPLETE'
+                    ORDER BY c2.updated_at DESC,c2.id DESC LIMIT 1)
+                ORDER BY c.asin""", (store_id, *[a.upper() for a in asins])).fetchall()
         if not rows:
             raise ValueError("상세정보가 완료된 선택 상품이 없습니다.")
         # Feed validated canonical records through the existing transactional importer.
