@@ -51,6 +51,33 @@ def selected_product_asins(rows: list[dict]) -> list[str]:
     return [str(row["asin"]) for row in rows if row.get("asin")]
 
 
+def product_grid_options() -> dict:
+    """Build the initial client options with empty data; rows are pushed by update()."""
+    return {
+        "columnDefs": [
+            {"field": "thumbnail", "headerName": "Thumbnail", "width": 100,
+             ":cellRenderer": "params => { try { if (!params.value || !params.value.startsWith('https://')) return ''; const img=document.createElement('img'); img.src=params.value; img.loading='lazy'; img.style.width='48px'; img.style.height='48px'; img.style.objectFit='contain'; img.onerror=() => { img.replaceWith(document.createTextNode('')); }; return img; } catch (_) { return ''; } }"},
+            {"field": "asin", "headerName": "ASIN", "checkboxSelection": True, "headerCheckboxSelection": True},
+            {"field": "title", "headerName": "Title", "flex": 2},
+            {"field": "brand", "headerName": "Brand"}, {"field": "price", "headerName": "Price"},
+            {"field": "source_kind", "headerName": "Source"}, {"field": "fit_score", "headerName": "Fit"},
+            {"field": "price_status", "headerName": "Price Status"}, {"field": "risk_status", "headerName": "Risk"},
+            {"field": "final_status", "headerName": "Final"}, {"field": "first_seen", "headerName": "First Seen"},
+            {"field": "last_seen", "headerName": "Last Seen"},
+        ],
+        "rowData": [],
+        "rowSelection": "multiple",
+        "pagination": False,
+        "defaultColDef": {"sortable": True, "filter": True, "resizable": True},
+        ":getRowId": "params => params.data.asin",
+    }
+
+
+def update_product_grid(grid, rows: list[dict]) -> None:
+    grid.options["rowData"] = rows
+    grid.update()
+
+
 class OperatorUI:
     """Local operator console. Business operations live in service modules."""
 
@@ -442,6 +469,14 @@ class OperatorUI:
         products_status = ui.label("상품 목록을 불러오는 중입니다.").classes("text-sm text-slate-600")
         grid_container = ui.column().classes("w-full")
         grid_ref = {"grid": None}
+        with grid_container:
+            grid_ref["grid"] = ui.aggrid(product_grid_options(), modules="community").classes("w-full h-[620px]")
+            def on_product_row_clicked(event):
+                row = product_row_from_event_args(event.args)
+                product_id = row.get("id")
+                if product_id is not None:
+                    self._show_product_detail(int(product_id))
+            grid_ref["grid"].on("rowClicked", on_product_row_clicked, ["data"])
         footer = ui.label("")
         def load_page():
             try:
@@ -452,33 +487,12 @@ class OperatorUI:
                 state["rows"] = data["rows"]
                 rows = [{**row, "thumbnail": (row["images"] or [""])[0],
                          "first_seen": row["first_seen_at"], "last_seen": row["last_seen_at"]} for row in data["rows"]]
-                grid_container.clear()
-                with grid_container:
-                    grid_ref["grid"] = ui.aggrid({
-                        "columnDefs": [
-                            {"field": "thumbnail", "headerName": "Thumbnail", "width": 100,
-                             "cellRenderer": "params => { if (!params.value || !params.value.startsWith('https://')) return ''; const img=document.createElement('img'); img.src=params.value; img.loading='lazy'; img.style.width='48px'; img.style.height='48px'; img.style.objectFit='contain'; return img; }"},
-                            {"field": "asin", "headerName": "ASIN", "checkboxSelection": True, "headerCheckboxSelection": True},
-                            {"field": "title", "headerName": "Title", "flex": 2},
-                            {"field": "brand", "headerName": "Brand"}, {"field": "price", "headerName": "Price"},
-                            {"field": "source_kind", "headerName": "Source"}, {"field": "fit_score", "headerName": "Fit"},
-                            {"field": "price_status", "headerName": "Price Status"}, {"field": "risk_status", "headerName": "Risk"},
-                            {"field": "final_status", "headerName": "Final"}, {"field": "first_seen", "headerName": "First Seen"},
-                            {"field": "last_seen", "headerName": "Last Seen"},
-                        ], "rowData": rows, "rowSelection": "multiple",
-                        "pagination": False, "defaultColDef": {"sortable": True, "filter": True, "resizable": True},
-                        "getRowId": "params => params.data.asin",
-                    }, modules="community").classes("w-full h-[620px]")
-                    def on_product_row_clicked(event):
-                        row = product_row_from_event_args(event.args)
-                        product_id = row.get("id")
-                        if product_id is not None:
-                            self._show_product_detail(int(product_id))
-                    grid_ref["grid"].on("rowClicked", on_product_row_clicked, ["data"])
+                # Keep one mounted grid and explicitly send its initial and later data.
+                update_product_grid(grid_ref["grid"], rows)
                 pages = max(1, (data["total"] + data["page_size"] - 1) // data["page_size"])
                 footer.set_text(f"총 {data['total']:,}개 · 페이지 {data['page'] + 1}/{pages} · 한 페이지 {data['page_size']}개")
                 if data["total"]:
-                    products_status.set_text(f"상품 {data['total']}개 불러옴 · Source {source_filter.value or 'ALL'} · Status {status_filter.value or 'ALL'}")
+                    products_status.set_text(f"상품 {data['total']}개 불러옴 · Grid 전달 {len(rows)}개 · Source {source_filter.value or 'ALL'} · Status {status_filter.value or 'ALL'}")
                 else:
                     products_status.set_text("현재 필터에 해당하는 상품이 없습니다.")
             except Exception as exc:

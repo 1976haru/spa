@@ -5,8 +5,10 @@ import pytest
 from shopsource.db import connect, init_db, upsert_store
 from shopsource.ui.v2 import (
     PRODUCT_SOURCE_OPTIONS,
+    product_grid_options,
     product_row_from_event_args,
     selected_product_asins,
+    update_product_grid,
 )
 from shopsource.ui.v2_service import product_page
 
@@ -101,3 +103,68 @@ def test_five_browser_capture_products_select_for_package(browser_capture_db):
     assert len(selected) == 5
     assert selected == [row["asin"] for row in rows]
     assert "상품 페이지에서 선택한 {len(self.package_selected_asins)}개 ASIN 사용 예정" in UI_SOURCE
+
+
+def test_products_grid_uses_colon_get_row_id():
+    options = product_grid_options()
+    assert options[":getRowId"] == "params => params.data.asin"
+    assert "getRowId" not in options
+
+
+def test_products_grid_js_renderer_uses_colon_expression():
+    options = product_grid_options()
+    thumbnail = next(column for column in options["columnDefs"] if column["field"] == "thumbnail")
+    assert ":cellRenderer" in thumbnail
+    assert "cellRenderer" not in thumbnail
+    assert thumbnail[":cellRenderer"].startswith("params =>")
+
+
+def test_products_grid_initial_row_data_update():
+    class Grid:
+        def __init__(self):
+            self.options = product_grid_options()
+            self.updates = 0
+
+        def update(self):
+            self.updates += 1
+
+    grid = Grid()
+    rows = [{"id": index, "asin": f"BCAP{index}"} for index in range(5)]
+    assert grid.options["rowData"] == []
+    update_product_grid(grid, rows)
+    assert grid.options["rowData"] == rows
+    assert grid.updates == 1
+
+
+def test_products_grid_does_not_recreate_on_every_load():
+    products_method = UI_SOURCE.split("    def _products(self):", 1)[1].split("    def _show_product_detail", 1)[0]
+    assert products_method.count("ui.aggrid(") == 1
+    assert "grid_container.clear()" not in products_method
+    assert "update_product_grid(grid_ref[\"grid\"], rows)" in products_method
+
+
+def test_products_grid_five_rows_contract(browser_capture_db):
+    result = product_page(store_id="001", page=0, page_size=100, status="ALL", source="ALL", db=browser_capture_db)
+    options = product_grid_options()
+    update_rows = [
+        {**row, "thumbnail": (row["images"] or [""])[0]}
+        for row in result["rows"]
+    ]
+    assert result["total"] == 5
+    assert len(update_rows) == 5
+    assert options["rowSelection"] == "multiple"
+    assert all(row.get("id") and row.get("asin") for row in update_rows)
+
+
+def test_products_grid_selection_five_products(browser_capture_db):
+    rows = product_page(store_id="001", page=0, page_size=100, status="ALL", source="ALL", db=browser_capture_db)["rows"]
+    selected = selected_product_asins(rows)
+    assert len(selected) == 5
+
+
+def test_existing_five_browser_capture_products_visible(browser_capture_db):
+    rows = product_page(store_id="001", page=0, page_size=100, status="ALL", source="ALL", db=browser_capture_db)["rows"]
+    visible = [{key: row.get(key) for key in ("asin", "title", "price", "source_kind", "final_status")} for row in rows]
+    assert len(visible) == 5
+    assert all(row["asin"] and row["title"] and row["price"] is not None for row in visible)
+    assert all(row["source_kind"] == "BROWSER_CAPTURE" and row["final_status"] == "RESERVE_B" for row in visible)
