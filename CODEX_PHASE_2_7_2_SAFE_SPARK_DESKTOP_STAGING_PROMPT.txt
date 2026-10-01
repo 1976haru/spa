@@ -1,0 +1,619 @@
+ShopSource Studio — Phase 2.7.2
+Spark Desktop Safe Dataset Staging Connector
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+
+Latest expected commit:
+8a91bbdb0ca2859dc2d56510ed81391d5af6af27
+Match Spark desktop loader contract
+
+==================================================
+0. 핵심 결론
+==================================================
+
+Phase 2.7.1에서 Spark Desktop v1.0.3의 실제 loader contract를 확인했다.
+
+중요:
+
+Spark의 [데이터 불러오기] 폴더 선택은
+선택한 외부 폴더의 JSON을 import/copy하는 기능이 아니다.
+
+동작은:
+
+1. 폴더 선택
+2. 선택 경로에서 basename만 storageId로 취득
+3. 실제 상품은 Spark 자체 storage root:
+
+C:\Users\user\AppData\Roaming\spark\storage\datasets\<storageId>
+
+에서 조회
+
+4. 해당 내부 dataset 폴더가 없으면 0개
+
+따라서 지금까지 D:\shop\...\exports\spark_center\...\ready\<package_id>
+를 직접 선택해 0개가 나온 것은 JSON schema가 아니라 경로 계약 문제였다.
+
+이번 Phase 목표는 Spark 앱을 수정하지 않고,
+ShopSource가 생성한 상품 JSON 5개를
+Spark의 observed dataset storage contract에 "안전하게 staging"하는 공식 사용자 동작을 만든다.
+
+==================================================
+1. 용어 바로잡기
+==================================================
+
+현재 프로그램에서 혼재된:
+
+"Spark Center package"
+"Spark Desktop data load"
+
+를 구분한다.
+
+A. Spark Desktop Staging
+- 대상: 현재 설치된 Spark Desktop v1.0.3
+- 경로: %APPDATA%\spark\storage\datasets\<dataset_id>
+- 실제 loader contract 확인됨
+- 이번 Phase에서 구현
+
+B. Spark Center Portal Package
+- 외부 폴더/파일 업로드 지원 여부는 별도 계약
+- portal_package_verified=false 유지
+- 이번 Phase에서 검증했다고 주장하지 않음
+
+UI/README/docs에서 둘을 혼동하지 않게 한다.
+
+==================================================
+2. 시작 전
+==================================================
+
+git status --short
+git log --oneline -10
+git fetch origin
+
+사용자 dirty file:
+
+stores/001_cabin_tidy.json
+
+절대:
+git reset --hard
+git restore
+git checkout --
+git clean -fd
+
+하지 마라.
+
+이 파일은 stage/commit하지 마라.
+
+==================================================
+3. 과거 TEST_5ITEMS 성공 위치 재검증
+==================================================
+
+docs/SPARK_INTEGRATION.md에는:
+
+TEST_5ITEMS_20260929_192255
+가 Spark에서 5/5 로드됐다고 기록돼 있다.
+
+이전 테스트 당시 실제 폴더 위치를 로그/history/filesystem에서 확인한다.
+
+특히:
+
+C:\Users\user\AppData\Roaming\spark\storage\datasets\TEST_5ITEMS_20260929_192255
+
+존재 여부 또는 과거 기록을 확인.
+
+가능한 경우:
+"외부 D: 폴더가 직접 import된 것이 아니라 Spark internal datasets root에 존재했던 test job을 선택한 것"
+
+인지 확인하고 docs의 설명을 정확하게 수정한다.
+
+근거 없으면 "과거 성공 위치 불명확"이라고 명시.
+
+==================================================
+4. Spark Desktop staging target
+==================================================
+
+Windows 기본 target:
+
+%APPDATA%\spark\storage\datasets
+
+실제 환경에서는:
+
+C:\Users\user\AppData\Roaming\spark\storage\datasets
+
+Path는 환경변수 APPDATA 기반으로 계산한다.
+username 하드코딩 금지.
+
+helper:
+
+def spark_desktop_datasets_root() -> Path:
+    ...
+
+Spark 설치 경로와 storage root 존재 여부를 preflight한다.
+
+==================================================
+5. 새 Connector
+==================================================
+
+새 모듈 권장:
+
+src/shopsource/connectors/spark_desktop_staging.py
+
+역할:
+
+프로젝트-local ready package folder를
+Spark Desktop datasets root 아래의 새 dataset folder로 안전하게 복사.
+
+예:
+
+Source:
+D:\shop\001_so_amazon\exports\spark_center\001_Cabin_Tidy\ready\SC_001_20261001_101734_ab09
+
+Destination:
+C:\Users\user\AppData\Roaming\spark\storage\datasets\SC_001_20261001_101734_ab09
+
+==================================================
+6. 허용되는 Spark storage 쓰기 범위
+==================================================
+
+이번 Phase에서는 명시적으로 다음만 허용한다:
+
+%APPDATA%\spark\storage\datasets\<NEW_DATASET_ID>\
+
+라는 "새 폴더 생성 + 상품 JSON 복사".
+
+절대 수정 금지:
+
+- 기존 Spark dataset 폴더
+- 기존 Spark 소싱 job
+- request_queues
+- key_value_stores
+- SDK_SESSION_POOL_STATE
+- cookies
+- tokens
+- Spark app files
+- Spark executable
+- app.asar
+- Spark DB가 있다면 그 DB
+
+즉 기존 Spark 데이터를 건드리지 않고
+새 dataset folder 하나만 추가한다.
+
+==================================================
+7. overwrite 금지
+==================================================
+
+Destination dataset_id가 이미 존재하면
+자동 overwrite 금지.
+
+기본:
+raise DatasetAlreadyExists
+
+UI에는:
+
+"동일한 Spark Dataset ID가 이미 존재합니다. 기존 데이터는 덮어쓰지 않았습니다."
+
+표시.
+
+사용자가 명시적으로 삭제/덮어쓰기하는 기능은 이번 Phase에 만들지 않는다.
+
+새 ID로 package/staging하도록 안내.
+
+==================================================
+8. Atomic staging
+==================================================
+
+복사 도중 Spark가 반쪽 dataset을 읽지 않도록 atomic staging 사용.
+
+Spark datasets root 아래에:
+
+.shopsource_stage_<dataset_id>_<nonce>
+
+임시 폴더 생성
+
+→ JSON 5개 copy
+→ 파일명/JSON parse/개수 검증
+→ fsync 가능한 범위 수행
+→ 최종:
+
+<dataset_id>
+
+로 rename/move.
+
+실패 시 temp folder 정리.
+
+기존 dataset은 절대 삭제하지 않는다.
+
+==================================================
+9. Source package validation
+==================================================
+
+staging 전에 source ready folder는 반드시:
+
+- 존재
+- directory
+- JSON만 존재
+- 000000001.json부터 연속 9자리 파일
+- 최소 1개
+- 각 file JSON object
+- duplicate ASIN 없음
+
+검증.
+
+현재 loader는 상품 field predicate를 강하게 검사하지 않지만
+ShopSource 자체 데이터 무결성은 유지한다.
+
+==================================================
+10. Exact byte copy
+==================================================
+
+staging 과정에서는 package JSON을 재serialize하지 않는다.
+
+Source ready/*.json
+→ Destination *.json
+
+byte-for-byte copy.
+
+각 파일 source/destination SHA-256 비교.
+
+staging report:
+
+file_count
+source_hashes
+destination_hashes
+all_hashes_match
+
+기록.
+
+==================================================
+11. Control Native 5 staging
+==================================================
+
+Phase 2.7.1 control:
+
+D:\shop\001_so_amazon\exports\spark_diagnostics\CONTROL_NATIVE_5_20261001_185948
+
+를 새 dataset ID로 Spark internal root에 staging한다.
+
+원본 control 폴더 자체 이름을 그대로 써도 되나,
+collision 검사 필수.
+
+예 destination:
+
+%APPDATA%\spark\storage\datasets\CONTROL_NATIVE_5_20261001_185948
+
+이 단계는 코드 구현 후 실제로 수행해도 된다.
+
+단 기존 Spark dataset을 수정하지 않는다.
+
+완료 보고에 destination path와 SHA 검증 결과를 적는다.
+
+==================================================
+12. Browser 5 staging
+==================================================
+
+현재 Browser package:
+
+D:\shop\001_so_amazon\exports\spark_center\001_Cabin_Tidy\ready\SC_001_20261001_101734_ab09
+
+도 동일 connector로 staging 준비.
+
+단 control 검증을 먼저 하기 위해
+UI에서 사용자가 명시적으로 클릭하기 전까지 자동 staging하지 않아도 된다.
+
+권장:
+Codex implementation smoke에서는 temp root 사용.
+실제 Spark root staging은 CONTROL_NATIVE_5만 수행.
+Browser package는 UI 버튼으로 사용자가 수행.
+
+==================================================
+13. Packages UI 재설계
+==================================================
+
+현재 [Spark Center packages] 화면에
+Spark Desktop 영역을 분리해 추가.
+
+예:
+
+### Spark Desktop v1.0.3
+
+[선택 Package를 Spark Desktop에 설치]
+
+설명:
+"Spark Desktop의 데이터 불러오기는 외부 폴더를 복사하지 않습니다.
+이 버튼은 선택 Package의 상품 JSON만 Spark datasets 폴더에 새 dataset으로 안전하게 복사합니다.
+기존 Spark 데이터는 덮어쓰지 않습니다."
+
+staging 성공 후 표시:
+
+Dataset ID:
+SC_...
+
+설치 경로:
+C:\Users\...\AppData\Roaming\spark\storage\datasets\SC_...
+
+상품:
+5
+
+Hash 검증:
+PASS
+
+다음 단계:
+Spark → 데이터 불러오기 → 해당 Dataset ID 폴더 선택
+
+==================================================
+14. Package row 선택 UX
+==================================================
+
+Package 목록에서 row 선택 또는 action button을 제공.
+
+권장 각 row action:
+
+[폴더 열기]
+[Spark Desktop에 설치]
+[Desktop 5/5 확인]
+
+Desktop 설치는 package_status CREATED/PASS인 경우에만.
+
+==================================================
+15. 수동 round-trip 확인 버튼
+==================================================
+
+Spark는 외부 UI이므로 ShopSource가 자동으로 5/5를 읽었다고 주장하지 않는다.
+
+사용자가 Spark 화면에서 실제로:
+
+전체 5
+포함 5
+제외 0
+
+을 확인한 뒤 ShopSource에서:
+
+[Desktop 로드 확인]
+
+버튼 클릭.
+
+확인 dialog:
+
+"Spark Desktop에서 이 Dataset이 전체 5개로 표시되는 것을 직접 확인했습니까?"
+
+사용자가 확인하면 package history에:
+
+spark_desktop_roundtrip_verified = true
+verified_at
+verified_product_count = 5
+
+기록.
+
+이것은 Spark Center portal_verified와 별개.
+
+==================================================
+16. 업로드 완료 표시와 분리
+==================================================
+
+현재 "업로드 완료 표시"가 있다면
+의미를 분리한다.
+
+- Spark Desktop staged
+- Spark Desktop load verified
+- Shopify upload verified
+- Spark Center portal upload verified
+
+서로 독립 상태.
+
+한 버튼이 여러 flag를 true로 만들면 안 된다.
+
+==================================================
+17. Desktop staging history
+==================================================
+
+DB table 또는 package metadata/history에 최소 저장:
+
+package_id
+dataset_id
+source_path
+destination_path
+product_count
+staged_at
+hash_verified
+spark_desktop_roundtrip_verified
+verified_at
+
+민감정보 없음.
+
+==================================================
+18. CLI 지원
+==================================================
+
+초보 사용자는 UI를 쓰지만
+테스트/복구용 CLI도 추가 가능.
+
+예:
+
+shopsource spark-desktop-stage --package-id SC_...
+shopsource spark-desktop-status --dataset-id SC_...
+
+단 destructive delete command는 이번 Phase에서 만들지 않는다.
+
+==================================================
+19. CONTROL acceptance 순서
+==================================================
+
+실제 운영 테스트 순서:
+
+1. CONTROL_NATIVE_5를 internal datasets root에 staging
+2. Spark Desktop 실행/새로고침
+3. 데이터 불러오기
+4. 기본 datasets 경로에 CONTROL_NATIVE_5_... 폴더가 보임
+5. 선택
+6. 전체 5 / 포함 5 / 제외 0 확인
+
+이게 PASS하면 loader path contract 확정.
+
+==================================================
+20. Browser acceptance 순서
+==================================================
+
+Control 5/5 확인 후:
+
+1. ShopSource Packages 화면
+2. SC_001_20261001_101734_ab09 선택
+3. [Spark Desktop에 설치]
+4. Spark 데이터 불러오기
+5. SC_001_20261001_101734_ab09 선택
+6. 전체 5 / 포함 5 / 제외 0 확인
+7. 이미지/ASIN/상품명/옵션/브랜드 표시 확인
+
+여기까지 성공하면:
+
+Browser Capture → ShopSource → Spark Desktop dataset load
+
+실제 VERIFIED.
+
+==================================================
+21. Shopify 업로드
+==================================================
+
+Browser 5/5 load 성공 전에는 Shopify 업로드로 넘어가지 않는다.
+
+성공 후:
+미국 주소 Shopify Location 선택
+→ 테스트 5상품 업로드
+→ 실제 Shopify 확인
+
+shopify_upload_verified는 그 뒤에만 true.
+
+==================================================
+22. Spark Center portal은 별도
+==================================================
+
+이번 Desktop staging 성공을
+Spark Center portal upload 성공으로 기록하지 않는다.
+
+portal_package_verified=false 유지.
+
+지원팀이 말한 외부 파일/폴더 업로드가
+별도 Spark Center 웹/기능을 의미한다면
+그 실제 UI에서 별도 테스트해야 한다.
+
+==================================================
+23. docs 수정
+==================================================
+
+docs/SPARK_INTEGRATION.md에서
+외부 ready folder를 Spark Desktop이 직접 import한다고 오해할 문구를 수정.
+
+정확히:
+
+Spark Desktop v1.0.3:
+폴더 선택 basename → internal storage/datasets/<id> lookup
+
+따라서 Desktop handoff:
+project package → explicit safe staging copy → internal dataset folder → 데이터 불러오기
+
+Spark Center Portal:
+별도 CONTRACT_PENDING
+
+그리고 과거 TEST_5ITEMS 성공 위치가 internal datasets root였는지
+확인 결과 반영.
+
+==================================================
+24. 테스트
+==================================================
+
+필수:
+
+test_spark_desktop_root_uses_appdata
+test_stage_creates_new_dataset_folder
+test_stage_refuses_existing_dataset
+test_stage_only_copies_json
+test_stage_requires_contiguous_nine_digit_files
+test_stage_rejects_invalid_json
+test_stage_preserves_bytes
+test_stage_hashes_match
+test_stage_does_not_touch_request_queues
+test_stage_does_not_touch_key_value_stores
+test_stage_control_native_five_contract
+test_stage_browser_five_contract
+test_desktop_roundtrip_flag_defaults_false
+test_desktop_roundtrip_manual_confirmation_sets_true
+test_desktop_verification_does_not_set_portal_verified
+test_desktop_verification_does_not_set_shopify_verified
+
+기존 전체 tests PASS.
+
+==================================================
+25. Quality Gate
+==================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Extension 변경 불필요하면 v0.1.4 유지.
+
+==================================================
+26. 사용자 dirty file
+==================================================
+
+stores/001_cabin_tidy.json
+
+수정/stage/commit/reset/restore 금지.
+
+==================================================
+27. Commit / Push
+==================================================
+
+관련 ShopSource code/docs/tests만 stage.
+
+진단용 control/native JSON
+Spark internal staged JSON
+exports
+DB
+사용자 store file
+
+Git commit 금지.
+
+commit:
+
+git commit -m "Add safe Spark desktop staging"
+
+push origin main
+
+최종:
+
+git status --short
+git log --oneline -8
+git rev-list --left-right --count main...origin/main
+
+0 0 확인.
+
+==================================================
+28. 완료 보고
+==================================================
+
+[1] 과거 TEST_5ITEMS 위치 확인 결과
+[2] Spark Desktop datasets root
+[3] staging connector 구조
+[4] overwrite 방지
+[5] atomic staging
+[6] byte/hash verification
+[7] CONTROL_NATIVE_5 source
+[8] CONTROL_NATIVE_5 destination
+[9] CONTROL 5개 hash 검증
+[10] Browser package source
+[11] Browser staging UI
+[12] Desktop load confirmation UI
+[13] status flags 분리
+[14] docs 수정
+[15] tests
+[16] 사용자 dirty file
+[17] commit SHA
+[18] 사용자가 지금 Spark에서 선택할 정확한 CONTROL dataset 폴더명
+
+지금 구현을 시작하라.
