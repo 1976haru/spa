@@ -123,7 +123,17 @@ CREATE TABLE IF NOT EXISTS export_runs (
     package_status TEXT NOT NULL DEFAULT 'CREATED',
     uploaded_at TEXT,
     note TEXT NOT NULL DEFAULT '',
-    portal_package_verified INTEGER NOT NULL DEFAULT 0
+    portal_package_verified INTEGER NOT NULL DEFAULT 0,
+    desktop_dataset_id TEXT,
+    desktop_source_path TEXT,
+    desktop_destination_path TEXT,
+    desktop_staged_at TEXT,
+    desktop_product_count INTEGER,
+    desktop_hash_verified INTEGER NOT NULL DEFAULT 0,
+    desktop_hashes_json TEXT NOT NULL DEFAULT '{}',
+    spark_desktop_roundtrip_verified INTEGER NOT NULL DEFAULT 0,
+    spark_desktop_verified_at TEXT,
+    spark_desktop_verified_product_count INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS sourcing_runs (
@@ -305,6 +315,16 @@ EXPORT_RUN_ADDITIVE_COLUMNS = {
     "uploaded_at": "TEXT",
     "note": "TEXT NOT NULL DEFAULT ''",
     "portal_package_verified": "INTEGER NOT NULL DEFAULT 0",
+    "desktop_dataset_id": "TEXT",
+    "desktop_source_path": "TEXT",
+    "desktop_destination_path": "TEXT",
+    "desktop_staged_at": "TEXT",
+    "desktop_product_count": "INTEGER",
+    "desktop_hash_verified": "INTEGER NOT NULL DEFAULT 0",
+    "desktop_hashes_json": "TEXT NOT NULL DEFAULT '{}'",
+    "spark_desktop_roundtrip_verified": "INTEGER NOT NULL DEFAULT 0",
+    "spark_desktop_verified_at": "TEXT",
+    "spark_desktop_verified_product_count": "INTEGER",
 }
 
 PRODUCT_ADDITIVE_COLUMNS = {

@@ -4,7 +4,11 @@ import asyncio
 import json
 import logging
 
-from ..connectors.spark_center_package import list_packages, mark_package
+from ..connectors.spark_center_package import (
+    confirm_spark_desktop_roundtrip, list_packages, mark_package,
+    stage_package_for_spark_desktop,
+)
+from ..connectors.spark_desktop_staging import DatasetAlreadyExists
 from ..capture.service import CaptureService
 from ..capture.batch import BatchSourcingService
 from ..classifier import classify_store
@@ -572,8 +576,14 @@ class OperatorUI:
 
     def _packages(self):
         ui = self.ui
+        ui.label("Spark Desktop v1.0.3 — 안전한 로컬 dataset staging").classes("text-lg font-semibold")
+        ui.label(
+            "Spark Desktop의 데이터 불러오기는 외부 폴더를 복사하지 않습니다. "
+            "이 기능은 선택 Package의 상품 JSON만 Spark datasets 폴더에 새 dataset으로 원자적으로 복사하며, 기존 dataset은 덮어쓰지 않습니다."
+        ).classes("text-amber-800")
+        desktop_stage_status = ui.label("Spark Desktop staging: 준비됨 · 실제 Spark load: NOT VERIFIED").classes("text-sm text-slate-700")
         ui.label("Browser Capture to Spark Center mapping is not portal-verified. Start with a 5-product round-trip; packages over 100 require confirmation.").classes("text-amber-800")
-        self._heading("Spark Center packages", "사용자가 Spark Center에 올릴 ready/package 폴더만 관리합니다.")
+        self._heading("Packages", "프로젝트-local package, Spark Desktop staging, Spark Center Portal handoff는 서로 다른 상태입니다.")
         status = ui.select(STATUS_OPTIONS, value=self.package_selected_statuses or ["PRIMARY"],
                            multiple=True, label="Status").classes("w-64")
         limit = ui.number("상품 수", value=50, min=1, max=5000).classes("w-32")
@@ -588,6 +598,46 @@ class OperatorUI:
         if self.package_selected_asins:
             ui.label(f"상품 페이지에서 선택한 {len(self.package_selected_asins)}개 ASIN 사용 예정")
         table_slot = ui.column().classes("w-full")
+        def stage_desktop(package_id):
+            try:
+                result = stage_package_for_spark_desktop(package_id)
+                desktop_stage_status.set_text(
+                    f"Spark Desktop staged: {result['dataset_id']} · {result['product_count']}개 · SHA-256 PASS · "
+                    f"{result['destination_path']} · 다음 단계: Spark > 데이터 불러오기에서 이 dataset 폴더 선택 "
+                    "(실제 load는 사용자가 확인하기 전까지 NOT VERIFIED)"
+                )
+                ui.notify(
+                    f"Staged {result['dataset_id']} · {result['product_count']} products · SHA-256 PASS",
+                    type="positive",
+                )
+                refresh_packages()
+            except Exception as exc:
+                message = (
+                    "동일한 Spark Dataset ID가 이미 존재합니다. 기존 데이터는 덮어쓰지 않았습니다. 새 package ID를 사용하세요."
+                    if isinstance(exc, DatasetAlreadyExists) else _safe_error(exc)
+                )
+                desktop_stage_status.set_text(f"Spark Desktop staging 실패: {message}")
+                ui.notify(message, type="negative")
+
+        def confirm_desktop(package_id, product_count):
+            with ui.dialog() as dialog, ui.card():
+                ui.label(
+                    f"Spark Desktop에서 이 Dataset이 전체 {product_count}개로 표시되는 것을 직접 확인했습니까? "
+                    "확인 버튼은 Spark Desktop load만 기록하며 Spark Center Portal/Shopify 상태는 변경하지 않습니다."
+                )
+                with ui.row():
+                    ui.button("취소", on_click=dialog.close).props("flat")
+                    def save_confirmation():
+                        try:
+                            confirm_spark_desktop_roundtrip(package_id, confirmed=True)
+                            dialog.close()
+                            refresh_packages()
+                            ui.notify("Spark Desktop load 확인을 기록했습니다.", type="positive")
+                        except Exception as exc:
+                            ui.notify(_safe_error(exc), type="negative")
+                    ui.button("직접 확인했습니다", on_click=save_confirmation).props("color=positive")
+            dialog.open()
+
         def refresh_packages():
             table_slot.clear()
             rows = list_packages(self.current_store, 50)
@@ -598,7 +648,19 @@ class OperatorUI:
                 for row in rows[:20]:
                     with ui.row().classes("w-full items-center border-b py-2"):
                         ui.label(f"{row['package_id']} · {row['package_status']} · {row['product_count']}개").classes("flex-1")
+                        ui.label(
+                            f"Desktop: {'LOAD VERIFIED' if row['spark_desktop_roundtrip_verified'] else ('STAGED / HASH PASS' if row['desktop_hash_verified'] else 'NOT STAGED')}"
+                        ).classes("text-xs text-slate-600")
+                        if row["desktop_destination_path"]:
+                            ui.label(f"Dataset {row['desktop_dataset_id']} · {row['desktop_destination_path']}").classes("text-xs text-slate-500 break-all")
                         ui.button("폴더 열기", on_click=lambda path=row["output_path"]: self._open_folder(path)).props("outline dense")
+                        if row["package_status"] == "CREATED" and row["validation_status"] == "PASS" and not row["desktop_dataset_id"]:
+                            ui.button("Spark Desktop에 설치", on_click=lambda pid=row["package_id"]: stage_desktop(pid)).props("outline dense")
+                        if row["desktop_hash_verified"] and not row["spark_desktop_roundtrip_verified"]:
+                            ui.button(
+                                "Desktop 로드 확인",
+                                on_click=lambda pid=row["package_id"], count=row["desktop_product_count"]: confirm_desktop(pid, count),
+                            ).props("color=positive dense")
                         ui.button("경로 복사", on_click=lambda path=row["output_path"]: ui.run_javascript(
                             f"navigator.clipboard.writeText({json.dumps(path)})")).props("flat dense")
                         if row["package_status"] == "CREATED":

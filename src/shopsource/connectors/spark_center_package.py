@@ -14,6 +14,7 @@ from .spark_handoff import (
 )
 from ..db import connect, get_store, init_db, utc_now
 from ..paths import EXPORT_DIR
+from .spark_desktop_staging import stage_dataset
 
 TARGET = "SPARK_CENTER_MANUAL"
 PACKAGE_STATUSES = {"CREATED", "UPLOADED", "FAILED", "ARCHIVED"}
@@ -195,7 +196,11 @@ def list_packages(store_id: str | None = None, limit: int = 20, db=None) -> list
             f"""
             SELECT package_id,target,store_id,store_name,statuses_json,output_path,
                    requested_limit,product_count,asin_hash,created_at,validation_status,
-                   package_status,uploaded_at,note,portal_package_verified
+                   package_status,uploaded_at,note,portal_package_verified,
+                   desktop_dataset_id,desktop_source_path,desktop_destination_path,
+                   desktop_staged_at,desktop_product_count,desktop_hash_verified,desktop_hashes_json,
+                   spark_desktop_roundtrip_verified,spark_desktop_verified_at,
+                   spark_desktop_verified_product_count
             FROM export_runs WHERE {' AND '.join(clauses)}
             ORDER BY created_at DESC,id DESC LIMIT ?
             """,
@@ -206,6 +211,9 @@ def list_packages(store_id: str | None = None, limit: int = 20, db=None) -> list
             **dict(row),
             "statuses": json.loads(row["statuses_json"] or "[]"),
             "portal_package_verified": bool(row["portal_package_verified"]),
+            "desktop_hash_verified": bool(row["desktop_hash_verified"]),
+            "desktop_hashes": json.loads(row["desktop_hashes_json"] or "{}"),
+            "spark_desktop_roundtrip_verified": bool(row["spark_desktop_roundtrip_verified"]),
         }
         for row in rows
     ]
@@ -237,4 +245,67 @@ def mark_package(package_id: str, status: str, note: str = "", db=None) -> dict:
         "uploaded_at": uploaded_at,
         "note": note,
         "portal_package_verified": False,
+    }
+
+
+def stage_package_for_spark_desktop(package_id: str, db=None) -> dict:
+    """Stage a passing package as a new Spark Desktop dataset; never overwrite."""
+    validate_output_id(package_id, "package_id")
+    init_db(db)
+    with connect(db) as con:
+        row = con.execute(
+            "SELECT output_path,product_count,validation_status,package_status "
+            "FROM export_runs WHERE package_id=? AND target=?",
+            (package_id, TARGET),
+        ).fetchone()
+    if not row:
+        raise KeyError(f"Spark package not found: {package_id}")
+    if row["validation_status"] != "PASS" or row["package_status"] != "CREATED":
+        raise ValueError("Only CREATED packages with PASS validation can be staged")
+    result = stage_dataset(row["output_path"], package_id)
+    if result.product_count != int(row["product_count"]):
+        raise RuntimeError("Staged product count does not match package history")
+    with connect(db) as con:
+        con.execute(
+            """UPDATE export_runs SET desktop_dataset_id=?,desktop_source_path=?,
+               desktop_destination_path=?,desktop_staged_at=?,desktop_product_count=?,
+               desktop_hash_verified=?,desktop_hashes_json=?,spark_desktop_roundtrip_verified=0,
+               spark_desktop_verified_at=NULL,spark_desktop_verified_product_count=NULL
+               WHERE package_id=? AND target=?""",
+            (result.dataset_id, str(result.source_path), str(result.destination_path),
+             result.staged_at, result.product_count, int(result.all_hashes_match),
+             json.dumps({"source": result.source_hashes, "destination": result.destination_hashes,
+                         "all_hashes_match": result.all_hashes_match}, sort_keys=True),
+             package_id, TARGET),
+        )
+    return result.to_dict()
+
+
+def confirm_spark_desktop_roundtrip(package_id: str, *, confirmed: bool, db=None) -> dict:
+    """Record an explicit user's confirmation of the Spark Desktop product count."""
+    if not confirmed:
+        raise ValueError("Spark Desktop round-trip confirmation was not given")
+    validate_output_id(package_id, "package_id")
+    init_db(db)
+    verified_at = utc_now()
+    with connect(db) as con:
+        row = con.execute(
+            """SELECT id,desktop_product_count,desktop_hash_verified,desktop_dataset_id
+               FROM export_runs WHERE package_id=? AND target=?""",
+            (package_id, TARGET),
+        ).fetchone()
+        if not row or not row["desktop_dataset_id"] or not row["desktop_hash_verified"]:
+            raise ValueError("Stage and hash-verify this package before confirming its Spark Desktop load")
+        con.execute(
+            """UPDATE export_runs SET spark_desktop_roundtrip_verified=1,
+               spark_desktop_verified_at=?,spark_desktop_verified_product_count=? WHERE id=?""",
+            (verified_at, row["desktop_product_count"], row["id"]),
+        )
+    return {
+        "package_id": package_id,
+        "spark_desktop_roundtrip_verified": True,
+        "verified_at": verified_at,
+        "verified_product_count": row["desktop_product_count"],
+        "portal_package_verified": False,
+        "shopify_upload_verified": False,
     }

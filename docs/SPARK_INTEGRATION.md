@@ -268,3 +268,20 @@ Spark-compatible Export는 아래가 모두 PASS일 때만 '지원' 상태로 �
 
 핵심 데이터와 규칙 엔진은 Connector와 분리한다.
 Spark 파일 계약이 확인되면 `SparkHandoffConnector`만 구현/교체하도록 유지한다.
+
+## 9. Spark Desktop v1.0.3 로컬 staging (Phase 2.7.2)
+
+Spark Desktop의 **데이터 불러오기** 폴더 선택은 외부 package 내용을 가져오지 않는다. 선택 경로의 basename을 dataset ID로 사용하고, `%APPDATA%\spark\storage\datasets\<dataset_id>`만 조회한다. 따라서 Desktop handoff는 다음 순서다.
+
+```text
+ShopSource ready package
+  → 사용자가 요청한 safe staging copy (새 dataset만)
+  → %APPDATA%\spark\storage\datasets\<dataset_id>
+  → Spark Desktop > 데이터 불러오기에서 해당 dataset 폴더 선택
+```
+
+`spark_desktop_staging`은 제품 JSON 파일만 새 staging directory에 byte-for-byte 복사하고 SHA-256을 대조한 뒤 원자적으로 dataset ID 이름으로 이동한다. ID가 이미 있으면 실패하며 기존 dataset을 변경하지 않는다. 이 제한적 동작은 사용자가 명시적으로 요청한 새 `datasets/<id>` 생성만 허용한다. 다른 Spark storage (예: `request_queues`, `key_value_stores`), 앱 파일과 DB에는 쓰지 않는다.
+
+Desktop package staging, Spark Desktop load verification, Spark Center Portal package verification, Shopify upload verification은 서로 독립 상태다. Staging이나 hash 성공은 Desktop load 성공이 아니며, 사용자의 명시적 5/5 확인 전에 `spark_desktop_roundtrip_verified=false`를 유지한다. Spark Center Portal은 별도 계약이므로 `portal_package_verified=false`를 유지한다.
+
+과거 기록의 `TEST_5ITEMS_20260929_192255`는 현재 환경에서 `%APPDATA%\spark\storage\datasets\TEST_5ITEMS_20260929_192255`로 확인되었다. 따라서 과거 5/5 기록은 internal datasets root에 있던 test dataset을 선택한 것과 부합하며, 외부 D: ready 폴더가 import되었다는 의미가 아니다.
