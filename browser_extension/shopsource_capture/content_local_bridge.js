@@ -4,6 +4,13 @@
   window.addEventListener('message', event => {
     const message = event.data;
     if (event.source !== window || event.origin !== trustedOrigin || message?.source !== 'shopsource-studio-ui') return;
+    if (message.type === 'campaign-command' && /^LC_[a-f0-9]{20}$/i.test(message.campaignId || '')) {
+      chrome.runtime.sendMessage({type:'shopsource-campaign-command',campaignId:message.campaignId,action:message.action || 'RESUME'}, response => {
+        const error = chrome.runtime.lastError;
+        window.postMessage({source:'shopsource-capture-extension',type:'campaign-command-result',ok:!error && response?.ok !== false,error:error?.message || response?.error || ''},trustedOrigin);
+      });
+      return;
+    }
     if (typeof message.runId !== 'string' || !/^BB_[a-f0-9]{20}$/i.test(message.runId)) return;
     const workerActions = {'worker-show':'show','worker-close':'close','worker-status':'status'};
     const isBatchNext = message.type === 'batch-open-next';

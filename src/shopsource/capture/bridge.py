@@ -5,12 +5,14 @@ from fastapi.responses import JSONResponse
 
 from .service import CaptureService
 from .batch import BatchSourcingService
+from .campaign import CampaignService
 
 
 def install_capture_routes(app, service: CaptureService | None = None) -> None:
     """Mount authenticated, loopback-only capture routes on the UI's FastAPI app."""
     capture = service or CaptureService()
     batches = BatchSourcingService(capture.db)
+    campaigns = CampaignService(capture.db)
 
     async def authorized(request: Request):
         token = request.headers.get("x-shopsource-pairing", "")
@@ -32,6 +34,10 @@ def install_capture_routes(app, service: CaptureService | None = None) -> None:
             body = await request.json()
             result = capture.capture_search(body)
             result["batch"] = batches.attach_latest(body.get("store_id"), body.get("keyword", ""), result["run_id"])
+            campaign_id = str(body.get("campaign_id") or "")
+            if campaign_id:
+                result["campaign"] = campaigns.record_search_capture(
+                    campaign_id, result["run_id"], body.get("next_url"), bool(body.get("exhausted")))
             return result
         except Exception as exc:
             capture.log_error("SEARCH", str(exc))
@@ -101,6 +107,33 @@ def install_capture_routes(app, service: CaptureService | None = None) -> None:
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=422)
 
+    async def campaign_create(request: Request):
+        denied = await authorized(request)
+        if denied: return denied
+        try:
+            body = await request.json()
+            return campaigns.create_live_2000(body.get("store_id", ""), body.get("target", 2000), body.get("search_delay_seconds", 8), body.get("detail_interval_seconds", 4))
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=422)
+
+    async def campaign_status(request: Request):
+        denied = await authorized(request)
+        if denied: return denied
+        try: return campaigns.get(request.path_params["campaign_id"])
+        except KeyError: return JSONResponse({"error": "Campaign not found."}, status_code=404)
+
+    async def campaign_action(request: Request):
+        denied = await authorized(request)
+        if denied: return denied
+        try:
+            body = await request.json()
+            campaign_id = request.path_params["campaign_id"]
+            campaign = campaigns.action(campaign_id, body.get("action", ""))
+            campaign["search_instruction"] = campaigns.next_search(campaign_id)
+            return campaign
+        except (KeyError, ValueError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=422)
+
     for path, endpoint, methods in (
         ("/api/capture/health", health, ["GET"]),
         ("/api/capture/search-results", search_results, ["POST"]),
@@ -109,5 +142,8 @@ def install_capture_routes(app, service: CaptureService | None = None) -> None:
         ("/api/capture/batches", batch_create, ["POST"]),
         ("/api/capture/batches/{run_id}", batch_status, ["GET"]),
         ("/api/capture/batches/{run_id}/action", batch_action, ["POST"]),
+        ("/api/capture/campaigns", campaign_create, ["POST"]),
+        ("/api/capture/campaigns/{campaign_id}", campaign_status, ["GET"]),
+        ("/api/capture/campaigns/{campaign_id}/action", campaign_action, ["POST"]),
     ):
         app.add_api_route(path, endpoint, methods=methods, include_in_schema=False)

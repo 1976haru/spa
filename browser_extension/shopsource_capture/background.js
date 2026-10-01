@@ -2,6 +2,7 @@ const API_DEFAULT = 'http://127.0.0.1:8081';
 const openingRuns = new Set();
 const pendingTabs = new Map();
 const workerTabs = new Map();
+const searchWorkerTabs = new Map();
 const PENDING_PREFIX = 'shopsource.pending.';
 const WORKER_PREFIX = 'shopsource.worker.';
 const OPEN_TIMEOUT_MS = 45000;
@@ -27,6 +28,19 @@ async function sendCapture(kind, payload) {
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(body.error || `ShopSource bridge error (${response.status})`);
   return body;
+}
+async function navigateCampaign(instruction) {
+  if (!instruction?.url || !instruction?.campaign_id) return;
+  const campaignId = instruction.campaign_id; const target = new URL(instruction.url);
+  target.hash = `shopsource_campaign=${encodeURIComponent(campaignId)}`;
+  let prior = searchWorkerTabs.get(campaignId); let tab = null;
+  if (!prior) {
+    const marked = await chrome.tabs.query({url:'https://www.amazon.com/*'});
+    const found = marked.find(candidate => (candidate.url || '').includes(`shopsource_campaign=${encodeURIComponent(campaignId)}`));
+    if (found?.id) { prior=found.id; searchWorkerTabs.set(campaignId,found.id); }
+  }
+  if (prior) { try { tab = await chrome.tabs.update(prior,{url:target.href,active:false}); } catch (_error) { searchWorkerTabs.delete(campaignId); } }
+  if (!tab) { const searchUrl=target.href; tab = await chrome.tabs.create({url:searchUrl,active:false}); searchWorkerTabs.set(campaignId,tab.id); }
 }
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const pendingKey = runId => PENDING_PREFIX + runId;
@@ -277,6 +291,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await clearPending(runId);
       }
       sendResponse({ok:true,result});
+      if (message.kind === 'search' && result.campaign?.search_instruction) {
+        const instruction=result.campaign.search_instruction;
+        setTimeout(()=>navigateCampaign(instruction),Math.max(6000,Number(instruction.delay_seconds||8)*1000));
+      }
+      if (message.kind === 'search' && result.campaign?.batch_run_id && result.campaign?.status === 'DETAILING') {
+        openNext(result.campaign.batch_run_id);
+      }
       if (runId && message.kind === 'search') openNext(runId);
       if (runId && message.kind === 'detail') setTimeout(() => openNext(runId),4000);
     }).catch(error => sendResponse({ok:false,error:error.message}));
@@ -285,6 +306,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'shopsource-batch-next') {
     openNext(message.runId).then(() => sendResponse({ok:true})).catch(() => sendResponse({ok:false}));
     return true;
+  }
+  if (message?.type === 'shopsource-campaign-command') {
+    api(`/api/capture/campaigns/${encodeURIComponent(message.campaignId)}/action`,{action:message.action||'RESUME'}).then(async campaign=>{
+      if(campaign.search_instruction) await navigateCampaign(campaign.search_instruction);
+      if(campaign.batch_run_id&&campaign.status==='DETAILING') await openNext(campaign.batch_run_id);
+      sendResponse({ok:true,campaign});
+    }).catch(error=>sendResponse({ok:false,error:error.message})); return true;
+  }
+  if (message?.type === 'shopsource-campaign-captcha') {
+    if(message.campaignId) api(`/api/capture/campaigns/${encodeURIComponent(message.campaignId)}/action`,{action:'CAPTCHA'}).catch(()=>{});
+    const tabId=searchWorkerTabs.get(message.campaignId); if(tabId) chrome.tabs.update(tabId,{active:true}).catch(()=>{}); return false;
   }
   if (message?.type === 'shopsource-worker-command') {
     const runId = message.runId;

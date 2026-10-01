@@ -284,6 +284,88 @@ CREATE TABLE IF NOT EXISTS browser_batch_events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS sourcing_campaigns (
+    campaign_id TEXT PRIMARY KEY,
+    store_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    candidate_target INTEGER NOT NULL,
+    detail_target INTEGER NOT NULL,
+    search_delay_seconds INTEGER NOT NULL DEFAULT 8,
+    detail_interval_seconds INTEGER NOT NULL DEFAULT 4,
+    stale_page_threshold INTEGER NOT NULL DEFAULT 2,
+    unique_candidates INTEGER NOT NULL DEFAULT 0,
+    detail_complete INTEGER NOT NULL DEFAULT 0,
+    master_imported INTEGER NOT NULL DEFAULT 0,
+    classified INTEGER NOT NULL DEFAULT 0,
+    duplicates INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    search_pages INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'DRAFT',
+    batch_run_id TEXT,
+    spark_package_id TEXT,
+    spark_dataset_id TEXT,
+    spark_total INTEGER,
+    spark_included INTEGER,
+    spark_excluded INTEGER,
+    spark_desktop_roundtrip_verified INTEGER NOT NULL DEFAULT 0,
+    verified_product_count INTEGER,
+    shopify_upload_attempted_at TEXT,
+    shopify_upload_result TEXT,
+    shopify_uploaded_count INTEGER,
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sourcing_campaign_keywords (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id TEXT NOT NULL REFERENCES sourcing_campaigns(campaign_id) ON DELETE CASCADE,
+    keyword TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    current_page INTEGER NOT NULL DEFAULT 0,
+    pages_captured INTEGER NOT NULL DEFAULT 0,
+    new_candidates INTEGER NOT NULL DEFAULT 0,
+    duplicates INTEGER NOT NULL DEFAULT 0,
+    consecutive_zero_pages INTEGER NOT NULL DEFAULT 0,
+    exhausted INTEGER NOT NULL DEFAULT 0,
+    last_url TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    UNIQUE(campaign_id, keyword)
+);
+
+CREATE TABLE IF NOT EXISTS sourcing_campaign_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id TEXT NOT NULL REFERENCES sourcing_campaigns(campaign_id) ON DELETE CASCADE,
+    asin TEXT NOT NULL,
+    capture_run_id TEXT NOT NULL,
+    first_keyword TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'NEEDS_DETAIL',
+    failure_code TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(campaign_id, asin)
+);
+
+CREATE TABLE IF NOT EXISTS sourcing_campaign_occurrences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id TEXT NOT NULL REFERENCES sourcing_campaigns(campaign_id) ON DELETE CASCADE,
+    asin TEXT NOT NULL,
+    keyword TEXT NOT NULL DEFAULT '',
+    search_url TEXT NOT NULL DEFAULT '',
+    page_number INTEGER NOT NULL DEFAULT 0,
+    captured_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sourcing_campaign_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id TEXT NOT NULL REFERENCES sourcing_campaigns(campaign_id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_products_price ON products(price);
 CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);
 CREATE INDEX IF NOT EXISTS idx_decisions_store_status ON store_product_decisions(store_id, final_status);
@@ -304,6 +386,9 @@ CREATE INDEX IF NOT EXISTS idx_capture_errors_created ON browser_capture_errors(
 CREATE INDEX IF NOT EXISTS idx_batch_runs_store_status ON browser_batch_runs(store_id,status,created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_batch_items_queue ON browser_batch_items(batch_run_id,state,priority,id);
 CREATE INDEX IF NOT EXISTS idx_batch_events_run ON browser_batch_events(batch_run_id,created_at);
+CREATE INDEX IF NOT EXISTS idx_campaigns_store_status ON sourcing_campaigns(store_id,status,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_campaign_candidates_state ON sourcing_campaign_candidates(campaign_id,state,id);
+CREATE INDEX IF NOT EXISTS idx_campaign_events_recent ON sourcing_campaign_events(campaign_id,id DESC);
 """
 
 EXPORT_RUN_ADDITIVE_COLUMNS = {

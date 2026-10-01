@@ -11,6 +11,7 @@ from ..connectors.spark_center_package import (
 from ..connectors.spark_desktop_staging import DatasetAlreadyExists
 from ..capture.service import CaptureService
 from ..capture.batch import BatchSourcingService
+from ..capture.campaign import CampaignService
 from ..classifier import classify_store
 from ..db import get_store, init_db, upsert_store
 from ..intelligence.keyword_engine import KeywordEngine
@@ -339,10 +340,107 @@ class OperatorUI:
                     f"recipe {len(KeywordEngine().add_recipes(self.current_store, [manual_keyword.value])['added'])}개 추가"), icon="edit").props("outline")
                 ui.button("새 Store 만들기", on_click=self._store_wizard, icon="add_business").props("outline")
 
+    def _live_2000_panel(self):
+        ui = self.ui
+        service = CampaignService()
+        active = {"campaign": service.active(self.current_store)}
+        with ui.card().classes("w-full border-2 border-blue-200 bg-blue-50"):
+            ui.label("LIVE 과제 2,000개").classes("text-xl font-bold")
+            ui.label("실제 실행은 아래 시작/계속 버튼을 눌렀을 때만 시작됩니다. 검색 탭 1개와 상세 탭 1개를 재사용합니다.").classes("text-sm")
+            with ui.row().classes("items-end"):
+                target = ui.number("고유 후보/상세 목표", value=2000, min=1, max=10000).classes("w-48")
+                search_delay = ui.number("검색 페이지 간격(초)", value=8, min=6, max=30).classes("w-48")
+            status = ui.label("캠페인 없음").classes("font-medium")
+            counts = ui.label("").classes("text-sm")
+            estimate = ui.label("").classes("text-sm text-amber-800")
+
+            def render(campaign):
+                if not campaign: return
+                active["campaign"] = campaign
+                status.set_text(f"{campaign['campaign_id']} · {campaign['status']}")
+                counts.set_text(f"후보 목표 {campaign['candidate_target']:,} · 고유 후보 {campaign['unique_candidates']:,} · 중복 {campaign['duplicates']:,} · 검색 페이지 {campaign['search_pages']:,} · 상세 완료 {campaign['detail_complete']:,} · MASTER {campaign['master_imported']:,} · Store 분류 {campaign['classified']:,} · 실패 {campaign['failed']:,} · Spark 준비 {campaign['classified']:,}")
+                seconds = int(campaign["minimum_remaining_seconds"])
+                estimate.set_text(f"최소 예상시간 {seconds // 3600}시간 {(seconds % 3600) // 60}분 · 실제 Amazon 로딩/확인 화면 때문에 더 길어질 수 있습니다.")
+
+            def command(action):
+                try:
+                    campaign = active.get("campaign")
+                    if not campaign:
+                        campaign = service.create_live_2000(self.current_store, int(target.value), int(search_delay.value), 4)
+                    if action in {"START", "RESUME"}:
+                        preflight = service.preflight(campaign["campaign_id"])
+                        if not preflight["database_backup_created"]: raise RuntimeError("Preflight DB backup failed")
+                    campaign = service.action(campaign["campaign_id"], action)
+                    render(campaign)
+                    if action in {"START", "RESUME", "RETRY"}:
+                        message = {"source":"shopsource-studio-ui", "type":"campaign-command", "campaignId":campaign["campaign_id"], "action":"RESUME"}
+                        ui.run_javascript("window.postMessage(" + json.dumps(message) + ", window.location.origin)")
+                    ui.notify("캠페인 상태를 갱신했습니다.", type="positive")
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            def make_package():
+                try:
+                    result = service.create_package(active["campaign"]["campaign_id"])
+                    ui.notify(f"Spark Package {result['package_id']} · {result['product_count']}개", type="positive")
+                    render(service.get(active["campaign"]["campaign_id"]))
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            def make_report():
+                try:
+                    result = service.report(active["campaign"]["campaign_id"])
+                    ui.notify("과제 summary report 생성: " + result["folder"], type="positive")
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            with ui.row():
+                ui.button("LIVE 과제 2,000 시작", on_click=lambda: command("START"), icon="play_arrow")
+                ui.button("과제 2,000 계속", on_click=lambda: command("RESUME"), icon="resume").props("outline")
+                ui.button("일시정지", on_click=lambda: command("PAUSE"), icon="pause").props("outline")
+                ui.button("실패만 재시도", on_click=lambda: command("RETRY"), icon="replay").props("outline")
+                ui.button("취소", on_click=lambda: command("CANCEL"), icon="stop").props("outline color=negative")
+            with ui.row():
+                ui.button("이 캠페인 상품으로 Spark Package 만들기", on_click=make_package, icon="outbox").props("outline")
+                ui.button("과제 summary report 생성", on_click=make_report, icon="description").props("outline")
+            with ui.expansion("Spark / Shopify 결과 기록", icon="fact_check").classes("w-full"):
+                ui.label("Spark UI에서 직접 확인한 값만 입력하세요. 포함 + 제외는 전체와 같아야 합니다.").classes("text-xs")
+                with ui.row():
+                    dataset_id = ui.input("Spark dataset ID").classes("w-48")
+                    spark_total = ui.number("Spark 전체", min=0).classes("w-36")
+                    spark_included = ui.number("Spark 포함", min=0).classes("w-36")
+                    spark_excluded = ui.number("Spark 제외", min=0).classes("w-36")
+                    verified_count = ui.number("검증 상품 수", min=0).classes("w-36")
+                with ui.row():
+                    upload_result = ui.select(["SUCCESS", "PARTIAL", "FAILED"], label="Shopify 업로드 결과").classes("w-48")
+                    uploaded_count = ui.number("Shopify 업로드 수(선택)", min=0).classes("w-48")
+                    outcome_notes = ui.input("메모").classes("w-72")
+                def save_outcome():
+                    try:
+                        campaign = active.get("campaign")
+                        if not campaign: raise ValueError("먼저 캠페인을 만드세요.")
+                        result = service.record_outcome(campaign["campaign_id"], spark_dataset_id=dataset_id.value or None,
+                            spark_total=None if spark_total.value is None else int(spark_total.value),
+                            spark_included=None if spark_included.value is None else int(spark_included.value),
+                            spark_excluded=None if spark_excluded.value is None else int(spark_excluded.value),
+                            verified_product_count=None if verified_count.value is None else int(verified_count.value),
+                            shopify_upload_result=upload_result.value or None,
+                            shopify_uploaded_count=None if uploaded_count.value is None else int(uploaded_count.value), notes=outcome_notes.value or "")
+                        render(result); ui.notify("Spark/Shopify 결과를 기록했습니다.", type="positive")
+                    except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+                ui.button("확인 결과 저장", on_click=save_outcome, icon="save").props("outline")
+            ui.label("CAPTCHA/확인 화면, 확장 연결 끊김 또는 반복 준비 실패 시 자동 일시정지하며 우회하지 않습니다. Spark에서 전체/포함/제외와 Shopify 업로드 결과를 확인 후 기록하세요.").classes("text-xs text-slate-600")
+            ui.label("확장 변경: chrome://extensions 또는 edge://extensions에서 ShopSource Capture v0.1.5를 다시 로드하세요.").classes("text-xs font-medium text-amber-800")
+            if active["campaign"]: render(active["campaign"])
+            def poll():
+                if active.get("campaign"):
+                    try: render(service.get(active["campaign"]["campaign_id"]))
+                    except Exception: pass
+            ui.timer(3.0, poll)
+
     def _sourcing(self):
         ui = self.ui
         profile = get_store(self.current_store)
         config = profile.get("sourcing") or {}
+        self._live_2000_panel()
+        ui.separator()
         ui.label("무료 브라우저 소싱 · API 필요 없음").classes("text-lg font-bold")
         ui.label("Amazon 검색과 상품 페이지를 직접 열고, 현재 화면에 보이는 자료만 확장으로 가져옵니다.")
         self._browser_capture_panel()
