@@ -11,6 +11,35 @@ BUY_BOX_SHIPPING = 18
 KEEPA_TO_SPARK_CAPABILITY = "KEEPA_TO_SPARK_MAPPING_UNVERIFIED"
 BROWSER_CAPTURE_TO_SPARK_CAPABILITY = "BROWSER_CAPTURE_TO_SPARK_MAPPING_UNVERIFIED"
 
+# Contract extracted from the installed Spark Desktop 1.0.3 main-process bundle
+# and its bundled @crawlee/memory-storage dataset reader. Product fields do not
+# participate in item enumeration; the selected directory's basename is used
+# as an ID under Spark's own storage/datasets root.
+SPARK_DESKTOP_LOADER_CONTRACT = {
+    "app_version": "1.0.3",
+    "selected_folder_handling": "use_basename_as_storage_id",
+    "dataset_storage_relative_path": "storage/datasets/<storage_id>",
+    "dataset_item_filename_pattern": "{index:09}.json",
+    "first_item_index": 1,
+    "item_json_read_predicate": "JSON.parse succeeds; no product keys or value types are checked",
+    "required_product_fields": [],
+    "quantity_required": False,
+    "image_main_dimensions_required": False,
+    "variation_display_labels_required": False,
+    "external_folder_contents_imported": False,
+    "count_without_metadata": "count regular files, then read sequential 9-digit item names",
+    "count_with_metadata": "use __metadata__.json itemCount",
+    "data_info_error_behavior": "caught; returns undefined",
+    "get_data_error_behavior": "caught; returns empty items and total zero",
+    "excluded_count": "unique ASIN union of deselected and filterDeselected",
+    "included_count": "itemCount minus excluded count",
+}
+
+
+def spark_desktop_loader_contract() -> dict:
+    """Return the read-only profile of the installed Spark Desktop loader."""
+    return dict(SPARK_DESKTOP_LOADER_CONTRACT)
+
 
 def cents_to_dollars(value) -> float | None:
     if value is None:
@@ -174,55 +203,10 @@ def normalize_spark_collected_at(value) -> int:
 
 
 def observed_spark_schema_issues(payload: dict) -> list[str]:
-    """Check the locally observed Spark product JSON type and nested-shape profile."""
-    issues = []
-    expected = {
-        "url": str, "asin": str, "title": str, "brand": str, "price": (int, float),
-        "options": dict, "tags": list, "category": str, "overview": list,
-        "aboutThis": list, "images": list, "rating": (int, float),
-        "reviewCount": int, "_sourceUrl": str, "_listPage": int, "_collectedAt": int,
-    }
-    for key, expected_type in expected.items():
-        value = payload.get(key)
-        if key not in payload or value is None or isinstance(value, bool) or not isinstance(value, expected_type):
-            issues.append(f"{key} must be {getattr(expected_type, '__name__', 'numeric')}")
-    for key in ("url", "asin", "title", "brand", "category", "_sourceUrl"):
-        if isinstance(payload.get(key), str) and not payload[key].strip():
-            issues.append(f"{key} must be non-empty")
-    if isinstance(payload.get("quantity"), bool) or (payload.get("quantity") is not None and not isinstance(payload.get("quantity"), int)):
-        issues.append("quantity must be an integer or null")
-    options = payload.get("options")
-    if isinstance(options, dict) and (
-        not isinstance(options.get("selectedVariations"), dict)
-        or not isinstance(options.get("variationDisplayLabels"), dict)
-    ):
-        issues.append("options must contain selectedVariations and variationDisplayLabels objects")
-    for key in ("tags", "overview", "aboutThis"):
-        value = payload.get(key)
-        if isinstance(value, list) and any(not isinstance(item, str) for item in value):
-            issues.append(f"{key} must contain strings")
-    images = payload.get("images")
-    if isinstance(images, list):
-        if not images:
-            issues.append("images must contain at least one observed image")
-        for index, image in enumerate(images):
-            prefix = f"images[{index}]"
-            if not isinstance(image, dict):
-                issues.append(f"{prefix} must be an object")
-                continue
-            for key in ("hiRes", "thumb", "large", "variant"):
-                if not isinstance(image.get(key), str):
-                    issues.append(f"{prefix}.{key} must be a string")
-            main = image.get("main")
-            if not isinstance(main, dict) or not main or any(
-                not isinstance(url, str) or not isinstance(size, list)
-                or len(size) not in (0, 2)
-                or any(isinstance(dimension, bool) or not isinstance(dimension, int) for dimension in size)
-                for url, size in main.items()
-            ):
-                issues.append(f"{prefix}.main must be an object of observed URL keys to integer lists")
-            if "lowRes" not in image or (image["lowRes"] is not None and not isinstance(image["lowRes"], str)):
-                issues.append(f"{prefix}.lowRes must be a string or null")
-            if "shoppableScene" not in image or (image["shoppableScene"] is not None and not isinstance(image["shoppableScene"], str)):
-                issues.append(f"{prefix}.shoppableScene must be a string or null")
-    return issues
+    """Return no inferred field-shape errors: Spark's reader only JSON.parse()s.
+
+    ShopSource separately requires product objects with ASIN/title for its own
+    export integrity, but the inspected Spark reader has no item-field schema
+    predicate. Malformed JSON is rejected by the reader's JSON.parse call.
+    """
+    return []

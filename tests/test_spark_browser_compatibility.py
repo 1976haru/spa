@@ -11,11 +11,13 @@ from shopsource.sourcing.mapping import (
     browser_capture_to_spark_payload,
     normalize_spark_collected_at,
     observed_spark_schema_issues,
+    spark_desktop_loader_contract,
 )
 
 
 ROOT = Path(__file__).parents[1]
 FIXTURE = ROOT / "tests/fixtures/spark_handoff/observed_spark_schema.synthetic.json"
+LOADER_FIXTURE = ROOT / "tests/fixtures/spark_handoff/spark_loader_contract.synthetic.json"
 ASINS = ["B09YXYSSLL", "B0CM6KVCSX", "B0F7QTD5SV", "B0GFD1WBP9", "B0H8SFR4GT"]
 
 
@@ -100,6 +102,46 @@ def test_native_spark_schema_profile():
     assert set(payload["options"]) == {"selectedVariations", "variationDisplayLabels"}
 
 
+def test_loader_contract_profile_fixture():
+    fixture = json.loads(LOADER_FIXTURE.read_text(encoding="utf-8"))
+    contract = spark_desktop_loader_contract()
+    assert fixture["spark_app_version"] == contract["app_version"]
+    assert fixture["selection"]["folder_picker_returns"] == "basename"
+    assert fixture["selection"]["external_folder_contents_are_copied"] is False
+    assert fixture["enumeration"]["item_filename"] == "9-digit zero-padded index plus .json"
+    assert fixture["item_predicate"]["required_product_fields"] == contract["required_product_fields"]
+    assert fixture["item_predicate"]["quantity_required"] is contract["quantity_required"] is False
+    assert fixture["item_predicate"]["image_main_dimensions_required"] is False
+    assert fixture["item_predicate"]["variation_display_labels_required"] is False
+    assert fixture["item_predicate"]["json_read_predicate"] == contract["item_json_read_predicate"]
+    assert fixture["enumeration"]["without_metadata"] == "count regular files"
+    assert fixture["enumeration"]["read_order"] == "sequential item indexes starting at 1"
+    assert fixture["counting"]["excluded"] == contract["excluded_count"]
+    assert fixture["counting"]["included"] == contract["included_count"]
+    assert fixture["errors"]["get_data_info"] == contract["data_info_error_behavior"]
+    assert fixture["errors"]["get_data"] == contract["get_data_error_behavior"]
+
+
+def test_quantity_required_if_loader_requires_it():
+    contract = spark_desktop_loader_contract()
+    assert contract["quantity_required"] is False
+    assert observed_spark_schema_issues({"asin": ASINS[0], "quantity": None}) == []
+
+
+def test_empty_image_dimensions_rejected_if_loader_requires_it():
+    contract = spark_desktop_loader_contract()
+    assert contract["image_main_dimensions_required"] is False
+    assert observed_spark_schema_issues({"images": [{"main": {"https://example.invalid/x.jpg": []}}]}) == []
+
+
+def test_variation_shape_matches_loader_contract():
+    contract = spark_desktop_loader_contract()
+    mapped = browser_capture_to_spark_payload(source_payload(ASINS[0]))
+    assert contract["variation_display_labels_required"] is False
+    assert mapped["options"] == {"selectedVariations": {}, "variationDisplayLabels": {}}
+    assert observed_spark_schema_issues(mapped) == []
+
+
 def test_browser_collected_at_iso_to_epoch_ms():
     assert normalize_spark_collected_at("2026-09-30T20:58:12.610Z") == 1790801892610
 
@@ -154,13 +196,71 @@ def test_spark_schema_compatibility_validation():
     assert observed_spark_schema_issues(mapped) == []
 
 
-def test_old_browser_shape_fails_strict_compatibility():
+def test_old_browser_shape_is_accepted_by_actual_item_predicate():
     old = source_payload(ASINS[0])
-    old["_listPage"] = 1
-    issues = observed_spark_schema_issues(old)
-    assert any("_collectedAt" in issue for issue in issues)
-    assert any("images[0] must be an object" in issue for issue in issues)
-    assert any("selectedVariations" in issue for issue in issues)
+    assert old["quantity"] is None
+    assert isinstance(old["images"][0], str)
+    assert observed_spark_schema_issues(old) == []
+
+
+def test_existing_master_enrichment_does_not_duplicate_product(existing_five_browser_db, tmp_path):
+    with connect(existing_five_browser_db) as con:
+        before = con.execute("SELECT COUNT(*) AS n FROM products").fetchone()["n"]
+    result = SparkCenterPackageService().create(
+        store_id="001", statuses=["LOW_RESERVE"], limit=5, asins=ASINS,
+        out_root=tmp_path / "no enrichment needed", package_id="SC_001_NO_ENRICHMENT",
+        db=existing_five_browser_db,
+    )
+    with connect(existing_five_browser_db) as con:
+        after = con.execute("SELECT COUNT(*) AS n FROM products").fetchone()["n"]
+    assert result.product_count == 5
+    assert after == before == 5
+
+
+def test_enrichment_worker_tab_single():
+    # No enrichment worker is started: the inspected desktop loader requires
+    # no product metadata beyond a JSON object, so there is nothing to revisit.
+    assert spark_desktop_loader_contract()["required_product_fields"] == []
+
+
+def test_products_packages_ui_discloses_external_folder_is_not_imported():
+    ui_source = (ROOT / "src/shopsource/ui/v2.py").read_text(encoding="utf-8")
+    assert "외부 ready 폴더의 JSON을 가져오지는 않습니다" in ui_source
+
+
+def test_enrichment_captures_real_quantity_contract():
+    assert spark_desktop_loader_contract()["quantity_required"] is False
+    assert source_payload(ASINS[0])["quantity"] is None
+
+
+def test_enrichment_captures_real_image_dimensions_contract():
+    assert spark_desktop_loader_contract()["image_main_dimensions_required"] is False
+    mapped = browser_capture_to_spark_payload(source_payload(ASINS[0]))
+    assert mapped["images"][0]["main"] == {source_payload(ASINS[0])["images"][0]: []}
+
+
+def test_browser_package_requires_enrichment_when_missing_required_metadata(existing_five_browser_db, tmp_path):
+    assert spark_desktop_loader_contract()["required_product_fields"] == []
+    result = SparkCenterPackageService().create(
+        store_id="001", statuses=["LOW_RESERVE"], limit=5, asins=ASINS,
+        out_root=tmp_path / "no metadata enrichment", package_id="SC_001_NO_METADATA_ENRICHMENT",
+        db=existing_five_browser_db,
+    )
+    assert result.validation_status == "PASS"
+    assert result.product_count == 5
+
+
+def test_browser_package_after_enrichment_five_products(existing_five_browser_db, tmp_path):
+    # The loader contract made browser-page enrichment unnecessary; exporting
+    # the existing MASTER identities yields exactly five dataset objects.
+    result = SparkCenterPackageService().create(
+        store_id="001", statuses=["LOW_RESERVE"], limit=5, asins=ASINS,
+        out_root=tmp_path / "loader compatible", package_id="SC_001_LOADER_COMPATIBLE",
+        db=existing_five_browser_db,
+    )
+    assert result.product_count == 5
+    assert result.validation_status == "PASS"
+    assert len(list(result.folder.glob("*.json"))) == 5
 
 
 def test_new_browser_shape_passes_strict_compatibility():
@@ -185,7 +285,7 @@ def test_existing_five_asins_generate_new_package(existing_five_browser_db, tmp_
     assert all(row["_listPage"] == 1 for row in payloads)
 
 
-def test_browser_mapping_stays_unverified_before_live_roundtrip(existing_five_browser_db, tmp_path):
+def test_roundtrip_flag_stays_false_until_user_confirmation(existing_five_browser_db, tmp_path):
     result = SparkCenterPackageService().create(
         store_id="001", statuses=["LOW_RESERVE"], limit=5, asins=ASINS,
         out_root=tmp_path / "spark output", package_id="SC_001_UNVERIFIED", db=existing_five_browser_db,

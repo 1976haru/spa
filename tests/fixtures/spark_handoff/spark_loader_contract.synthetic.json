@@ -1,0 +1,30 @@
+{
+  "spark_app_version": "1.0.3",
+  "selection": {
+    "folder_picker_returns": "basename",
+    "dataset_root_relative_to_session_data": "storage/datasets",
+    "external_folder_contents_are_copied": false
+  },
+  "enumeration": {
+    "metadata_file": "__metadata__.json",
+    "without_metadata": "count regular files",
+    "read_order": "sequential item indexes starting at 1",
+    "item_filename": "9-digit zero-padded index plus .json"
+  },
+  "item_predicate": {
+    "json_read_predicate": "JSON.parse succeeds; no product keys or value types are checked",
+    "required_product_fields": [],
+    "quantity_required": false,
+    "image_main_dimensions_required": false,
+    "variation_display_labels_required": false
+  },
+  "counting": {
+    "total": "dataset metadata itemCount or enumerated file count",
+    "excluded": "unique ASIN union of deselected and filterDeselected",
+    "included": "itemCount minus excluded count"
+  },
+  "errors": {
+    "get_data_info": "caught; returns undefined",
+    "get_data": "caught; returns empty items and total zero"
+  }
+}

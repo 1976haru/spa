@@ -26,6 +26,7 @@ tests/fixtures/spark_handoff/*
 !tests/fixtures/spark_handoff/README.md
 !tests/fixtures/spark_handoff/.gitkeep
 !tests/fixtures/spark_handoff/observed_spark_schema.synthetic.json
+!tests/fixtures/spark_handoff/spark_loader_contract.synthetic.json
 exports/**/*.json
 exports/**/*.csv
 *.xlsx

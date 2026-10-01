@@ -15,6 +15,7 @@ from ..db import connect, get_store, init_db, utc_now
 from ..paths import EXPORT_DIR
 from ..sourcing.mapping import (BROWSER_CAPTURE_TO_SPARK_CAPABILITY, KEEPA_TO_SPARK_CAPABILITY,
                                 browser_capture_to_spark_payload, observed_spark_schema_issues,
+                                spark_desktop_loader_contract,
                                 to_spark_product_payload)
 
 CAPABILITY_STATUS = "DATASET_LOAD_VERIFIED"
@@ -225,6 +226,7 @@ class SparkHandoffConnector(ExportConnector):
                                     for kind in sorted({row["source_kind"] for row in rows})}
         if browser_mapping:
             manifest["browser_capture_mapping_verified"] = False
+            manifest["spark_desktop_loader_contract"] = spark_desktop_loader_contract()
             manifest["observed_spark_schema_compatible"] = not any(
                 error.startswith("Observed Spark schema incompatibility:") for error in preflight_errors
             )
@@ -239,6 +241,9 @@ class SparkHandoffConnector(ExportConnector):
         if browser_mapping:
             report["warnings"].append(
                 "Browser capture to Spark payload mapping has not completed a portal round-trip test"
+            )
+            report["warnings"].append(
+                "Spark Desktop folder selection resolves only the selected folder basename under its own storage/datasets; selecting an external export folder does not import its JSON files"
             )
             manifest["observed_spark_schema_compatible"] = report["observed_spark_schema_compatible"]
             manifest["spark_desktop_roundtrip_verified"] = False
@@ -422,12 +427,6 @@ class SparkHandoffConnector(ExportConnector):
                     schema_error = f"Observed Spark schema incompatibility: {file.name} {issue}"
                     if schema_error not in errors:
                         errors.append(schema_error)
-                if payload.get("quantity") is None:
-                    warnings.append(f"{file.name}: quantity is null in captured source; nullability was not observed in Spark samples")
-                for image_index, image in enumerate(payload.get("images", [])):
-                    main = image.get("main") if isinstance(image, dict) else None
-                    if isinstance(main, dict) and any(not sizes for sizes in main.values()):
-                        warnings.append(f"{file.name}: image dimensions were not captured; no dimensions were guessed")
         if len(asins) != len(set(asins)):
             errors.append("Duplicate ASIN detected")
         if manifest["product_count"] != len(files):
@@ -457,6 +456,7 @@ class SparkHandoffConnector(ExportConnector):
             "spark_desktop_roundtrip_verified": False,
             "shopify_upload_verified": False,
             "portal_package_verified": False,
+            "spark_desktop_loader_contract": spark_desktop_loader_contract() if browser_mapping else None,
             "errors": errors,
             "warnings": warnings,
             "validated_at": utc_now(),

@@ -582,6 +582,9 @@ class OperatorUI:
             "Local JSON validation: 대기 · Observed Spark schema compatibility: 대기 · Actual Spark load: NOT VERIFIED"
         ).classes("text-sm text-slate-700")
         ui.label("로컬 JSON/schema 검사는 Spark Desktop의 실제 dataset load 성공을 의미하지 않습니다.").classes("text-xs text-amber-800")
+        ui.label(
+            "현재 Spark Desktop 폴더 선택은 선택한 경로의 폴더명만 자체 storage/datasets에서 엽니다. 외부 ready 폴더의 JSON을 가져오지는 않습니다."
+        ).classes("text-xs text-amber-800")
         if self.package_selected_asins:
             ui.label(f"상품 페이지에서 선택한 {len(self.package_selected_asins)}개 ASIN 사용 예정")
         table_slot = ui.column().classes("w-full")
