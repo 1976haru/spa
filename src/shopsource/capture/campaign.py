@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import secrets
 import subprocess
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -140,10 +141,25 @@ class CampaignService:
                                       (campaign_id, capture["keyword"])).fetchone()
             if not keyword_row:
                 raise ValueError("Captured keyword is not in this campaign.")
+            first_candidate = con.execute("SELECT search_payload_json FROM browser_capture_candidates WHERE run_id=? ORDER BY id LIMIT 1", (capture_run_id,)).fetchone()
+            first_payload = json.loads(first_candidate["search_payload_json"]) if first_candidate else {}
+            page_number = int(first_payload.get("_listPage") or keyword_row["current_page"] + 1)
+            normalized_url = _normalized_search_url(capture["search_url"])
+            seen_page = con.execute("SELECT id FROM sourcing_campaign_pages WHERE campaign_id=? AND (keyword=? AND page_number=? OR normalized_url=?)",
+                                    (campaign_id, capture["keyword"], page_number, normalized_url)).fetchone()
+            if seen_page:
+                con.execute("UPDATE sourcing_campaigns SET search_worker_status='CONNECTED',last_search_capture_at=?,last_search_error='',current_keyword=?,current_page=? WHERE campaign_id=?",
+                            (now, capture["keyword"], page_number, campaign_id))
+                self._event(con, campaign_id, "SEARCH_CAPTURE_ACK_DUPLICATE", {"keyword": capture["keyword"], "page": page_number})
+                duplicate_result = True
+            else:
+                duplicate_result = False
+                con.execute("INSERT INTO sourcing_campaign_pages(campaign_id,keyword,page_number,normalized_url,capture_run_id,captured_at) VALUES(?,?,?,?,?,?)",
+                            (campaign_id, capture["keyword"], page_number, normalized_url, capture_run_id, now))
             candidates = con.execute("SELECT asin FROM browser_capture_candidates WHERE run_id=? ORDER BY id", (capture_run_id,)).fetchall()
             added = duplicates = 0
             target = int(campaign["candidate_target"])
-            for item in candidates:
+            for item in ([] if duplicate_result else candidates):
                 asin = item["asin"]
                 con.execute("""INSERT INTO sourcing_campaign_occurrences
                     (campaign_id,asin,keyword,search_url,page_number,captured_at) VALUES(?,?,?,?,?,?)""",
@@ -157,21 +173,25 @@ class CampaignService:
                         VALUES(?,?,?,?, 'NEEDS_DETAIL',?,?)""",
                         (campaign_id, asin, capture_run_id, capture["keyword"], now, now))
                     added += 1
-            zero_pages = 0 if added else int(keyword_row["consecutive_zero_pages"]) + 1
-            keyword_exhausted = bool(exhausted or not next_url or zero_pages >= int(campaign["stale_page_threshold"]))
-            con.execute("""UPDATE sourcing_campaign_keywords SET current_page=current_page+1,
-                pages_captured=pages_captured+1,new_candidates=new_candidates+?,duplicates=duplicates+?,
-                consecutive_zero_pages=?,exhausted=?,last_url=?,updated_at=? WHERE id=?""",
-                (added, duplicates, zero_pages, int(keyword_exhausted), capture["search_url"], now, keyword_row["id"]))
+            zero_pages = int(keyword_row["consecutive_zero_pages"]) if duplicate_result else (0 if added else int(keyword_row["consecutive_zero_pages"]) + 1)
+            keyword_exhausted = bool(keyword_row["exhausted"] or (not duplicate_result and (exhausted or not next_url or zero_pages >= int(campaign["stale_page_threshold"]))))
+            page_increment = int(not duplicate_result)
+            con.execute("""UPDATE sourcing_campaign_keywords SET current_page=current_page+?,
+                pages_captured=pages_captured+?,new_candidates=new_candidates+?,duplicates=duplicates+?,
+                consecutive_zero_pages=?,exhausted=?,last_url=?,next_url=?,updated_at=? WHERE id=?""",
+                (page_increment, page_increment, added, duplicates, zero_pages, int(keyword_exhausted), capture["search_url"], next_url or "", now, keyword_row["id"]))
             total = int(campaign["unique_candidates"]) + added
             status = "CANDIDATE_TARGET_REACHED" if total >= target else "RUNNING"
             con.execute("""UPDATE sourcing_campaigns SET unique_candidates=?,duplicates=duplicates+?,
-                search_pages=search_pages+1,status=?,updated_at=? WHERE campaign_id=?""",
-                (total, duplicates, status, now, campaign_id))
-            self._event(con, campaign_id, "SEARCH_PAGE_CAPTURED", {"keyword": capture["keyword"], "added": added, "duplicates": duplicates, "exhausted": keyword_exhausted})
+                search_pages=search_pages+?,status=?,search_worker_status='CONNECTED',current_keyword=?,current_page=?,
+                last_search_capture_at=?,last_search_error='',updated_at=? WHERE campaign_id=?""",
+                (total, duplicates, int(not duplicate_result), status, capture["keyword"], page_number, now, now, campaign_id))
+            if not duplicate_result:
+                self._event(con, campaign_id, "SEARCH_PAGE_CAPTURED", {"keyword": capture["keyword"], "page": page_number, "added": added, "duplicates": duplicates, "exhausted": keyword_exhausted})
         if status == "CANDIDATE_TARGET_REACHED":
             self._ensure_detail_batch(campaign_id)
         result = self.get(campaign_id)
+        result["duplicate_capture"] = duplicate_result
         result["search_instruction"] = self.next_search(campaign_id, next_url if not keyword_exhausted else None)
         return result
 
@@ -182,8 +202,11 @@ class CampaignService:
         current = next((x for x in campaign["keywords"] if not x["exhausted"]), None)
         if not current:
             return None
-        if dom_next_url and current["pages_captured"]:
+        if dom_next_url:
             return {"campaign_id": campaign_id, "keyword": current["keyword"], "url": dom_next_url,
+                    "delay_seconds": campaign["search_delay_seconds"]}
+        if current.get("next_url"):
+            return {"campaign_id": campaign_id, "keyword": current["keyword"], "url": current["next_url"],
                     "delay_seconds": campaign["search_delay_seconds"]}
         from urllib.parse import quote_plus
         return {"campaign_id": campaign_id, "keyword": current["keyword"],
@@ -223,6 +246,38 @@ class CampaignService:
         remaining = max(0, int(result["detail_target"]) - int(result["detail_complete"]))
         result["minimum_remaining_seconds"] = remaining * int(result["detail_interval_seconds"])
         return result
+
+    def record_extension_event(self, campaign_id: str, event_name: str, payload: dict | None = None) -> dict:
+        allowed = {"SEARCH_WORKER_CREATED", "SEARCH_WORKER_REUSED", "SEARCH_CAPTURE_TRIGGERED",
+                   "SEARCH_CAPTURE_ACK", "SEARCH_CAPTURE_ERROR", "SEARCH_RESULTS_NOT_READY", "SEARCH_CAPTCHA",
+                   "SEARCH_WORKER_MISSING"}
+        event_name = str(event_name or "").upper()
+        if event_name not in allowed:
+            raise ValueError("Unsupported campaign search event.")
+        data = payload if isinstance(payload, dict) else {}
+        keyword = str(data.get("keyword") or "")[:300]
+        try: page = max(0, int(data.get("page") or 0))
+        except (TypeError, ValueError): page = 0
+        error = str(data.get("error") or event_name).replace("\n", " ")[:500]
+        now = utc_now()
+        worker_status = "CONNECTED"
+        if event_name in {"SEARCH_CAPTURE_ERROR", "SEARCH_RESULTS_NOT_READY", "SEARCH_WORKER_MISSING"}: worker_status = "ERROR"
+        if event_name == "SEARCH_CAPTCHA": worker_status = "CAPTCHA"
+        with connect(self.db) as con:
+            if not con.execute("SELECT 1 FROM sourcing_campaigns WHERE campaign_id=?", (campaign_id,)).fetchone():
+                raise KeyError(campaign_id)
+            con.execute("""UPDATE sourcing_campaigns SET search_worker_status=?,
+                current_keyword=CASE WHEN ?='' THEN current_keyword ELSE ? END,
+                current_page=CASE WHEN ?>0 THEN ? ELSE current_page END,
+                last_search_capture_at=CASE WHEN ?='SEARCH_CAPTURE_ACK' THEN ? ELSE last_search_capture_at END,
+                last_search_error=CASE WHEN ? IN ('SEARCH_CAPTURE_ERROR','SEARCH_RESULTS_NOT_READY','SEARCH_WORKER_MISSING','SEARCH_CAPTCHA') THEN ? ELSE '' END,
+                updated_at=? WHERE campaign_id=?""",
+                (worker_status, keyword, keyword, page, page, event_name, now, event_name, error, now, campaign_id))
+            self._event(con, campaign_id, event_name, {"keyword": keyword, "page": page,
+                                                       "error": error if worker_status in {"ERROR", "CAPTCHA"} else ""})
+            if event_name == "SEARCH_CAPTCHA":
+                con.execute("UPDATE sourcing_campaigns SET status='PAUSED_NEEDS_USER' WHERE campaign_id=?", (campaign_id,))
+        return self.get(campaign_id)
 
     def _sync(self, campaign_id: str) -> None:
         with connect(self.db) as con:
@@ -294,7 +349,7 @@ class CampaignService:
         result = {"database_backup": str(backup), "database_backup_created": backup.is_file(),
                   "disk_free_bytes": free, "store_profile_loaded": bool(get_store(campaign["store_id"], self.db)),
                   "active_campaign_same_id": self.active(campaign["store_id"])["campaign_id"] == campaign_id,
-                  "extension_required_version": "0.1.5", "extension_health": "CHECK_IN_UI",
+                  "extension_required_version": "0.1.6", "extension_health": "CHECK_IN_UI",
                   "spark_staging_connector": "AVAILABLE"}
         with connect(self.db) as con:
             self._event(con, campaign_id, "PREFLIGHT", result)
@@ -338,3 +393,11 @@ class CampaignService:
     def _event(con, campaign_id: str, event_type: str, payload: dict | None = None) -> None:
         con.execute("INSERT INTO sourcing_campaign_events(campaign_id,event_type,payload_json,created_at) VALUES(?,?,?,?)",
                     (campaign_id, event_type, json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":")), utc_now()))
+
+
+def _normalized_search_url(value: str) -> str:
+    parts = urlsplit(value)
+    excluded = {"ref", "qid", "sr", "sprefix", "crid", "dib"}
+    query = urlencode(sorted((key, item) for key, item in parse_qsl(parts.query, keep_blank_values=True)
+                             if key.casefold() not in excluded))
+    return urlunsplit((parts.scheme.casefold(), parts.netloc.casefold(), parts.path, query, ""))

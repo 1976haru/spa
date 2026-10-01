@@ -134,6 +134,15 @@ def install_capture_routes(app, service: CaptureService | None = None) -> None:
         except (KeyError, ValueError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=422)
 
+    async def campaign_event(request: Request):
+        denied = await authorized(request)
+        if denied: return denied
+        try:
+            body = await request.json()
+            return campaigns.record_extension_event(request.path_params["campaign_id"], body.get("event", ""), body.get("payload", {}))
+        except KeyError: return JSONResponse({"error": "Campaign not found."}, status_code=404)
+        except ValueError as exc: return JSONResponse({"error": str(exc)}, status_code=422)
+
     for path, endpoint, methods in (
         ("/api/capture/health", health, ["GET"]),
         ("/api/capture/search-results", search_results, ["POST"]),
@@ -145,5 +154,6 @@ def install_capture_routes(app, service: CaptureService | None = None) -> None:
         ("/api/capture/campaigns", campaign_create, ["POST"]),
         ("/api/capture/campaigns/{campaign_id}", campaign_status, ["GET"]),
         ("/api/capture/campaigns/{campaign_id}/action", campaign_action, ["POST"]),
+        ("/api/capture/campaigns/{campaign_id}/events", campaign_event, ["POST"]),
     ):
         app.add_api_route(path, endpoint, methods=methods, include_in_schema=False)

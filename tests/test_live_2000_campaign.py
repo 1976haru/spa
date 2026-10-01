@@ -27,8 +27,11 @@ def products(start, count):
 
 
 def capture_page(db, service, campaign_id, items, next_url="https://www.amazon.com/s?k=trunk+organizer&page=2", keyword="trunk organizer"):
+    current = service.get(campaign_id)
+    page = next(row["pages_captured"] for row in current["keywords"] if row["keyword"].casefold() == keyword.casefold()) + 1
+    search_url = f"https://www.amazon.com/s?k=trunk+organizer&page={page}"
     result = CaptureService(db).capture_search({"store_id":"001", "keyword":keyword,
-        "search_url":"https://www.amazon.com/s?k=trunk+organizer", "products":items})
+        "search_url":search_url, "page_number":page, "products":items})
     return service.record_search_capture(campaign_id, result["run_id"], next_url)
 
 
@@ -83,6 +86,75 @@ def test_campaign_resume_same_id_and_survives_ui_restart(tmp_path):
     service.action(cid, "PAUSE")
     assert CampaignService(db).create_live_2000("001")["campaign_id"] == cid
     assert CampaignService(db).action(cid, "RESUME")["campaign_id"] == cid
+
+
+def test_campaign_search_worker_persisted_and_restored():
+    source = (Path(__file__).parents[1] / "browser_extension/shopsource_capture/background.js").read_text(encoding="utf-8")
+    assert "shopsource.searchWorker." in source
+    assert "chrome.storage.session.set({[searchWorkerKey(campaignId)]:record})" in source
+    assert "restoreSearchWorkers" in source and "chrome.storage.session.get(null)" in source
+
+
+def test_search_tab_complete_triggers_explicit_capture():
+    source = (Path(__file__).parents[1] / "browser_extension/shopsource_capture/background.js").read_text(encoding="utf-8")
+    assert "changeInfo.status!=='complete'" in source
+    assert "triggerCampaignSearchCapture(tabId,campaignId)" in source
+    assert "type:'shopsource-campaign-capture',campaignId" in source
+
+
+def test_search_capture_does_not_require_hash_and_hash_fallback_deduped():
+    source = (Path(__file__).parents[1] / "browser_extension/shopsource_capture/content_search.js").read_text(encoding="utf-8")
+    assert "shopsource-campaign-capture" in source
+    assert "const inFlight = new Map()" in source and "const completed = new Map()" in source
+    assert "shopsource_campaign" in source  # retained only as recovery fallback
+    assert source.index("shopsource-campaign-capture") < source.index("shopsource_campaign")
+
+
+def test_search_capture_waits_for_results_and_timeout_reports_error():
+    source = (Path(__file__).parents[1] / "browser_extension/shopsource_capture/content_search.js").read_text(encoding="utf-8")
+    assert "Date.now() + 20000" in source and "await wait(500)" in source
+    assert "SEARCH_RESULTS_NOT_READY" in source
+
+
+def test_search_captcha_pauses_campaign(tmp_path):
+    _db, service, cid = setup_campaign(tmp_path)
+    result = service.record_extension_event(cid, "SEARCH_CAPTCHA", {"keyword":"trunk organizer", "error":"robot check"})
+    assert result["status"] == "PAUSED_NEEDS_USER"
+    assert result["search_worker_status"] == "CAPTCHA"
+
+
+def test_search_page_captured_once(tmp_path):
+    db, service, cid = setup_campaign(tmp_path, 10)
+    captured = CaptureService(db).capture_search({"store_id":"001", "keyword":"trunk organizer",
+        "search_url":"https://www.amazon.com/s?k=trunk+organizer&page=1", "page_number":1, "products":products(1, 2)})
+    first = service.record_search_capture(cid, captured["run_id"], "https://www.amazon.com/s?k=trunk+organizer&page=2")
+    second = service.record_search_capture(cid, captured["run_id"], "https://www.amazon.com/s?k=trunk+organizer&page=2")
+    assert first["search_pages"] == second["search_pages"] == 1
+    assert second["duplicate_capture"] is True
+    assert second["unique_candidates"] == 2
+
+
+def test_campaign_resume_reuses_same_search_tab():
+    source = (Path(__file__).parents[1] / "browser_extension/shopsource_capture/background.js").read_text(encoding="utf-8")
+    assert "validSearchWorker(message.campaignId)" in source
+    assert "chrome.tabs.update(prior,{url:target.href,active:false})" in source
+
+
+def test_search_failure_visible_in_campaign_status(tmp_path):
+    _db, service, cid = setup_campaign(tmp_path)
+    result = service.record_extension_event(cid, "SEARCH_RESULTS_NOT_READY", {"keyword":"trunk organizer", "page":1, "error":"timeout"})
+    assert result["search_worker_status"] == "ERROR"
+    assert result["current_keyword"] == "trunk organizer"
+    assert result["last_search_error"] == "timeout"
+
+
+def test_deleted_dialog_slot_does_not_notify_after_close():
+    source = (Path(__file__).parents[1] / "src/shopsource/ui/v2.py").read_text(encoding="utf-8")
+    start = source.index("def save_confirmation():")
+    end = source.index("ui.button(\"직접 확인했습니다\"", start)
+    callback = source[start:end]
+    assert callback.index("ui.notify(\"Spark Desktop load 확인을 기록했습니다.\"") < callback.index("dialog.close()")
+    assert callback.index("dialog.close()") < callback.index("refresh_packages()")
 
 
 def test_campaign_detail_target_2000(tmp_path):

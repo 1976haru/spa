@@ -353,6 +353,8 @@ class OperatorUI:
             status = ui.label("캠페인 없음").classes("font-medium")
             counts = ui.label("").classes("text-sm")
             estimate = ui.label("").classes("text-sm text-amber-800")
+            search_health = ui.label("검색 Worker: 연결 대기").classes("text-sm")
+            search_warning = ui.label("").classes("text-sm text-red-700 font-medium")
 
             def render(campaign):
                 if not campaign: return
@@ -361,6 +363,22 @@ class OperatorUI:
                 counts.set_text(f"후보 목표 {campaign['candidate_target']:,} · 고유 후보 {campaign['unique_candidates']:,} · 중복 {campaign['duplicates']:,} · 검색 페이지 {campaign['search_pages']:,} · 상세 완료 {campaign['detail_complete']:,} · MASTER {campaign['master_imported']:,} · Store 분류 {campaign['classified']:,} · 실패 {campaign['failed']:,} · Spark 준비 {campaign['classified']:,}")
                 seconds = int(campaign["minimum_remaining_seconds"])
                 estimate.set_text(f"최소 예상시간 {seconds // 3600}시간 {(seconds % 3600) // 60}분 · 실제 Amazon 로딩/확인 화면 때문에 더 길어질 수 있습니다.")
+                worker_state = campaign.get("search_worker_status", "NOT_CONNECTED")
+                search_health.set_text(
+                    f"검색 Worker: {worker_state} · keyword {campaign.get('current_keyword') or '대기'} · page {campaign.get('current_page') or 0} · "
+                    f"마지막 캡처 {campaign.get('last_search_capture_at') or '없음'} · 오류 {campaign.get('last_search_error') or '없음'}"
+                )
+                warning = ""
+                if campaign["status"] == "RUNNING" and campaign["search_pages"] == 0 and campaign.get("started_at"):
+                    try:
+                        from datetime import datetime, timezone
+                        started = datetime.fromisoformat(campaign["started_at"].replace("Z", "+00:00"))
+                        if (datetime.now(timezone.utc) - started).total_seconds() >= 15:
+                            warning = "검색 탭은 열렸지만 자동 캡처 응답이 없습니다. 기존 캠페인에서 '과제 2,000 계속'을 눌러 검색 Worker를 다시 연결하세요."
+                    except (TypeError, ValueError): pass
+                if campaign.get("last_search_error"):
+                    warning = f"마지막 검색 오류: {campaign['last_search_error']}"
+                search_warning.set_text(warning)
 
             def command(action):
                 try:
@@ -394,6 +412,7 @@ class OperatorUI:
             with ui.row():
                 ui.button("LIVE 과제 2,000 시작", on_click=lambda: command("START"), icon="play_arrow")
                 ui.button("과제 2,000 계속", on_click=lambda: command("RESUME"), icon="resume").props("outline")
+                ui.button("검색 Worker 다시 연결", on_click=lambda: command("RESUME"), icon="sync").props("outline")
                 ui.button("일시정지", on_click=lambda: command("PAUSE"), icon="pause").props("outline")
                 ui.button("실패만 재시도", on_click=lambda: command("RETRY"), icon="replay").props("outline")
                 ui.button("취소", on_click=lambda: command("CANCEL"), icon="stop").props("outline color=negative")
@@ -427,7 +446,7 @@ class OperatorUI:
                     except Exception as exc: ui.notify(_safe_error(exc), type="negative")
                 ui.button("확인 결과 저장", on_click=save_outcome, icon="save").props("outline")
             ui.label("CAPTCHA/확인 화면, 확장 연결 끊김 또는 반복 준비 실패 시 자동 일시정지하며 우회하지 않습니다. Spark에서 전체/포함/제외와 Shopify 업로드 결과를 확인 후 기록하세요.").classes("text-xs text-slate-600")
-            ui.label("확장 변경: chrome://extensions 또는 edge://extensions에서 ShopSource Capture v0.1.5를 다시 로드하세요.").classes("text-xs font-medium text-amber-800")
+            ui.label("ShopSource Capture v0.1.6을 다시 로드한 뒤 이 기존 캠페인에서 '과제 2,000 계속'을 누르세요.").classes("text-xs font-medium text-amber-800")
             if active["campaign"]: render(active["campaign"])
             def poll():
                 if active.get("campaign"):
@@ -661,8 +680,8 @@ class OperatorUI:
                 with ui.row():
                     for label, status in (("PRIMARY 승격", "PRIMARY"), ("RESERVE 강등", "RESERVE_B"),
                                           ("REVIEW", "REVIEW"), ("RESTRICTED 해제", "PRIMARY")):
-                        ui.button(label, on_click=lambda status=status: (bulk_override(self.current_store, [product_id], status), dialog.close(), ui.notify("수동 override 저장")))
-                    ui.button("Override 해제", on_click=lambda: (clear_bulk_override(self.current_store, [product_id]), dialog.close(), ui.notify("override 해제"))).props("outline")
+                        ui.button(label, on_click=lambda status=status: (bulk_override(self.current_store, [product_id], status), ui.notify("수동 override 저장"), dialog.close()))
+                    ui.button("Override 해제", on_click=lambda: (clear_bulk_override(self.current_store, [product_id]), ui.notify("override 해제"), dialog.close())).props("outline")
             ui.label("Occurrence history").classes("font-semibold mt-3")
             ui.table(columns=[{"name": key, "label": key, "field": key} for key in
                               ("job_id", "source_file", "collected_at", "source_url", "source_kind")],
@@ -728,11 +747,12 @@ class OperatorUI:
                     def save_confirmation():
                         try:
                             confirm_spark_desktop_roundtrip(package_id, confirmed=True)
-                            dialog.close()
-                            refresh_packages()
                             ui.notify("Spark Desktop load 확인을 기록했습니다.", type="positive")
                         except Exception as exc:
                             ui.notify(_safe_error(exc), type="negative")
+                            return
+                        dialog.close()
+                        refresh_packages()
                     ui.button("직접 확인했습니다", on_click=save_confirmation).props("color=positive")
             dialog.open()
 
@@ -762,7 +782,11 @@ class OperatorUI:
                         ui.button("경로 복사", on_click=lambda path=row["output_path"]: ui.run_javascript(
                             f"navigator.clipboard.writeText({json.dumps(path)})")).props("flat dense")
                         if row["package_status"] == "CREATED":
-                            ui.button("업로드 완료 표시", on_click=lambda pid=row["package_id"]: (mark_package(pid, "UPLOADED", "Marked in UI V2"), refresh_packages(), ui.notify("사용자 수동 업로드 기록 저장"))).props("dense")
+                            def mark_uploaded(pid=row["package_id"]):
+                                mark_package(pid, "UPLOADED", "Marked in UI V2")
+                                ui.notify("사용자 수동 업로드 기록 저장", type="positive")
+                                refresh_packages()
+                            ui.button("업로드 완료 표시", on_click=mark_uploaded).props("dense")
                         ui.button("보관", on_click=lambda pid=row["package_id"]: (mark_package(pid, "ARCHIVED", "Archived in UI V2"), refresh_packages())).props("flat dense")
         def generate_package():
             try:
@@ -788,7 +812,10 @@ class OperatorUI:
                     ui.label("Browser Capture Spark Center portal round-trip is not verified. Continue with a package over 100 products?")
                     with ui.row():
                         ui.button("Cancel", on_click=confirm_dialog.close).props("flat")
-                        ui.button("Continue", on_click=lambda: (confirm_dialog.close(), generate_package())).props("color=warning")
+                        def confirm_generate_package():
+                            generate_package()
+                            confirm_dialog.close()
+                        ui.button("Continue", on_click=confirm_generate_package).props("color=warning")
                 confirm_dialog.open()
                 return
             generate_package()
@@ -1289,7 +1316,8 @@ class OperatorUI:
                     path = create_store_profile(profile)
                     self.stores = list_stores()
                     self.current_store = profile["store_id"]
-                    dialog.close(); ui.notify(f"Store Profile 저장: {path}", type="positive")
+                    ui.notify(f"Store Profile 저장: {path}", type="positive")
+                    dialog.close()
                     ui.navigate.to("/stores")
                 except Exception as exc:
                     ui.notify(_safe_error(exc), type="negative")

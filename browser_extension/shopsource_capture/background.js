@@ -5,6 +5,7 @@ const workerTabs = new Map();
 const searchWorkerTabs = new Map();
 const PENDING_PREFIX = 'shopsource.pending.';
 const WORKER_PREFIX = 'shopsource.worker.';
+const SEARCH_WORKER_PREFIX = 'shopsource.searchWorker.';
 const OPEN_TIMEOUT_MS = 45000;
 const HANDSHAKE_ATTEMPTS = 10;
 const HANDSHAKE_INTERVAL_MS = 500;
@@ -33,14 +34,59 @@ async function navigateCampaign(instruction) {
   if (!instruction?.url || !instruction?.campaign_id) return;
   const campaignId = instruction.campaign_id; const target = new URL(instruction.url);
   target.hash = `shopsource_campaign=${encodeURIComponent(campaignId)}`;
-  let prior = searchWorkerTabs.get(campaignId); let tab = null;
+  let record = await validSearchWorker(campaignId); let tab = null;
+  let prior = record?.tabId;
   if (!prior) {
     const marked = await chrome.tabs.query({url:'https://www.amazon.com/*'});
     const found = marked.find(candidate => (candidate.url || '').includes(`shopsource_campaign=${encodeURIComponent(campaignId)}`));
-    if (found?.id) { prior=found.id; searchWorkerTabs.set(campaignId,found.id); }
+    if (found?.id) { prior=found.id; record=await saveSearchWorker(campaignId,found.id,found.url || target.href); }
   }
-  if (prior) { try { tab = await chrome.tabs.update(prior,{url:target.href,active:false}); } catch (_error) { searchWorkerTabs.delete(campaignId); } }
-  if (!tab) { const searchUrl=target.href; tab = await chrome.tabs.create({url:searchUrl,active:false}); searchWorkerTabs.set(campaignId,tab.id); }
+  if (prior) { try { tab = await chrome.tabs.update(prior,{url:target.href,active:false}); await saveSearchWorker(campaignId,tab.id,target.href,record?.createdAt); await sendCampaignEvent(campaignId,'SEARCH_WORKER_REUSED',{url:target.href}); }
+    catch (_error) { await clearSearchWorker(campaignId); } }
+  if (!tab) { const searchUrl=target.href; tab = await chrome.tabs.create({url:searchUrl,active:false}); await saveSearchWorker(campaignId,tab.id,searchUrl); await sendCampaignEvent(campaignId,'SEARCH_WORKER_CREATED',{url:searchUrl}); }
+}
+const searchWorkerKey = campaignId => SEARCH_WORKER_PREFIX + campaignId;
+const normalizedSearchPage = value => { try { const url=new URL(value); url.hash=''; for(const key of ['ref','qid','sr','sprefix','crid']) url.searchParams.delete(key); url.searchParams.sort(); return url.href; } catch(_error) { return value || ''; } };
+async function saveSearchWorker(campaignId,tabId,lastUrl,createdAt=Date.now(),updates={}) {
+  const prior=searchWorkerTabs.get(campaignId) || {};
+  const record={campaignId,tabId,createdAt:Number(createdAt)||Date.now(),lastUrl:lastUrl || prior.lastUrl || '',
+    captureInFlight:Boolean(prior.captureInFlight),lastCaptureAt:prior.lastCaptureAt || null,
+    lastCapturedUrl:prior.lastCapturedUrl || '',...updates};
+  searchWorkerTabs.set(campaignId,record);
+  try { await chrome.storage.session.set({[searchWorkerKey(campaignId)]:record}); } catch(_error) {}
+  return record;
+}
+async function clearSearchWorker(campaignId) {
+  searchWorkerTabs.delete(campaignId);
+  try { await chrome.storage.session.remove(searchWorkerKey(campaignId)); } catch(_error) {}
+}
+async function validSearchWorker(campaignId) {
+  let record=searchWorkerTabs.get(campaignId);
+  if (!record) {
+    try { const stored=(await chrome.storage.session.get(searchWorkerKey(campaignId)))[searchWorkerKey(campaignId)]; if(stored?.campaignId===campaignId&&Number.isInteger(stored.tabId)){record=stored;searchWorkerTabs.set(campaignId,record);} } catch(_error) {}
+  }
+  if (!record) return null;
+  try { const tab=await chrome.tabs.get(record.tabId); if(tab.url&&tab.url!==record.lastUrl) record=await saveSearchWorker(campaignId,tab.id,tab.url,record.createdAt); return record; }
+  catch(_error) { await clearSearchWorker(campaignId); await sendCampaignEvent(campaignId,'SEARCH_WORKER_MISSING',{error:'Persisted search worker tab is missing'}); return null; }
+}
+async function sendCampaignEvent(campaignId,event,payload={}) {
+  try { return await api(`/api/capture/campaigns/${encodeURIComponent(campaignId)}/events`,{event,payload}); }
+  catch(_error) { return null; }
+}
+async function restoreSearchWorkers() {
+  try {
+    const values=await chrome.storage.session.get(null);
+    for(const [key,stored] of Object.entries(values)) {
+      if(!key.startsWith(SEARCH_WORKER_PREFIX)||!stored?.campaignId||!Number.isInteger(stored.tabId)) continue;
+      try {
+        const tab=await chrome.tabs.get(stored.tabId);
+        const record={...stored,lastUrl:tab.url || stored.lastUrl,captureInFlight:false};
+        searchWorkerTabs.set(record.campaignId,record);
+        await chrome.storage.session.set({[key]:record});
+        if(tab.status==='complete') setTimeout(()=>triggerCampaignSearchCapture(tab.id,record.campaignId),0);
+      } catch(_error) { await chrome.storage.session.remove(key); await sendCampaignEvent(stored.campaignId,'SEARCH_WORKER_MISSING',{error:'Persisted search worker tab is missing'}); }
+    }
+  } catch(_error) {}
 }
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const pendingKey = runId => PENDING_PREFIX + runId;
@@ -181,6 +227,56 @@ function sendTabMessage(tabId, message) {
     });
   });
 }
+async function triggerCampaignSearchCapture(tabId,campaignId) {
+  await restorePromise;
+  let campaignState;
+  try { campaignState=await api(`/api/capture/campaigns/${encodeURIComponent(campaignId)}`,undefined,'GET'); }
+  catch(_error) { return; }
+  if(campaignState.status!=='RUNNING') return;
+  const record=await validSearchWorker(campaignId);
+  if(!record||record.tabId!==tabId) return;
+  let tab;
+  try { tab=await chrome.tabs.get(tabId); } catch(_error) { return; }
+  let parsed;
+  try { parsed=new URL(tab.url || ''); } catch(_error) { return; }
+  if(!/(^|\.)amazon\.com$/i.test(parsed.hostname)||!/^\/s(?:\/|$)/i.test(parsed.pathname)) return;
+  const pageUrl=normalizedSearchPage(tab.url);
+  const current=searchWorkerTabs.get(campaignId) || record;
+  if(current.captureInFlight||current.lastCapturedUrl===pageUrl) return;
+  await saveSearchWorker(campaignId,tabId,tab.url,current.createdAt,{captureInFlight:true});
+  await sendCampaignEvent(campaignId,'SEARCH_CAPTURE_TRIGGERED',{keyword:parsed.searchParams.get('k')||'',page:Number(parsed.searchParams.get('page'))||1});
+  let failure='SEARCH_CAPTURE_ERROR';
+  try {
+    for(let attempt=0;attempt<HANDSHAKE_ATTEMPTS;attempt++) {
+      const {response,error}=await sendTabMessage(tabId,{type:'shopsource-campaign-capture',campaignId});
+      if(response?.ok) {
+        const latest=searchWorkerTabs.get(campaignId) || current;
+        await saveSearchWorker(campaignId,tabId,tab.url,latest.createdAt,{captureInFlight:false,lastCaptureAt:Date.now(),lastCapturedUrl:pageUrl});
+        await sendCampaignEvent(campaignId,'SEARCH_CAPTURE_ACK',{keyword:parsed.searchParams.get('k')||'',page:Number(parsed.searchParams.get('page'))||1});
+        const campaign=response.result?.campaign;
+        if(campaign?.status==='RUNNING'&&campaign.search_instruction) {
+          const instruction=campaign.search_instruction;
+          setTimeout(()=>navigateCampaign(instruction),Math.max(6000,Number(instruction.delay_seconds||8)*1000));
+        } else if(campaign?.batch_run_id&&campaign.status==='DETAILING') {
+          openNext(campaign.batch_run_id);
+        }
+        return;
+      }
+      const message=response?.error || '';
+      if(message==='CAPTCHA_DETECTED') { failure='SEARCH_CAPTCHA'; break; }
+      if(message==='SEARCH_RESULTS_NOT_READY') { failure='SEARCH_RESULTS_NOT_READY'; break; }
+      if(!error) { failure='SEARCH_CAPTURE_ERROR'; break; }
+      if(attempt<HANDSHAKE_ATTEMPTS-1) await delay(HANDSHAKE_INTERVAL_MS);
+    }
+  } finally {
+    const latest=searchWorkerTabs.get(campaignId) || current;
+    await saveSearchWorker(campaignId,tabId,tab.url,latest.createdAt,{captureInFlight:false});
+  }
+  const event=failure==='SEARCH_CAPTCHA'?'SEARCH_CAPTCHA':failure;
+  await sendCampaignEvent(campaignId,event,{keyword:parsed.searchParams.get('k')||'',page:Number(parsed.searchParams.get('page'))||1,
+    error:failure==='SEARCH_RESULTS_NOT_READY'?'Amazon search result cards did not become ready within 20 seconds':failure==='SEARCH_CAPTCHA'?'Amazon CAPTCHA/robot check detected':'Search content script handshake receiver did not become ready'});
+  if(failure==='SEARCH_CAPTCHA') { try { await chrome.tabs.update(tabId,{active:true}); } catch(_error) {} }
+}
 async function triggerAutoCapture(tabId, runId, asin, record) {
   if (record.triggering) return;
   record.triggering = true;
@@ -234,8 +330,28 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (record) triggerAutoCapture(tabId,pending.runId,pending.asin,record);
   }).catch(()=>{});
 });
+chrome.tabs.onUpdated.addListener((tabId,changeInfo,tab)=>{
+  if(changeInfo.status!=='complete') return;
+  restorePromise.then(async()=>{
+    const entry=[...searchWorkerTabs.entries()].find(([,record])=>record.tabId===tabId);
+    if(!entry) return;
+    const [campaignId]=entry;
+    const url=changeInfo.url || tab.url || '';
+    if(/captcha|robot.?check|validatecaptcha|validate-captcha/i.test(`${url} ${tab.title||''}`)) {
+      await sendCampaignEvent(campaignId,'SEARCH_CAPTCHA',{error:'Amazon CAPTCHA/robot check detected'});
+      try { await chrome.tabs.update(tabId,{active:true}); } catch(_error) {}
+      return;
+    }
+    triggerCampaignSearchCapture(tabId,campaignId);
+  }).catch(()=>{});
+});
 chrome.tabs.onCreated.addListener(tab => { trackMarkedTab(tab).catch(()=>{}); });
 chrome.tabs.onRemoved.addListener(tabId => {
+  for(const [campaignId,record] of searchWorkerTabs.entries()) {
+    if(record.tabId!==tabId) continue;
+    clearSearchWorker(campaignId).then(()=>sendCampaignEvent(campaignId,'SEARCH_WORKER_MISSING',{error:'Search worker tab was closed'})).catch(()=>{});
+    break;
+  }
   for (const [runId,record] of workerTabs.entries()) {
     if (record.tabId !== tabId) continue;
     clearPending(runId).then(() => clearWorker(runId)).then(() => extensionEvent(runId,'WORKER_TAB_MISSING','', '', tabId)).catch(()=>{});
@@ -290,13 +406,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await extensionEvent(runId,'AUTO_CAPTURE_ACK',message.payload?.product?.asin || '','CAPTURE_ACKNOWLEDGED',sender.tab?.id);
         await clearPending(runId);
       }
+      const campaignId=message.kind==='search'?String(message.payload?.campaign_id||''):'';
+      if(campaignId) {
+        const worker=searchWorkerTabs.get(campaignId);
+        if(worker&&sender.tab?.id===worker.tabId) {
+          await saveSearchWorker(campaignId,worker.tabId,sender.tab.url||worker.lastUrl,worker.createdAt,
+            {captureInFlight:false,lastCaptureAt:Date.now(),lastCapturedUrl:normalizedSearchPage(sender.tab.url||worker.lastUrl)});
+        }
+      }
       sendResponse({ok:true,result});
-      if (message.kind === 'search' && result.campaign?.search_instruction) {
+      if (message.kind === 'search' && !campaignId && result.campaign?.search_instruction) {
         const instruction=result.campaign.search_instruction;
         setTimeout(()=>navigateCampaign(instruction),Math.max(6000,Number(instruction.delay_seconds||8)*1000));
-      }
-      if (message.kind === 'search' && result.campaign?.batch_run_id && result.campaign?.status === 'DETAILING') {
-        openNext(result.campaign.batch_run_id);
       }
       if (runId && message.kind === 'search') openNext(runId);
       if (runId && message.kind === 'detail') setTimeout(() => openNext(runId),4000);
@@ -309,14 +430,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message?.type === 'shopsource-campaign-command') {
     api(`/api/capture/campaigns/${encodeURIComponent(message.campaignId)}/action`,{action:message.action||'RESUME'}).then(async campaign=>{
-      if(campaign.search_instruction) await navigateCampaign(campaign.search_instruction);
+      if(campaign.search_instruction) {
+        const worker=await validSearchWorker(message.campaignId);
+        if(worker) {
+          const tab=await chrome.tabs.get(worker.tabId).catch(()=>null);
+          if(tab&&tab.status==='complete'&&worker.lastCapturedUrl!==normalizedSearchPage(tab.url||'')) triggerCampaignSearchCapture(tab.id,message.campaignId);
+          else await navigateCampaign(campaign.search_instruction);
+        } else await navigateCampaign(campaign.search_instruction);
+      }
       if(campaign.batch_run_id&&campaign.status==='DETAILING') await openNext(campaign.batch_run_id);
       sendResponse({ok:true,campaign});
     }).catch(error=>sendResponse({ok:false,error:error.message})); return true;
   }
+  if(message?.type==='shopsource-campaign-event') {
+    sendCampaignEvent(String(message.campaignId||''),String(message.event||''),message.payload||{}).then(()=>sendResponse({ok:true}));
+    return true;
+  }
   if (message?.type === 'shopsource-campaign-captcha') {
-    if(message.campaignId) api(`/api/capture/campaigns/${encodeURIComponent(message.campaignId)}/action`,{action:'CAPTCHA'}).catch(()=>{});
-    const tabId=searchWorkerTabs.get(message.campaignId); if(tabId) chrome.tabs.update(tabId,{active:true}).catch(()=>{}); return false;
+    if(message.campaignId) sendCampaignEvent(message.campaignId,'SEARCH_CAPTCHA',{error:'Amazon CAPTCHA/robot check detected'});
+    const record=searchWorkerTabs.get(message.campaignId); if(record) chrome.tabs.update(record.tabId,{active:true}).catch(()=>{}); return false;
   }
   if (message?.type === 'shopsource-worker-command') {
     const runId = message.runId;
@@ -354,4 +486,4 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
-const restorePromise = Promise.all([restoreWorkerTabs(),restorePendingTabs()]);
+const restorePromise = Promise.all([restoreWorkerTabs(),restorePendingTabs(),restoreSearchWorkers()]);

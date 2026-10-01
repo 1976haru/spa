@@ -10,6 +10,6 @@ Unpacked Manifest V3 extension for explicitly capturing product information pres
 4. Open extension Options and enter the local URL, Store ID, and pairing code.
 5. On an Amazon search page or product page, use the ShopSource page button or extension popup.
 
-After installing Phase 2.9, reload ShopSource Capture v0.1.5 from `chrome://extensions` or `edge://extensions`, then refresh the open ShopSource UI tab once so the localhost content bridge is injected. LIVE campaigns reuse one marked search tab and the existing single detail worker tab. Session metadata contains only worker/pending identifiers, tab ID, ASIN, and creation time; no page content or Amazon credentials are stored. CAPTCHA is surfaced and pauses the campaign; the extension contains no bypass or stealth behavior.
+After installing Phase 2.9.1, reload ShopSource Capture v0.1.6 from `chrome://extensions` or `edge://extensions`, then refresh `http://127.0.0.1:8081/sourcing` and click **과제 2,000 계속** to resume the existing campaign. Search worker tab ID, URL, timestamps, and capture guard are held in `chrome.storage.session`; no page content or Amazon credentials are stored. The background worker explicitly handshakes with the loaded search content script. CAPTCHA is surfaced and pauses the campaign.
 
 The extension captures only the current search-results page DOM. It does not paginate or bypass CAPTCHA/robot checks. Detail tabs are started by an explicitly created ShopSource batch and processed sequentially, one at a time. Image URLs are recorded; image binaries are not downloaded.

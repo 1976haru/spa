@@ -317,6 +317,11 @@ CREATE TABLE IF NOT EXISTS sourcing_campaigns (
     started_at TEXT,
     finished_at TEXT,
     updated_at TEXT NOT NULL
+    ,search_worker_status TEXT NOT NULL DEFAULT 'NOT_CONNECTED'
+    ,current_keyword TEXT NOT NULL DEFAULT ''
+    ,current_page INTEGER NOT NULL DEFAULT 0
+    ,last_search_capture_at TEXT
+    ,last_search_error TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS sourcing_campaign_keywords (
@@ -331,6 +336,7 @@ CREATE TABLE IF NOT EXISTS sourcing_campaign_keywords (
     consecutive_zero_pages INTEGER NOT NULL DEFAULT 0,
     exhausted INTEGER NOT NULL DEFAULT 0,
     last_url TEXT NOT NULL DEFAULT '',
+    next_url TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL,
     UNIQUE(campaign_id, keyword)
 );
@@ -366,6 +372,18 @@ CREATE TABLE IF NOT EXISTS sourcing_campaign_events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS sourcing_campaign_pages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id TEXT NOT NULL REFERENCES sourcing_campaigns(campaign_id) ON DELETE CASCADE,
+    keyword TEXT NOT NULL,
+    page_number INTEGER NOT NULL,
+    normalized_url TEXT NOT NULL,
+    capture_run_id TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    UNIQUE(campaign_id, keyword, page_number),
+    UNIQUE(campaign_id, normalized_url)
+);
+
 CREATE INDEX IF NOT EXISTS idx_products_price ON products(price);
 CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);
 CREATE INDEX IF NOT EXISTS idx_decisions_store_status ON store_product_decisions(store_id, final_status);
@@ -389,6 +407,7 @@ CREATE INDEX IF NOT EXISTS idx_batch_events_run ON browser_batch_events(batch_ru
 CREATE INDEX IF NOT EXISTS idx_campaigns_store_status ON sourcing_campaigns(store_id,status,created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_campaign_candidates_state ON sourcing_campaign_candidates(campaign_id,state,id);
 CREATE INDEX IF NOT EXISTS idx_campaign_events_recent ON sourcing_campaign_events(campaign_id,id DESC);
+CREATE INDEX IF NOT EXISTS idx_campaign_pages_lookup ON sourcing_campaign_pages(campaign_id,keyword,page_number);
 """
 
 EXPORT_RUN_ADDITIVE_COLUMNS = {
@@ -426,6 +445,16 @@ BATCH_RUN_ADDITIVE_COLUMNS = {
     "restricted_count": "INTEGER NOT NULL DEFAULT 0",
     "precompleted_count": "INTEGER NOT NULL DEFAULT 0",
 }
+
+CAMPAIGN_ADDITIVE_COLUMNS = {
+    "search_worker_status": "TEXT NOT NULL DEFAULT 'NOT_CONNECTED'",
+    "current_keyword": "TEXT NOT NULL DEFAULT ''",
+    "current_page": "INTEGER NOT NULL DEFAULT 0",
+    "last_search_capture_at": "TEXT",
+    "last_search_error": "TEXT NOT NULL DEFAULT ''",
+}
+
+CAMPAIGN_KEYWORD_ADDITIVE_COLUMNS = {"next_url": "TEXT NOT NULL DEFAULT ''"}
 
 
 def utc_now() -> str:
@@ -480,6 +509,14 @@ def init_db(path: str | Path | None = None) -> Path:
         for name, declaration in EXPORT_RUN_ADDITIVE_COLUMNS.items():
             if name not in export_columns:
                 con.execute(f"ALTER TABLE export_runs ADD COLUMN {name} {declaration}")
+        campaign_columns = {row["name"] for row in con.execute("PRAGMA table_info(sourcing_campaigns)")}
+        for name, declaration in CAMPAIGN_ADDITIVE_COLUMNS.items():
+            if name not in campaign_columns:
+                con.execute(f"ALTER TABLE sourcing_campaigns ADD COLUMN {name} {declaration}")
+        keyword_columns = {row["name"] for row in con.execute("PRAGMA table_info(sourcing_campaign_keywords)")}
+        for name, declaration in CAMPAIGN_KEYWORD_ADDITIVE_COLUMNS.items():
+            if name not in keyword_columns:
+                con.execute(f"ALTER TABLE sourcing_campaign_keywords ADD COLUMN {name} {declaration}")
         con.execute("UPDATE export_runs SET package_id=job_id WHERE package_id IS NULL")
         con.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_export_runs_package_id "

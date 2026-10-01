@@ -4,7 +4,7 @@
 
 From UI V2 → Sourcing → API-free browser sourcing, choose a Store keyword and target count, then start a Batch. Review the Amazon search page and use the extension to capture its current DOM results. ShopSource queues unique candidates and opens detail pages sequentially (one tab at a time, with a minimum four-second interval); completed details can flow into MASTER and Store classification automatically. Search pagination remains manual. Resolve any Amazon confirmation screen yourself; the queue pauses without bypassing it. Start with five products and verify the Spark Center portal round-trip before scaling. See [docs/BATCH_SOURCING.md](docs/BATCH_SOURCING.md).
 
-Phase 2.9 adds an explicit **LIVE 과제 2,000개** campaign. It preserves every search occurrence, counts unique ASINs, rotates diversified keywords, resumes from SQLite checkpoints, reuses one search tab and one detail tab, and pauses for CAPTCHA/user action. It can build a Spark package from the campaign ASIN set and generate assignment evidence reports. The real run starts only when the operator clicks the LIVE start/continue button. Reload ShopSource Capture version 0.1.5 from `chrome://extensions` or `edge://extensions`, then refresh ShopSource once.
+Phase 2.9.1 fixes LIVE search auto capture with an explicit service worker to content script handshake, persisted search worker state, a bounded result readiness wait, and visible worker errors. To resume an existing campaign, reload ShopSource Capture v0.1.6, refresh `http://127.0.0.1:8081/sourcing`, then click **과제 2,000 계속**. Do not start a new campaign.
 
 ## API-free browser sourcing (Phase 2.5)
 
