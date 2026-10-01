@@ -1,0 +1,826 @@
+ShopSource Studio — Phase 2.8
+Massive Scale Readiness: 10K / 50K Benchmark + Production-Safe Load Architecture
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+
+Latest expected commit:
+2d4d7de3b5cea7bf2b908a28df615691fa2ad09c
+Add safe Spark desktop staging
+
+==================================================
+0. 목표
+==================================================
+
+사용자는 향후 실제 소싱 규모를 10,000~50,000개까지 고려하고 있다.
+
+20/50/100개 단위 테스트는 너무 작다.
+이번 Phase는 ShopSource의 내부 시스템이
+10K/50K 규모를 버틸 수 있는지 빠르게 검증한다.
+
+중요:
+실제 Amazon 상품 상세 50,000개를 지금 브라우저에서 무작정 여는 것이 목표가 아니다.
+
+현재 Browser Capture는:
+- single worker tab
+- 최소 4초 간격
+- CAPTCHA 우회 없음
+
+이므로 실제 50K 상세방문은 매우 오래 걸리고 차단 가능성도 커진다.
+
+따라서 이번 Phase는 두 층으로 나눈다.
+
+A. 시스템 대규모 성능 검증
+- 1K / 10K / 50K synthetic benchmark
+- 외부 network 0
+- 실제 production DB 0 영향
+- Spark/Shopify 업로드 0
+- DB/UI/classification/package/queue 성능 확인
+
+B. 실제 Amazon 대규모 운영 준비
+- real candidate 수만 개 축적 가능 구조
+- 상세 보강은 선별/우선순위 기반
+- CAPTCHA 우회 없이
+- 재개/checkpoint 가능한 구조
+
+==================================================
+1. 시작 전 보호
+==================================================
+
+반드시:
+
+git status --short
+git log --oneline -10
+git fetch origin
+
+사용자 파일:
+
+stores/001_cabin_tidy.json
+
+절대:
+git reset --hard
+git restore
+git checkout --
+git clean -fd
+
+하지 마라.
+
+stage/commit 금지.
+
+실제 production DB를 benchmark에서 절대 사용하지 않는다.
+
+==================================================
+2. Benchmark 전용 DB
+==================================================
+
+새 전용 benchmark root:
+
+D:\shop\001_so_amazon\benchmarks\
+
+예:
+
+benchmarks/
+  20261001_200000_50k/
+    benchmark.sqlite3
+    report.json
+    report.md
+    metrics.csv
+    temp_packages/
+
+.gitignore에 benchmarks/** 추가.
+
+단 README placeholder가 필요하면 .gitkeep만 허용.
+
+Benchmark DB에는 synthetic data만 들어간다.
+
+production DB:
+data/shopsource.sqlite3 등
+절대 write 금지.
+
+==================================================
+3. Synthetic product 규칙
+==================================================
+
+실제 Amazon ASIN과 혼동되지 않는 synthetic IDs를 사용한다.
+
+예:
+T000000001
+T000000002
+...
+
+10자리 규칙을 만족하더라도
+source_kind는 반드시:
+
+BENCHMARK_SYNTHETIC
+
+으로 별도 표시.
+
+모든 synthetic title에도:
+
+"[BENCHMARK]"
+
+prefix.
+
+절대:
+- Spark Desktop staging
+- Spark Center package 실제 운영 폴더
+- Shopify upload
+- Amazon detail open
+
+대상으로 사용될 수 없게 hard block.
+
+==================================================
+4. Benchmark scenario
+==================================================
+
+최소 시나리오:
+
+SMOKE_1K
+STANDARD_10K
+MASSIVE_50K
+
+각 scenario에서 측정:
+
+1. DB 초기화
+2. 1K/10K/50K candidates insert
+3. MASTER upsert
+4. occurrences insert
+5. Store classification
+6. store_product_decisions
+7. ASIN dedupe
+8. repeated occurrence merge
+9. Products server-side pagination
+10. Source/status/search filtering
+11. sorting
+12. selected 100 / 1K / 10K retrieval
+13. batch queue 10K / 50K state operations
+14. package payload build simulation
+15. validation
+16. history query
+17. app startup/query warmup
+
+외부 network 호출 0.
+
+==================================================
+5. 현실적인 데이터 분포
+==================================================
+
+모두 똑같은 synthetic row를 복제하지 마라.
+
+고정 seed를 사용해 deterministic하게 분포 생성:
+
+price:
+$5 ~ $300
+
+bands:
+LOW_RESERVE
+RESERVE_A/B/C
+PRIMARY
+HIGH_RESERVE
+
+risk:
+SAFE
+REVIEW
+RESTRICTED 후보
+
+source:
+BENCHMARK_SYNTHETIC 단일 source_kind지만
+raw payload completeness는 여러 단계
+
+brand:
+약 500개 synthetic brands
+
+category:
+약 100개 synthetic categories
+
+title keywords:
+car organizer / trunk / console / visor / seat / storage 등
+다양한 synthetic combination
+
+rating:
+1.0~5.0
+
+review_count:
+0~100000
+
+중복:
+약 10~20% occurrence duplicate simulation
+
+==================================================
+6. Benchmark는 실제 Connector hard-block
+==================================================
+
+아래 connector는 BENCHMARK_SYNTHETIC을 반드시 거부:
+
+SparkDesktopStaging
+SparkCenterPackageService production path
+Shopify future connector
+real browser batch
+Keepa/live source
+
+예:
+
+raise BenchmarkDataNotExportable
+
+테스트 필수.
+
+Benchmark package simulation은:
+
+benchmarks/<run>/temp_packages/
+
+안에서만 수행.
+
+==================================================
+7. 대용량 DB 쓰기 최적화
+==================================================
+
+현재 row-by-row insert가 병목인지 측정.
+
+필요하면:
+
+- explicit transaction
+- executemany
+- chunked bulk insert
+- UPSERT
+- WAL mode 검토
+- synchronous 설정은 안전성 고려
+- proper indexes
+
+를 적용.
+
+단 production correctness를 희생하지 않는다.
+
+benchmark-only PRAGMA로 성능을 속이지 마라.
+
+production-compatible 설정으로 측정.
+
+==================================================
+8. Index audit
+==================================================
+
+50K에서 실제 query plan 확인:
+
+EXPLAIN QUERY PLAN
+
+중요 query:
+
+products by asin
+store_product_decisions by store/product
+source_kind filter
+final_status filter
+title/brand search
+browser candidates by run/asin
+batch_items by run/state
+occurrences by product
+package select by store/status/asins
+
+full table scan이 치명적인 곳은 index 추가.
+
+불필요한 index 남발 금지.
+
+==================================================
+9. Products UI 50K 대응
+==================================================
+
+절대 50,000 rows를 한 번에 browser로 보내지 않는다.
+
+현재 server-side page:
+100 rows/page
+
+유지 또는 개선.
+
+요구:
+
+- total count separate
+- current page only transfer
+- search/filter/sort SQLite side
+- rowData <= page_size
+- UI initial render가 50K 때문에 느려지지 않음
+
+page size:
+50 / 100 / 200 / 500
+허용 가능.
+
+==================================================
+10. Selection 모델
+==================================================
+
+50K에서 checkbox 50K를 실제 browser DOM에 만들지 않는다.
+
+다음 선택 방식 지원:
+
+A. current page select
+B. current filtered result select-all (logical selection)
+C. explicit ASIN set
+D. status-based package
+
+filtered select-all은
+50K ASIN을 browser client memory에 전부 들고 있을 필요 없게
+server-side selection descriptor 사용 권장.
+
+예:
+
+SelectionSpec:
+{
+  store_id,
+  filters,
+  excluded_asins,
+  explicit_included_asins
+}
+
+향후 10K package에서도 안정적으로 사용.
+
+==================================================
+11. Package scale test
+==================================================
+
+Benchmark mode에서:
+
+100
+1,000
+10,000
+50,000
+
+JSON payload generation simulation.
+
+측정:
+
+- 생성 시간
+- validation 시간
+- total bytes
+- average bytes/product
+- peak memory 가능 범위
+
+실제 Spark root에는 쓰지 않는다.
+
+50K files를 한 폴더에 만들 때 Windows filesystem 성능도 측정.
+
+필요하면 50K file creation test는 optional flag:
+
+--with-files
+
+기본 benchmark는 in-memory/stream simulation 가능.
+
+==================================================
+12. 50K 파일 시스템 전략
+==================================================
+
+Spark loader가 9자리 연속 JSON을 기대하므로
+실제 Spark dataset은 flat folder를 유지해야 한다.
+
+따라서 50K 실제 package에서:
+000000001.json
+...
+000050000.json
+
+형태를 지원해야 한다.
+
+하지만 생성 과정은 streaming write.
+
+50K payload list 전체를 memory에 잡지 않는다.
+
+generator/chunk 기반.
+
+==================================================
+13. Batch queue 50K 구조 테스트
+==================================================
+
+browser_batch_items 50K fixture 생성.
+
+측정:
+
+- queue insert
+- next_item lookup
+- state transition
+- retry selection
+- count summary
+- DONE detection
+
+O(n) full scan을 매 item마다 한다면 수정.
+
+필요한 state/index:
+
+(run_id, state)
+(run_id, ordinal)
+(run_id, asin)
+
+검토.
+
+==================================================
+14. Dashboard/summary count
+==================================================
+
+50K에서 매 refresh마다
+복잡한 Python loop로 전체 rows를 읽지 않는다.
+
+SQL aggregate:
+
+COUNT
+GROUP BY
+SUM CASE
+
+사용.
+
+Dashboard refresh가 일정 규모 이상에서도 안정적이어야 함.
+
+==================================================
+15. Benchmark 명령
+==================================================
+
+CLI 추가:
+
+shopsource benchmark-scale --count 1000
+shopsource benchmark-scale --count 10000
+shopsource benchmark-scale --count 50000
+
+옵션:
+
+--seed 1976
+--with-files
+--store-id BENCH001
+--output benchmarks/...
+
+예:
+
+python -m shopsource.cli benchmark-scale --count 50000 --seed 1976
+
+==================================================
+16. UI 추가
+==================================================
+
+Settings 또는 Dashboard에:
+
+"대규모 성능 테스트"
+
+섹션.
+
+버튼:
+
+[1,000개 테스트]
+[10,000개 테스트]
+[50,000개 테스트]
+
+명확한 경고:
+
+"실제 Amazon/Shopify/Spark에는 연결하지 않는 로컬 benchmark입니다."
+
+결과:
+
+PASS/FAIL
+총 시간
+insert/sec
+classification/sec
+query p50/p95
+package simulation/sec
+DB size
+max rows transferred to UI
+errors
+
+==================================================
+17. 성능 기준
+==================================================
+
+하드웨어마다 다르므로 절대 초 단위 PASS를 임의 설정하지 마라.
+
+대신 regression baseline 방식.
+
+첫 50K benchmark를 BASELINE으로 저장.
+
+이후:
+
+- 같은 PC
+- 같은 count
+- 같은 seed
+
+에서 2배 이상 느려지면 warning.
+
+기능적 PASS 조건:
+
+- 50K MASTER count 정확
+- decisions count 정확
+- duplicate handling 정확
+- pagination count 정확
+- first/last page 정확
+- filtered counts 정확
+- queue state 정확
+- memory blow-up/crash 없음
+- connector leak 없음
+
+==================================================
+18. real Amazon scale architecture
+==================================================
+
+Benchmark와 별도로 실제 live 전략을 문서화.
+
+50K 상세페이지를 전부 즉시 방문하는 방식은
+API-free single-worker 구조에서 비효율적이다.
+
+실제 운영은 2-stage:
+
+STAGE 1 — Candidate harvesting
+검색 결과에서:
+ASIN
+title
+price
+rating
+review count
+thumbnail
+sponsored
+keyword/page
+
+를 빠르게 누적.
+
+목표:
+10K~50K candidate MASTER/CANDIDATE pool.
+
+STAGE 2 — Detail enrichment
+후보를 priority score로 정렬하고
+실제 필요한 상품만 상세 페이지 방문.
+
+우선순위 예:
+- Store price band 근접
+- title relevance
+- review/rating threshold
+- duplicate family 제거
+- already detailed 제외
+- risk/restricted keyword 제외는 삭제가 아니라 후순위/분류
+
+즉 50K candidates 중
+상위 N개만 detailed.
+
+==================================================
+19. user-selectable enrichment target
+==================================================
+
+Sourcing UI에:
+
+후보 목표:
+10,000
+20,000
+50,000
+
+상세 보강 목표:
+500
+1,000
+5,000
+10,000
+
+별도로 설정.
+
+"후보 50K = 상세 50K"로 묶지 않는다.
+
+==================================================
+20. Live detail 시간 표시
+==================================================
+
+현재 최소 interval을 기준으로
+사용자에게 예상 최소 처리 시간을 표시.
+
+예:
+
+상세 1,000개
+상세 10,000개
+상세 50,000개
+
+에 대해 현재 delay 기준 estimated minimum duration 표시.
+
+CAPTCHA/네트워크 시간은 별도라 실제는 더 길 수 있음을 표시.
+
+숫자는 코드에서 계산하고 하드코딩하지 않는다.
+
+==================================================
+21. CAPTCHA / anti-bot 정책
+==================================================
+
+대규모 테스트 때문에:
+
+- CAPTCHA 우회
+- stealth plugin
+- proxy rotation
+- cookie hijack
+- rate-limit bypass
+
+추가 금지.
+
+CAPTCHA:
+PAUSED_NEEDS_USER
+
+유지.
+
+대량 sourcing은:
+checkpoint/resume
+keyword campaign
+candidate prefilter
+
+로 해결.
+
+==================================================
+22. Keyword campaign 구조
+==================================================
+
+대규모 candidate 축적을 위해:
+
+Sourcing Campaign
+
+개념 추가 가능.
+
+Campaign:
+campaign_id
+store_id
+keywords[]
+candidate_target
+detail_target
+status
+created_at
+updated_at
+
+각 keyword별:
+pages_captured
+candidates_new
+duplicates
+last_page
+
+사용자가 Amazon 검색 페이지를 직접 이동/capture하면
+Campaign에 누적.
+
+자동 pagination은 이번 Phase에서 구현하지 않아도 됨.
+
+==================================================
+23. Candidate dedupe at 50K
+==================================================
+
+동일 ASIN은:
+MASTER Product 1개
+
+search occurrence/history는 여러 개 유지.
+
+50K candidate capture에서:
+duplicate hit가 수천 개여도
+중복 MASTER 생성 금지.
+
+==================================================
+24. Benchmark report
+==================================================
+
+report.md 예:
+
+ShopSource Massive Scale Benchmark
+
+Environment
+- Python
+- SQLite
+- OS
+- CPU/RAM 가능하면
+- commit SHA
+
+Scenario
+- 50,000
+
+Results
+- candidates inserted
+- unique MASTER
+- occurrences
+- classifications
+- DB size
+- elapsed
+- rows/sec
+- query p50
+- query p95
+- Products page first load
+- search latency
+- filtered count
+- package simulation
+- batch next_item latency
+- PASS/FAIL
+
+Bottlenecks
+- ...
+
+Recommended live targets
+- candidate pool
+- detail enrichment
+
+==================================================
+25. 50K 실제 benchmark를 이번 작업에서 실행
+==================================================
+
+코드만 만들고 끝내지 마라.
+
+실제로 local benchmark를 실행:
+
+1,000
+10,000
+50,000
+
+모두.
+
+production DB/network/Spark/Shopify에 영향 없어야 한다.
+
+완료 보고에 실제 측정 결과 포함.
+
+50K가 FAIL이면 원인 분석하고
+가능한 범위에서 최적화 후 다시 실행.
+
+==================================================
+26. 테스트
+==================================================
+
+필수:
+
+test_benchmark_uses_isolated_db
+test_benchmark_never_calls_network
+test_benchmark_data_cannot_stage_to_spark
+test_benchmark_data_cannot_export_to_shopify
+test_generate_50000_unique_products
+test_duplicate_occurrences_do_not_duplicate_master
+test_products_page_never_returns_more_than_page_size
+test_filtered_count_50000
+test_batch_next_item_indexed
+test_batch_50000_state_counts
+test_package_streaming_does_not_require_full_list
+test_selection_spec_filtered_all
+test_scale_report_written
+test_scale_baseline_compare
+
+기존 전체 tests PASS.
+
+==================================================
+27. Quality Gate
+==================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+실제 benchmark:
+
+python -m shopsource.cli benchmark-scale --count 1000 --seed 1976
+python -m shopsource.cli benchmark-scale --count 10000 --seed 1976
+python -m shopsource.cli benchmark-scale --count 50000 --seed 1976
+
+==================================================
+28. 사용자 dirty file
+==================================================
+
+stores/001_cabin_tidy.json
+
+절대 수정/stage/commit/reset/restore 금지.
+
+benchmark output
+DB
+metrics
+reports
+
+Git commit 금지.
+
+==================================================
+29. Commit / Push
+==================================================
+
+코드/docs/tests만 stage.
+
+commit:
+
+git commit -m "Add massive scale benchmark"
+
+push origin main
+
+최종:
+
+git status --short
+git log --oneline -8
+git rev-list --left-right --count main...origin/main
+
+0 0 확인.
+
+==================================================
+30. 완료 보고
+==================================================
+
+[1] 1K benchmark 결과
+[2] 10K benchmark 결과
+[3] 50K benchmark 결과
+[4] 50K DB size
+[5] insert/classification throughput
+[6] Products query p50/p95
+[7] Batch next_item 성능
+[8] Package 10K/50K simulation
+[9] 발견된 병목
+[10] 추가한 index/optimization
+[11] UI pagination 50K 안전성
+[12] SelectionSpec 구조
+[13] Candidate 50K / Detail N 분리 구조
+[14] Live 상세 예상시간 표시
+[15] CAPTCHA 정책 유지
+[16] tests
+[17] 사용자 dirty file
+[18] commit SHA
+[19] 다음 실제 live 테스트 권장 규모
+
+지금 구현을 시작하라.
