@@ -1,0 +1,406 @@
+ShopSource Studio — Phase 2.9.1
+LIVE 2000 Search Auto-Capture Handshake Hotfix
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+
+Current implementation commit:
+d1b62c0ad7b5b0b12070922919a5d2f79011300d
+Add live 2000 sourcing campaign
+
+==================================================
+0. Actual live failure
+==================================================
+
+User started LIVE 2,000 campaign.
+
+Observed:
+- campaign status = RUNNING
+- Amazon search worker tab opens
+- after 15–20 seconds:
+  unique_candidates = 0
+  search_pages = 0
+  detail_complete = 0
+
+Therefore:
+UI → local bridge → extension campaign command → background navigateCampaign()
+is working at least enough to open the Amazon search tab.
+
+But the first search page is not being successfully auto-captured / acknowledged.
+
+Current code in content_search.js relies on:
+location.hash contains shopsource_campaign
+→ setTimeout(()=>submit(campaignId),1200)
+
+This is fragile because Amazon navigation/redirect/canonicalization may drop/change the hash, content script timing may precede result readiness, or submit errors are suppressed for campaign mode.
+
+We need an explicit search-page handshake similar to the existing detail worker handshake.
+
+Do NOT cancel or recreate the user's current campaign.
+The hotfix must allow the same persisted campaign ID to continue after extension/UI reload.
+
+==================================================
+1. First inspect before editing
+==================================================
+
+git status --short
+git log --oneline -8
+git fetch origin
+
+Never modify/reset/stage:
+stores/001_cabin_tidy.json
+
+Read:
+- browser_extension/shopsource_capture/background.js
+- browser_extension/shopsource_capture/content_search.js
+- browser_extension/shopsource_capture/content_local_bridge.js
+- src/shopsource/capture/bridge.py
+- src/shopsource/capture/campaign.py
+- src/shopsource/ui/v2.py
+- tests/test_live_2000_campaign.py
+
+==================================================
+2. Required architecture change
+==================================================
+
+Do not rely on URL hash auto-submit as the primary trigger.
+
+Background service worker must own search-campaign state and explicitly tell the Amazon content script:
+
+{
+  type: "shopsource-campaign-capture",
+  campaignId: "<LC_...>"
+}
+
+after the search worker tab finishes loading.
+
+Hash marker may remain only as fallback/debug/recovery marker.
+
+==================================================
+3. Persist search worker state
+==================================================
+
+Current searchWorkerTabs Map is memory-only.
+
+Add storage.session persistence for campaign search workers, analogous to detail worker persistence.
+
+Suggested key:
+shopsource.searchWorker.<campaignId>
+
+Record:
+campaignId
+tabId
+createdAt
+lastUrl
+captureInFlight
+lastCaptureAt
+
+On service-worker restart:
+restore valid search worker tab records.
+
+Do not touch user-opened Amazon tabs.
+
+==================================================
+4. Explicit search handshake
+==================================================
+
+Add function, conceptually:
+
+triggerCampaignSearchCapture(tabId, campaignId)
+
+Behavior:
+- wait until tab status complete
+- send chrome.tabs.sendMessage:
+  {type:"shopsource-campaign-capture", campaignId}
+- retry receiver-not-ready several times (e.g. 10 × 500ms)
+- content script itself performs result-readiness wait before capture
+- one page must be captured once only
+- no duplicate submit due both hash and background trigger
+
+Use a per-campaign/page in-flight guard.
+
+==================================================
+5. Search result readiness
+==================================================
+
+content_search.js should not blindly capture at 1200ms.
+
+Implement a bounded wait:
+- look for visible valid search result cards:
+  [data-component-type="s-search-result"][data-asin]
+- OR detect CAPTCHA/robot-check
+- OR timeout
+
+Suggested:
+poll every 500ms
+max 20 seconds
+
+If cards appear:
+capture.
+
+If CAPTCHA:
+send shopsource-campaign-captcha.
+
+If timeout:
+return structured:
+SEARCH_RESULTS_NOT_READY
+
+No infinite loop.
+
+==================================================
+6. Auto trigger dedupe
+==================================================
+
+A page may receive:
+- hash fallback
+- background explicit handshake
+- user button click
+
+Prevent duplicate campaign capture for the same campaign + normalized search URL + page.
+
+Use content-script in-memory key and/or server-side idempotency if appropriate.
+
+Do not prevent manual non-campaign capture.
+
+==================================================
+7. Background onUpdated for search worker
+==================================================
+
+Current chrome.tabs.onUpdated mainly handles detail worker pending state.
+
+Extend it so that if:
+- tabId belongs to a persisted search worker
+- Amazon search page
+- status complete
+
+then trigger explicit campaign search capture.
+
+If Amazon redirects and hash disappears, campaign association must still survive via searchWorker storage record.
+
+This is the key hotfix.
+
+==================================================
+8. Error visibility
+==================================================
+
+Current content_search.js suppresses alert/errors in campaign mode.
+
+Add structured extension event reporting for search failures:
+
+SEARCH_CAPTURE_TRIGGERED
+SEARCH_CAPTURE_ACK
+SEARCH_CAPTURE_ERROR
+SEARCH_RESULTS_NOT_READY
+SEARCH_CAPTCHA
+SEARCH_WORKER_REUSED
+SEARCH_WORKER_CREATED
+
+Persist useful error/event information through existing local bridge/campaign event path.
+
+Do not log cookies/tokens/auth.
+
+==================================================
+9. Campaign UI health status
+==================================================
+
+LIVE 2,000 panel should show:
+
+검색 Worker: 연결 / 오류
+현재 keyword
+현재 page
+마지막 검색 캡처 시각
+마지막 오류
+
+If campaign is RUNNING and:
+search_pages == 0
+for a reasonable startup window after START/RESUME,
+show visible warning:
+"검색 탭은 열렸지만 자동 캡처 응답이 없습니다."
+
+Do not silently remain RUNNING forever.
+
+Add:
+[검색 Worker 다시 연결]
+button if useful.
+
+It should re-send RESUME/campaign command for the SAME campaign ID.
+Never create a second campaign.
+
+==================================================
+10. NiceGUI stale-slot RuntimeError hotfix
+==================================================
+
+Separate error observed:
+
+RuntimeError:
+The parent element this slot belongs to has been deleted.
+
+Location:
+src/shopsource/ui/v2.py
+save_confirmation
+ui.notify after dialog.close()/refresh_packages
+
+Fix all dialog callbacks where:
+- dialog.close()
+- clear()/refresh deletes parent slot
+- then ui.notify() is called using deleted context.
+
+Do not call ui.notify from a deleted slot context.
+
+Use a safe notification strategy:
+- capture client before destructive UI update, then use client-safe notification if supported
+OR
+- notify before close/refresh
+OR
+- schedule refresh after notification
+OR
+- restructure callback so stale slot is not used.
+
+Specifically fix confirm_desktop/save_confirmation and audit similar dialog callbacks.
+
+Add regression test if practical.
+
+==================================================
+11. Extension version
+==================================================
+
+This changes extension JS.
+
+Bump:
+0.1.5 → 0.1.6
+
+Update:
+manifest.json
+README/docs
+UI message
+
+User instruction after install:
+edge://extensions or chrome://extensions
+→ ShopSource Capture v0.1.6
+→ Reload
+→ reload http://127.0.0.1:8081/sourcing
+→ press "과제 2,000 계속"
+
+Do NOT tell user to click START again.
+Same campaign must resume.
+
+==================================================
+12. Keep existing safety policy
+==================================================
+
+No:
+- CAPTCHA bypass
+- stealth
+- proxy rotation
+- cookie/session extraction
+- hidden Amazon API
+- auth bypass
+
+Search worker:
+max 1 tab per campaign.
+
+Detail worker:
+max 1 tab per batch.
+
+==================================================
+13. Tests
+==================================================
+
+Add/adjust tests for:
+
+test_campaign_search_worker_persisted
+test_campaign_search_worker_restored
+test_search_tab_complete_triggers_explicit_capture
+test_search_capture_does_not_require_hash
+test_search_capture_hash_fallback_deduped
+test_search_capture_waits_for_results
+test_search_capture_timeout_reports_error
+test_search_captcha_pauses_campaign
+test_search_page_captured_once
+test_campaign_resume_reuses_same_search_tab
+test_campaign_resume_same_campaign_id
+test_search_failure_visible_in_campaign_status
+test_deleted_dialog_slot_does_not_raise_notify_runtimeerror
+
+Existing tests must pass.
+
+==================================================
+14. Quality gate
+==================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+node --check browser_extension/shopsource_capture/background.js
+node --check browser_extension/shopsource_capture/content_search.js
+node --check browser_extension/shopsource_capture/content_product.js
+node --check browser_extension/shopsource_capture/content_local_bridge.js
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+==================================================
+15. Do not launch real 2,000 run from Codex
+==================================================
+
+Do not create/cancel/restart the user's real campaign.
+
+Do not browse Amazon from Codex.
+
+Implement the hotfix only.
+
+The user will:
+- reload v0.1.6
+- reload ShopSource
+- press "과제 2,000 계속"
+
+The persisted RUNNING campaign must continue.
+
+==================================================
+16. Commit / push
+==================================================
+
+Code/docs/tests only.
+
+Do not stage:
+stores/001_cabin_tidy.json
+DB
+backups
+exports
+runtime data
+
+Commit:
+git commit -m "Fix live campaign search capture handshake"
+
+Push origin/main.
+
+Final:
+git rev-list --left-right --count main...origin/main
+must be:
+0 0
+
+==================================================
+17. Completion report
+==================================================
+
+Report:
+[1] confirmed failure mechanism
+[2] whether URL hash loss/timing was reproduced or only identified as fragility
+[3] explicit search handshake implementation
+[4] search worker persistence
+[5] result readiness logic
+[6] duplicate-capture guard
+[7] failure/CAPTCHA reporting
+[8] UI health display
+[9] NiceGUI stale-slot fix
+[10] extension version
+[11] tests
+[12] dirty user file preserved
+[13] commit SHA
+[14] exact user resume steps for the EXISTING campaign
+
+Implement now.
