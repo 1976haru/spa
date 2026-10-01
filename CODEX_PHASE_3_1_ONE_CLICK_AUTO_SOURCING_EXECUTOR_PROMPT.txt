@@ -1,0 +1,459 @@
+ShopSource Studio — Phase 3.1
+ONE-CLICK STORE AUTO SOURCING EXECUTOR
+
+Prerequisite:
+Phase 3.0 One-Click Store Auto Sourcing Planner must be implemented and pushed first.
+
+Repository:
+D:\shop\001_so_amazon
+https://github.com/1976haru/spa.git
+branch main
+
+==================================================
+0. Final user experience
+==================================================
+
+The user wants:
+
+1. Select Store
+2. Enter desired sourcing count
+3. Click:
+
+[자동 소싱 시작]
+
+Then ShopSource does the rest:
+- loads/creates plan
+- chooses categories
+- chooses best keywords
+- allocates quota
+- runs Amazon search worker
+- rotates keyword automatically
+- stops low-yield keyword
+- moves to next category
+- reallocates unused quota
+- reaches store target
+- detail enrichment
+- MASTER import
+- Store classification
+- prepares Spark package
+- user receives result
+
+No category-by-category clicking.
+No keyword-by-keyword clicking.
+
+==================================================
+1. Protect current real campaign
+==================================================
+
+Do not alter/cancel/restart any existing LIVE 2,000 campaign.
+
+All tests use isolated temp DB.
+
+Real one-click run is started only by explicit user UI click after implementation.
+
+==================================================
+2. Auto Store Campaign
+==================================================
+
+New campaign type:
+AUTO_STORE
+
+Persistent model fields:
+- campaign_id
+- plan_id
+- store_id
+- total_target
+- detail_target
+- status
+- current_category_id
+- current_keyword_id
+- unique_candidates
+- detail_complete
+- master_imported
+- classified
+- duplicates
+- failures
+- created_at
+- updated_at
+
+States:
+DRAFT
+RUNNING_SEARCH
+SEARCH_COMPLETE
+DETAILING
+READY_FOR_SPARK
+PAUSED
+PAUSED_NEEDS_USER
+DONE
+CANCELLED
+
+==================================================
+3. Category scheduler
+==================================================
+
+For each enabled category:
+- category quota
+- progress
+- active keywords ranked by score
+
+Scheduler chooses:
+1. category with largest remaining weighted deficit
+2. best non-exhausted keyword
+3. page progression
+
+When category quota reached:
+move to another category.
+
+When keyword exhausted:
+move to next keyword.
+
+When category cannot reach quota:
+reallocate remaining quota to categories with:
+- high yield
+- remaining capacity
+- store relevance
+
+All category quotas + reallocations must preserve total target.
+
+==================================================
+4. Keyword stop conditions
+==================================================
+
+Stop current keyword when any:
+- max pages reached
+- max unique candidates reached
+- stale 2 pages
+- no DOM next link
+- CAPTCHA pauses entire campaign
+- campaign target reached
+
+Do not keep traversing low-yield keyword indefinitely.
+
+==================================================
+5. Learning
+==================================================
+
+After each page:
+update keyword runtime metrics:
+- new candidates
+- duplicates
+- yield/page
+- duplicate rate
+- last page
+- exhausted reason
+
+After campaign:
+update historical keyword metrics.
+
+Next campaigns should favor historically useful keywords.
+
+Do not permanently delete poor keywords.
+
+==================================================
+6. Search worker
+==================================================
+
+Reuse explicit search handshake architecture from Phase 2.9.1.
+
+Requirements:
+- one search worker tab per auto campaign
+- persisted in chrome.storage.session
+- restore after service worker restart
+- DOM actual next link only
+- explicit background→content capture handshake
+- 6–30 sec configurable delay
+- default 8 sec
+
+No tab explosion.
+
+==================================================
+7. Detail worker
+==================================================
+
+Reuse existing one-detail-worker architecture.
+
+Once search target reached:
+SEARCH_COMPLETE → DETAILING
+
+Queue campaign candidates.
+
+Do not revisit:
+- DETAIL_COMPLETE
+- MASTER_IMPORTED
+unless explicit retry is needed.
+
+Single worker tab.
+Minimum existing safe interval.
+
+==================================================
+8. Resume
+==================================================
+
+Must survive:
+- UI refresh
+- extension service worker restart
+- ShopSource restart
+- browser tab loss
+- PC restart where persisted DB remains
+
+On resume:
+- same campaign ID
+- reconstruct category/keyword/page position
+- reconstruct search/detail worker safely
+- do not repeat already captured pages
+- do not duplicate MASTER
+
+==================================================
+9. User UI
+==================================================
+
+Primary UI:
+
+### 스토어 자동 소싱
+
+Store: 001 | Cabin Tidy
+목표: [10,000]
+
+[자동 소싱 시작]
+
+While running:
+
+상태          SEARCHING / DETAILING
+전체 목표      10,000
+고유 후보       3,842
+현재 카테고리   Console Storage
+카테고리 진행   722 / 1,300
+현재 keyword   center console organizer
+keyword page   3 / 5
+중복            1,112
+상세 완료       ...
+MASTER          ...
+실패            ...
+
+[일시정지] [계속] [실패 재시도] [취소]
+
+Advanced plan hidden by default.
+
+==================================================
+10. Result-first experience
+==================================================
+
+When done, show compact summary:
+
+자동 소싱 완료
+
+고유 후보       10,000
+상세 완료        8,xxx / 10,000
+MASTER           ...
+Store 분류       ...
+PRIMARY          ...
+RESERVE          ...
+REVIEW           ...
+RESTRICTED       ...
+Spark 준비       ...
+
+[SPARK PACKAGE 만들기]
+
+Option:
+If safe and configured:
+auto-create Spark package when READY_FOR_SPARK.
+Default can be ON for later, but do not auto-stage to Spark unless user explicitly enables it.
+
+==================================================
+11. Target semantics
+==================================================
+
+Default:
+candidate target = user target
+
+Detail target:
+from Phase 3.0 plan detail ratio.
+
+Assignment preset:
+100%.
+
+Large operating mode:
+may use 25–100%.
+
+Always display both counts.
+
+==================================================
+12. Existing MASTER dedupe
+==================================================
+
+Same ASIN:
+one MASTER product.
+
+If candidate already exists in MASTER:
+- count candidate occurrence/history
+- do not duplicate product
+- depending detail completeness, skip detail if already sufficient
+
+This should reduce unnecessary Amazon visits.
+
+==================================================
+13. Optional smart fill
+==================================================
+
+Before Amazon search, calculate how many existing MASTER products already satisfy the store/category plan.
+
+Advanced setting:
+"기존 MASTER 재사용"
+
+Default ON.
+
+Then the campaign can fill target with:
+- existing relevant MASTER
+- new sourced products
+
+But UI must separately display:
+existing reused
+new sourced
+
+For assignment mode, default can be NEW SOURCED ONLY if needed for proof.
+
+==================================================
+14. Automatic package
+==================================================
+
+Campaign result set should support direct package generation.
+
+No 10,000 checkbox selection.
+
+Use campaign ASIN set server-side.
+
+Spark safe staging remains existing separate action.
+
+==================================================
+15. Reporting
+==================================================
+
+Create store auto sourcing report:
+- total target
+- categories
+- category quotas
+- category actuals
+- keywords attempted
+- pages
+- yield
+- duplicate rate
+- failures
+- candidate count
+- detail/master/classification counts
+- elapsed
+- package id
+
+No credentials.
+
+==================================================
+16. Safety
+==================================================
+
+No:
+- CAPTCHA bypass
+- stealth
+- proxy rotation
+- cookie/session extraction
+- private Amazon API
+- undocumented auth
+
+CAPTCHA:
+PAUSED_NEEDS_USER.
+
+==================================================
+17. Tests
+==================================================
+
+Required:
+test_auto_store_one_click_creates_or_loads_plan
+test_auto_store_selects_category_without_user_input
+test_auto_store_selects_keyword_without_user_input
+test_category_quota_progress
+test_category_quota_reallocation
+test_keyword_stale_rotates
+test_keyword_max_pages_rotates
+test_keyword_max_candidates_rotates
+test_total_target_hard_stop
+test_search_worker_single
+test_search_worker_resume
+test_duplicate_page_not_recaptured
+test_existing_master_not_duplicated
+test_detail_queue_created_after_search_complete
+test_detail_resume
+test_campaign_result_server_side
+test_campaign_package_generation
+test_auto_store_report
+test_no_live_network_in_tests
+
+Existing tests PASS.
+
+==================================================
+18. Scale simulation
+==================================================
+
+Run isolated simulated campaigns:
+- 2,000
+- 10,000
+- 50,000
+
+Do not use Amazon network.
+
+Verify scheduler terminates correctly and target hard-stop works.
+
+==================================================
+19. Extension version
+==================================================
+
+If extension changes from current version, bump patch version and update UI/docs.
+
+==================================================
+20. Quality gate
+==================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+node --check all extension JS if changed.
+
+CLI/UI help PASS.
+
+==================================================
+21. Commit/push
+==================================================
+
+Never stage:
+stores/001_cabin_tidy.json
+DB
+backups
+exports
+runtime data
+
+Commit:
+git commit -m "Add one click auto sourcing executor"
+
+push origin/main
+
+==================================================
+22. Completion report
+==================================================
+
+[1] one-click button
+[2] category scheduler
+[3] keyword scheduler
+[4] quota reallocation
+[5] learning metrics
+[6] search worker
+[7] detail worker
+[8] resume
+[9] result summary
+[10] package integration
+[11] 2K/10K/50K simulation
+[12] tests
+[13] extension version
+[14] user dirty file
+[15] commit SHA
+[16] exact steps for user to run first AUTO STORE campaign
+
+Implement only after Phase 3.0 is complete.
+Do not launch a real Amazon campaign automatically.
