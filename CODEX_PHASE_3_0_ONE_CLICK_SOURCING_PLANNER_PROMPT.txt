@@ -1,0 +1,475 @@
+ShopSource Studio — Phase 3.0
+ONE-CLICK STORE AUTO SOURCING PLANNER
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+- Current implementation baseline: f941ece51e1adf47b208e88f6c61f56ca22b7bcf
+
+==================================================
+0. 사용자 최종 UX
+==================================================
+
+사용자가 원하는 최종 경험은 매우 단순하다.
+
+001 | Cabin Tidy
+
+[자동 소싱 시작]
+
+버튼 하나를 누르면 ShopSource가:
+- 스토어에 필요한 카테고리를 알아서 구성
+- 카테고리별 keyword pool을 알아서 구성
+- 너무 많은 keyword를 전부 돌리지 않고 상위 keyword만 선택
+- 카테고리별 목표량을 자동 배분
+- 전체 목표량까지 자동 계획
+- 사용자는 결과만 확인
+
+이번 Phase 3.0은 "Planner"까지 구현한다.
+실제 Amazon live 자동 실행 엔진은 Phase 3.1에서 연결한다.
+
+==================================================
+1. 현재 LIVE 2,000 보호
+==================================================
+
+현재 실제 campaign:
+LC_aab4075226b7c41c933f
+
+상태:
+DETAILING
+
+실제 2,000 후보 수집이 이미 완료되었고 상세 작업이 진행 중이다.
+
+절대:
+- current campaign cancel/reset
+- production DB migration 실패로 campaign 손상
+- 실제 Amazon live 시작
+- UI/extension 강제 restart
+- current batch 변경
+
+하지 마라.
+
+모든 신규 기능 테스트는 TEMP DB/fixture에서 수행한다.
+
+stores/001_cabin_tidy.json은 기존 사용자 dirty file이다.
+절대 reset/restore/stage/commit하지 마라.
+
+==================================================
+2. 새 개념
+==================================================
+
+Store Auto Sourcing Plan
+
+구조:
+
+Store
+  ├ Category 1
+  │   ├ Keyword pool
+  │   ├ quota
+  │   ├ max active keywords
+  │   └ limits
+  ├ Category 2
+  └ ...
+
+사용자는 평상시 category/keyword를 직접 입력할 필요가 없어야 한다.
+고급 설정에서만 수정 가능.
+
+==================================================
+3. DB 구조
+==================================================
+
+권장 신규 tables:
+
+store_sourcing_plans
+- plan_id
+- store_id
+- name
+- total_candidate_target
+- detail_target
+- mode
+- status
+- created_at
+- updated_at
+
+store_sourcing_categories
+- id
+- plan_id
+- category_key
+- category_name
+- weight
+- quota
+- priority
+- enabled
+- source
+- created_at
+- updated_at
+
+store_sourcing_keywords
+- id
+- category_id
+- keyword
+- source
+- score
+- enabled
+- historical_yield
+- duplicate_rate
+- price_fit
+- quality_fit
+- risk_rate
+- pages_used
+- last_run_at
+- created_at
+- updated_at
+
+Do not put runtime secrets here.
+
+==================================================
+4. Category planner
+==================================================
+
+Create a deterministic local CategoryPlanner.
+
+Inputs:
+- Store Profile
+- store category
+- concept
+- include keywords
+- exclude keywords
+- risk rules
+- current MASTER product titles/brands/categories if available
+- existing KeywordEngine recipes
+- prior sourcing campaign keyword/yield statistics if available
+
+No paid API required.
+No LLM/API network call required.
+
+For Cabin Tidy, expected examples may include:
+- Trunk Storage
+- Seat Organization
+- Console Storage
+- Cargo
+- Cup Holder
+- Visor / Documents
+- Trash / Cleanup
+- Travel Storage
+- Small Accessories
+
+Do not hardcode Cabin Tidy-only behavior.
+Implement generic rules with domain-specific seed expansion as data/config.
+
+If the planner cannot confidently split a store, fallback:
+- 1 broad store category
+- several subtopic keyword groups
+
+Never fail because category count is unknown.
+
+==================================================
+5. Keyword pool
+==================================================
+
+Each category may own 50–100+ candidate keywords.
+
+BUT:
+The runtime must NOT automatically use all of them.
+
+Default limits:
+- max active keywords per category = 15
+- allowed range 3–30
+- max pages per keyword = 5
+- stale pages = 2
+- max unique candidates per keyword = 300
+
+These are plan defaults, configurable in advanced settings.
+
+Keyword sources:
+- Store Profile recipes
+- include keywords
+- category name expansions
+- KeywordEngine recommendations
+- previous successful keywords
+- safe local phrase templates
+
+Deduplicate case-insensitively.
+
+==================================================
+6. Keyword scoring
+==================================================
+
+Score keywords using available local evidence.
+
+Suggested components:
+- semantic/store fit
+- category fit
+- historical candidate yield
+- low duplicate rate
+- price fit
+- quality fit
+- low risk rate
+- freshness / not recently exhausted
+
+No single component can force deletion.
+
+Keep poor keywords as DISABLED/LOW_PRIORITY rather than deleting.
+
+==================================================
+7. Quota allocation
+==================================================
+
+User gives only:
+total sourcing target
+
+Example:
+10,000
+
+Planner automatically allocates category quotas.
+
+Use category weight based on:
+- category importance/store relevance
+- historical yield
+- estimated breadth
+- optional current product deficit
+
+Rules:
+- quotas sum exactly to total target
+- minimum quota for enabled category
+- avoid assigning huge quota to low-yield category
+- unused quota can be reallocated in Phase 3.1
+
+No equal split unless evidence is absent.
+
+==================================================
+8. Detail target
+==================================================
+
+User default experience should not require entering two numbers.
+
+Default:
+candidate target = user total
+detail target = candidate target
+
+Advanced option:
+detail ratio
+e.g. 25%, 50%, 100%
+
+Mission/assignment preset can keep 100%.
+
+==================================================
+9. One-click UI
+==================================================
+
+Sourcing page top area:
+
+### 스토어 자동 소싱
+
+현재 Store:
+001 | Cabin Tidy
+
+소싱 목표:
+[10,000]
+
+모드:
+[균형] default
+options:
+- 빠르게
+- 균형
+- 깊게
+
+[자동 소싱 계획 만들기]
+[자동 소싱 시작]  <-- Phase 3.1 connects this
+
+Default user should only need:
+target → 자동 소싱 시작
+
+Planner can be auto-created silently if missing.
+
+Advanced expansion:
+- categories
+- weights
+- active keyword cap
+- page cap
+- detail ratio
+
+==================================================
+10. Plan preview
+==================================================
+
+Optional collapsed preview:
+
+Trunk Storage        quota 1,800   active keywords 15 / pool 82
+Seat Organization    quota 1,500   active keywords 15 / pool 67
+Console Storage      quota 1,300   active keywords 14 / pool 54
+...
+
+Show:
+- total quota
+- category count
+- keyword pool total
+- active keyword count
+
+Do not require manual approval by default.
+
+==================================================
+11. Current LIVE campaign UI cleanup
+==================================================
+
+Current issue:
+After candidate target is reached and campaign status becomes DETAILING,
+search worker may be missing and UI shows ERROR.
+
+Fix semantics:
+
+If unique_candidates >= candidate_target and status in:
+CANDIDATE_TARGET_REACHED
+DETAILING
+READY_FOR_SPARK
+DONE
+
+then search stage should display:
+
+검색 단계: COMPLETE
+후보: 2,000 / 2,000
+
+Do not show old search-worker-missing error as an active blocking error.
+
+During DETAILING instead show:
+상세 Worker status
+current ASIN
+last detail success
+detail completed / target
+failure count
+
+Historical search error can remain in event log.
+
+Do not disturb current campaign DB state.
+
+==================================================
+12. Planner versioning
+==================================================
+
+Each plan has:
+planner_version
+
+Changing planner logic later must not silently mutate running plan.
+
+Plan snapshot is immutable once execution starts.
+New recommendation creates a new version.
+
+==================================================
+13. Scale expectations
+==================================================
+
+Planner must support:
+- 1 store
+- 10 categories
+- 50–100 keywords/category
+- total 500–2,000 keywords
+- candidate target up to 50,000
+
+UI must never render every keyword by default.
+Use pagination / collapsed category view.
+
+==================================================
+14. Safety
+==================================================
+
+No:
+- Amazon live browsing in this phase
+- CAPTCHA bypass
+- stealth
+- proxy rotation
+- cookies/session extraction
+- undocumented Amazon APIs
+- Shopify upload
+
+This Phase is planner/data/UI only.
+
+==================================================
+15. Tests
+==================================================
+
+Required tests:
+
+test_auto_plan_created_from_store_profile
+test_auto_plan_requires_no_manual_keyword_input
+test_category_quotas_sum_to_total_target
+test_keyword_pool_dedupes_case_insensitive
+test_active_keyword_cap
+test_keyword_page_cap_defaults
+test_stale_page_default
+test_keyword_score_uses_historical_yield_when_available
+test_low_score_keyword_preserved_not_deleted
+test_plan_version_snapshot
+test_plan_supports_1000_keywords
+test_plan_supports_50000_target
+test_detail_ratio_default_100_percent
+test_detail_ratio_advanced
+test_detailing_ui_marks_search_complete
+test_detailing_ui_shows_detail_worker_not_search_error
+test_current_live_campaign_not_mutated_by_planner
+
+Existing tests all PASS.
+
+==================================================
+16. Quality gate
+==================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Do not run real Amazon.
+
+==================================================
+17. Docs
+==================================================
+
+Create:
+docs/ONE_CLICK_AUTO_SOURCING.md
+
+Explain in Korean:
+- user only presses one button
+- categories/keywords/quotas are internal plan
+- advanced controls optional
+- Phase 3.1 will execute plan
+
+==================================================
+18. Commit/push
+==================================================
+
+Do not commit:
+DB
+backups
+exports
+stores/001_cabin_tidy.json
+runtime data
+
+Commit:
+git commit -m "Add one click sourcing planner"
+
+Push origin/main.
+
+Final:
+main...origin/main = 0 0
+
+==================================================
+19. Completion report
+==================================================
+
+[1] new planner structure
+[2] automatic category generation
+[3] keyword pool generation
+[4] keyword scoring
+[5] quota allocation
+[6] one-click UI
+[7] advanced settings
+[8] current LIVE campaign UI cleanup
+[9] scale test
+[10] tests
+[11] user dirty file preserved
+[12] commit SHA
+
+Implement now, but DO NOT start or alter the current real LIVE 2,000 campaign.
