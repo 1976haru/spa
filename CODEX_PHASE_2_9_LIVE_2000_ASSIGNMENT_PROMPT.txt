@@ -1,0 +1,702 @@
+ShopSource Studio — Phase 2.9
+LIVE 2,000 Product Assignment Run
+Real Amazon → ShopSource → Spark Desktop → Shopify Upload
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+
+Latest expected implementation:
+2d4d7de3b5cea7bf2b908a28df615691fa2ad09c
+Add safe Spark desktop staging
+
+Phase 2.8 massive-scale synthetic benchmark prompt exists, but user priority is now a REAL 2,000-product assignment run.
+Do not block the 2,000 live test waiting for 50K synthetic benchmark work.
+
+==================================================
+0. Real goal
+==================================================
+
+The assignment requires sourcing 2,000 products.
+
+The user wants to test the full real workflow now:
+
+Amazon real search/capture
+→ ShopSource candidate pool
+→ detail enrichment
+→ MASTER
+→ Store classification
+→ Spark package
+→ Spark Desktop staging
+→ Spark data load
+→ Spark price/inventory filtering
+→ Shopify upload
+
+The previous 5-product live flow has already succeeded end-to-end, including actual Shopify upload.
+
+Now build a production-safe "LIVE 2000" operating mode.
+
+==================================================
+1. Important operational rule
+==================================================
+
+Do NOT interpret "2,000 sourced" as "exactly 2,000 Amazon pages must be uploaded".
+
+Spark behavior already observed by user:
+- out-of-stock items may be excluded during Spark collection/processing
+- price filtering is applied in Spark before upload
+- manually excluded products are separate from price filtering
+
+ShopSource rule remains:
+- do not delete valid products just because price is low/high
+- keep them in MASTER as LOW_RESERVE / HIGH_RESERVE / etc.
+
+Therefore expose two counters:
+
+A. sourced_unique_target
+B. upload_eligible_target
+
+Default assignment mode:
+sourced_unique_target = 2000
+
+If the user later needs 2,000 actually upload-eligible products, the campaign can continue beyond 2,000 candidates until eligible count reaches 2,000.
+
+Do not hardcode an assumed exclusion percentage.
+
+==================================================
+2. User-facing LIVE 2000 mode
+==================================================
+
+Add a clear Sourcing mode/preset:
+
+"LIVE 과제 2,000개"
+
+Preset:
+- unique candidate target: 2000
+- detail target: 2000
+- Store: current store (001 Cabin Tidy)
+- auto MASTER import: ON
+- auto Store classification: ON
+- checkpoint/resume: ON
+- one reusable Amazon worker tab: ON
+- CAPTCHA: pause and require user action
+- no bypass/stealth/proxy/cookie tricks
+
+Allow user to change target, but preset button fills 2000.
+
+==================================================
+3. Campaign model
+==================================================
+
+Add persistent sourcing campaign tables if not already present.
+
+Suggested:
+
+sourcing_campaigns
+- campaign_id
+- store_id
+- name
+- candidate_target
+- detail_target
+- unique_candidates
+- detail_complete
+- master_imported
+- classified
+- duplicates
+- failed
+- status
+- created_at
+- updated_at
+
+sourcing_campaign_keywords
+- campaign_id
+- keyword
+- current_page
+- pages_captured
+- new_candidates
+- duplicates
+- exhausted
+- last_url
+- updated_at
+
+Campaign status:
+DRAFT
+RUNNING
+PAUSED
+PAUSED_NEEDS_USER
+CANDIDATE_TARGET_REACHED
+DETAILING
+READY_FOR_SPARK
+DONE
+CANCELLED
+
+==================================================
+4. Candidate harvesting for 2,000
+==================================================
+
+Current manual one-page capture is too cumbersome for 2,000.
+
+Implement a conservative assisted search-page campaign using ONE ShopSource-owned Amazon search worker tab.
+
+Important:
+- no CAPTCHA bypass
+- no stealth
+- no proxy rotation
+- no cookie/session extraction
+- no hidden API
+- no Amazon private endpoints
+
+Use normal browser navigation only.
+
+Flow:
+1. User explicitly starts LIVE 2000 campaign.
+2. ShopSource opens Amazon search page for current keyword.
+3. Capture rendered search result cards.
+4. Store/dedupe candidates.
+5. Wait a conservative configurable delay.
+6. Navigate same search worker tab to next Amazon search result page.
+7. Repeat until:
+   - candidate target reached
+   - page exhausted
+   - CAPTCHA detected
+   - user pauses/cancels
+8. Then move to next keyword.
+
+Default search-page delay:
+8 seconds
+
+Allowed UI range:
+6–30 seconds
+
+Never go below 6 seconds in live mode.
+
+==================================================
+5. Keyword pool
+==================================================
+
+For Cabin Tidy, use existing Keyword Studio output.
+
+Do not rely on only one broad keyword like "trunk organizer".
+
+Generate/use a diversified campaign list such as:
+- trunk organizer
+- car trunk storage
+- car seat organizer
+- backseat organizer
+- center console organizer
+- car console storage
+- seat gap organizer
+- seat gap filler organizer
+- visor organizer
+- glove box organizer
+- car storage organizer
+- car interior storage
+- cargo organizer
+- SUV organizer
+- car trash organizer
+- headrest organizer
+- car cup holder organizer
+- trunk storage box
+- foldable trunk organizer
+- car document organizer
+
+Use existing keyword intelligence where possible.
+Do not hardcode only this list if dynamic keyword output already exists.
+
+Campaign should rotate keywords when:
+- no new candidates for N pages
+- Amazon says no more results
+- page has no valid cards
+
+Default stale threshold:
+2 consecutive pages with 0 new unique candidates.
+
+==================================================
+6. Search page navigation
+==================================================
+
+Use the same ShopSource-owned search worker tab for all campaign search pages.
+
+Do not accumulate dozens/hundreds of search tabs.
+
+Navigation:
+chrome.tabs.update(searchWorkerTabId, {url: nextUrl, active:false})
+
+Capture after page load/readiness.
+
+Preserve user-opened Amazon tabs.
+
+Search worker tab and detail worker tab may be separate, but each campaign has at most:
+- 1 search worker tab
+- 1 detail worker tab
+
+No tab explosion.
+
+==================================================
+7. Pagination URL
+==================================================
+
+Prefer actual page navigation links from rendered Amazon DOM.
+
+Do not invent undocumented API calls.
+
+Find "next" anchor/button from current rendered search page and use its href.
+
+If missing:
+keyword exhausted.
+
+Do not blindly construct unlimited page=N URLs if DOM does not expose next.
+
+==================================================
+8. Candidate target semantics
+==================================================
+
+unique_candidates counts distinct ASINs for current campaign/store.
+
+Repeated search appearances:
+- keep occurrence/history
+- increment duplicates
+- do not increase unique candidate target
+
+When unique_candidates >= 2000:
+stop search harvesting automatically.
+
+Do not continue unnecessary search page traversal.
+
+==================================================
+9. Candidate-first, detail-second
+==================================================
+
+For this assignment preset, default detail_target=2000.
+
+But architecture must support:
+candidate_target != detail_target.
+
+After candidate target is reached:
+Campaign transitions:
+CANDIDATE_TARGET_REACHED → DETAILING
+
+Queue candidates requiring detail.
+
+Already DETAIL_COMPLETE / MASTER_IMPORTED candidates do not need to be revisited.
+
+==================================================
+10. Detail processing
+==================================================
+
+Reuse existing Phase 2.6.5 single Amazon detail worker tab.
+
+Keep:
+- concurrency = 1
+- minimum interval = 4 seconds
+- explicit background/content handshake
+- one-shot capture
+- expected ASIN mismatch guard
+- service worker recovery
+- CAPTCHA pause
+- retry/checkpoint
+
+For 2,000 live mode:
+do not open 2,000 tabs.
+Reuse one worker tab.
+
+==================================================
+11. Runtime estimate
+==================================================
+
+UI must display estimated minimum duration.
+
+At 4 seconds minimum detail interval:
+2000 details have a theoretical scheduling floor of about 2h 13m before page-load/capture/CAPTCHA overhead.
+
+Calculate dynamically from:
+remaining_details × configured_interval
+
+Show:
+"최소 예상시간"
+and:
+"실제 Amazon 로딩/확인 화면 때문에 더 길어질 수 있습니다."
+
+Do not promise exact completion time.
+
+==================================================
+12. Resume across restart
+==================================================
+
+2,000 run may take hours.
+
+Campaign must survive:
+- ShopSource restart
+- browser extension worker restart
+- UI refresh
+- PC/app interruption where DB remains intact
+
+On restart:
+show active incomplete campaign.
+
+Buttons:
+[과제 2,000 계속]
+[일시정지]
+[취소]
+[실패만 재시도]
+
+Do not create a second campaign accidentally.
+
+==================================================
+13. Checkpoint frequency
+==================================================
+
+Persist progress after every meaningful state transition.
+
+No large in-memory-only progress.
+
+Campaign dashboard counters come from DB.
+
+==================================================
+14. Failure handling
+==================================================
+
+Classify failures:
+- CAPTCHA
+- Amazon page unavailable
+- detail readiness timeout
+- missing/invalid ASIN
+- extension handshake failure
+- network/browser interruption
+- duplicate
+- unknown
+
+Failed detail items remain retryable.
+
+Do not delete MASTER/candidate records because of failure.
+
+==================================================
+15. Live 2,000 dashboard
+==================================================
+
+Add a compact progress panel:
+
+LIVE 과제 2,000
+
+후보 목표          2,000
+고유 후보          1,245
+중복                318
+검색 페이지          31
+상세 완료           742
+MASTER              742
+Store 분류          742
+실패                  9
+Spark 준비            0
+상태              DETAILING
+최소 예상시간       ...
+
+Buttons:
+[계속]
+[일시정지]
+[실패 재시도]
+[캠페인 상세]
+
+==================================================
+16. Memory/UI safety
+==================================================
+
+Never render 2,000 product cards at once.
+
+Campaign list:
+server-side pagination.
+
+Products:
+existing paginated DB query.
+
+Batch/campaign event log:
+latest 50/100 by default.
+
+==================================================
+17. Spark package for 2,000
+==================================================
+
+When 2,000 detail/master/classified products are ready:
+
+Create a package from the explicit campaign result set.
+
+Do not depend on manually checking 2,000 checkboxes.
+
+Add:
+[이 캠페인 상품으로 Spark Package 만들기]
+
+It uses campaign's successfully MASTER_IMPORTED/classified ASIN set.
+
+If campaign has exactly 2,000 ready:
+package_count=2000.
+
+If fewer due unresolved failures:
+show exact count and warn.
+
+==================================================
+18. Spark Desktop staging
+==================================================
+
+Reuse Phase 2.7.2 safe staging connector.
+
+For 2,000 dataset:
+- new unique dataset ID
+- no overwrite
+- atomic temp staging
+- byte-for-byte JSON copy
+- SHA-256 verification
+
+Do not touch existing Spark datasets.
+
+==================================================
+19. Spark load verification for 2,000
+==================================================
+
+User will manually verify Spark UI.
+
+ShopSource should show checklist:
+
+[ ] Spark 전체 count 확인
+[ ] 포함 count 확인
+[ ] 제외 count 확인
+[ ] 이미지 표시 확인
+[ ] ASIN/상품명 확인
+[ ] 가격 필터 확인
+
+Manual confirmation records:
+spark_desktop_roundtrip_verified=true
+verified_product_count=<actual>
+
+Do not auto-claim verified.
+
+==================================================
+20. Price filter / stock behavior
+==================================================
+
+Document and display the observed division of responsibility:
+
+ShopSource:
+- preserves valid sourced products
+- classifies by store price bands
+- does not delete LOW/HIGH reserve solely on price
+
+Spark:
+- user applies final price filter before upload
+- unavailable/out-of-stock products may already be excluded in Spark's collection/processing
+- manual exclude remains separate
+
+For the 2,000 assignment, record:
+Spark total
+Spark included
+Spark excluded
+final uploaded count
+
+This allows the user to prove:
+"2,000 sourced"
+even if final upload count is lower after filtering/exclusions.
+
+==================================================
+21. Shopify upload tracking
+==================================================
+
+After user performs Spark → Shopify upload,
+allow recording:
+
+campaign_id
+spark_dataset_id
+spark_total
+spark_included
+spark_excluded
+shopify_upload_attempted_at
+shopify_upload_result
+shopify_uploaded_count if observable
+notes
+
+No Shopify token storage in ShopSource for this phase.
+
+==================================================
+22. Assignment evidence report
+==================================================
+
+Generate:
+
+exports/assignment_reports/<campaign_id>/
+  assignment_summary.md
+  assignment_summary.json
+  sourcing_counts.csv
+
+Report fields:
+- campaign name
+- store
+- started/finished
+- unique candidates
+- duplicates
+- detail complete
+- MASTER
+- classification counts
+- failures
+- Spark dataset ID
+- Spark total/included/excluded
+- Shopify upload status
+- package path
+- commit/app version
+
+Do not include cookies/tokens/private auth data.
+
+==================================================
+23. Safety stop conditions
+==================================================
+
+Auto-pause campaign when:
+- CAPTCHA detected
+- repeated page readiness failures
+- extension disconnected
+- ShopSource bridge health fails
+- user manually pauses
+
+No bypass.
+
+==================================================
+24. Preflight before actual LIVE run
+==================================================
+
+Before starting actual 2,000 campaign, run:
+
+A. DB backup
+B. extension health
+C. Spark staging connector health
+D. disk free space
+E. current active campaign check
+F. store profile load
+G. browser extension version check
+
+Create a local backup of production SQLite before the run.
+
+Backup path:
+backups/pre_live_2000_<timestamp>.sqlite3
+
+Do not commit backups.
+
+==================================================
+25. Do not run the real 2,000 automatically during Codex implementation
+==================================================
+
+Codex must implement and test the mode,
+but must NOT itself launch a 2,000-product Amazon live run without the user's explicit UI action.
+
+Unit/integration tests use synthetic/local fixtures only.
+
+At end, user will start LIVE 2000 from UI.
+
+==================================================
+26. Tests
+==================================================
+
+Required:
+
+test_live_2000_preset
+test_campaign_unique_candidate_target
+test_campaign_duplicate_does_not_increment_unique
+test_campaign_stops_search_at_2000
+test_search_worker_tab_single
+test_detail_worker_tab_single
+test_search_next_link_from_dom_contract
+test_search_no_next_marks_keyword_exhausted
+test_zero_new_pages_rotate_keyword
+test_campaign_resume_same_id
+test_campaign_survives_ui_restart
+test_campaign_detail_target_2000
+test_campaign_does_not_redetail_completed
+test_campaign_package_uses_campaign_asins
+test_live_2000_does_not_render_all_products
+test_assignment_report_counts
+test_spark_counts_recorded_separately
+test_shopify_upload_count_optional
+test_no_captcha_bypass
+test_preflight_backup_created
+
+Existing tests all PASS.
+
+==================================================
+27. Quality Gate
+==================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+If extension JS changes:
+node --check browser_extension/shopsource_capture/background.js
+node --check browser_extension/shopsource_capture/content_search.js
+node --check browser_extension/shopsource_capture/content_product.js
+node --check browser_extension/shopsource_capture/content_local_bridge.js
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+==================================================
+28. Extension version
+==================================================
+
+If browser extension changes:
+0.1.4 → 0.1.5
+
+README/UI must tell user to reload v0.1.5.
+
+==================================================
+29. User dirty file
+==================================================
+
+stores/001_cabin_tidy.json
+
+Never reset/restore/stage/commit it.
+
+==================================================
+30. Commit / Push
+==================================================
+
+Code/docs/tests only.
+
+commit:
+
+git commit -m "Add live 2000 sourcing campaign"
+
+push origin main
+
+Final:
+git status --short
+git log --oneline -8
+git rev-list --left-right --count main...origin/main
+
+main...origin/main = 0 0
+
+==================================================
+31. Completion report
+==================================================
+
+[1] LIVE 2000 preset
+[2] Campaign DB structure
+[3] Candidate search worker tab
+[4] Search pagination behavior
+[5] Keyword rotation
+[6] Unique candidate target logic
+[7] Detail 2000 queue
+[8] Single detail worker tab
+[9] Runtime estimate UI
+[10] Checkpoint/resume
+[11] Failure recovery
+[12] Campaign progress UI
+[13] Campaign → Spark package
+[14] Safe Spark staging
+[15] Spark counts tracking
+[16] Shopify upload tracking
+[17] Assignment evidence report
+[18] Preflight DB backup
+[19] tests
+[20] extension version
+[21] user dirty file
+[22] commit SHA
+[23] exact steps the user should click to start the real 2,000 run
+
+Implement now, but DO NOT launch the actual 2,000-product live Amazon run automatically.
