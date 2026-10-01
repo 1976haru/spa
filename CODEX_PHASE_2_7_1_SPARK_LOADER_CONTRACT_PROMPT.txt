@@ -1,0 +1,600 @@
+ShopSource Studio — Phase 2.7.1
+Spark Desktop Dataset Loader Contract Probe + Exact Compatibility Fix
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+
+Latest expected commit:
+6157a81e18f221b45e4c1a570c54672efddb5bf5
+Fix Spark browser payload compatibility
+
+==================================================
+0. 실제 live 결과 — Phase 2.7도 실패
+==================================================
+
+새 Browser Capture package:
+
+SC_001_20260930_223249_1949
+
+경로:
+D:\shop\001_so_amazon\exports\spark_center\001_Cabin_Tidy\ready\SC_001_20260930_223249_1949
+
+를 Spark Desktop의 "데이터 불러오기"에서 선택했다.
+
+Spark UI 결과:
+
+작업 ID: SC_001_20260930_223249_1949
+전체 0개
+포함 0개
+제외 0개
+데이터가 없습니다
+
+즉 폴더/job ID 자체는 인식하지만
+상품 JSON을 상품 레코드로 받아들이지 않는다.
+
+Phase 2.7의 observed-schema validation PASS는
+실제 Spark loader 계약을 충분히 모델링하지 못했다.
+
+이번 단계부터는 필드 모양을 추측하지 말고
+Spark Desktop의 실제 local loader contract를 READ ONLY로 찾아
+그 조건에 맞춘다.
+
+==================================================
+1. 중요한 현재 단서
+==================================================
+
+실제 Spark native dataset sample에서는 관측됨:
+
+- quantity: 전부 integer로 관측됨
+- images[].main 값: [width, height] 양의 정수 2개
+- options:
+  selectedVariations: object
+  variationDisplayLabels: object
+- _listPage: integer
+- _collectedAt: epoch milliseconds integer
+
+그러나 현재 Browser package에는 적어도:
+
+- quantity: null
+- 과거 5개 상품은 image main dimension이 실제 capture되지 않아 [] 가능
+- options variationDisplayLabels가 빈 object일 수 있음
+
+이 값들은 Phase 2.7 validator가 허용했지만,
+현재까지 본 Spark native sample에는 동일 형태가 관측되지 않았다.
+
+따라서 이 세 항목을 실제 loader가 필수로 검사하는지 확인해야 한다.
+
+==================================================
+2. 시작 전
+==================================================
+
+반드시:
+
+git status --short
+git log --oneline -10
+git fetch origin
+
+사용자 dirty file:
+
+stores/001_cabin_tidy.json
+
+절대 reset/restore/checkout/clean하지 마라.
+stage/commit하지 마라.
+
+==================================================
+3. Spark 애플리케이션은 READ ONLY 분석
+==================================================
+
+목표:
+Spark의 "데이터 불러오기"가 dataset JSON을 읽고
+전체/포함/제외 목록에 넣는 실제 validation/filter 조건을 찾는다.
+
+Spark 앱 파일은 절대 수정하지 않는다.
+
+가능한 설치 위치를 READ ONLY 탐색:
+
+C:\Users\user\AppData\Local\Programs\
+C:\Users\user\AppData\Local\
+C:\Users\user\AppData\Roaming\
+C:\Program Files\
+C:\Program Files (x86)\
+
+spark 실행파일/전자 앱 resources/app.asar/resources 등을 찾는다.
+
+가능하면 현재 실행 중인 Spark process의 executable path도
+READ ONLY로 확인한다.
+
+PowerShell/CMD 예:
+Get-Process | Where-Object {$_.ProcessName -match 'spark'} | Select Path
+
+앱 수정, DLL injection, patch, hook 금지.
+
+==================================================
+4. Electron bundle/source READ ONLY inspection
+==================================================
+
+Electron app이면 다음을 찾는다:
+
+resources\app.asar
+resources\app\
+dist\
+renderer\
+main\
+*.js
+*.map
+
+app.asar를 검사할 때도 원본은 수정하지 않는다.
+
+필요하면 repository 외부 임시 진단 폴더로 extract:
+D:\shop\001_so_amazon\.diagnostics\spark_app_readonly\
+
+원본 app.asar는 절대 변경하지 않는다.
+
+.diagnostics는 Git ignore 대상인지 확인하고
+커밋하지 않는다.
+
+==================================================
+5. 검색할 문자열
+==================================================
+
+실제 loader code를 찾기 위해 다음 문자열을 검색:
+
+"데이터 불러오기"
+"최근 작업 불러오기"
+"데이터가 없습니다"
+"전체"
+"포함"
+"제외"
+"datasets"
+"selectedVariations"
+"variationDisplayLabels"
+"_collectedAt"
+"_listPage"
+"reviewCount"
+"quantity"
+"images"
+"hiRes"
+"shoppableScene"
+"readFile"
+"readdir"
+"JSON.parse"
+"folder"
+"dataset"
+
+한국어 문자열이 bundle에서 번역 key라면
+해당 translation key에서 호출 지점을 역추적한다.
+
+==================================================
+6. 절대 조사하지 말 영역
+==================================================
+
+이번 작업은 local dataset loader contract 분석만 한다.
+
+다음은 읽거나 복사하거나 보고하지 마라:
+
+- cookies
+- access tokens
+- Shopify token
+- Amazon session
+- login credentials
+- SDK_SESSION_POOL_STATE.json
+- key_value_stores session 내용
+- undocumented authenticated server API
+- CAPTCHA bypass logic
+
+목표는 오직 "로컬 폴더 JSON을 UI 목록에 넣는 조건"이다.
+
+==================================================
+7. Loader predicate를 실제 코드로 확인
+==================================================
+
+가능하면 다음을 정확히 찾아 완료 보고:
+
+A. 폴더에서 어떤 파일을 enumerate하는지
+B. 파일 확장자/파일명 조건
+C. JSON parse 후 어떤 key를 요구하는지
+D. 어떤 field type을 요구하는지
+E. 어떤 조건이면 skip되는지
+F. 전체/포함/제외 count가 언제 증가하는지
+G. quantity=null 처리
+H. images[].main=[] 처리
+I. options empty labels 처리
+J. URL/ASIN/title/price 조건
+K. 파일별 예외가 catch되어 조용히 skip되는지
+
+코드가 minified여도 predicate를 사람이 읽을 수 있게 pseudocode로 정리한다.
+
+추측과 실제 코드 확인을 명확히 구분한다.
+
+==================================================
+8. Native control folder 생성
+==================================================
+
+동시에 현재 Spark 자체 dataset에서
+정상 상품 JSON 5개를 그대로 COPY해서 control folder를 만든다.
+
+원본 위치:
+C:\Users\user\AppData\Roaming\spark\storage\datasets\<known_job>\*.json
+
+출력:
+D:\shop\001_so_amazon\exports\spark_diagnostics\CONTROL_NATIVE_5_<timestamp>\
+
+조건:
+- exact byte copy 또는 내용 수정 없는 copy
+- 000000001.json ~ 000000005.json
+- 상품 JSON만
+- manifest/report 없음
+
+원본 Spark storage는 READ ONLY.
+
+이 폴더는 Git에 커밋 금지.
+
+완료 보고에 정확한 control folder 경로를 적는다.
+
+==================================================
+9. Browser 실패 package exact diff
+==================================================
+
+다음 package 5개를 읽는다:
+
+D:\shop\001_so_amazon\exports\spark_center\001_Cabin_Tidy\ready\SC_001_20260930_223249_1949
+
+native control과 비교:
+
+- top-level key set
+- missing keys
+- extra keys
+- type difference
+- null difference
+- nested object shape
+- file encoding
+- BOM 유무
+- line endings은 참고
+- JSON root object 여부
+- filename pattern
+- file size
+
+특히 5개 전부에 공통인 Browser-only incompatibility를 우선 찾는다.
+
+==================================================
+10. Phase 2.7 validator 오류 수정
+==================================================
+
+실제 loader code 또는 control evidence가
+quantity integer를 요구하면:
+
+quantity=None을 PASS시키지 마라.
+
+실제 loader가 image main [width,height]를 요구하면:
+
+empty []를 PASS시키지 마라.
+
+실제 loader가 variationDisplayLabels non-empty를 요구하면:
+
+{}를 PASS시키지 마라.
+
+즉 observed_spark_schema_issues()는
+"우리가 만든 shape"가 아니라
+"실제 loader가 받아들이는 shape"를 검사하게 수정한다.
+
+==================================================
+11. 기존 5개를 위한 실제 metadata enrichment
+==================================================
+
+만약 loader가 현재 MASTER 5개에 없는 관측값을 필수로 요구하면
+가짜 값을 넣지 않는다.
+
+대신 Browser Extension을 이용해
+기존 5개를 자동으로 재방문하여 필요한 metadata를 실제 DOM에서 다시 수집한다.
+
+새 Products UI action 권장:
+
+[선택 상품 Spark 정보 보강]
+
+대상:
+현재 선택된 BROWSER_CAPTURE ASIN
+
+동작:
+- 새 product identity 생성 금지
+- MASTER 중복 생성 금지
+- 기존 ASIN product row update/merge
+- ShopSource Worker Tab 1개 재사용
+- selected ASIN을 순차 방문
+- 필요한 실제 DOM metadata capture
+- 완료 후 package 재생성 가능
+
+==================================================
+12. quantity 실제 관측
+==================================================
+
+quantity가 필수라면 Amazon 상품 페이지에서
+실제 DOM으로 관측한다.
+
+우선 후보:
+
+#quantity select
+select[name="quantity"]
+#selectQuantity
+
+numeric option value/text를 읽고
+실제 available numeric choices 중 native scraper 의미와 가장 가까운 값을
+loader/native sample과 비교해 결정한다.
+
+예:
+native quantity가 1/10/20처럼 나타나는 이유가
+quantity selector maximum이라면
+그 maximum을 저장한다.
+
+반드시 실제 DOM evidence로 확인.
+무조건 1을 넣는 fallback 금지.
+
+관측 불가하면 enrichment FAIL로 표시한다.
+
+==================================================
+13. image dimensions 실제 관측
+==================================================
+
+image main size가 필수라면 실제 DOM에서 수집:
+
+#landingImage data-a-dynamic-image
+data-old-hires
+img.naturalWidth
+img.naturalHeight
+
+가능하면 Amazon page 내 이미 로드된 DOM/script 데이터만 사용한다.
+별도 네트워크 scraping 요청 추가 금지.
+
+최소 대표 image 1개라도
+실제 URL + 실제 width/height를 확보해야 한다면 그렇게 한다.
+
+가짜 [1,1], [1500,1500] 삽입 금지.
+
+==================================================
+14. options / variation labels 실제 관측
+==================================================
+
+필요 시 실제 DOM에서:
+
+#twister
+#variation_* elements
+select
+aria-label/title
+
+을 사용해:
+
+selectedVariations
+variationDisplayLabels
+
+를 Spark native shape로 저장한다.
+
+variant가 없는 상품에서 loader가 empty object를 허용하는지는
+실제 loader code 또는 native no-variation sample로 확인한다.
+
+==================================================
+15. URL query requirement
+==================================================
+
+Native URLs에:
+?psc=1&trnd=<ASIN>
+
+이 보이지만 이것이 loader 필수인지
+실제 코드로 확인하기 전에는 추가하지 않는다.
+
+loader가 URL 형식 자체를 검사하지 않으면
+canonical /dp/<ASIN> 유지 가능.
+
+==================================================
+16. Extension version
+==================================================
+
+Phase 2.7에서 content_product.js가 이미 변경됐지만
+manifest가 0.1.4에 머물러 있었다.
+
+이번에 extension JS를 추가 수정한다면
+반드시:
+
+0.1.4 → 0.1.5
+
+로 올린다.
+
+UI/README:
+chrome://extensions에서 v0.1.5 Reload 필요
+
+명시.
+
+==================================================
+17. Enrichment 상태 UI
+==================================================
+
+Products 화면에 선택 상품 기준:
+
+Spark metadata:
+- quantity: observed/missing
+- image dimensions: observed/missing
+- variation labels: observed/missing
+- source page metadata: observed/missing
+
+표시 가능하게 한다.
+
+[선택 상품 Spark 정보 보강] 실행 후:
+
+5/5 READY
+
+가 되어야 package 생성 허용.
+
+loader-required field가 빠졌으면
+package Validation PASS를 주지 않는다.
+
+==================================================
+18. 새 package 생성
+==================================================
+
+기존 실패 package는 수정하지 않는다.
+
+다음은 모두 증거로 보존:
+SC_001_20260930_220504_85a2
+SC_001_20260930_223249_1949
+
+enrichment/loader fix 후
+새 package 생성:
+
+SC_001_<new_timestamp>_<id>
+
+기존 MASTER ASIN 5개 그대로:
+
+B09YXYSSLL
+B0CM6KVCSX
+B0F7QTD5SV
+B0GFD1WBP9
+B0H8SFR4GT
+
+재소싱하여 새 상품 생성 금지.
+
+==================================================
+19. 새 package strict validation
+==================================================
+
+새 Validation PASS 조건은:
+
+- local JSON valid
+- exact loader-required fields/types pass
+- quantity required면 all integer
+- dimensions required면 all required dimensions present
+- options loader rule pass
+- search source/list page pass if required
+- no invented values
+- no internal/sensitive fields
+
+그리고 여전히:
+
+spark_desktop_roundtrip_verified = false
+
+사용자가 Spark에서 5/5 확인하기 전까지 유지.
+
+==================================================
+20. Controlled test artifacts
+==================================================
+
+완료 후 사용자에게 두 폴더 경로를 제공:
+
+A. CONTROL_NATIVE_5_<timestamp>
+   - exact native Spark JSON 5개
+   - 현재 Spark app loader 자체가 외부 folder를 받아들이는지 확인용
+
+B. NEW_BROWSER_5 package
+   - loader contract에 맞춘 Browser Capture 5개
+
+사용자는 먼저 A를 Spark에서 로드한다.
+
+A 결과:
+5/5 → loader/path 정상, Browser schema만 문제였음.
+0/5 → 현재 Spark version/import path/폴더 handling 문제. Browser mapper 추가 수정 중단.
+
+A가 5/5이면 B를 로드한다.
+
+B 결과:
+5/5 → Browser mapping 실제 성공.
+0/5 → event/loader predicate diff를 다시 좁힌다.
+
+==================================================
+21. 테스트
+==================================================
+
+필수:
+
+test_loader_contract_profile_fixture
+test_quantity_required_if_loader_requires_it
+test_empty_image_dimensions_rejected_if_loader_requires_it
+test_variation_shape_matches_loader_contract
+test_existing_master_enrichment_does_not_duplicate_product
+test_enrichment_worker_tab_single
+test_enrichment_captures_real_quantity_contract
+test_enrichment_captures_real_image_dimensions_contract
+test_browser_package_requires_enrichment_when_missing_required_metadata
+test_browser_package_after_enrichment_five_products
+test_roundtrip_flag_stays_false_until_user_confirmation
+
+기존 전체 tests PASS.
+
+==================================================
+22. Quality Gate
+==================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+Extension 변경 시:
+
+node --check browser_extension/shopsource_capture/content_product.js
+node --check browser_extension/shopsource_capture/background.js
+node --check browser_extension/shopsource_capture/content_local_bridge.js
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+==================================================
+23. 사용자/외부 파일 보호
+==================================================
+
+stores/001_cabin_tidy.json
+수정/stage/commit 금지.
+
+Spark installed app:
+READ ONLY.
+
+Spark storage:
+READ ONLY.
+
+native copied diagnostic JSON:
+Git commit 금지.
+
+==================================================
+24. Commit / Push
+==================================================
+
+코드 변경이 발생한 경우 관련 ShopSource 파일만 stage.
+
+commit:
+
+git commit -m "Match Spark desktop loader contract"
+
+push origin main
+
+최종:
+
+git status --short
+git log --oneline -8
+git rev-list --left-right --count main...origin/main
+
+main...origin/main = 0 0
+
+==================================================
+25. 완료 보고
+==================================================
+
+[1] Spark executable/install path
+[2] loader code 위치
+[3] loader predicate pseudocode
+[4] JSON enumerate/file naming rule
+[5] exact required fields/types
+[6] quantity null 허용 여부
+[7] image main empty dimensions 허용 여부
+[8] variationDisplayLabels empty 허용 여부
+[9] current Browser 5개가 skip되는 정확한 조건
+[10] CONTROL_NATIVE_5 경로
+[11] enrichment 구현 여부
+[12] 실제 5개 enrichment 결과
+[13] extension version
+[14] NEW_BROWSER_5 package 경로
+[15] strict validation 결과
+[16] tests
+[17] 사용자 dirty file
+[18] commit SHA
+[19] 사용자가 Spark에서 먼저 선택할 CONTROL 폴더
+[20] CONTROL 성공 후 선택할 Browser 새 폴더
+
+지금 진행하라.
