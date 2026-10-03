@@ -1,0 +1,605 @@
+ShopSource Studio — Phase 3.8
+MEGA MENU / SHOPIFY NAVIGATION AUTOMATION
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+- Baseline: e4e99aa6aa39a571c12f02a845a475a2aa000e46
+
+Context
+- Phase 3.1–3.7 are implemented.
+- User completed the Shopify mega-menu assignment manually.
+- The assignment flow was:
+  Shopify Admin → Content → Menus → Main menu → Add menu item → create parent/child hierarchy → save → Online Store → Theme Edit/Customize → Header → mega-menu-related theme setting → save.
+- User wants to move quickly through assignments now and refine edge cases later.
+- Therefore this phase should implement a safe, reusable V1 automation using the existing collection planner/publisher and theme infrastructure without overcomplicating UI.
+
+Goal
+Automate:
+1. menu structure planning
+2. collection-link mapping
+3. Shopify navigation create/update preview
+4. safe navigation sync
+5. mega-menu theme configuration preview
+6. theme apply when safely supported
+7. manual fallback when theme mapping/write capability is unavailable
+8. Store Build integration
+
+IMPORTANT during implementation/tests:
+- NO real Shopify write
+- NO live theme write
+- NO Amazon run
+- NO Spark upload
+- all Shopify/theme calls mocked
+
+======================================================================
+0. FINAL USER EXPERIENCE
+======================================================================
+
+### 메가메뉴 자동화
+
+Store:
+001 | Cabin Tidy
+
+Main navigation:
+READY
+
+Collections:
+7 mapped / 0 missing
+
+Suggested menu:
+
+Home
+
+Shop
+ ├─ Trunk Organizers
+ ├─ Seat Organizers
+ ├─ Console Storage
+ ├─ Cup Holders & Storage
+ ├─ Trash & Cleanup
+ ├─ Visor & Documents
+ └─ Cargo & Travel
+
+About Us
+Contact
+
+[메뉴 자동 설계]
+[Shopify 메뉴 미리보기]
+[Shopify 메뉴 동기화]
+[메가메뉴 테마 미리보기]
+[메가메뉴 적용]
+[수동 적용 안내]
+
+Advanced settings collapsed by default.
+
+======================================================================
+1. REUSE EXISTING COLLECTION PLAN
+======================================================================
+
+Primary source:
+Phase 3.2 collection planner.
+
+Use:
+- enabled collection definitions
+- priority/order
+- collection_key
+- title
+- handle
+- shopify_collection_id when synced
+- warnings
+- expected product count
+
+If collection publisher has synced collections:
+use Shopify collection ID/URL.
+
+If only local plan exists:
+allow PLAN_ONLY status but do not create broken remote links.
+
+Do not create separate hardcoded Cabin Tidy taxonomy.
+
+Cabin Tidy fixture may resemble:
+- Trunk Organizers
+- Seat Organizers
+- Console Storage
+- Cup Holders & Storage
+- Trash & Cleanup
+- Visor & Documents
+- Cargo & Travel
+
+but production must be data-driven.
+
+======================================================================
+2. NAVIGATION PLAN MODEL
+======================================================================
+
+Add persisted navigation plan data.
+
+Suggested:
+
+store_navigation_plans
+- plan_id
+- store_id
+- source_collection_plan_id nullable
+- plan_version
+- status
+- root_menu_handle
+- root_menu_title
+- created_at
+- updated_at
+
+store_navigation_items
+- id
+- plan_id
+- item_key
+- parent_item_key nullable
+- title
+- link_type
+- resource_id nullable
+- url nullable
+- position
+- depth
+- enabled
+- source_collection_key nullable
+- shopify_menu_item_id nullable
+- sync_status
+- created_at
+- updated_at
+
+Keep maximum depth compatible with Shopify navigation constraints detected/used by current API.
+V1 should normally use:
+depth 0: top-level
+depth 1: collection children
+
+Do not make unnecessary third-level nesting by default.
+
+======================================================================
+3. DEFAULT PLAN LOGIC
+======================================================================
+
+Default root/main menu should preserve existing merchant items.
+
+Do NOT delete or replace unrelated existing menu items.
+
+Suggested generated structure:
+
+Home
+Shop
+  [collection children]
+About Us
+Contact
+
+Important:
+Only manage ShopSource-owned menu branch by default.
+
+Preferred parent:
+Shop
+
+Parent link strategy:
+- first choice: all collections page if current store/theme/navigation supports a stable link
+- otherwise all products page
+- otherwise no-op/manual decision
+- never fabricate a broken URL
+
+Child items:
+link to actual corresponding Shopify collections.
+
+If a collection is missing remotely:
+mark child as MISSING_RESOURCE / SKIP
+do not point it to a different collection merely to fill the menu.
+
+This explicitly fixes the temporary assignment workaround where multiple labels were linked to Trunk Organizers.
+
+======================================================================
+4. EXISTING MENU DISCOVERY
+======================================================================
+
+Read current Shopify menus using the current supported Admin GraphQL navigation API.
+
+Codex must inspect current official Shopify docs/API schema at implementation time and use the supported API version already pinned by the project.
+
+Required behavior:
+- discover likely main menu
+- identify by handle/title and actual theme/header reference when possible
+- preserve all unrelated existing items
+- detect existing Shop branch
+- detect existing children
+- detect user manual changes
+
+Statuses:
+FOUND
+NOT_FOUND
+AMBIGUOUS
+CONFLICT
+
+If ambiguous:
+do not auto-write.
+
+======================================================================
+5. MENU SYNC / IDEMPOTENCY
+======================================================================
+
+Implement provider/service:
+
+NavigationService
+- discover_main_menu()
+- build_plan()
+- preview()
+- sync()
+- verify()
+- retry_failed()
+
+Use supported Shopify menu mutations such as current menuCreate/menuUpdate equivalents after verifying official schema.
+
+Idempotency:
+- rerun must not duplicate Shop parent or children
+- same collection_key maps to same managed navigation item
+- title/position/link changes become UPDATE
+- unchanged becomes NO_CHANGE
+
+Actions:
+CREATE
+UPDATE
+MOVE
+NO_CHANGE
+SKIP
+CONFLICT
+
+Never auto-delete unrelated merchant items.
+
+Managed removals:
+disable/skip by default rather than destructive remote delete unless future explicit policy is added.
+
+======================================================================
+6. COLLECTION LINK MAPPING
+======================================================================
+
+For each collection child:
+- title comes from collection plan
+- target uses actual Shopify collection resource when available
+- verify handle/resource ID
+- do not use one collection as placeholder for another
+
+Preview must show:
+
+Menu label
+Target collection
+Remote collection ID/handle
+Action
+Warning
+
+Warnings:
+MISSING_COLLECTION
+MISSING_REMOTE_ID
+DUPLICATE_LABEL
+DUPLICATE_TARGET
+AMBIGUOUS_RESOURCE
+CONFLICT
+
+======================================================================
+7. LOCAL PREVIEW
+======================================================================
+
+Before any Shopify write show tree preview.
+
+Example:
+
+Shop
+├─ Trunk Organizers → /collections/trunk-organizers
+├─ Seat Organizers → /collections/seat-organizers
+...
+
+Summary:
+planned items
+remote matched
+create
+update
+move
+no change
+skipped
+conflicts
+missing collections
+
+Preview must be immutable/hash-bound.
+If collection/menu inputs change after preview:
+invalidate preview and require preview again.
+
+======================================================================
+8. THEME MEGA-MENU DISCOVERY
+======================================================================
+
+Reuse Phase 3.4/3.7 theme discovery infrastructure.
+
+Inspect published theme:
+- header section schema
+- settings_schema
+- section blocks
+- menu settings
+- mega menu settings/blocks
+- labels/IDs/types
+
+Do NOT hardcode only Dawn.
+
+Detect whether theme supports:
+- dropdown only
+- mega menu block/settings
+- mega menu by matching parent label
+- mega menu by menu handle
+- unsupported/unknown
+
+Return:
+MEGA_SUPPORTED_HIGH_CONFIDENCE
+MEGA_SUPPORTED_REVIEW_REQUIRED
+DROPDOWN_ONLY
+NOT_FOUND
+MANUAL_ACTION_REQUIRED
+
+======================================================================
+9. MEGA MENU CONFIGURATION PLAN
+======================================================================
+
+Generate a plan for the parent label "Shop" or data-driven equivalent.
+
+If theme expects a mega-menu block keyed by parent menu label:
+propose exact value.
+
+If theme expects navigation handle/reference:
+propose exact menu reference.
+
+If theme supports only dropdown:
+do not falsely claim mega-menu applied.
+Use DROPDOWN_ONLY or MANUAL_ACTION_REQUIRED.
+
+Do not modify unrelated Header settings.
+
+======================================================================
+10. THEME APPLY SAFETY
+======================================================================
+
+Before theme write:
+- current theme read
+- current header settings read
+- backup relevant files/settings
+- proposed minimal diff
+- confidence HIGH
+- current preview valid
+- required theme write capability verified
+- explicit user confirmation
+
+If write capability or mapping is unavailable:
+MANUAL_ACTION_REQUIRED
+
+Manual guide should reflect the actual assignment flow:
+
+Online Store
+→ Theme Edit / Customize
+→ Header
+→ select/add Mega menu setting or block
+→ choose/match "Shop"
+→ Save
+
+Do not automate browser GUI clicks.
+
+======================================================================
+11. ASSIGNMENT MODE
+======================================================================
+
+Add simple beginner helper:
+
+### 메가메뉴 과제 모드
+
+[현재 메뉴 검사]
+[Shop 하위 메뉴 자동 제안]
+[링크 검사]
+[저장 전 체크리스트]
+[테마 메가메뉴 적용 안내]
+
+Checks:
+- parent exists
+- child indentation/hierarchy
+- child labels
+- child links
+- duplicate targets
+- missing links
+- temporary placeholder links
+
+Important:
+If several different child labels all point to one collection such as Trunk Organizers:
+show WARNING:
+"여러 메뉴가 같은 컬렉션에 연결되어 있습니다. 과제용 임시 연결일 수 있습니다."
+
+Do not block assignment mode unless requested.
+
+======================================================================
+12. UI
+======================================================================
+
+Add card:
+
+### 메가메뉴 자동화
+
+Navigation:
+READY / NEEDS REVIEW / NOT CONNECTED
+
+Collections:
+7 / 7 mapped
+
+Theme:
+MEGA SUPPORTED / DROPDOWN ONLY / MANUAL ACTION
+
+Buttons:
+[메뉴 자동 설계]
+[메뉴 미리보기]
+[Shopify 메뉴 동기화]
+[링크 검사]
+[메가메뉴 미리보기]
+[메가메뉴 적용]
+[수동 적용 안내]
+
+Tree preview should be readable.
+
+Advanced:
+- parent label
+- collection count
+- include Home
+- include About
+- include Contact
+- ordering
+- theme detection details
+
+Default beginner mode hides technical details.
+
+======================================================================
+13. STORE BUILD INTEGRATION
+======================================================================
+
+Extend StoreBuildRun with navigation stages after collection sync and before/around homepage/theme finalization.
+
+Suggested stage order:
+
+...
+COLLECTION_VERIFY
+NAVIGATION_PLAN
+NAVIGATION_SYNC_PREVIEW
+NAVIGATION_SYNC
+NAVIGATION_VERIFY
+MEGA_MENU_PREVIEW
+MEGA_MENU_APPLY
+BRAND_APPLY_PREVIEW
+BRAND_APPLY
+HOMEPAGE_PLAN
+FINAL_VERIFY
+COMPLETE
+
+If menu sync succeeds but theme mega-menu apply requires manual work:
+NAVIGATION stages COMPLETE
+MEGA_MENU_APPLY = MANUAL_ACTION_REQUIRED
+
+Do not mark entire stage falsely complete.
+
+======================================================================
+14. REPORTS
+======================================================================
+
+exports/navigation_reports/<store>/<run_id>/
+- navigation_plan.json
+- sync_preview.json
+- sync_result.json
+- theme_mega_preview.json
+- summary.md
+
+No secrets.
+Do not commit exports.
+
+Include:
+- menu mapping
+- collection mapping
+- conflicts
+- duplicate target warnings
+- theme support status
+- manual steps if required
+
+======================================================================
+15. TESTS
+======================================================================
+
+All external calls mocked.
+
+Required minimum:
+
+test_navigation_plan_from_collection_plan
+test_navigation_preserves_unrelated_items
+test_shop_parent_created_once
+test_repeat_sync_no_duplicate
+test_collection_child_maps_correct_resource
+test_missing_collection_not_mapped_to_wrong_resource
+test_duplicate_target_warning
+test_preview_invalidated_when_inputs_change
+test_navigation_create_update_move_nochange
+test_navigation_conflict_on_manual_drift
+test_navigation_verify_after_write
+test_assignment_mode_detects_placeholder_links
+test_theme_detect_mega_menu_high_confidence
+test_theme_dropdown_only_not_false_complete
+test_theme_unknown_manual_fallback
+test_mega_apply_preview_no_write
+test_mega_apply_minimal_header_patch
+test_mega_backup_before_write
+test_store_build_navigation_stage_order
+test_no_real_network_in_tests
+test_protected_store_file_untouched
+
+All existing tests PASS.
+
+======================================================================
+16. SAFETY / PROTECTED FILE
+======================================================================
+
+Never reset/restore/checkout/clean/stage/commit:
+stores/001_cabin_tidy.json
+
+During Codex implementation:
+- NO real Shopify navigation write
+- NO real theme write
+- NO Amazon run
+- NO Spark upload
+- NO paid image generation
+
+======================================================================
+17. QUALITY GATE
+======================================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+======================================================================
+18. COMMIT / PUSH
+======================================================================
+
+Do not commit:
+- protected store file
+- DB/runtime state
+- exports
+- reports
+- credentials
+- theme backups
+
+Commit:
+git commit -m "Add mega menu automation"
+
+Push:
+git push origin main
+
+Final:
+git rev-list --left-right --count main...origin/main
+must be:
+0 0
+
+======================================================================
+19. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] navigation plan architecture
+[2] collection mapping
+[3] preservation of existing menu items
+[4] duplicate/wrong-link detection
+[5] Shopify navigation preview/sync
+[6] idempotency
+[7] theme mega-menu detection
+[8] apply/manual fallback
+[9] assignment mode
+[10] StoreBuild integration
+[11] tests
+[12] protected file
+[13] commit SHA
+[14] push state
+[15] what remains for a real Cabin Tidy navigation live test
+
+Implement now, but DO NOT perform a real Shopify navigation write or live theme write during Codex execution.
