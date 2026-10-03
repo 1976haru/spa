@@ -927,3 +927,237 @@ Report:
 If YES:
 still do not start real provider audit or Shopify write.
 Wait for user.
+
+
+======================================================================
+32. ASSIGNMENT AUTOMATION — HERO BANNER
+======================================================================
+
+The next challenge/assignment includes "나만의 메인 배너 만들기".
+
+Phase 3.9 already implements the underlying Hero planning/theme automation.
+Phase 4.1.2 must expose it as a beginner one-click assignment workflow.
+
+Add under "스토어 디자인 > 홈페이지":
+
+### 메인 배너
+
+Status:
+- 준비 안 됨
+- 이미지 필요
+- 적용 준비
+- 적용 완료
+- 수동 적용 필요
+
+Primary beginner button:
+[메인 배너 자동 만들기]
+
+AUTO flow:
+1. load Store Profile + BrandProfile
+2. load current homepage/theme
+3. generate/restore approved headline/body/CTA plan
+4. choose an approved manual image or approved generated image
+5. validate wide hero aspect / mobile crop
+6. verify CTA target exists
+7. create theme diff preview
+8. if high-confidence theme mapping:
+   stop once at live theme-write confirmation
+9. after approval:
+   apply minimal diff
+10. re-read and verify
+11. mark assignment-ready
+12. automatically return to AUTO workflow
+
+If no approved hero image exists:
+WAITING_FOR_INPUT with one clear action:
+[배너 이미지 선택]
+or
+[이미지 생성 준비]
+
+Do not expose theme JSON by default.
+
+The user supplied/approved Cabin Tidy-style hero should be supported as a manual approved asset.
+Do not hardcode this exact image or copy for future stores.
+
+Do not embed text into newly generated hero images by default; theme text overlay is preferred.
+If the user intentionally selects a precomposed banner image containing text, treat it as MANUAL_ASSET and warn about mobile crop/accessibility, but do not reject it automatically.
+
+Assignment helper:
+[과제 제출용 확인]
+
+Checklist:
+- hero visible
+- heading present
+- supporting copy present
+- CTA button present
+- CTA target valid
+- no broken image
+- desktop preview
+- mobile-safe warning status
+
+======================================================================
+33. ASSIGNMENT AUTOMATION — CATEGORY SHORTCUTS
+======================================================================
+
+The next challenge/assignment also includes "카테고리 바로가기 만들기".
+
+The uploaded training video demonstrates a category shortcut/landing-page pattern:
+- collection/category images
+- image/button cards
+- each card links to the matching collection/category destination
+- a page-builder/editor may be used manually in the course example
+
+ShopSource must automate the RESULT, not automate third-party PageFly GUI clicks.
+
+Reuse Phase 3.9 category-shortcut planning and Phase 3.2/3.3 collection mappings/assets.
+
+Add under "스토어 디자인 > 홈페이지":
+
+### 카테고리 바로가기
+
+Primary:
+[카테고리 바로가기 자동 만들기]
+
+AUTO flow:
+1. read enabled collection plan
+2. keep only actual/ready Shopify collection mappings for live apply
+3. select 4–8 priority categories
+4. reuse approved collection images first
+5. generate/manual fallback for missing image
+6. build title + image + target link card model
+7. verify that EVERY shortcut points to its own intended collection
+8. detect duplicate/wrong targets
+9. detect missing images
+10. map to current theme:
+   preferred: collection-list / collection cards
+   fallback: multicolumn image+title+link
+11. create preview
+12. if high-confidence:
+    stop once at live theme-write confirmation
+13. apply minimal managed section
+14. re-read and verify all links
+15. mark assignment-ready
+
+Do NOT:
+- map multiple different labels to Trunk Organizers as a placeholder
+- create a shortcut to a non-existent remote collection
+- automate PageFly GUI/browser clicks
+- require PageFly if native/current theme can render the same result
+
+If the installed storefront is built around an external page builder and ShopSource cannot safely map it:
+MANUAL_ACTION_REQUIRED
+and generate exact beginner instructions rather than pretending success.
+
+Assignment helper:
+[과제 제출용 확인]
+
+Checklist:
+- 4+ shortcut cards when enough collections exist
+- each card has title
+- each card has image/icon
+- each link resolves to correct collection
+- no placeholder "#"
+- no duplicate wrong target
+- desktop/mobile layout acceptable
+- saved/published state verifiable where API permits
+
+======================================================================
+34. HOMEPAGE "AUTO COMPLETE" FLOW
+======================================================================
+
+Add one beginner action:
+
+[홈페이지 자동 완성]
+
+This should combine existing Phase 3.9 capabilities:
+
+Hero
+→ Category Shortcuts
+→ Featured Collections
+→ existing unrelated sections preserved
+→ final homepage verify
+
+Safe planning/image reuse happens automatically.
+
+Human gates only for:
+- paid image generation
+- manual image approval
+- real theme write
+- ambiguous theme/page-builder mapping
+
+After a user approves one homepage theme write, automatically:
+- verify hero
+- verify CTA
+- verify category shortcut links
+- verify collection section
+- generate assignment-ready summary
+
+Do not force the user to separately open:
+Homepage Automation
+Collection Automation
+Theme
+Navigation
+unless there is a problem.
+
+Dashboard "오늘 할 일" should recognize:
+- hero missing
+- category shortcuts missing
+and offer:
+[홈페이지 자동 완성]
+
+======================================================================
+35. PAGE BUILDER / COURSE-VIDEO COMPATIBILITY
+======================================================================
+
+The assignment video may show a third-party page builder such as PageFly.
+
+Rules:
+- do not automate third-party page-builder GUI clicks
+- do not depend on a third-party page builder for ShopSource automation
+- prefer native Shopify theme JSON/schema when high-confidence
+- if the actual published page is controlled by a page-builder template that cannot be safely written via existing official integration, return MANUAL_ACTION_REQUIRED
+- still generate all assets, category-link plan, labels, target URLs, and a simple step-by-step manual placement guide
+- never claim the page-builder result was applied if it was not verified
+
+Create a capability result:
+NATIVE_THEME_AUTO
+NATIVE_THEME_REVIEW_REQUIRED
+EXTERNAL_PAGE_BUILDER_MANUAL
+UNSUPPORTED_MANUAL
+
+======================================================================
+36. ADDITIONAL TESTS FOR ASSIGNMENT AUTOMATION
+======================================================================
+
+Add tests:
+
+test_banner_assignment_beginner_one_click
+test_banner_manual_asset_supported
+test_banner_precomposed_text_asset_warns_mobile_accessibility
+test_banner_cta_requires_real_collection_target
+test_homepage_auto_complete_preserves_unrelated_sections
+
+test_category_assignment_from_collection_plan
+test_category_shortcut_each_target_is_correct_collection
+test_category_shortcut_wrong_duplicate_target_blocked
+test_category_shortcut_missing_remote_collection_skipped
+test_category_shortcut_reuses_approved_collection_images
+test_category_shortcut_native_collection_list_preferred
+test_category_shortcut_multicolumn_fallback
+test_external_page_builder_never_gui_automated
+test_external_page_builder_manual_fallback_truthful
+test_assignment_ready_summary
+
+Existing Phase 3.9 regression tests must remain green.
+
+======================================================================
+37. UPDATED COMPLETION REPORT
+======================================================================
+
+In addition to the prior report, include:
+
+[21] 메인 배너 과제 one-click automation
+[22] 카테고리 바로가기 과제 one-click automation
+[23] 홈페이지 자동 완성 flow
+[24] PageFly/external builder fallback
+[25] assignment readiness checks
