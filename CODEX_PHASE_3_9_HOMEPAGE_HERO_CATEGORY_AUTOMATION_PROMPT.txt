@@ -1,0 +1,801 @@
+ShopSource Studio — Phase 3.9
+HOMEPAGE HERO BANNER + CATEGORY SHORTCUT AUTOMATION
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+- Baseline: 83622ba11529d23a1ce8b0a8bd18a9c6f9e16744
+
+Context
+- Phase 3.1–3.8 are implemented.
+- User has now completed manual assignments for:
+  sourcing/Spark workflow, collections, logo/favicon, and mega menu.
+- Remaining visible assignments include:
+  "나만의 메인 배너 만들기"
+  "카테고리 바로가기 만들기"
+- User wants to finish store automation now, then spend remaining time on real integration, debugging, and corrections.
+- Therefore this phase should automate BOTH:
+  A. homepage hero/main banner
+  B. category shortcut/navigation section
+  and integrate them with BrandProfile, Collection Planner, Store Build, existing theme automation, and image provider.
+- Fine-grained theme-specific polishing can be done later during live integration.
+
+Goal
+Build a safe V1 storefront homepage automation layer:
+BrandProfile
+→ Hero banner plan
+→ hero image prompt/asset
+→ category shortcut plan
+→ category image/icon prompts/assets
+→ theme section detection
+→ dry-run diff
+→ safe apply/manual fallback
+→ verification
+→ StoreBuild integration
+
+IMPORTANT during implementation/tests:
+- NO real paid image generation
+- NO real Shopify/theme write
+- NO Amazon run
+- NO Spark upload
+- all network calls mocked
+
+======================================================================
+0. FINAL USER EXPERIENCE
+======================================================================
+
+### 홈페이지 자동화
+
+Store:
+001 | Cabin Tidy
+
+Brand:
+Cabin Tidy
+
+Hero Banner:
+READY / NEEDS IMAGE / NEEDS REVIEW
+
+Category Shortcuts:
+7 categories / READY
+
+Theme:
+SUPPORTED / MANUAL ACTION
+
+[홈페이지 자동 설계]
+[메인 배너 만들기]
+[카테고리 바로가기 만들기]
+[홈페이지 미리보기]
+[Shopify 적용]
+[수동 적용 안내]
+
+Preview example:
+
+Hero
+- headline: A Better Organized Cabin Starts Here
+- body: Smart, practical solutions designed to keep your car neat, comfortable, and ready for every journey.
+- CTA: Shop Car Organization
+- target: /collections/all or selected featured collection
+- image: READY
+
+Category shortcuts
+- Trunk Organizers
+- Seat Organizers
+- Console Storage
+- Cup Holders & Storage
+- Trash & Cleanup
+- Visor & Documents
+- Cargo & Travel
+
+======================================================================
+1. HOMEPAGE PLAN MODEL
+======================================================================
+
+Create persistent store homepage plan structures.
+
+Suggested:
+
+store_homepage_plans
+- plan_id
+- store_id
+- brand_profile_id nullable
+- collection_plan_id nullable
+- planner_version
+- status
+- source_hash
+- created_at
+- updated_at
+
+store_hero_plans
+- id
+- plan_id
+- hero_key
+- headline
+- subheadline/body
+- cta_label
+- cta_target_type
+- cta_collection_key nullable
+- cta_url nullable
+- image_prompt
+- image_alt_text
+- image_asset_id nullable
+- priority
+- enabled
+- theme_mapping_status
+- created_at
+- updated_at
+
+store_category_shortcut_plans
+- id
+- plan_id
+- shortcut_key
+- collection_key
+- title
+- subtitle nullable
+- target_collection_id nullable
+- target_handle nullable
+- image_prompt
+- image_alt_text
+- image_asset_id nullable
+- icon_style nullable
+- position
+- enabled
+- theme_mapping_status
+- created_at
+- updated_at
+
+Do not store image binary blobs in DB.
+
+======================================================================
+2. REUSE EXISTING DATA
+======================================================================
+
+Primary inputs:
+
+- Store Profile
+- Phase 3.7 BrandProfile
+- Phase 3.2 collection plan
+- Phase 3.3 collection image assets when available
+- Phase 3.8 navigation plan
+- existing homepage/theme discovery from Phase 3.4
+- existing Shopify connection
+
+Do not create a separate unrelated taxonomy.
+
+BrandProfile should control:
+- palette
+- visual tone
+- photography direction
+- typography tone
+- avoid list
+
+Collection plan should control:
+- category shortcut titles
+- ordering
+- remote collection mapping
+- imagery subject
+
+======================================================================
+3. HERO BANNER AUTO-PLANNING
+======================================================================
+
+Generate a hero banner plan automatically.
+
+Inputs:
+- brand name
+- store category
+- target customer
+- market
+- brand personality
+- highest-priority collections
+- existing approved brand assets
+- homepage theme capability
+
+Outputs:
+- headline
+- supporting copy
+- CTA label
+- CTA target
+- image prompt
+- image alt text
+- suggested focal point
+- overlay/readability hints
+- mobile-safe crop hints
+
+Rules:
+- concise ecommerce copy
+- one clear value proposition
+- avoid exaggerated/unverifiable claims
+- no fabricated discounts
+- no fake urgency
+- no fake reviews/social proof
+- no misleading "best", "#1", "guaranteed" claims unless explicitly supported
+- CTA must point to a real existing target when live
+- default hero should be simple and legible
+
+Cabin Tidy fixture may resemble:
+headline:
+A Better Organized Cabin Starts Here
+
+body:
+Smart, practical solutions designed to keep your car neat, comfortable, and ready for every journey.
+
+CTA:
+Shop Car Organization
+
+This is fixture guidance only, not production hardcoding.
+
+======================================================================
+4. HERO IMAGE PROMPT
+======================================================================
+
+Generate hero image prompt using BrandProfile.
+
+Default ecommerce visual rules:
+- photorealistic premium lifestyle image
+- wide desktop hero composition
+- mobile-safe central subject
+- clear negative space where headline/CTA may overlay
+- no embedded text
+- no logo
+- no watermark
+- no fake UI
+- no illegible signs
+- no direct copying of third-party branded product packaging
+- natural realistic lighting
+- brand palette harmony
+- appropriate category subject
+
+For Cabin Tidy-style fixture:
+- premium organized vehicle interior
+- practical storage/organization cues
+- clean dark-neutral interior
+- warm natural highlights
+- space for overlay copy
+- no visible trademarked brand marks
+
+Do not actually call paid image generation in Codex tests.
+
+======================================================================
+5. HERO IMAGE PROVIDER
+======================================================================
+
+Reuse/generalize Phase 3.3/3.7 image-provider infrastructure.
+
+Providers:
+- MANUAL
+- OPENAI_IMAGES optional
+
+Paid generation requires explicit opt-in.
+
+Store generated asset metadata in existing/generalized BrandAsset/ImageAsset system when reasonable.
+
+Suggested path:
+exports/homepage_assets/<store>/<plan_id>/hero/
+
+Do not commit generated assets.
+
+Image validation:
+- supported format
+- non-zero size
+- minimum dimensions
+- wide aspect suitability
+- content bounds
+- optional mobile crop preview
+- safe file-size threshold
+
+======================================================================
+6. CATEGORY SHORTCUT AUTO-PLANNING
+======================================================================
+
+Generate shortcuts from enabled Phase 3.2 collections.
+
+Default count:
+- 4–8 depending on collection availability
+- do not force empty categories
+
+Selection:
+- priority
+- expected product count
+- no serious warnings
+- remote mapping when live
+
+For each shortcut:
+- title
+- target collection
+- image/icon source
+- image prompt
+- alt text
+- display order
+
+If a collection is not remotely available:
+PLAN_ONLY / SKIP_REMOTE
+Do not map it to the wrong collection.
+
+======================================================================
+7. CATEGORY SHORTCUT VISUALS
+======================================================================
+
+Support:
+A. reuse collection image from Phase 3.3
+B. manual image
+C. generated category image
+D. simple icon/mark fallback
+
+Prefer reuse of approved collection images when available.
+
+If generating new category visuals:
+- consistent style across all categories
+- 1:1 or theme-required aspect
+- no text/logo/watermark
+- category visually obvious
+- brand palette/tone consistent
+- no duplicate image reused for unrelated categories unless explicitly allowed
+
+Detect duplicate asset reuse and warn.
+
+Suggested path:
+exports/homepage_assets/<store>/<plan_id>/categories/
+
+======================================================================
+8. THEME SECTION DISCOVERY
+======================================================================
+
+Reuse Phase 3.4/3.7/3.8 theme discovery infrastructure.
+
+Inspect current published theme and schema for sections/blocks supporting:
+
+Hero/banner candidates:
+- image banner
+- slideshow
+- hero
+- image with text
+
+Category shortcut candidates:
+- collection list
+- multicolumn
+- featured collection list
+- custom grid
+- collection cards
+
+Do not hardcode Dawn only.
+
+Return detection statuses:
+
+HERO_SUPPORTED_HIGH_CONFIDENCE
+HERO_SUPPORTED_REVIEW_REQUIRED
+HERO_NOT_FOUND
+
+CATEGORY_SUPPORTED_HIGH_CONFIDENCE
+CATEGORY_SUPPORTED_REVIEW_REQUIRED
+CATEGORY_NOT_FOUND
+
+MANUAL_ACTION_REQUIRED when unsupported/uncertain.
+
+======================================================================
+9. HERO THEME MAPPING
+======================================================================
+
+Map canonical hero fields to theme schema:
+
+canonical:
+- image
+- mobile image if available
+- heading
+- text/body
+- button label
+- button link
+- overlay opacity if supported
+- content position if supported
+- text alignment if supported
+
+Only map settings proven by schema.
+
+Do not invent setting IDs.
+
+If theme supports only some fields:
+apply only known safe fields and report unsupported fields.
+
+======================================================================
+10. CATEGORY THEME MAPPING
+======================================================================
+
+Map collection shortcuts to a suitable theme section.
+
+Preferred:
+collection list / collection-card section referencing real collection resources.
+
+Fallback:
+multicolumn with image + title + link.
+
+Do not create broken links.
+
+Do not silently replace existing unrelated homepage section.
+
+Create ShopSource-managed section IDs deterministically.
+
+Repeated apply must not duplicate the same section.
+
+======================================================================
+11. HOMEPAGE COMPOSITION / ORDER
+======================================================================
+
+Default proposed homepage order should be conservative:
+
+Header
+Hero
+Category Shortcuts
+Existing sections...
+Featured collections (existing Phase 3.4 managed sections)
+Footer
+
+Do not reorder unrelated existing merchant sections unless explicit user choice.
+
+If existing hero/category sections exist:
+detect them and decide:
+NO_CHANGE
+UPDATE_MANAGED
+CONFLICT
+CREATE_NEW
+
+Do not create duplicate hero banners on rerun.
+
+======================================================================
+12. DRY-RUN DIFF
+======================================================================
+
+Before any theme write generate:
+
+- current homepage JSON
+- proposed homepage JSON
+- section-level diff
+- asset mapping
+- links
+- warnings
+
+Actions:
+CREATE_SECTION
+UPDATE_SECTION
+MOVE_MANAGED_SECTION
+NO_CHANGE
+CONFLICT
+SKIP
+MANUAL_ACTION_REQUIRED
+
+Preview hash-bound:
+if plan/assets/theme change, invalidate preview.
+
+======================================================================
+13. APPLY SAFETY
+======================================================================
+
+Actual live apply only when:
+- Shopify connection verified
+- current preview valid
+- required assets APPROVED
+- theme mapping high confidence
+- required theme write capability available
+- user explicitly confirms
+
+Before write:
+- backup current homepage/theme settings
+
+Write:
+- smallest possible patch
+
+After write:
+- re-fetch
+- verify section existence
+- verify links
+- verify image references/settings
+
+Provide rollback.
+
+If theme write capability unavailable:
+MANUAL_ACTION_REQUIRED.
+
+Do not automate browser clicks.
+
+======================================================================
+14. ASSIGNMENT MODE — MAIN BANNER
+======================================================================
+
+Add a beginner helper:
+
+### 메인 배너 과제 모드
+
+[배너 문구 자동 작성]
+[배너 이미지 프롬프트 생성]
+[배너 이미지 파일 선택]
+[이미지 검사]
+[테마 적용 미리보기]
+[수동 적용 안내]
+
+Show:
+Headline
+Body
+CTA
+CTA Link
+Image
+Alt text
+
+Manual instructions should be generated from detected theme when possible.
+
+Generic fallback:
+Online Store
+→ Theme Edit / Customize
+→ Hero/Image Banner section
+→ image
+→ heading
+→ text
+→ button
+→ link
+→ Save
+
+======================================================================
+15. ASSIGNMENT MODE — CATEGORY SHORTCUTS
+======================================================================
+
+Add:
+
+### 카테고리 바로가기 과제 모드
+
+[컬렉션에서 자동 구성]
+[카테고리 이미지 준비]
+[링크 검사]
+[테마 적용 미리보기]
+[수동 적용 안내]
+
+Checks:
+- collection exists
+- target link valid
+- title
+- image/icon present
+- no wrong duplicate target
+- no broken link
+- order
+
+Generic fallback:
+Online Store
+→ Theme Edit / Customize
+→ Add section
+→ Collection list / equivalent
+→ select collections
+→ image/card settings
+→ Save
+
+======================================================================
+16. UI
+======================================================================
+
+Add a simple top-level card:
+
+### 홈페이지 자동화
+
+Hero Banner:
+READY / NEEDS IMAGE / NEEDS REVIEW
+
+Category Shortcuts:
+7 READY / 1 SKIPPED
+
+Theme:
+SUPPORTED / MANUAL ACTION
+
+Buttons:
+[홈페이지 자동 설계]
+[메인 배너 만들기]
+[카테고리 바로가기 만들기]
+[홈페이지 미리보기]
+[Shopify에 적용]
+[롤백]
+[수동 적용 안내]
+
+Advanced collapsed:
+- headline override
+- CTA override
+- hero image provider
+- hero alignment
+- category count
+- section order
+- image aspect
+- theme mapping diagnostics
+
+Beginner mode should remain simple.
+
+======================================================================
+17. STORE BUILD INTEGRATION
+======================================================================
+
+Extend StoreBuildRun.
+
+Recommended additions after brand/collection/navigation planning:
+
+HOMEPAGE_PLAN
+HERO_ASSET_PREVIEW
+HERO_ASSET_GENERATION
+CATEGORY_SHORTCUT_PLAN
+CATEGORY_ASSET_PREVIEW
+CATEGORY_ASSET_GENERATION
+HOMEPAGE_SYNC_PREVIEW
+HOMEPAGE_SYNC
+HOMEPAGE_VERIFY
+
+Integrate with existing Phase 3.4 homepage collection plan.
+Do not duplicate or conflict with existing featured collection automation.
+
+Suggested final storefront orchestration:
+
+Brand
+→ Sourcing
+→ Products
+→ Collections
+→ Collection Images
+→ Navigation/Mega Menu
+→ Hero
+→ Category Shortcuts
+→ Featured Collections
+→ Brand Apply
+→ Homepage Verify
+→ Final Verify
+
+If theme writes unavailable:
+homepage theme stages can end MANUAL_ACTION_REQUIRED while other store stages remain complete.
+
+======================================================================
+18. REPORTS
+======================================================================
+
+exports/homepage_reports/<store>/<run_id>/
+- homepage_plan.json
+- hero_plan.json
+- category_shortcuts.json
+- apply_preview.json
+- summary.md
+
+No secrets.
+Do not commit reports/assets/backups.
+
+Include:
+- copy
+- links
+- asset hashes
+- collection mappings
+- theme mapping confidence
+- apply status
+- verify status
+- manual action required
+
+======================================================================
+19. VALIDATION / ERROR DETECTION
+======================================================================
+
+Detect and surface:
+
+- missing hero image
+- invalid CTA target
+- duplicate hero
+- missing collection
+- category shortcut points to wrong collection
+- duplicate target across unrelated category shortcuts
+- duplicate category image across unrelated shortcuts
+- missing alt text
+- unsupported aspect ratio
+- theme schema mismatch
+- stale preview
+- remote drift
+- missing write capability
+
+Do not silently “fix” uncertain theme structure.
+
+======================================================================
+20. TESTS
+======================================================================
+
+All external calls mocked.
+
+Required minimum tests:
+
+test_homepage_plan_from_brand_and_collections
+test_hero_copy_generated_without_fake_claims
+test_hero_cta_requires_real_target
+test_hero_prompt_no_embedded_text
+test_hero_asset_opt_in_required_for_paid_generation
+test_hero_image_validation
+test_category_shortcuts_from_collection_plan
+test_missing_collection_skipped_not_wrongly_mapped
+test_category_duplicate_target_warning
+test_category_duplicate_asset_warning
+test_existing_collection_image_reused
+test_theme_detect_hero_high_confidence
+test_theme_detect_collection_list_high_confidence
+test_theme_unknown_manual_fallback
+test_homepage_preserves_unrelated_sections
+test_repeat_apply_no_duplicate_hero
+test_repeat_apply_no_duplicate_category_section
+test_homepage_preview_invalidated_on_change
+test_homepage_apply_preview_no_write
+test_homepage_backup_before_write
+test_homepage_verify_after_write
+test_homepage_rollback
+test_assignment_banner_mode
+test_assignment_category_shortcut_mode
+test_store_build_homepage_stage_order
+test_no_real_network_in_tests
+test_protected_store_file_untouched
+
+All existing tests PASS.
+
+======================================================================
+21. PROTECTED FILE / SAFETY
+======================================================================
+
+Never reset/restore/checkout/clean/stage/commit:
+stores/001_cabin_tidy.json
+
+During Codex implementation:
+- NO real Shopify write
+- NO theme write
+- NO paid image call
+- NO Amazon run
+- NO Spark upload
+
+======================================================================
+22. QUALITY GATE
+======================================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+======================================================================
+23. COMMIT / PUSH
+======================================================================
+
+Do not commit:
+- protected store file
+- DB/runtime state
+- exports
+- generated homepage images
+- reports
+- credentials
+- theme backups
+
+Commit:
+git commit -m "Add homepage hero and category automation"
+
+Push:
+git push origin main
+
+Final:
+git rev-list --left-right --count main...origin/main
+must be:
+0 0
+
+======================================================================
+24. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] homepage plan architecture
+[2] hero copy generation
+[3] hero image prompt/provider
+[4] category shortcut generation
+[5] collection/image reuse
+[6] theme hero detection/mapping
+[7] category section detection/mapping
+[8] dry-run/apply/rollback
+[9] main banner assignment mode
+[10] category shortcut assignment mode
+[11] StoreBuild integration
+[12] tests
+[13] protected file
+[14] commit SHA
+[15] push state
+[16] what remains before Cabin Tidy real homepage live test
+
+Implement now, but DO NOT perform any real Shopify/theme write or paid image generation during Codex execution.
