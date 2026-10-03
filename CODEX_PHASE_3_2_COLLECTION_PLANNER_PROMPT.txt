@@ -1,0 +1,391 @@
+ShopSource Studio — Phase 3.2
+ONE-CLICK COLLECTION PLANNER
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+- Baseline: 0423674e05b301034ad4ec3fc1e73072308f739c
+
+Goal:
+Turn the manual Shopify collection mission into a reusable per-store collection plan.
+This phase is LOCAL PLANNING ONLY: no Shopify write, no Amazon live run, no theme write.
+
+==================================================
+0. Final user experience
+==================================================
+
+User should eventually see:
+
+001 | Cabin Tidy
+
+[컬렉션 자동 설계]
+
+Result:
+- Trunk Organizers
+- Seat Organizers
+- Console Storage
+- Cargo & Travel
+- Cup Holders
+- Trash & Cleanup
+- Visor & Documents
+...
+
+Each plan entry includes:
+- title
+- English description
+- handle suggestion
+- automatic inclusion conditions
+- estimated matched product count
+- image prompt
+- image alt text
+- priority/order
+- source category
+- sync status
+
+User should NOT manually type collection titles, descriptions, or keywords.
+
+==================================================
+1. Protect current data
+==================================================
+
+Do not:
+- run Amazon
+- change sourcing campaigns
+- write Shopify
+- change current Shopify store
+- stage/upload Spark
+- mutate existing product Store Decisions
+
+stores/001_cabin_tidy.json remains protected dirty file:
+never reset/restore/stage/commit.
+
+All tests use temp DB/fixtures.
+
+==================================================
+2. Use existing Auto Sourcing Plan
+==================================================
+
+Reuse Phase 3.0/3.1 sourcing plan as primary input.
+
+Inputs:
+- store profile
+- store_sourcing_plans
+- store_sourcing_categories
+- store_sourcing_keywords
+- products/MASTER titles
+- store_product_decisions
+- prior sourcing campaign results
+- current imported product titles/brands where available
+
+Collection categories should normally align with sourcing categories.
+
+Do not create a second unrelated taxonomy if sourcing categories already exist.
+
+==================================================
+3. Collection plan data model
+==================================================
+
+Suggested tables:
+
+store_collection_plans
+- plan_id
+- store_id
+- sourcing_plan_id nullable
+- planner_version
+- status
+- created_at
+- updated_at
+
+store_collection_definitions
+- id
+- plan_id
+- collection_key
+- title
+- description_html
+- handle
+- priority
+- enabled
+- match_mode
+- estimated_product_count
+- image_prompt
+- image_alt_text
+- shopify_collection_id nullable
+- shopify_sync_status
+- created_at
+- updated_at
+
+store_collection_conditions
+- id
+- collection_definition_id
+- field
+- relation
+- value
+- group_operator
+- priority
+
+==================================================
+4. Conditions: current/manual compatibility
+==================================================
+
+The user manually created:
+Trunk Organizers
+Title CONTAINS "Trunk"
+
+Planner should support this exact behavior.
+
+Supported local canonical fields:
+- TITLE
+- PRODUCT_TYPE
+- TAG
+- VENDOR
+- PRICE
+- METAFIELD (future)
+
+Relations:
+- EQUALS
+- NOT_EQUALS
+- CONTAINS
+- NOT_CONTAINS
+- STARTS_WITH
+- ENDS_WITH
+- GREATER_THAN
+- LESS_THAN
+
+For the current Spark-uploaded catalog, title-based rules are an acceptable fallback.
+
+For future direct Shopify upload, prefer stable ShopSource-generated TAG rules where possible because tags are less brittle than product titles.
+
+Planner output must explicitly record rule strategy:
+TITLE_FALLBACK
+TAG_PREFERRED
+MIXED
+
+==================================================
+5. Collection generation rules
+==================================================
+
+Default collection count:
+- small store: 4–6
+- normal niche store: 6–10
+- broad niche store: 8–15
+
+Do not create dozens of near-duplicate collections.
+
+For each sourcing category:
+1. determine if category is substantial enough
+2. generate customer-friendly English title
+3. generate concise English description
+4. build one or more safe matching conditions
+5. estimate product count from local MASTER/store data
+6. generate image prompt
+7. generate alt text
+
+Do not create empty collections by default unless user enables future/empty collections.
+
+==================================================
+6. Avoid overly broad title rules
+==================================================
+
+Example:
+Title CONTAINS "Car"
+would match far too much.
+
+Add quality rules:
+- reject overly generic single-word conditions
+- prefer distinctive phrases
+- combine conditions when needed
+- estimate precision against current product titles
+
+Examples for Cabin Tidy:
+Trunk Organizers:
+  TITLE CONTAINS "Trunk"
+
+Seat Organizers:
+  TITLE CONTAINS "Seat Organizer"
+  OR TITLE CONTAINS "Backseat Organizer"
+
+Console Storage:
+  TITLE CONTAINS "Console"
+
+Cup Holders & Storage:
+  TITLE CONTAINS "Cup Holder"
+
+Trash & Cleanup:
+  TITLE CONTAINS "Trash"
+  OR TITLE CONTAINS "Cleaning"
+
+But do not hardcode Cabin Tidy-only logic; category phrase generation should be reusable.
+
+==================================================
+7. Preview matching locally
+==================================================
+
+Before Shopify sync:
+simulate each collection condition against current MASTER/store products.
+
+Display:
+- estimated matches
+- sample 5 products
+- overlap with other collections
+- unmatched percentage
+
+Warn:
+- 0 matches
+- >70% of entire store in one collection
+- extreme overlap with another collection
+- ambiguous broad rule
+
+Do not block reasonable overlap; products may belong to multiple collections.
+
+==================================================
+8. Image prompt generation
+==================================================
+
+Generate a production-ready image prompt for each collection.
+
+Example style:
+- photorealistic ecommerce lifestyle
+- clear category subject
+- no text
+- no logo
+- no watermark
+- square 1:1
+- bright, clean, premium
+- visually consistent with store identity
+
+Store visual identity should come from Store Profile when available.
+
+Do NOT call an image API in Phase 3.2.
+Only create prompt + alt text.
+
+==================================================
+9. UI
+==================================================
+
+Add top-level/Store section:
+
+### 컬렉션 자동화
+
+[컬렉션 자동 설계]
+
+Summary:
+컬렉션 8개
+예상 포함 상품 1,842개
+미분류 135개
+중복 포함 허용
+
+Each row:
+Title | 예상상품 | Rule | Image | 상태
+
+Actions:
+[미리보기]
+[다시 설계]
+[JSON 내보내기]
+
+Future buttons displayed disabled/coming next:
+[Shopify에 컬렉션 생성]
+[이미지 자동 생성]
+
+Advanced settings hidden by default:
+- desired collection count
+- title rule vs tag preference
+- min products per collection
+- max overlap warning
+- language
+
+==================================================
+10. Plan versioning/idempotency
+==================================================
+
+Once synced in future, do not silently change collection rules.
+
+Planner rerun creates draft revision.
+Show diff:
+- new collections
+- changed title/description
+- changed conditions
+- removed/disabled collections
+
+No destructive delete by default.
+
+==================================================
+11. Export
+==================================================
+
+Export local plan:
+exports/collection_plans/<store>/<plan_id>/
+  collection_plan.json
+  collection_plan.md
+
+Include:
+- titles/descriptions
+- rules
+- estimated counts
+- image prompts
+- source category
+- planner version
+
+No secrets.
+
+==================================================
+12. Tests
+==================================================
+
+Required:
+test_collection_plan_from_sourcing_plan
+test_collection_title_description_generated
+test_manual_trunk_rule_supported
+test_generic_car_rule_rejected
+test_collection_local_match_count
+test_collection_overlap_warning
+test_collection_zero_match_warning
+test_collection_image_prompt_generated
+test_collection_plan_versioned
+test_collection_export_json
+test_collection_export_md
+test_no_shopify_write_in_planner
+test_no_amazon_network_in_planner
+test_1000_products_preview_fast
+
+All existing tests PASS.
+
+==================================================
+13. Quality gate
+==================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+==================================================
+14. Commit/push
+==================================================
+
+Do not commit DB/backups/exports/runtime data/protected store file.
+
+Commit:
+git commit -m "Add automated collection planner"
+
+Push origin/main.
+
+Final main...origin/main = 0 0.
+
+==================================================
+15. Completion report
+==================================================
+
+[1] collection planner architecture
+[2] collection count for Cabin Tidy fixture
+[3] generated example definitions
+[4] local match/overlap preview
+[5] image prompts
+[6] UI
+[7] exports
+[8] tests
+[9] protected file
+[10] commit SHA
+
+Implement now.
