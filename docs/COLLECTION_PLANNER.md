@@ -36,3 +36,8 @@ the later phases.
 The title-rule specificity estimate is the share of local matches supported by
 at least one multi-word title phrase. It is a heuristic, not a semantic
 relevance guarantee.
+
+Phase 3.3 adds Shopify connection, dry-run, conflict-aware collection sync,
+collection image preparation, staged Shopify Files uploads, and opt-in Online
+Store publication. See [SHOPIFY_COLLECTION_PUBLISHER.md](SHOPIFY_COLLECTION_PUBLISHER.md)
+for credentials, scopes, pinned API version, and operator safety boundaries.

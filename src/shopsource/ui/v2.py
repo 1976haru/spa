@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from pathlib import Path
 
 from ..connectors.spark_center_package import (
     confirm_spark_desktop_roundtrip, list_packages, mark_package,
@@ -13,10 +14,12 @@ from ..capture.service import CaptureService
 from ..capture.batch import BatchSourcingService
 from ..capture.campaign import CampaignService
 from ..collection_planner import CollectionPlanner
+from ..shopify_collections import ShopifyCollectionPublisher, get_connection as get_shopify_connection, save_connection as save_shopify_connection, save_shopify_token
+from ..collection_images import ManualImageProvider, OpenAIImagesProvider, generate_collection_image
 from ..classifier import classify_store
 from ..db import get_store, init_db, upsert_store
 from ..intelligence.keyword_engine import KeywordEngine
-from ..paths import AMAZON_INBOX_DIR, STORE_DIR
+from ..paths import AMAZON_INBOX_DIR, EXPORT_DIR, STORE_DIR
 from ..importer import import_amazon_source
 from ..sourcing.credentials import delete_api_key, get_api_key, save_api_key
 from ..sourcing.engine import SourcingEngine, new_run_id
@@ -215,7 +218,9 @@ class OperatorUI:
                                "max_overlap_warning": float(overlap_limit.value or 80) / 100,
                                "include_empty": bool(include_empty.value), "language": language.value or "en"}
                     result = CollectionPlanner().create_plan(self.current_store, settings=options)
+                    preview_ref["value"] = None
                     render_plan(result)
+                    render_image_actions(result)
                     ui.notify(f"컬렉션 계획 v{result['version']}을 저장했습니다. Shopify에는 쓰지 않았습니다.", type="positive")
                 except Exception as exc:
                     ui.notify(_safe_error(exc), type="negative")
@@ -233,7 +238,10 @@ class OperatorUI:
                 try:
                     plan = plan_ref.get("plan")
                     if not plan: raise ValueError("미리보기할 계획이 없습니다. 먼저 자동 설계를 실행하세요.")
-                    render_plan(CollectionPlanner().get_plan(plan["plan_id"]))
+                    saved = CollectionPlanner().get_plan(plan["plan_id"])
+                    preview_ref["value"] = None
+                    render_plan(saved)
+                    render_image_actions(saved)
                 except Exception as exc: ui.notify(_safe_error(exc), type="negative")
 
             with ui.row():
@@ -243,6 +251,141 @@ class OperatorUI:
                 ui.button("JSON/MD 내보내기", on_click=export_plan, icon="download").props("outline")
                 ui.button("Shopify에 컬렉션 생성 (Phase 3.3)", on_click=None).props("disable outline")
                 ui.button("이미지 자동 생성 (다음 단계)", on_click=None).props("disable outline")
+
+        ui.separator()
+        with ui.card().classes("w-full border border-emerald-200"):
+            ui.label("Shopify 연결 / 컬렉션 게시").classes("text-lg font-semibold")
+            config = get_shopify_connection(self.current_store)
+            connection_label = ui.label(
+                f"Shopify: {config['shop_domain']} · {config['status']} · API {config['api_version']}" if config else "Shopify: NOT CONFIGURED"
+            ).classes("font-medium")
+            with ui.expansion("Shopify 연결 설정 (토큰은 Windows 자격 증명에만 저장)", icon="lock"):
+                shop_domain = ui.input("Shopify shop domain (*.myshopify.com)", value=config.get("shop_domain", "") if config else "").classes("w-96")
+                shop_token = ui.input("Admin API access token (저장 후 화면에서 지워짐)").props("type=password autocomplete=new-password").classes("w-96")
+                ui.label("Required scopes: read_products, write_products, read_publications; publication: write_publications; Files: write_files").classes("text-xs text-slate-600")
+                def save_shopify_config():
+                    try:
+                        save_shopify_connection(self.current_store, shop_domain.value or "")
+                        if shop_token.value:
+                            save_shopify_token(self.current_store, shop_token.value)
+                            shop_token.value = ""
+                        connection_label.set_text(f"Shopify: {shop_domain.value} · CONFIGURED · API 2026-07")
+                        ui.notify("연결 설정을 저장했습니다. token은 OS credential store 외부에 저장되지 않습니다.", type="positive")
+                    except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+                ui.button("연결 설정/토큰 저장", on_click=save_shopify_config, icon="save")
+            connection_detail = ui.label("권한 및 publication 미확인").classes("text-xs text-slate-600")
+            def verify_shopify():
+                try:
+                    result = ShopifyCollectionPublisher().verify(self.current_store)
+                    connection_label.set_text("Shopify: CONNECTED" if not result["missing_scopes"] else "Shopify: MISSING SCOPES")
+                    pubs = ", ".join(f"{p.get('name')} [{p.get('id')}]" for p in result["online_store_publications"])
+                    connection_detail.set_text(f"Missing required: {', '.join(result['missing_scopes']) or 'none'} · Optional: {', '.join(result['missing_optional_scopes']) or 'none'} · Online Store: {pubs or 'not found'}")
+                    ui.notify("Shopify 연결/권한을 확인했습니다.", type="positive" if not result["missing_scopes"] else "warning")
+                except Exception as exc:
+                    connection_detail.set_text(f"확인 실패: {_safe_error(exc)}")
+                    ui.notify(_safe_error(exc), type="negative")
+            ui.button("Shopify 연결 확인 / 권한 확인", on_click=verify_shopify, icon="verified_user").props("outline")
+            generate_opt_in = ui.checkbox("이미지 자동 생성 사용 (체크해야 유료 API 호출 가능)", value=False)
+            publish_opt_in = ui.checkbox("온라인 스토어에 공개", value=False)
+            image_area = ui.column().classes("w-full")
+            image_status = ui.label("이미지 준비 상태: 계획 생성 후 확인").classes("text-sm")
+            preview_label = ui.label("Shopify plan 상태: 미리보기 전").classes("text-sm")
+            preview_ref = {"value": None}
+            def render_image_actions(plan):
+                image_area.clear()
+                ready = 0
+                publisher = ShopifyCollectionPublisher()
+                with image_area:
+                    for definition in plan.get("collections", []):
+                        key = definition["collection_key"]
+                        with ui.row().classes("w-full items-center"):
+                            ui.label(definition["title"]).classes("w-48 font-medium")
+                            path_input = ui.input("Existing image path").classes("w-96")
+                            def attach(k=key, d=definition, path_control=path_input):
+                                try:
+                                    ManualImageProvider().register(self.current_store, k, path_control.value or "", alt_text=d.get("image_alt_text", ""))
+                                    ui.notify(f"{d['title']}: image ready", type="positive")
+                                    render_image_actions(plan)
+                                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+                            def generate(d=definition):
+                                try:
+                                    if not generate_opt_in.value:
+                                        raise RuntimeError("먼저 '이미지 자동 생성 사용'을 체크해야 유료 호출이 허용됩니다.")
+                                    output = generate_collection_image(self.current_store, d, provider=OpenAIImagesProvider(), enabled=True)
+                                    ui.notify(f"Generated image: {output['path']}", type="positive")
+                                    render_image_actions(plan)
+                                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+                            ui.button("직접 파일 연결", on_click=attach, icon="image").props("outline dense")
+                            ui.button("이미지 생성", on_click=generate, icon="auto_awesome").props("outline dense")
+                            asset = publisher._image_asset(self.current_store, key)
+                            if asset:
+                                ready += 1
+                                try:
+                                    relative = Path(asset["path"]).resolve().relative_to((EXPORT_DIR / "collection_images").resolve())
+                                    ui.image("/collection_images/" + relative.as_posix()).classes("w-24 h-24 object-cover rounded border")
+                                except ValueError:
+                                    pass
+                                ui.label(f"READY · {asset['path']}").classes("text-xs text-emerald-700")
+                            else:
+                                ui.label("MISSING").classes("text-xs text-amber-700")
+                image_status.set_text(f"이미지 준비: {ready}/{len(plan.get('collections', []))} ready · 모두 생성 시 예상 호출 {len(plan.get('collections', []))}회")
+            def preview_shopify():
+                try:
+                    plan = plan_ref.get("plan")
+                    if not plan: raise ValueError("먼저 컬렉션 자동 설계를 실행하세요.")
+                    result = ShopifyCollectionPublisher().dry_run(plan, publish_online_store=bool(publish_opt_in.value))
+                    preview_ref["value"] = result
+                    preview_label.set_text("미리보기: " + " · ".join(f"{k} {v}" for k, v in result["counts"].items()))
+                    with ui.dialog() as dialog, ui.card().classes("w-[900px] max-w-[95vw]"):
+                        ui.label("Shopify 변경 미리보기 · 현재 변경 없음").classes("text-lg font-bold")
+                        for item in result["items"]:
+                            ui.label(f"{item['action']} · {item['title']} · 예상 상품 {item['estimated_product_count']} · image {item['image_status']}" + (f" · {item['reason']}" if item.get("reason") else ""))
+                        ui.button("닫기", on_click=dialog.close).props("flat")
+                    dialog.open()
+                except Exception as exc:
+                    preview_label.set_text(f"미리보기 실패: {_safe_error(exc)}")
+                    ui.notify(_safe_error(exc), type="negative")
+            def confirm_shopify_sync():
+                plan = plan_ref.get("plan")
+                if not plan: ui.notify("먼저 컬렉션 계획을 생성하세요.", type="warning"); return
+                if not preview_ref["value"]: ui.notify("먼저 동기화 미리보기를 실행하세요.", type="warning"); return
+                current_connection = get_shopify_connection(self.current_store)
+                if (preview_ref["value"].get("plan_id") != plan.get("plan_id")
+                        or preview_ref["value"].get("store_id") != self.current_store
+                        or preview_ref["value"].get("shop_domain") != (current_connection or {}).get("shop_domain")
+                        or preview_ref["value"].get("publish_online_store") != bool(publish_opt_in.value)):
+                    ui.notify("계획/연결/공개 옵션이 미리보기 이후 바뀌었습니다. dry-run을 다시 실행하세요.", type="warning"); return
+                with ui.dialog() as dialog, ui.card():
+                    ui.label("명시적 확인: Shopify 컬렉션 쓰기를 실행합니다.").classes("font-bold text-amber-800")
+                    ui.label("CREATE/UPDATE만 수행합니다. Shopify에서 컬렉션을 삭제하지 않습니다.")
+                    def do_sync():
+                        try:
+                            result = ShopifyCollectionPublisher().sync(plan, confirmed=True, publish_online_store=bool(publish_opt_in.value), expected_preview=preview_ref["value"])
+                            dialog.close()
+                            preview_label.set_text("결과: " + " · ".join(f"{k} {v}" for k, v in result["summary"].items()))
+                            ui.notify(f"Shopify sync complete · {result['run_id']}", type="positive")
+                        except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+                    with ui.row():
+                        ui.button("취소", on_click=dialog.close).props("flat")
+                        ui.button("확인 — Shopify 쓰기", on_click=do_sync, icon="cloud_upload").props("color=negative")
+                dialog.open()
+            with ui.row():
+                ui.button("동기화 미리보기", on_click=preview_shopify, icon="preview").props("outline")
+                def generate_all_images():
+                    plan = plan_ref.get("plan")
+                    if not plan: ui.notify("먼저 컬렉션 계획을 생성하세요.", type="warning"); return
+                    if not generate_opt_in.value: ui.notify("유료 API 사용 opt-in을 켜야 합니다.", type="warning"); return
+                    failures=[]
+                    for definition in plan.get("collections", []):
+                        try:
+                            generate_collection_image(self.current_store, definition, provider=OpenAIImagesProvider(), enabled=True)
+                        except Exception as exc: failures.append(f"{definition['title']}: {_safe_error(exc)}")
+                    render_image_actions(plan)
+                    ui.notify(f"이미지 생성 완료. 성공 {len(plan['collections'])-len(failures)} · 실패 {len(failures)}", type="positive" if not failures else "warning")
+                    if failures: preview_label.set_text("이미지 실패: " + " | ".join(failures[:5]))
+                ui.button("컬렉션 이미지 모두 생성", on_click=generate_all_images, icon="collections").props("outline")
+                ui.button("Shopify에 컬렉션 생성/동기화", on_click=confirm_shopify_sync, icon="cloud_upload").props("color=primary")
+            ui.label("Collection sync report에는 조건, 결과, Shopify ID가 기록됩니다. secrets는 포함되지 않습니다.").classes("text-xs text-slate-500")
 
     def _heading(self, title: str, subtitle: str | None = None):
         self.ui.label(title).classes("text-2xl font-bold text-slate-900")
@@ -1578,6 +1721,9 @@ def main():
         raise RuntimeError('UI V2 needs the optional dependency: pip install -e ".[ui]"') from exc
     from fastapi.middleware.cors import CORSMiddleware
     from ..capture.bridge import install_capture_routes
+    image_root = EXPORT_DIR / "collection_images"
+    image_root.mkdir(parents=True, exist_ok=True)
+    app.add_static_files("/collection_images", str(image_root))
     app.add_middleware(CORSMiddleware, allow_origin_regex=r"chrome-extension://[a-p]{32}",
                        allow_methods=["GET", "POST", "OPTIONS"],
                        allow_headers=["Content-Type", "X-ShopSource-Pairing"])
