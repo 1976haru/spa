@@ -15,6 +15,7 @@ from .paths import EXPORT_DIR
 STAGES = ("PLAN", "BRAND_PLAN", "BRAND_ASSET_PREVIEW", "BRAND_ASSET_GENERATION", "BRAND_ASSET_APPROVAL",
           "SOURCING", "SOURCE_VALIDATION", "PRODUCT_SYNC_PREVIEW", "PRODUCT_SYNC", "PRODUCT_VERIFY",
           "COLLECTION_PLAN", "COLLECTION_IMAGE", "COLLECTION_SYNC_PREVIEW", "COLLECTION_SYNC", "COLLECTION_VERIFY",
+          "NAVIGATION_PLAN", "NAVIGATION_SYNC_PREVIEW", "NAVIGATION_SYNC", "NAVIGATION_VERIFY", "MEGA_MENU_PREVIEW", "MEGA_MENU_APPLY",
           "BRAND_APPLY_PREVIEW", "BRAND_APPLY", "HOMEPAGE_PLAN", "FINAL_VERIFY", "COMPLETE")
 STAGE_STATES = {"PENDING", "RUNNING", "COMPLETE", "COMPLETE_WITH_WARNINGS", "PAUSED", "FAILED", "MANUAL_ACTION_REQUIRED", "SKIPPED"}
 
@@ -65,7 +66,8 @@ class StoreBuildOrchestrator:
                    "collection_images": False, "paid_image_opt_in": False, "collection_sync": True,
                    "publish_collections": False, "homepage_plan": True, "source_target": 2000,
                    "publish_status": "DRAFT", "media_mode": "MANUAL_MEDIA", "brand_automation": False,
-                   "brand_image_opt_in": False, "brand_image_model": None, "brand_apply": False, **(options or {})}
+                   "brand_image_opt_in": False, "brand_image_model": None, "brand_apply": False,
+                   "navigation_automation": False,"navigation_sync": False,"mega_menu_apply": False, **(options or {})}
         provider = str(provider).upper(); mode = str(mode).upper()
         if provider not in {"DIRECT_SHOPIFY", "SPARK_FALLBACK"}: raise ValueError("Unknown product route")
         if mode not in {"PREVIEW", "LIVE"}: raise ValueError("mode must be PREVIEW or LIVE")
@@ -148,6 +150,16 @@ class StoreBuildOrchestrator:
                 preview_id=run["stage_data"].get("BRAND_APPLY_PREVIEW",{}).get("preview_id")
                 check=BrandThemeService(db=self.db).verify_manual_apply(preview_id) if preview_id else {"status":"NOT_FOUND"}
                 if check.get("status")!="VERIFIED":raise RuntimeError("Shopify theme settings do not yet match the approved logo/favicon preview.")
+            if expected == "mega_menu_manual_applied":
+                from .navigation import MegaMenuThemeService
+                preview_id=run["stage_data"].get("MEGA_MENU_PREVIEW",{}).get("preview_id")
+                check=MegaMenuThemeService(db=self.db).verify_manual_apply(preview_id) if preview_id else {"status":"NOT_FOUND"}
+                if check.get("status")!="VERIFIED":raise RuntimeError("Shopify theme does not match the approved mega-menu preview; keep this stage manual.")
+            if expected == "navigation_manual_synced":
+                from .navigation import NavigationService
+                plan_id=run["stage_data"].get("NAVIGATION_PLAN",{}).get("navigation_plan_id")
+                check=NavigationService(db=self.db).verify(run["store_id"],plan_id) if plan_id else {"verified":False}
+                if not check.get("verified"):raise RuntimeError("Shopify navigation does not match the current ShopSource preview.")
             self._set_stage(run_id, stage, "COMPLETE_WITH_WARNINGS", counts={"manual_confirmation": expected})
             run = self.get(run_id)
         elif run["status"] == "FAILED":
@@ -445,6 +457,57 @@ class StoreBuildOrchestrator:
             if not verified:
                 raise RuntimeError("Collection verification failed; inspect collection sync results before continuing.")
             return {"verified": True, "counts": {"verified_or_unchanged": len(items), "failed": 0}}
+        if stage == "NAVIGATION_PLAN":
+            if not options.get("navigation_automation"):return {"stage_status":"SKIPPED"}
+            from .navigation import NavigationService
+            navigation=NavigationService(db=self.db)
+            collection_plan_id=data.get("collection_plan_id")
+            if not collection_plan_id:
+                from .collection_planner import CollectionPlanner
+                collection_plan_id=CollectionPlanner(self.db).create_plan(store_id)["plan_id"]
+                data["collection_plan_id"]=collection_plan_id
+            plan=navigation.build_plan(store_id,collection_plan_id)
+            data["navigation_plan_id"]=plan["plan_id"]
+            return {"counts":{"planned_items":len(plan["items"]),"mapped_collections":sum(item["depth"]==1 and item["sync_status"]=="PLANNED" for item in plan["items"])},"navigation_plan_id":plan["plan_id"]}
+        if stage == "NAVIGATION_SYNC_PREVIEW":
+            if not options.get("navigation_automation"):return {"stage_status":"SKIPPED"}
+            from .navigation import NavigationService
+            plan_id=data.get("navigation_plan_id")
+            if not plan_id:return {"stage_status":"SKIPPED"}
+            preview=NavigationService(db=self.db).preview(plan_id);data["navigation_preview_id"]=preview["preview_id"]
+            return {"counts":preview.get("summary",{}),"preview_status":preview.get("status"),"navigation_preview_id":preview["preview_id"]}
+        if stage == "NAVIGATION_SYNC":
+            if not options.get("navigation_sync"):return {"stage_status":"SKIPPED"}
+            from .navigation import NavigationService
+            preview_id=data.get("navigation_preview_id")
+            if not preview_id:return {"status":"MANUAL_ACTION_REQUIRED","manual_gate":"NAVIGATION_SYNC","instructions":"Create a fresh navigation preview before sync."}
+            result=NavigationService(db=self.db).sync(preview_id,confirmed=True);data["navigation_sync_result"]=result
+            if result.get("status") not in {"VERIFIED","NO_CHANGE"}:
+                return {"status":"MANUAL_ACTION_REQUIRED","manual_gate":"NAVIGATION_SYNC","result":result,"instructions":"Resolve menu conflicts/permissions and review a fresh preview before resuming."}
+            return {"counts":result.get("counts",{}),"result":result}
+        if stage == "NAVIGATION_VERIFY":
+            if not options.get("navigation_automation"):return {"stage_status":"SKIPPED"}
+            from .navigation import NavigationService
+            result=NavigationService(db=self.db).verify(store_id,data.get("navigation_plan_id"))
+            data["navigation_verify_result"]=result
+            if options.get("navigation_sync") and not result.get("verified"):
+                return {"status":"MANUAL_ACTION_REQUIRED","manual_gate":"NAVIGATION_SYNC","result":result,"instructions":"Shopify navigation readback does not match the approved preview."}
+            return {"counts":{"verified":bool(result.get("verified"))},"result":result,"stage_status":"COMPLETE_WITH_WARNINGS" if not result.get("verified") else "COMPLETE"}
+        if stage == "MEGA_MENU_PREVIEW":
+            if not options.get("navigation_automation"):return {"stage_status":"SKIPPED"}
+            from .navigation import MegaMenuThemeService
+            preview=MegaMenuThemeService(db=self.db).preview(store_id,parent_label=(options.get("navigation_parent_label") or "Shop"))
+            data["mega_menu_preview_id"]=preview["preview_id"]
+            # Unsupported themes remain accurately visible; the separate apply stage becomes a manual gate.
+            return {"counts":{"actions":len(preview.get("actions",[]))},"preview_id":preview["preview_id"],"preview_status":preview["status"],"support":preview.get("support",{}).get("status"),"stage_status":"COMPLETE_WITH_WARNINGS" if preview["status"]!="PREVIEW" else "COMPLETE"}
+        if stage == "MEGA_MENU_APPLY":
+            if not options.get("mega_menu_apply"):return {"stage_status":"SKIPPED"}
+            from .navigation import MegaMenuThemeService
+            preview_id=data.get("mega_menu_preview_id")
+            if not preview_id:return {"status":"MANUAL_ACTION_REQUIRED","manual_gate":"MEGA_MENU_APPLY","instructions":"Create a current high-confidence mega-menu preview first."}
+            result=MegaMenuThemeService(db=self.db).apply(preview_id,confirmed=True);data["mega_menu_apply_result"]=result
+            if result.get("status")!="VERIFIED":return {"status":"MANUAL_ACTION_REQUIRED","manual_gate":"MEGA_MENU_APPLY","result":result,"instructions":"Use Theme Editor Header settings to connect Shop to the mega menu and save."}
+            return {"counts":{"verified":True},"result":result}
         if stage == "HOMEPAGE_PLAN":
             if not options.get("homepage_plan"): return {"stage_status": "SKIPPED"}
             from .homepage_collections import HomepageCollectionService, ShopifyThemeReader, build_homepage_plan
@@ -473,7 +536,8 @@ class StoreBuildOrchestrator:
         details = run["stage_data"].get(run["stage"], {})
         return {"SOURCE_WORKER": "source_complete", "SOURCE_CAPTCHA": "amazon_challenge_resolved",
                 "SPARK_UPLOAD": "spark_upload_confirmed", "THEME_APPLY": "theme_manual_apply_confirmed",
-                "BRAND_APPROVAL": "brand_assets_approved", "BRAND_MANUAL_APPLY": "brand_theme_manual_applied"}.get(details.get("manual_gate"), "manual_action_confirmed")
+                "BRAND_APPROVAL": "brand_assets_approved", "BRAND_MANUAL_APPLY": "brand_theme_manual_applied",
+                "MEGA_MENU_APPLY":"mega_menu_manual_applied","NAVIGATION_SYNC":"navigation_manual_synced"}.get(details.get("manual_gate"), "manual_action_confirmed")
 
     def _default_final_status(self, run_id):
         run = self.get(run_id)

@@ -19,6 +19,7 @@ from ..collection_images import ManualImageProvider, OpenAIImagesProvider, gener
 from ..classifier import classify_store
 from ..db import connect, get_store, init_db, upsert_store
 from ..homepage_collections import HomepageCollectionService, ShopifyThemeReader, build_homepage_plan
+from ..navigation import MegaMenuThemeService, NavigationService
 from ..store_build import StoreBuildOrchestrator
 from ..intelligence.keyword_engine import KeywordEngine
 from ..paths import AMAZON_INBOX_DIR, EXPORT_DIR, STORE_DIR
@@ -41,6 +42,7 @@ NAV_ITEMS = [
     ("/stores", "storefront", "스토어"),
     ("/sourcing", "travel_explore", "소싱"),
     ("/collections", "collections_bookmark", "컬렉션 자동화"),
+    ("/navigation", "account_tree", "메가메뉴 자동화"),
     ("/products", "inventory_2", "상품"),
     ("/packages", "outbox", "패키지"),
     ("/history", "history", "기록"),
@@ -158,6 +160,7 @@ class OperatorUI:
             elif path == "/stores": self._stores()
             elif path == "/sourcing": self._sourcing()
             elif path == "/collections": self._collections()
+            elif path == "/navigation": self._navigation()
             elif path == "/products": self._products()
             elif path == "/packages": self._packages()
             elif path == "/history": self._history()
@@ -170,7 +173,7 @@ class OperatorUI:
     def _store_build(self):
         ui = self.ui
         self._heading("스토어 자동 구축", "소싱부터 Shopify 상품·컬렉션·홈페이지 계획까지 단계별로 이어갑니다. 실제 실행 전 미리보기와 확인이 필요합니다.")
-        ui.label("실제 소싱·Shopify 쓰기·유료 이미지 생성은 [실제 실행]을 선택한 뒤 시작할 때만 가능합니다. Theme 적용 및 Spark 업로드는 수동 확인 단계입니다.").classes("text-sm text-amber-800")
+        ui.label("실제 소싱·Shopify 쓰기·유료 이미지 생성은 LIVE 실행과 해당 옵션을 모두 선택해야 합니다. Navigation/Theme 쓰기는 별도 확인을 거치며 지원되지 않는 테마는 수동 단계로 남습니다.").classes("text-sm text-amber-800")
         store = next((row for row in self.stores if row["store_id"] == self.current_store), None)
         ui.label(f"Store: {self.current_store} | {store['store_name'] if store else self.current_store}").classes("text-xl font-semibold")
         with ui.card().classes("w-full border border-sky-200"):
@@ -185,6 +188,9 @@ class OperatorUI:
                 collection_sync = ui.checkbox("Shopify 컬렉션 자동 생성", value=True)
                 publish_collections = ui.checkbox("Online Store 공개", value=False)
                 homepage = ui.checkbox("홈페이지 컬렉션 계획", value=True)
+                navigation_automation = ui.checkbox("메가메뉴 계획/검증 포함", value=False)
+                navigation_sync = ui.checkbox("Shopify Navigation 실제 동기화", value=False)
+                mega_menu_apply = ui.checkbox("테마 메가메뉴 적용 허용", value=False)
                 brand_automation = ui.checkbox("브랜드 profile/자산 단계 포함", value=False)
                 brand_paid = ui.checkbox("브랜드 이미지 자동 생성 사용 (유료 opt-in)", value=False)
                 brand_model = ui.input("OpenAI 이미지 모델 (기본: gpt-image-1)", value="gpt-image-1").classes("w-72")
@@ -193,7 +199,7 @@ class OperatorUI:
                 product_status = ui.select({"DRAFT": "DRAFT (권장)", "ACTIVE": "ACTIVE"}, value="DRAFT", label="Shopify 상품 상태").classes("w-56")
                 product_media = ui.select({"MANUAL_MEDIA": "수동 이미지 (권장)", "SOURCE_MEDIA": "SOURCE_MEDIA", "GENERATED_MEDIA": "GENERATED_MEDIA", "MIXED": "MIXED"}, value="MANUAL_MEDIA", label="상품 미디어 정책").classes("w-72")
                 source_rights = ui.checkbox("원본 상품 이미지 재사용 권리 확인", value=False)
-                confirmation = ui.select({"source_complete": "Amazon 소싱 worker 완료 확인", "amazon_challenge_resolved": "Amazon 확인 화면을 직접 해결 완료", "spark_upload_confirmed": "SparkShopify 업로드 완료 확인", "theme_manual_apply_confirmed": "Theme patch 수동 적용 완료 확인"}, label="수동 단계 확인", value=None).classes("w-96")
+                confirmation = ui.select({"source_complete": "Amazon 소싱 worker 완료 확인", "amazon_challenge_resolved": "Amazon 확인 화면을 직접 해결 완료", "spark_upload_confirmed": "SparkShopify 업로드 완료 확인", "theme_manual_apply_confirmed": "Theme patch 수동 적용 완료 확인", "mega_menu_manual_applied":"Mega menu 테마 수동 적용 확인", "navigation_manual_synced":"Shop 메뉴 수동 동기화 완료 확인"}, label="수동 단계 확인", value=None).classes("w-96")
             current = {"run_id": None}
             status_label = ui.label("Run: 미리보기 전").classes("font-medium")
             timeline = ui.column().classes("w-full gap-1")
@@ -225,7 +231,9 @@ class OperatorUI:
                                "media_mode": product_media.value or "MANUAL_MEDIA",
                                "source_media_rights_confirmed": bool(source_rights.value),
                                "brand_automation": bool(brand_automation.value), "brand_image_opt_in": bool(brand_paid.value),
-                               "brand_image_model": brand_model.value or "gpt-image-1", "brand_apply": bool(brand_apply.value)}
+                               "brand_image_model": brand_model.value or "gpt-image-1", "brand_apply": bool(brand_apply.value),
+                               "navigation_automation":bool(navigation_automation.value),"navigation_sync":bool(navigation_sync.value),
+                               "mega_menu_apply":bool(mega_menu_apply.value)}
                     service = StoreBuildOrchestrator()
                     result = service.preview(self.current_store, options=options, provider=provider.value or "DIRECT_SHOPIFY", mode=mode.value or "PREVIEW")
                     show_run(service.get(result["run_id"]))
@@ -237,12 +245,21 @@ class OperatorUI:
                     ui.notify("먼저 최신 미리보기를 만드세요.", type="warning"); return
                 if mode.value != "LIVE":
                     ui.notify("실제 실행 모드를 선택해야 시작할 수 있습니다.", type="warning"); return
-                try:
-                    service = StoreBuildOrchestrator()
-                    result = await asyncio.to_thread(service.start, current["run_id"], live_confirmed=True)
-                    show_run(result)
-                    ui.notify("Store Build 단계가 실행/수동 게이트까지 진행되었습니다.", type="positive" if result["status"] != "FAILED" else "negative")
-                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+                with ui.dialog() as dialog,ui.card():
+                    ui.label("LIVE Store Build를 시작합니다. 선택한 sourcing, Shopify 상품/컬렉션/navigation, 이미지 및 Theme 옵션은 실제 서비스에 적용될 수 있습니다.")
+                    ui.label(f"Store {self.current_store} · Navigation sync {'ON' if navigation_sync.value else 'OFF'} · Mega-menu Theme apply {'ON' if mega_menu_apply.value else 'OFF'} · 유료 브랜드 이미지 {'ON' if brand_paid.value else 'OFF'}")
+                    with ui.row():
+                        ui.button("취소",on_click=dialog.close).props("outline")
+                        async def confirm_live():
+                            dialog.close()
+                            try:
+                                service=StoreBuildOrchestrator()
+                                result=await asyncio.to_thread(service.start,current["run_id"],live_confirmed=True)
+                                show_run(result)
+                                ui.notify("Store Build 단계가 실행/수동 게이트까지 진행되었습니다.",type="positive" if result["status"]!="FAILED" else "negative")
+                            except Exception as exc:ui.notify(_safe_error(exc),type="negative")
+                        ui.button("LIVE 실행 확인",on_click=confirm_live).props("color=negative")
+                dialog.open()
 
             async def pause_build():
                 if current["run_id"] and StoreBuildOrchestrator().pause(current["run_id"]):
@@ -583,6 +600,132 @@ class OperatorUI:
             logo_upload;favicon_upload;opt_in;transparent;generated
             prompt_area;asset_area
         refresh()
+
+    def _navigation(self):
+        ui=self.ui
+        from ..navigation import inspect_assignment_menu
+        self._heading("메가메뉴 자동화", "컬렉션 플랜을 Shopify 메뉴로 연결하고 published theme의 메가메뉴 지원을 점검합니다.")
+        ui.label("미리보기는 읽기 전용입니다. Navigation sync와 theme 적용은 각각 별도 확인 후에만 실행됩니다.").classes("text-sm text-amber-800")
+        state={"plan":None,"preview":None,"theme_preview":None,"menu":None}
+        nav=NavigationService();theme_service=MegaMenuThemeService()
+        with ui.card().classes("w-full border-2 border-violet-200 bg-violet-50"):
+            ui.label(f"Store: {self.current_store} | {next((row['store_name'] for row in self.stores if row['store_id']==self.current_store),self.current_store)}").classes("text-xl font-bold")
+            status=ui.label("Navigation: 검사 전 · Collections: — · Theme: 미검사")
+            parent=ui.input("상위 메뉴 label",value="Shop").classes("w-64")
+            with ui.expansion("고급 설정",icon="tune"):
+                parent_url=ui.select({"/collections/all":"모든 컬렉션 (/collections/all)","/collections":"컬렉션 (/collections)"},value="/collections/all",label="상위 Shop 링크").classes("w-96")
+            tree=ui.column().classes("w-full gap-1")
+            action_area=ui.column().classes("w-full gap-1")
+            checklist=ui.column().classes("w-full gap-1")
+            theme_area=ui.column().classes("w-full gap-1")
+
+            def render_tree(items):
+                tree.clear()
+                with tree:
+                    def add(item,depth=0):
+                        ui.label(f"{'　'*depth}{'├─ ' if depth else ''}{item.get('title','')} → {item.get('url') or item.get('resourceId') or '링크 미지정'}").classes("text-sm")
+                        for child in item.get("items",[]):add(child,depth+1)
+                    for item in items:add(item)
+
+            def design():
+                try:
+                    plan=nav.build_plan(self.current_store,options={"parent_label":parent.value or "Shop","parent_url":parent_url.value or "/collections/all"})
+                    state["plan"]=plan;state["preview"]=None
+                    rows=plan["items"];render_tree([{"title":rows[0]["title"],"url":rows[0]["url"],"items":[{"title":x["title"],"url":x["url"],"warning":x["sync_status"]} for x in rows[1:]]}])
+                    total=len(rows)-1;mapped=sum(item["sync_status"]=="PLANNED" for item in rows[1:])
+                    status.set_text(f"Navigation: NEEDS REVIEW · Collections: {mapped}/{total} mapped · Theme: 미검사")
+                    ui.notify(f"메뉴 계획 v{plan['plan_version']} 저장. Shopify write는 수행하지 않았습니다.",type="positive")
+                except Exception as exc:ui.notify(_safe_error(exc),type="negative")
+
+            def preview():
+                try:
+                    if not state["plan"]:raise ValueError("먼저 메뉴 자동 설계를 실행하세요.")
+                    result=nav.preview(state["plan"]["plan_id"]);state["preview"]=result;render_tree(result.get("tree",[]));action_area.clear()
+                    with action_area:
+                        ui.label(" · ".join(f"{key} {value}" for key,value in result.get("summary",{}).items())).classes("font-semibold")
+                        for action in result.get("actions",[]):ui.label(f"{action.get('action')} · {action.get('title',action.get('item_key',''))} · {action.get('target',action.get('warning',action.get('reason','')))}").classes("text-sm")
+                    status.set_text(f"Navigation: {result['status']} · CREATE {result.get('summary',{}).get('CREATE',0)} / UPDATE {result.get('summary',{}).get('UPDATE',0)} / MOVE {result.get('summary',{}).get('MOVE',0)} / NO CHANGE {result.get('summary',{}).get('NO CHANGE',0)}")
+                    ui.notify(f"메뉴 미리보기 {result['status']}",type="positive" if result["status"]=="READY" else "warning")
+                except Exception as exc:ui.notify(_safe_error(exc),type="negative")
+
+            async def sync():
+                review=state.get("preview")
+                if not review or review.get("status")!="READY":ui.notify("충돌 없는 최신 미리보기가 필요합니다.",type="warning");return
+                with ui.dialog() as dialog,ui.card():
+                    ui.label("Main menu의 ShopSource 관리 하위 항목을 생성/갱신합니다. 기존 다른 항목은 보존됩니다.")
+                    with ui.row():
+                        ui.button("취소",on_click=dialog.close).props("outline")
+                        async def confirm():
+                            dialog.close()
+                            try:
+                                result=await asyncio.to_thread(nav.sync,review["preview_id"],confirmed=True)
+                                ui.notify(f"Navigation sync: {result['status']}",type="positive" if result["status"] in {"VERIFIED","NO_CHANGE"} else "negative")
+                            except Exception as exc:ui.notify(_safe_error(exc),type="negative")
+                        ui.button("동기화",on_click=confirm).props("color=negative")
+                dialog.open()
+
+            def inspect():
+                checklist.clear()
+                try:
+                    snapshot=nav.discover_main_menu(self.current_store);state["menu"]=snapshot.get("menu")
+                    expected=[item for item in state.get("plan",{}).get("items",[]) if item.get("depth")==1]
+                    checks=inspect_assignment_menu(snapshot.get("menu"),expected)
+                    with checklist:
+                        ui.label(f"현재 메뉴 {snapshot['status']} · Shop parent {'있음' if checks['parent_exists'] else '없음'} · 하위 항목 {checks['child_count']}개")
+                        checks_by_code={finding.get("code") for finding in checks["findings"]}
+                        criteria=[("Shop parent 존재",not "MISSING_PARENT" in checks_by_code and checks["parent_exists"]),
+                                  ("child 들여쓰기",checks["children_indented"] or not expected),
+                                  ("child label",all(str(item.get("title","")).strip() for item in expected)),
+                                  ("링크 존재","MISSING_LINK" not in checks_by_code),
+                                  ("duplicate target","DUPLICATE_TARGET" not in checks_by_code),
+                                  ("missing link","MISSING_CHILD" not in checks_by_code),
+                                  ("임시 placeholder link","PLACEHOLDER_LINK" not in checks_by_code)]
+                        for label,passed in criteria:ui.label(f"{'✓' if passed else '⚠'} 저장 전 확인: {label}").classes("text-sm")
+                        for finding in checks["findings"]:ui.label(f"WARNING {finding['code']}: {finding.get('message',finding.get('label',''))}").classes("text-amber-800")
+                    ui.notify(f"링크 검사 경고 {len(checks['findings'])}개",type="warning" if checks["findings"] else "positive")
+                except Exception as exc:ui.notify(_safe_error(exc),type="negative")
+
+            def preview_theme():
+                try:
+                    result=theme_service.preview(self.current_store,parent_label=parent.value or "Shop");state["theme_preview"]=result;theme_area.clear()
+                    with theme_area:
+                        ui.label(f"Theme: {(result.get('theme') or {}).get('name','—')} · {result.get('support',{}).get('status')} · {result['status']}")
+                        ui.label(json.dumps(result.get("actions",[]),ensure_ascii=False,indent=2)).classes("text-xs whitespace-pre-wrap")
+                    ui.notify(f"Theme mega-menu {result['status']}",type="positive" if result["status"]=="PREVIEW" else "warning")
+                except Exception as exc:ui.notify(_safe_error(exc),type="negative")
+
+            async def apply_theme():
+                review=state.get("theme_preview")
+                if not review or review.get("status")!="PREVIEW":ui.notify("고신뢰 최신 Theme preview와 write 권한이 필요합니다.",type="warning");return
+                with ui.dialog() as dialog,ui.card():
+                    ui.label("변경 전 settings_data 백업 후 Shop 메가메뉴 설정만 적용하고 Shopify에서 다시 확인합니다.")
+                    with ui.row():
+                        ui.button("취소",on_click=dialog.close).props("outline")
+                        async def confirm():
+                            dialog.close()
+                            try:
+                                result=await asyncio.to_thread(theme_service.apply,review["preview_id"],confirmed=True)
+                                ui.notify(f"Mega menu theme: {result['status']}",type="positive" if result["status"]=="VERIFIED" else "negative")
+                            except Exception as exc:ui.notify(_safe_error(exc),type="negative")
+                        ui.button("적용",on_click=confirm).props("color=negative")
+                dialog.open()
+
+            def guide():ui.notify("Online Store → Theme Edit / Customize → Header → 메가메뉴 설정/블록 → Shop 연결 → Save",type="info")
+
+            with ui.row().classes("flex-wrap"):
+                ui.button("메뉴 자동 설계",on_click=design,icon="auto_awesome").props("color=primary")
+                ui.button("메뉴 미리보기",on_click=preview,icon="visibility").props("outline")
+                ui.button("Shopify 메뉴 동기화",on_click=sync,icon="sync").props("color=negative")
+                ui.button("링크 검사",on_click=inspect,icon="link").props("outline")
+                ui.button("메가메뉴 테마 미리보기",on_click=preview_theme,icon="preview").props("outline")
+                ui.button("메가메뉴 적용",on_click=apply_theme,icon="publish").props("color=negative")
+                ui.button("수동 적용 안내",on_click=guide,icon="help").props("outline")
+            with ui.expansion("메가메뉴 과제 모드",icon="school"):
+                ui.label("현재 메뉴 검사 · Shop 하위 메뉴 자동 제안 · 링크 검사 · 저장 전 체크리스트 · 테마 적용 안내")
+                ui.button("현재 메뉴 검사",on_click=inspect)
+                ui.button("Shop 하위 메뉴 자동 제안",on_click=design)
+                checklist
+            tree;action_area;theme_area
 
     def _collections(self):
         ui = self.ui

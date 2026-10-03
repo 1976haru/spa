@@ -22,7 +22,7 @@ from .shopify_collections import ShopifyGraphQLClient, get_connection, get_shopi
 
 THEME_READ_SCOPE = "read_themes"
 THEMES_QUERY = "query ShopSourceThemes { themes(first: 50) { nodes { id name role } } }"
-THEME_FILES_QUERY = "query ShopSourceThemeFiles($id: ID!) { theme(id: $id) { id name role files(first: 250, filenames: [\"templates/index.json\", \"sections/*\"]) { nodes { filename body { __typename ... on OnlineStoreThemeFileBodyText { content } ... on OnlineStoreThemeFileBodyBase64 { contentBase64 } } } } } }"
+THEME_FILES_QUERY = "query ShopSourceThemeFiles($id: ID!) { theme(id: $id) { id name role files(first: 250, filenames: [\"templates/index.json\", \"sections/*\", \"config/settings_schema.json\", \"config/settings_data.json\"]) { nodes { filename body { __typename ... on OnlineStoreThemeFileBodyText { content } ... on OnlineStoreThemeFileBodyBase64 { contentBase64 } } } } } }"
 
 
 def _now() -> str:
@@ -159,6 +159,7 @@ class ShopifyThemeReader:
                 "api_version": config["api_version"], "scopes": scopes,
                 "theme": {"id": theme["id"], "name": theme["name"], "role": theme["role"]},
                 "template_filename": template_name, "template": template, "schemas": schemas,
+                "theme_files": files,
                 "manual_patch_mode": True, "warning": None if schemas else "No compatible featured-collection section schema was found."}
 
 
