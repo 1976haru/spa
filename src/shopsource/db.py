@@ -384,6 +384,55 @@ CREATE TABLE IF NOT EXISTS sourcing_campaign_pages (
     UNIQUE(campaign_id, normalized_url)
 );
 
+CREATE TABLE IF NOT EXISTS store_sourcing_plans (
+    plan_id TEXT PRIMARY KEY,
+    store_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    total_candidate_target INTEGER NOT NULL,
+    detail_target INTEGER NOT NULL,
+    detail_ratio REAL NOT NULL,
+    mode TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'DRAFT',
+    planner_version TEXT NOT NULL,
+    settings_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(store_id, version)
+);
+CREATE TABLE IF NOT EXISTS store_sourcing_categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL REFERENCES store_sourcing_plans(plan_id) ON DELETE CASCADE,
+    category_key TEXT NOT NULL,
+    category_name TEXT NOT NULL,
+    weight REAL NOT NULL,
+    quota INTEGER NOT NULL,
+    priority INTEGER NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(plan_id, category_key)
+);
+CREATE TABLE IF NOT EXISTS store_sourcing_keywords (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category_id INTEGER NOT NULL REFERENCES store_sourcing_categories(id) ON DELETE CASCADE,
+    keyword TEXT NOT NULL,
+    source TEXT NOT NULL,
+    score REAL NOT NULL DEFAULT 0,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    historical_yield REAL,
+    duplicate_rate REAL,
+    price_fit REAL,
+    quality_fit REAL,
+    risk_rate REAL,
+    pages_used INTEGER NOT NULL DEFAULT 0,
+    last_run_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(category_id, keyword COLLATE NOCASE)
+);
+
 CREATE INDEX IF NOT EXISTS idx_products_price ON products(price);
 CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);
 CREATE INDEX IF NOT EXISTS idx_decisions_store_status ON store_product_decisions(store_id, final_status);

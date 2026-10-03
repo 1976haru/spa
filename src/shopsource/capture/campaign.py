@@ -243,6 +243,21 @@ class CampaignService:
             result = dict(row)
             result["keywords"] = [dict(x) for x in con.execute("SELECT * FROM sourcing_campaign_keywords WHERE campaign_id=? ORDER BY position", (campaign_id,)).fetchall()]
             result["events"] = [dict(x) for x in con.execute("SELECT * FROM sourcing_campaign_events WHERE campaign_id=? ORDER BY id DESC LIMIT 100", (campaign_id,)).fetchall()]
+            batch = con.execute("SELECT status,detail_complete,failed_count FROM browser_batch_runs WHERE run_id=?",
+                                (result.get("batch_run_id"),)).fetchone() if result.get("batch_run_id") else None
+            current_detail = con.execute("SELECT asin,state,last_error FROM browser_batch_items WHERE batch_run_id=? AND state='DETAIL_OPENED' ORDER BY priority,id LIMIT 1",
+                                         (result.get("batch_run_id"),)).fetchone() if result.get("batch_run_id") else None
+            last_detail_success = con.execute("SELECT updated_at FROM browser_batch_items WHERE batch_run_id=? AND state IN ('DETAIL_COMPLETE','MASTER_IMPORTED') ORDER BY updated_at DESC,id DESC LIMIT 1",
+                                              (result.get("batch_run_id"),)).fetchone() if result.get("batch_run_id") else None
+        result["search_stage_complete"] = (
+            int(result["unique_candidates"]) >= int(result["candidate_target"])
+            and result["status"] in {"CANDIDATE_TARGET_REACHED", "DETAILING", "READY_FOR_SPARK", "DONE"}
+        )
+        result["detail_worker_status"] = batch["status"] if batch else ("NOT_STARTED" if result["search_stage_complete"] else "WAITING")
+        result["detail_current_asin"] = current_detail["asin"] if current_detail else ""
+        result["detail_last_error"] = current_detail["last_error"] if current_detail else ""
+        result["detail_last_success_at"] = last_detail_success["updated_at"] if last_detail_success else None
+        result["detail_failure_count"] = int(batch["failed_count"]) if batch else int(result.get("failed", 0))
         remaining = max(0, int(result["detail_target"]) - int(result["detail_complete"]))
         result["minimum_remaining_seconds"] = remaining * int(result["detail_interval_seconds"])
         return result

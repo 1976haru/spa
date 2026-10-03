@@ -19,6 +19,7 @@ from ..paths import AMAZON_INBOX_DIR, STORE_DIR
 from ..importer import import_amazon_source
 from ..sourcing.credentials import delete_api_key, get_api_key, save_api_key
 from ..sourcing.engine import SourcingEngine, new_run_id
+from ..sourcing.planner import CategoryPlanner
 from ..sourcing.providers.keepa import KeepaProvider
 from .v2_service import (
     bulk_override, clear_bulk_override, create_spark_package, create_store_profile,
@@ -354,6 +355,7 @@ class OperatorUI:
             counts = ui.label("").classes("text-sm")
             estimate = ui.label("").classes("text-sm text-amber-800")
             search_health = ui.label("검색 Worker: 연결 대기").classes("text-sm")
+            detail_health = ui.label("").classes("text-sm")
             search_warning = ui.label("").classes("text-sm text-red-700 font-medium")
 
             def render(campaign):
@@ -361,22 +363,28 @@ class OperatorUI:
                 active["campaign"] = campaign
                 status.set_text(f"{campaign['campaign_id']} · {campaign['status']}")
                 counts.set_text(f"후보 목표 {campaign['candidate_target']:,} · 고유 후보 {campaign['unique_candidates']:,} · 중복 {campaign['duplicates']:,} · 검색 페이지 {campaign['search_pages']:,} · 상세 완료 {campaign['detail_complete']:,} · MASTER {campaign['master_imported']:,} · Store 분류 {campaign['classified']:,} · 실패 {campaign['failed']:,} · Spark 준비 {campaign['classified']:,}")
+                if campaign.get("search_stage_complete"):
+                    search_health.set_text(f"검색 단계: COMPLETE · 후보 {campaign['unique_candidates']:,} / {campaign['candidate_target']:,}")
+                    detail_health.set_text(f"상세 Worker: {campaign.get('detail_worker_status', 'UNKNOWN')} · 현재 ASIN {campaign.get('detail_current_asin') or '대기'} · 마지막 성공 {campaign.get('detail_last_success_at') or '없음'} · 상세 완료 {campaign['detail_complete']:,} / {campaign['detail_target']:,} · 실패 {campaign.get('detail_failure_count', 0)}")
+                    search_warning.set_text("")
+                else:
+                    worker_state = campaign.get("search_worker_status", "NOT_CONNECTED")
+                    search_health.set_text(
+                        f"검색 Worker: {worker_state} · keyword {campaign.get('current_keyword') or '대기'} · page {campaign.get('current_page') or 0} · "
+                        f"마지막 캡처 {campaign.get('last_search_capture_at') or '없음'} · 오류 {campaign.get('last_search_error') or '없음'}"
+                    )
+                    detail_health.set_text("")
                 seconds = int(campaign["minimum_remaining_seconds"])
                 estimate.set_text(f"최소 예상시간 {seconds // 3600}시간 {(seconds % 3600) // 60}분 · 실제 Amazon 로딩/확인 화면 때문에 더 길어질 수 있습니다.")
-                worker_state = campaign.get("search_worker_status", "NOT_CONNECTED")
-                search_health.set_text(
-                    f"검색 Worker: {worker_state} · keyword {campaign.get('current_keyword') or '대기'} · page {campaign.get('current_page') or 0} · "
-                    f"마지막 캡처 {campaign.get('last_search_capture_at') or '없음'} · 오류 {campaign.get('last_search_error') or '없음'}"
-                )
                 warning = ""
-                if campaign["status"] == "RUNNING" and campaign["search_pages"] == 0 and campaign.get("started_at"):
+                if not campaign.get("search_stage_complete") and campaign["status"] == "RUNNING" and campaign["search_pages"] == 0 and campaign.get("started_at"):
                     try:
                         from datetime import datetime, timezone
                         started = datetime.fromisoformat(campaign["started_at"].replace("Z", "+00:00"))
                         if (datetime.now(timezone.utc) - started).total_seconds() >= 15:
                             warning = "검색 탭은 열렸지만 자동 캡처 응답이 없습니다. 기존 캠페인에서 '과제 2,000 계속'을 눌러 검색 Worker를 다시 연결하세요."
                     except (TypeError, ValueError): pass
-                if campaign.get("last_search_error"):
+                if not campaign.get("search_stage_complete") and campaign.get("last_search_error"):
                     warning = f"마지막 검색 오류: {campaign['last_search_error']}"
                 search_warning.set_text(warning)
 
@@ -458,6 +466,8 @@ class OperatorUI:
         ui = self.ui
         profile = get_store(self.current_store)
         config = profile.get("sourcing") or {}
+        self._auto_sourcing_planner_panel()
+        ui.separator()
         self._live_2000_panel()
         ui.separator()
         ui.label("무료 브라우저 소싱 · API 필요 없음").classes("text-lg font-bold")
@@ -563,6 +573,45 @@ class OperatorUI:
         ui.separator()
         ui.label("최근 run history").classes("text-lg font-semibold")
         self._render_runs(list_sourcing_runs(self.current_store, 30))
+
+    def _auto_sourcing_planner_panel(self):
+        ui = self.ui
+        with ui.card().classes("w-full border-2 border-emerald-200 bg-emerald-50"):
+            ui.label("스토어 자동 소싱 계획").classes("text-xl font-bold")
+            ui.label("목표 수량만 입력하면 카테고리, keyword pool, 우선순위와 quota를 로컬에서 계획합니다. 실제 수집은 Phase 3.1에서 연결됩니다.").classes("text-sm")
+            with ui.row().classes("items-end"):
+                target = ui.number("후보 목표", value=10000, min=1, max=50000).classes("w-48")
+                mode = ui.select({"fast": "빠르게", "balanced": "균형", "deep": "깊게"}, value="balanced", label="모드").classes("w-40")
+            with ui.expansion("고급 설정", icon="tune"):
+                detail_ratio = ui.number("상세 보강 비율", value=100, min=1, max=100, suffix="%").classes("w-48")
+                keyword_cap = ui.number("카테고리별 활성 keyword 상한", value=15, min=3, max=30).classes("w-64")
+                page_cap = ui.number("keyword별 페이지 상한", value=5, min=1, max=20).classes("w-64")
+                stale_pages = ui.number("연속 무성과 페이지", value=2, min=1, max=10).classes("w-64")
+                unique_cap = ui.number("keyword별 고유 후보 상한", value=300, min=1, max=5000).classes("w-64")
+            summary = ui.label("계획을 만들면 축약 미리보기가 표시됩니다.").classes("text-sm")
+            preview = ui.column().classes("w-full gap-1")
+
+            def create_plan():
+                try:
+                    plan = CategoryPlanner().create_plan(
+                        self.current_store, int(target.value), mode=mode.value or "balanced",
+                        detail_ratio=float(detail_ratio.value or 100) / 100,
+                        advanced={"max_active_keywords_per_category": int(keyword_cap.value),
+                                  "max_pages_per_keyword": int(page_cap.value),
+                                  "stale_pages": int(stale_pages.value),
+                                  "max_unique_candidates_per_keyword": int(unique_cap.value)},
+                    )
+                    summary.set_text(f"v{plan['version']} · 목표 {plan['total_candidate_target']:,} · 상세 {plan['detail_target']:,} · 카테고리 {len(plan['categories'])} · keyword pool {plan['keyword_pool_total']:,} · 기본 활성 {plan['active_keyword_count']:,}")
+                    preview.clear()
+                    with preview:
+                        for category in plan["categories"]:
+                            active = min(plan["settings"]["max_active_keywords_per_category"], sum(k["enabled"] for k in category["keywords"]))
+                            ui.label(f"{category['category_name']} · quota {category['quota']:,} · 활성 {active} / pool {len(category['keywords'])}").classes("text-sm")
+                    ui.notify("자동 소싱 계획을 저장했습니다. 실제 Amazon 실행은 시작하지 않았습니다.", type="positive")
+                except Exception as exc:
+                    ui.notify(_safe_error(exc), type="negative")
+
+            ui.button("자동 소싱 계획 만들기", on_click=create_plan, icon="auto_awesome")
 
     @staticmethod
     def _run_status_text(run):
