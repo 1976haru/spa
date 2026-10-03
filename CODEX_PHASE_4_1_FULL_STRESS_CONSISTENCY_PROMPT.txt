@@ -1,0 +1,1165 @@
+ShopSource Studio — Phase 4.1
+FULL CONSISTENCY / STRESS / FAILURE-INJECTION TEST
+Release Candidate Qualification Before Live Shopify Testing
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+- Baseline: 8d69783348f56e49ea55a4a54204334dd80852b8
+
+Context
+- Phase 4.0 Store Completion Master is COMPLETE.
+- Current full suite at Phase 4.0: 458 passed, 1 skipped.
+- The user-approved sequence is:
+  Phase 4.0 complete-store implementation
+  → Phase 4.1 code consistency / stress / simulation / bug fixing
+  → Phase 4.2 real Cabin Tidy live pilot
+- Phase 4.1 is the final NO-LIVE release qualification gate.
+- Do not add broad new product features unless required to fix a stress/consistency defect.
+- Goal is to prove the system is internally coherent, resumable, failure-tolerant, scalable, and safe enough to begin a small real Shopify pilot.
+
+ABSOLUTE RULE:
+During Phase 4.1 there must be ZERO real:
+- Amazon execution
+- Shopify mutation
+- Shopify theme write
+- Shopify page/policy write
+- Spark upload
+- paid OpenAI image call
+- checkout/order/payment
+- shipping/tax/payment/domain configuration change
+
+All external systems must be fake/mock/synthetic/local fixtures.
+
+======================================================================
+0. RELEASE GATE
+======================================================================
+
+Phase 4.1 may only be marked PASS if:
+
+1. all existing unit/integration tests pass
+2. all new consistency tests pass
+3. all required stress profiles pass
+4. crash/restart/resume tests pass
+5. retry/idempotency tests pass
+6. no duplicate remote-intent generation is found
+7. no blocker-status corruption is found
+8. no protected user file is touched
+9. no secret appears in logs/reports
+10. no real network/write occurs
+11. all bugs discovered during the phase are fixed and the FULL suite is rerun after the last fix
+12. main == origin/main
+
+Final status:
+RELEASE_CANDIDATE_PASS
+or
+RELEASE_CANDIDATE_FAIL
+
+Do not use “mostly pass”.
+
+======================================================================
+1. PROTECT USER DATA
+======================================================================
+
+Protected file:
+
+stores/001_cabin_tidy.json
+
+It is an existing dirty user file.
+
+NEVER:
+- reset
+- restore
+- checkout
+- clean
+- stage
+- commit
+- overwrite
+- normalize
+
+Production DB:
+read only only if absolutely needed for schema inspection.
+Stress tests must use temporary/synthetic databases.
+
+Do not mutate:
+- live campaigns
+- Store Decisions
+- Shopify credentials
+- Spark datasets
+- browser extension runtime state
+
+======================================================================
+2. FIRST: INVENTORY CURRENT SYSTEM
+======================================================================
+
+Before stress testing, build an architecture/test inventory.
+
+Identify:
+- DB schema/migrations
+- repositories/services
+- Phase 3.1–4.0 stage graph
+- StoreBuild checkpoint model
+- StoreCompletionPlan
+- Shopify product sync
+- collection sync
+- navigation sync
+- homepage/theme sync
+- brand/image flows
+- reporting/export
+- local bridge/browser extension boundaries
+- Spark fallback
+- credential handling
+- UI callbacks
+
+Create:
+docs/PHASE_4_1_STRESS_TEST_PLAN.md
+
+The plan must map each critical component to:
+- normal test
+- scale test
+- failure injection
+- resume test
+- idempotency test
+- data-integrity invariant
+
+======================================================================
+3. STATIC CODE CONSISTENCY AUDIT
+======================================================================
+
+Search for and review:
+
+- TODO
+- FIXME
+- XXX
+- NotImplementedError
+- placeholder implementations
+- dead callbacks
+- unreachable UI actions
+- duplicated status enums
+- duplicated safe-status lists
+- inconsistent API version strings
+- inconsistent Shopify scope names
+- duplicated theme mutation logic
+- inconsistent path handling
+- broad bare except
+- swallowed exceptions
+- mutable default arguments
+- unbounded retry loops
+- unbounded list accumulation
+- unbounded UI rendering
+- accidental real-network test code
+- secret logging
+- hardcoded Cabin Tidy production logic
+- hardcoded absolute user-specific paths outside intended repo/runtime config
+
+Do not mechanically remove legitimate TODO comments.
+Classify findings:
+CRITICAL
+HIGH
+MEDIUM
+LOW
+EXPECTED
+
+Fix CRITICAL/HIGH.
+Fix MEDIUM if directly relevant to release safety.
+Document intentional LOW/EXPECTED.
+
+======================================================================
+4. DATA MODEL / ENUM CONSISTENCY
+======================================================================
+
+Verify one authoritative meaning for cross-module states.
+
+Check at minimum:
+
+Store Decisions:
+PRIMARY
+RESERVE_A
+RESERVE_B
+RESERVE_C
+LOW_RESERVE
+HIGH_RESERVE
+REVIEW
+RESTRICTED
+ARCHIVED
+
+Run/stage states:
+PENDING
+RUNNING
+COMPLETE
+COMPLETE_WITH_WARNINGS
+PAUSED
+FAILED
+MANUAL_ACTION_REQUIRED
+SKIPPED
+
+Preview actions:
+CREATE
+UPDATE
+MOVE
+NO_CHANGE
+CONFLICT
+SKIP
+and module-specific equivalents
+
+Completion states:
+VERIFIED
+MANUAL_ACTION_REQUIRED
+BLOCKED
+
+Detect:
+- spelling drift
+- semantic mismatch
+- one module treating RESTRICTED as safe
+- one module falsely treating MANUAL_ACTION_REQUIRED as COMPLETE
+- inconsistent source-of-truth lists
+
+Centralize only where safe.
+Do not perform a giant risky refactor merely for style.
+
+======================================================================
+5. DB SCHEMA / MIGRATION CONSISTENCY
+======================================================================
+
+Test from:
+
+A. fresh empty DB
+B. DB representing older pre-Phase-3 schema
+C. DB representing Phase 3.5-era schema
+D. DB representing Phase 3.9-era schema
+E. current schema
+
+Required:
+- app startup works
+- migrations are deterministic
+- repeated migration is idempotent
+- no table/data destructive reset
+- expected indexes exist
+- foreign-key/reference integrity is valid where enforced
+- checkpoint rows survive migration
+- StoreCompletion data can coexist with previous phase data
+
+Add migration tests/fixtures as needed.
+
+If the project does not use formal numbered migrations, test whatever schema-initialization/upgrade mechanism actually exists.
+
+======================================================================
+6. FULL END-TO-END SYNTHETIC STORE SIMULATION
+======================================================================
+
+Create a realistic synthetic complete-store fixture.
+
+Minimum standard profile:
+
+Store:
+1
+
+Products:
+10,000
+
+Collections:
+12
+
+Navigation:
+main + mega menu + footer
+
+Brand:
+complete
+
+Homepage:
+hero + category shortcuts + featured collections
+
+Pages:
+About/Contact/FAQ/Shipping/Returns/Policies
+
+Commerce readiness:
+mixed but configurable
+
+Run end-to-end through:
+
+Store profile
+→ sourcing-plan input fixture
+→ MASTER/store decisions
+→ DIRECT_SHOPIFY preview with mocked Shopify
+→ product queue/checkpoint
+→ collection plan
+→ collection sync preview
+→ brand plan/assets metadata
+→ navigation plan
+→ homepage plan
+→ StoreCompletionPlan
+→ readiness report
+
+No real APIs.
+
+Validate exact counts at every stage.
+
+======================================================================
+7. SCALE PROFILES
+======================================================================
+
+Implement reusable stress profiles, not one-off test scripts.
+
+A. SMALL
+- 100 products
+- 5 collections
+
+B. MEDIUM
+- 2,000 products
+- 8 collections
+
+C. LARGE
+- 10,000 products
+- 15 collections
+
+D. MASSIVE
+- 50,000 products
+- 30 collections
+
+Mandatory local qualification:
+SMALL
+MEDIUM
+LARGE
+MASSIVE
+
+Do not render all 50,000 product rows into NiceGUI.
+
+For MASSIVE:
+test service/data path and paginated/summary UI model.
+
+======================================================================
+8. LONG-TERM MULTI-STORE SCALE
+======================================================================
+
+The project target is 100–200 sister stores.
+
+Simulate at least:
+
+Scenario A:
+10 stores × 2,000 products
+
+Scenario B:
+50 stores × 1,000 products
+
+Scenario C:
+200 store profiles/plans × 100 products each
+
+The purpose is NOT to materialize 200 full UIs at once.
+Test:
+- store isolation
+- plan isolation
+- ID uniqueness
+- DB query correctness
+- report path isolation
+- no cross-store product decisions
+- no cross-store collection mappings
+- no cross-store Shopify IDs
+- no cross-store image/brand asset leakage
+
+Add explicit cross-store contamination tests.
+
+======================================================================
+9. PERFORMANCE / MEMORY MEASUREMENT
+======================================================================
+
+Create a benchmark harness.
+
+Suggested:
+scripts/stress_phase_4_1.py
+or equivalent project-appropriate location.
+
+Measure:
+- elapsed time per stage
+- products/sec where meaningful
+- peak Python memory where measurable
+- DB row/query growth
+- report generation time
+- output file size
+
+Use:
+- time.perf_counter
+- tracemalloc and/or psutil if already/appropriately available
+
+Do not introduce a heavy dependency solely for pretty metrics.
+
+Record baselines in:
+artifacts/stress or temp output
+but do NOT commit large generated datasets/reports.
+
+Committed documentation may contain summary thresholds/results only.
+
+Avoid arbitrary “must finish in X seconds” across all machines.
+Use safety/regression thresholds:
+- no obvious O(N²) explosion
+- MASSIVE completes within practical local test budget
+- memory scales approximately linearly/sublinearly
+- UI path does not attempt to materialize entire dataset
+
+If runtime is excessive, profile and fix.
+
+======================================================================
+10. DB QUERY / N+1 AUDIT
+======================================================================
+
+For:
+- product sync preview
+- collection matching
+- navigation planning
+- completion inspection
+- broken-link inspection
+- report generation
+
+Measure/query-count where feasible.
+
+Detect obvious N+1 patterns that make 10k/50k unusable.
+
+Optimize with:
+- batch reads
+- indexes
+- streaming/pagination
+- bulk lookup maps
+
+Do not sacrifice correctness for micro-optimization.
+
+======================================================================
+11. CHECKPOINT / CRASH / RESUME MATRIX
+======================================================================
+
+For each resumable StoreBuild stage, simulate process interruption AFTER durable checkpoint.
+
+At minimum interruption around:
+
+SOURCING
+PRODUCT_SYNC
+PRODUCT_VERIFY
+COLLECTION_PLAN
+COLLECTION_SYNC
+NAVIGATION_SYNC
+HOMEPAGE_PLAN
+HOMEPAGE_SYNC
+STATIC_PAGES
+POLICIES
+FOOTER
+SEO
+QUALITY_AUDIT
+COMMERCE_READINESS
+FINAL_VERIFY
+
+Simulate:
+- abrupt exception
+- app restart/new service instance
+- reload DB
+- resume
+
+Verify:
+- completed work not duplicated
+- failed item retained
+- current stage correct
+- retry count sane
+- no false COMPLETE
+- report final counts correct
+
+Create table-driven resume tests.
+
+======================================================================
+12. PAUSE / CONTINUE / CANCEL-LIKE SAFETY
+======================================================================
+
+Where the system supports pause/continue:
+test pause during batch boundaries.
+
+If explicit cancel exists:
+test safe status persistence.
+
+If cancel does not exist:
+do not invent broad new cancel feature unless needed for safety.
+
+Verify app restart after PAUSED preserves resume capability.
+
+======================================================================
+13. IDEMPOTENCY MATRIX
+======================================================================
+
+Repeat same exact full synthetic run:
+
+2 times
+5 times
+
+Verify:
+- no duplicate product mapping
+- no duplicate collection
+- no duplicate menu Shop branch
+- no duplicate mega-menu block
+- no duplicate hero
+- no duplicate category shortcut section
+- no duplicate footer managed links
+- no duplicate static page
+- no duplicate report entity mapping
+- no state regression
+
+Expected second-run actions should predominantly become:
+NO_CHANGE
+or verified equivalent.
+
+======================================================================
+14. STALE PREVIEW MATRIX
+======================================================================
+
+For every preview-gated subsystem:
+
+Products
+Collections
+Navigation
+Brand apply
+Homepage
+Footer/pages if preview-gated
+Completion safe apply
+
+Generate preview, then mutate INPUT FIXTURE only:
+- product data
+- collection plan
+- brand asset
+- menu target
+- theme version
+- Shopify mocked remote hash
+- page copy
+
+Verify stale preview is rejected before write.
+
+No stale preview may silently execute.
+
+======================================================================
+15. SHOPIFY GRAPHQL FAILURE INJECTION
+======================================================================
+
+Mock failures:
+
+- HTTP timeout
+- connection reset
+- 429/throttle
+- GraphQL top-level errors
+- mutation userErrors
+- partial batch success
+- malformed/missing field
+- pagination interrupted
+- remote entity deleted
+- remote handle conflict
+- stale remote version/drift
+- scope missing
+- token absent
+- publication missing
+
+Verify:
+- bounded retries
+- backoff path
+- retry only transient failures
+- permanent userErrors not endlessly retried
+- one item failure does not abort unrelated items where isolation is expected
+- checkpoint is durable
+- final counts correct
+- secret never logged
+
+======================================================================
+16. RATE LIMIT / THROTTLE SIMULATION
+======================================================================
+
+Simulate Shopify throttle metadata / 429 behavior.
+
+Verify:
+- respects retry-after/cost information when adapter supports it
+- bounded exponential backoff
+- no busy-loop
+- no duplicate mutation from retry ambiguity
+- safe resume after exhaustion
+
+Tests must use mocked time/sleep where practical so suite is not slow.
+
+======================================================================
+17. IMAGE PROVIDER FAILURE INJECTION
+======================================================================
+
+For OPENAI_IMAGES mock:
+
+- missing key
+- opt-in false
+- timeout
+- provider error
+- malformed payload
+- invalid file bytes
+- unsupported dimensions
+- partial category-image batch failure
+
+Verify:
+- no paid call without opt-in
+- no secret logging
+- one failure isolated
+- manual fallback available
+- asset approval still required
+- generated status not falsely APPROVED
+
+======================================================================
+18. THEME SCHEMA VARIATION / FUZZ TESTS
+======================================================================
+
+Create a theme-schema fixture matrix.
+
+At least:
+1. Dawn-like
+2. renamed settings IDs with equivalent labels
+3. hero available, no collection-list
+4. collection-list available, no hero
+5. dropdown navigation only
+6. mega-menu block by parent label
+7. mega-menu by menu reference
+8. logo/favicon unknown mapping
+9. missing settings_schema
+10. malformed section schema
+11. extra unrelated sections
+12. manually drifted ShopSource-managed section
+
+Verify:
+- high-confidence only when justified
+- no invented setting IDs
+- unknown becomes MANUAL_ACTION_REQUIRED
+- unrelated theme config preserved
+- minimal patch
+- rollback data created
+- no false COMPLETE
+
+Add light schema fuzzing:
+- optional/missing keys
+- reordered keys
+- unknown setting types
+- extra fields
+
+No need for randomized non-deterministic tests; use deterministic fixture permutations.
+
+======================================================================
+19. BROKEN-LINK GRAPH STRESS
+======================================================================
+
+Synthetic:
+- 10k products
+- 30 collections
+- 500 internal links
+- valid targets
+- stale handles
+- duplicates
+- placeholder #
+- blanks
+- missing remote IDs
+- intentional shared legal links
+
+Verify:
+- correct classifications
+- no false duplicate warnings for legitimately shared targets
+- performance acceptable
+- deterministic output ordering
+
+======================================================================
+20. COLLECTION MATCHING STRESS
+======================================================================
+
+For 50,000 synthetic product titles and 30 collection rule sets:
+- title fallback
+- tag preferred
+- mixed
+- overlap
+- zero match
+- overly broad rule
+- unicode/punctuation/case variants
+
+Verify:
+- deterministic counts
+- no accidental product loss
+- no O(N×M×expensive regex) catastrophe
+- broad-rule warnings
+- stable sampling of preview items
+
+======================================================================
+21. PRODUCT SYNC PAYLOAD SAFETY STRESS
+======================================================================
+
+Generate products with:
+- single variant
+- multiple variants
+- missing price
+- zero price
+- negative price
+- long title
+- unicode title
+- duplicate titles / distinct ASIN
+- same ASIN / repeated occurrence
+- missing brand
+- missing media
+- many tags
+- merchant-owned tags
+- restricted/archived status
+
+Verify:
+- identity uses source/store ID, never title only
+- RESTRICTED/ARCHIVED never sync
+- Amazon source price never silently becomes selling price
+- merchant tags preserved
+- productSet list fields never accidentally cleared
+- multi-variant unsupported cases SKIP safely
+- no duplicate mapping
+
+======================================================================
+22. REPORT GENERATION STRESS
+======================================================================
+
+For MASSIVE dataset:
+generate:
+- store build report
+- completion report
+- blockers/manual/warnings
+
+Verify:
+- streaming or memory-safe approach
+- valid JSON
+- deterministic counts
+- no secrets
+- no token-like fixture leaked
+- paths safe on Windows
+- report names unique per store/run
+
+======================================================================
+23. WINDOWS FILESYSTEM ROBUSTNESS
+======================================================================
+
+Project runs on Windows.
+
+Test/handle:
+- long-ish paths
+- spaces
+- Korean Unicode filenames/paths
+- existing directories
+- read-only/permission denied temp path
+- atomic rename failure
+- partially written report
+- stale temp file
+
+The user previously encountered:
+warning: could not open directory '.pytest_tmp/': Permission denied
+
+Do not blindly delete user/system directories.
+Make test temp/cache paths configurable and resilient.
+If pytest cache/temp warning is harmless, document it; if project-created, fix cleanup/permissions safely.
+
+======================================================================
+24. DB LOCK / CONCURRENCY SIMULATION
+======================================================================
+
+If SQLite/current DB supports concurrent accesses:
+simulate multiple readers + limited writers appropriate to architecture.
+
+Test:
+- two store plans generated concurrently/sequentially interleaved
+- checkpoint update while report reader runs
+- no cross-store lock-induced data corruption
+
+Do not design unsupported high-write concurrency if app is fundamentally single-process.
+Goal is graceful behavior, bounded retry or clear failure.
+
+======================================================================
+25. UI SCALE SAFETY
+======================================================================
+
+NiceGUI UI must not try to render 10k/50k cards.
+
+Verify:
+- summary counts
+- pagination/limited previews
+- maximum preview rows
+- expandable details
+- no huge synchronous HTML string
+- progress updates bounded
+
+Synthetic UI/service tests should confirm row caps.
+
+Do not attempt a 50k-row visual browser rendering test.
+
+======================================================================
+26. STATUS / PROGRESS CONSISTENCY
+======================================================================
+
+Inject combinations:
+- one product failed but stage mostly complete
+- image failures
+- collection conflict
+- navigation manual gate
+- theme manual gate
+- payment blocker
+- shipping blocker
+
+Verify:
+- COMPLETE_WITH_WARNINGS vs FAILED is correct
+- MANUAL_ACTION_REQUIRED not shown as COMPLETE
+- READY score does not hide blockers
+- final report and UI agree on counts/status
+
+Create cross-layer invariant tests:
+DB state == service summary == UI summary model == report summary.
+
+======================================================================
+27. SECURITY / SECRET REDACTION
+======================================================================
+
+Use synthetic tokens shaped like:
+- Shopify access token
+- OpenAI API key
+- bearer token
+- cookie-like string
+
+Pass them through:
+- exceptions
+- GraphQL errors
+- reports
+- logs
+- UI error text
+
+Verify all are redacted.
+
+Also verify:
+- credentials never stored in DB plaintext
+- credential lookup failure safe
+- no browser cookie/session extraction added
+- no secret in git diff
+
+======================================================================
+28. NETWORK KILL SWITCH TEST
+======================================================================
+
+Add/confirm a test-mode guard that makes accidental real network use fail immediately.
+
+For the Phase 4.1 suite:
+any unmocked outbound network attempt should fail the test.
+
+Do this using project-appropriate monkeypatch/socket/HTTP adapter guards.
+
+Do not break normal production network code.
+
+======================================================================
+29. DETERMINISM
+======================================================================
+
+Run key planners repeatedly with same input:
+- sourcing plan where deterministic
+- collection plan
+- brand prompt plan
+- navigation plan
+- homepage plan
+- completion plan
+
+Verify stable ordering/keys/hashes.
+
+Random selection must not affect production decisions unless explicitly seeded and documented.
+
+======================================================================
+30. FULL STORE REPEAT SIMULATION
+======================================================================
+
+Run the full STANDARD synthetic store build three times against same synthetic remote state:
+
+Run 1:
+mostly CREATE
+
+Run 2:
+mostly NO_CHANGE
+
+Then mutate:
+- 5 products
+- 1 collection title
+- 1 menu order
+- hero copy
+- 1 footer link
+
+Run 3:
+only expected UPDATE/MOVE actions
+
+Verify no unrelated changes.
+
+======================================================================
+31. FAILURE RECOVERY SOAK
+======================================================================
+
+Create a deterministic soak simulation:
+- 10,000 products
+- injected transient failure every N mocked operations
+- process/service recreation at selected checkpoints
+- retry failed only
+
+Run enough iterations to exercise:
+- retry
+- checkpoint
+- resume
+- completion reporting
+
+Keep runtime practical.
+Do not use real sleeps.
+
+======================================================================
+32. FULL TEST SUITE POLICY
+======================================================================
+
+Workflow:
+
+A. baseline full suite
+B. Phase 4.1 focused tests
+C. stress profiles
+D. fix defects
+E. rerun focused tests
+F. rerun ALL stress profiles affected by fixes
+G. FINAL full suite after the last code change
+
+No completion report until G passes.
+
+======================================================================
+33. BUG FIX POLICY
+======================================================================
+
+For every discovered defect record:
+
+- ID
+- severity
+- reproduction
+- root cause
+- fix
+- regression test
+- verification
+
+Create:
+docs/PHASE_4_1_DEFECTS.md
+
+Do not hide failing tests by:
+- skipping them
+- loosening assertions without rationale
+- increasing timeout blindly
+- reducing test scale below requirement
+- swallowing exceptions
+
+A skip is allowed only for a genuinely platform-dependent condition and must be documented.
+
+======================================================================
+34. STRESS REPORT
+======================================================================
+
+Generate:
+docs/PHASE_4_1_STRESS_RESULTS.md
+
+Committed summary may contain:
+- machine-independent test profile
+- dataset sizes
+- pass/fail
+- elapsed timings
+- peak-memory observations
+- defects fixed
+- known limitations
+- release candidate verdict
+
+Do not commit giant raw stress outputs.
+
+Raw local output:
+exports/stress_reports/<run_id>/
+or temp equivalent
+
+Include:
+summary.json
+timings.json
+failures.json
+invariants.json
+
+No secrets.
+
+======================================================================
+35. RELEASE CANDIDATE MANIFEST
+======================================================================
+
+Create:
+docs/RELEASE_CANDIDATE_4_1.md
+
+Include:
+- baseline SHA
+- final SHA
+- Python/version dependency context
+- total normal tests
+- stress profiles passed
+- known skipped tests and reason
+- known non-blocking limitations
+- manual gates still expected in Phase 4.2
+- explicit:
+  REAL SHOPIFY WRITE TESTED = NO
+  REAL AMAZON EXECUTION TESTED = NO
+  REAL PAYMENT TESTED = NO
+
+Verdict:
+RELEASE_CANDIDATE_PASS
+or FAIL
+
+======================================================================
+36. TEST IMPLEMENTATION FILES
+======================================================================
+
+Use project-appropriate structure, e.g.:
+
+tests/stress/
+  test_scale_profiles.py
+  test_failure_injection.py
+  test_resume_matrix.py
+  test_theme_matrix.py
+  test_multi_store_isolation.py
+  test_security_redaction.py
+  test_completion_invariants.py
+
+scripts/
+  stress_phase_4_1.py
+
+Do not require manual editing to run standard profile.
+
+Suggested CLI:
+python scripts/stress_phase_4_1.py --profile standard
+python scripts/stress_phase_4_1.py --profile massive
+
+If adding CLI commands fits existing CLI architecture, okay, but do not overcomplicate.
+
+======================================================================
+37. REQUIRED MINIMUM NEW TESTS
+======================================================================
+
+At minimum include tests for:
+
+test_50k_completion_plan
+test_50k_collection_matching
+test_10k_product_sync_preview
+test_multi_store_200_isolation
+test_cross_store_remote_id_never_leaks
+test_full_store_second_run_idempotent
+test_full_store_targeted_change_only_updates_target
+test_resume_every_major_stage
+test_transient_failure_retry_bounded
+test_permanent_user_error_not_retried_forever
+test_stale_preview_all_mutating_modules
+test_shopify_throttle_backoff_mocked
+test_partial_batch_failure_isolated
+test_theme_schema_matrix
+test_theme_malformed_manual_fallback
+test_broken_link_graph_large
+test_report_massive_memory_safe
+test_windows_unicode_paths
+test_permission_denied_temp_path_safe
+test_ui_preview_rows_capped
+test_status_db_ui_report_consistent
+test_secrets_redacted_from_all_outputs
+test_unmocked_network_fails_test
+test_protected_store_file_untouched
+
+All existing tests must remain green.
+
+======================================================================
+38. PRACTICAL PERFORMANCE ACCEPTANCE
+======================================================================
+
+Do not hardcode unrealistic machine-specific millisecond limits.
+
+But fail/flag if any of these occur:
+- clear O(N²) runaway at 50k
+- memory explosion that risks ordinary desktop operation
+- UI attempts full 50k render
+- report generation duplicates entire catalog multiple times unnecessarily
+- DB query count scales catastrophically
+- standard profile cannot finish in practical local-development time
+- infinite/busy retry
+- checkpoint resume duplicates completed writes/intents
+
+Record observed timings rather than pretending universal SLA.
+
+======================================================================
+39. QUALITY GATE
+======================================================================
+
+Run:
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Then Phase 4.1 stress harness:
+standard
+massive
+
+Run final full pytest AFTER final fix.
+
+======================================================================
+40. COMMIT / PUSH
+======================================================================
+
+Do not commit:
+stores/001_cabin_tidy.json
+production DB
+raw stress datasets
+raw huge reports
+runtime exports
+credentials
+generated media
+browser session data
+
+Code/tests/docs only.
+
+Preferred final commit:
+git commit -m "Qualify store builder with stress tests"
+
+If multiple bug-fix commits are useful during work, acceptable.
+Final branch must be clean except protected dirty store file.
+
+Push:
+git push origin main
+
+Final:
+git rev-list --left-right --count main...origin/main
+must be:
+0 0
+
+======================================================================
+41. FINAL COMPLETION REPORT
+======================================================================
+
+Report exactly:
+
+[1] baseline SHA
+[2] final SHA
+[3] baseline normal tests
+[4] final normal tests
+[5] Phase 4.1 new test count
+[6] SMALL/MEDIUM/LARGE/MASSIVE results
+[7] 50k timing/memory observations
+[8] multi-store isolation results
+[9] DB/migration findings
+[10] idempotency results
+[11] crash/resume matrix
+[12] failure injection results
+[13] theme schema matrix
+[14] broken-link/collection stress
+[15] security/redaction/network-kill-switch
+[16] UI scale safety
+[17] defects found and fixed by severity
+[18] known limitations remaining
+[19] protected file state
+[20] commit/push state
+[21] RELEASE_CANDIDATE_PASS or FAIL
+[22] exact prerequisites before Phase 4.2 Cabin Tidy live pilot
+
+If FAIL:
+do not proceed to Phase 4.2.
+Fix blockers and rerun Phase 4.1.
+
+If PASS:
+do not perform Phase 4.2 automatically.
+Wait for user approval for real Shopify testing.
+
+Implement and execute Phase 4.1 now.
