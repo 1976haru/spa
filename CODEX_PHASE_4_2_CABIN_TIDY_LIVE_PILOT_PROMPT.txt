@@ -1,0 +1,762 @@
+ShopSource Studio — Phase 4.2
+CABIN TIDY CONTROLLED LIVE PILOT
+Real Shopify Read/Write Validation With Small, Reversible Gates
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+- Baseline: 4d5cd4f13bf53d4539d16e994635a21bbe04bf37
+
+Context
+- Phase 4.0 Store Completion Master: COMPLETE
+- Phase 4.1 Full consistency/stress qualification: RELEASE_CANDIDATE_PASS
+- Final Phase 4.1 suite: 502 passed, 1 skipped
+- Standard + MASSIVE harness: PASS
+- 50k and 200-store isolation: PASS
+- Real Shopify write tested so far: NO
+- Real Amazon execution tested so far: NO
+- Real payment/checkout tested so far: NO
+
+Goal
+Perform the FIRST controlled real Shopify validation for Store 001 | Cabin Tidy.
+
+This phase is NOT a mass rollout.
+It must use small, explicit, reversible gates.
+
+The default path is:
+READ-ONLY PREFLIGHT
+→ 10 DRAFT PRODUCTS
+→ REMOTE VERIFY
+→ SMALL COLLECTION PILOT
+→ NAVIGATION PILOT
+→ BRAND/HOMEPAGE VERIFY/APPLY ONLY WHEN SAFE
+→ FINAL LIVE PILOT REPORT
+
+DO NOT:
+- run a 2,000+ product live batch
+- publish products ACTIVE by default
+- perform real payment
+- create real order
+- alter tax rules
+- alter shipping rates automatically
+- change domain
+- disable storefront password automatically
+- delete products/collections/pages/theme data
+- run live Amazon sourcing unless separately approved
+- change business/legal policy facts without user input
+
+======================================================================
+0. HARD SAFETY RULES
+======================================================================
+
+Protected file:
+stores/001_cabin_tidy.json
+
+NEVER:
+- reset
+- restore
+- checkout
+- clean
+- stage
+- commit
+- overwrite
+
+No secret output:
+- Shopify token
+- OpenAI key
+- cookie/session data
+- bearer values
+
+No browser cookie extraction or undocumented auth.
+
+All destructive actions are prohibited.
+
+If any gate fails:
+STOP
+persist state
+report exact failure
+do not continue automatically.
+
+======================================================================
+1. LIVE PILOT RUN MODEL
+======================================================================
+
+Create/Reuse a persisted run:
+
+run type:
+CABIN_TIDY_LIVE_PILOT
+
+States:
+PREFLIGHT
+PRODUCT_PREVIEW
+PRODUCT_WRITE
+PRODUCT_VERIFY
+COLLECTION_PREVIEW
+COLLECTION_WRITE
+COLLECTION_VERIFY
+NAVIGATION_PREVIEW
+NAVIGATION_WRITE
+NAVIGATION_VERIFY
+BRAND_THEME_PREVIEW
+BRAND_THEME_APPLY
+HOMEPAGE_PREVIEW
+HOMEPAGE_APPLY
+HOMEPAGE_VERIFY
+COMPLETION_CHECK
+DONE
+STOPPED
+FAILED
+MANUAL_ACTION_REQUIRED
+
+Persist:
+- run_id
+- gate
+- remote IDs
+- before hashes
+- after hashes
+- counts
+- user confirmation timestamps/flags
+- errors
+- rollback metadata
+
+======================================================================
+2. GATE A — READ-ONLY PREFLIGHT
+======================================================================
+
+Before ANY real write, perform read-only checks.
+
+Verify:
+- Store selected = 001 | Cabin Tidy
+- Shopify domain matches intended store
+- API version matches current project-supported version
+- credential exists
+- token works
+- required scopes for product pilot
+- current publication metadata
+- current main menu
+- current published theme
+- current logo/favicon/theme state
+- current collections
+- current product count
+- target market/currency read-only status when available
+- no stale local preview
+- no unresolved critical StoreCompletion blocker that would make even a DRAFT pilot unsafe
+
+Minimum product-pilot scopes:
+- read_products
+- write_products
+
+Later collection/navigation/theme scopes are checked separately before those gates.
+
+Show a read-only Preflight summary in Korean.
+
+Do not write anything during this gate.
+
+Required explicit user decision:
+[파일럿 계속]
+or
+[중단]
+
+======================================================================
+3. GATE B — SELECT EXACTLY 10 SAFE PRODUCTS
+======================================================================
+
+Use existing Phase 3.6 controlled pilot selector.
+
+Default:
+10 products
+Maximum:
+10 for this Phase 4.2 first live run
+Do not silently expand to 20.
+
+Eligibility:
+PRIMARY
+RESERVE_A
+RESERVE_B
+RESERVE_C
+LOW_RESERVE
+HIGH_RESERVE
+REVIEW
+
+Exclude:
+RESTRICTED
+ARCHIVED
+
+Prioritize:
+- explicit valid Shopify selling price
+- source ID / ASIN
+- title
+- simple/supported variant structure
+- no remote conflict
+- no missing required identity fields
+
+Deterministic selection.
+
+Show exact 10-row preview:
+- source ID
+- title
+- ShopSource selling price
+- currency
+- action CREATE/UPDATE/NO_CHANGE/CONFLICT/SKIP
+- tags
+- variant mode
+- media mode
+- warnings
+
+If fewer than 5 are safely writable:
+STOP and report.
+Do not lower safety checks.
+
+======================================================================
+4. PRODUCT WRITE POLICY
+======================================================================
+
+First real pilot product state:
+DRAFT only.
+
+Do not publish ACTIVE.
+
+First pass media:
+OFF by default.
+
+First pass inventory:
+UNMANAGED unless current verified strategy safely manages it.
+
+Write only fields already defined as ShopSource-owned by Phase 3.5/3.6.
+
+Never use Amazon source price as selling price.
+
+No price:
+SKIP.
+
+No automatic deletion.
+
+No unsupported multi-variant flattening.
+
+Before product write:
+explicit confirmation dialog:
+
+"Cabin Tidy에 최대 10개의 DRAFT 상품을 실제 생성/수정합니다. 실제 Shopify 변경이 발생합니다."
+
+Require explicit confirmation.
+
+======================================================================
+5. GATE C — REAL PRODUCT WRITE
+======================================================================
+
+Execute only confirmed CREATE/UPDATE items.
+
+Per item:
+- perform mutation
+- inspect GraphQL errors/userErrors
+- persist remote product ID
+- persist variant mapping
+- checkpoint immediately after durable success
+
+If one item fails:
+continue independent items where safe,
+but record failure.
+
+No infinite retries.
+
+Use existing bounded retry/backoff logic.
+
+If credential/scope/drift changes:
+STOP.
+
+======================================================================
+6. GATE D — REMOTE PRODUCT VERIFICATION
+======================================================================
+
+After write, re-fetch each touched product.
+
+Verify at minimum:
+- remote product exists
+- Shopify product ID matches local mapping
+- title expected
+- DRAFT status
+- expected selling price
+- ShopSource owned tags present
+- merchant tags preserved
+- expected variant mapping
+- no duplicate mapping for same source/store identity
+
+Status:
+VERIFIED
+VERIFY_FAILED
+
+Do not treat mutation response alone as success.
+
+If any duplicate or identity mismatch appears:
+STOP before collection/navigation/theme writes.
+
+Generate a product pilot summary.
+
+======================================================================
+7. OPTIONAL PRODUCT MEDIA SECOND PASS
+======================================================================
+
+Do NOT automatically enable.
+
+Only if product identity/price verification is clean and the user explicitly opts in.
+
+Media rights status must be:
+RIGHTS_CONFIRMED
+or GENERATED
+or approved MANUAL
+
+RIGHTS_REVIEW_REQUIRED:
+do not upload automatically.
+
+This optional second pass may be deferred entirely until later.
+
+======================================================================
+8. GATE E — COLLECTION PILOT
+======================================================================
+
+After verified products exist:
+
+Use Phase 3.2/3.3 collection plan.
+
+For first live collection pilot:
+maximum 3 collections.
+
+Prefer collections that have verified pilot products.
+
+Use TAG_PREFERRED for DIRECT_SHOPIFY pilot products.
+
+Preview:
+- collection title
+- rules
+- expected verified pilot matches
+- action
+- image status
+- publication intent
+
+Do not create empty live collections merely to satisfy a count.
+
+Explicit confirmation required before real collection writes.
+
+======================================================================
+9. COLLECTION WRITE / VERIFY
+======================================================================
+
+Real collection pilot:
+maximum 3 collections.
+
+Do not delete existing collection.
+
+After create/update:
+re-fetch and verify:
+- collection ID
+- title
+- rule/source mapping
+- pilot product inclusion expectation
+- publication status only if user explicitly enabled publish
+
+If current existing manual Trunk Organizers collection conflicts:
+show CONFLICT or safe adoption path.
+Do not duplicate it blindly.
+
+======================================================================
+10. GATE F — NAVIGATION PILOT
+======================================================================
+
+Use Phase 3.8.
+
+Before live navigation write:
+check scopes:
+- read_online_store_navigation
+- write_online_store_navigation
+
+Preview only the ShopSource-managed Shop branch.
+
+For first live pilot:
+- preserve Home and all unrelated menu entries
+- link only collections that actually exist remotely
+- do NOT keep assignment placeholder links where different labels point to Trunk Organizers
+- missing collection child = SKIP
+
+Explicit confirmation required.
+
+After write:
+re-fetch and verify tree.
+
+No deletion of unrelated merchant menu items.
+
+======================================================================
+11. BRAND / LOGO / FAVICON LIVE BEHAVIOR
+======================================================================
+
+The user already manually completed the logo/favicon assignment.
+
+Therefore Phase 4.2 should first READ and inspect current theme/store state.
+
+If existing logo/favicon are already correctly applied:
+mark:
+EXISTING_VERIFIED
+or
+APPLIED_NOT_RENDER_VERIFIED
+
+Do NOT re-upload/replace them automatically.
+
+Only propose a write if:
+- user selects approved managed asset
+- current mapping high confidence
+- explicit confirmation
+- required theme capability exists
+
+Otherwise:
+MANUAL_ACTION_REQUIRED
+or NO_CHANGE.
+
+======================================================================
+12. HOMEPAGE PILOT
+======================================================================
+
+Use Phase 3.9 plan.
+
+First live homepage scope should be small:
+
+A. Hero banner
+B. Category shortcuts
+
+Do NOT also rewrite every homepage section.
+
+Preview:
+- current theme/homepage hash
+- hero proposed copy
+- CTA target
+- hero image state
+- category shortcut collection targets
+- proposed minimal diff
+- unrelated sections unchanged
+
+If required hero/category images are not approved:
+STOP at preview/manual asset gate.
+
+If theme mapping is not HIGH confidence:
+MANUAL_ACTION_REQUIRED.
+
+======================================================================
+13. THEME WRITE GATE
+======================================================================
+
+Before ANY live theme write:
+- create backup
+- verify live published theme ID
+- verify preview is current
+- verify high-confidence schema mapping
+- verify required theme write capability/approval
+- explicit user confirmation
+
+If any requirement missing:
+do NOT write.
+
+Do not automate Theme Editor GUI clicks.
+
+If Shopify theme write is not available:
+generate exact manual instructions and continue final report as:
+MANUAL_ACTION_REQUIRED.
+
+======================================================================
+14. FOOTER / STATIC PAGES / POLICIES IN PHASE 4.2
+======================================================================
+
+Do NOT automatically publish business/legal content with unknown facts.
+
+Phase 4.2 may:
+- generate/read previews
+- inspect existing pages
+- identify missing required business inputs
+- prepare drafts
+
+But no live policy/page write unless:
+- all required business facts are explicitly supplied by user
+- user reviewed the content
+- explicit confirmation is given
+
+Keep launch readiness blocked if required policy/business values remain unresolved.
+
+======================================================================
+15. SHIPPING / TAX / PAYMENT / DOMAIN
+======================================================================
+
+Phase 4.2 is READ-ONLY for:
+- shipping rates/profiles
+- tax settings
+- payment settings
+- domain
+- SSL
+- storefront password/launch state
+
+Do not change them.
+
+Report:
+READY
+NEEDS_REVIEW
+MANUAL_ACTION_REQUIRED
+BLOCKED
+
+No actual payment/order/checkout.
+
+======================================================================
+16. COMPLETION CHECK
+======================================================================
+
+After live pilot gates, run StoreCompletionService against the REAL store state.
+
+Generate:
+- readiness score
+- blockers
+- manual actions
+- warnings
+- verified items
+
+Important:
+This does NOT mean launch approval.
+
+Expected likely blockers may include:
+- shipping business setup
+- payment confirmation
+- tax review
+- policy/business inputs
+- media rights
+- mobile/manual accessibility check
+
+Do not hide these.
+
+======================================================================
+17. LIVE PILOT REPORT
+======================================================================
+
+Create:
+exports/live_pilot_reports/001_cabin_tidy/<run_id>/
+
+Files:
+- preflight.json
+- product_preview.json
+- product_results.json
+- product_verify.json
+- collection_preview.json
+- collection_results.json
+- navigation_preview.json
+- navigation_results.json
+- homepage_preview.json
+- completion_summary.json
+- manual_actions.md
+- rollback_manifest.json
+- summary.md
+
+No secrets.
+
+Summary must distinguish:
+- read-only checks
+- real writes performed
+- writes skipped
+- verified
+- failed
+- manual action required
+
+======================================================================
+18. ROLLBACK POLICY
+======================================================================
+
+No automatic destructive rollback/delete.
+
+Rollback means:
+- restore theme files/settings from backup when safe and explicitly confirmed
+- restore managed menu/theme config if supported
+- revert managed updates where previous value is known and non-destructive
+- products/collections created during pilot are NOT automatically deleted
+
+Provide remote IDs for manual cleanup if user chooses.
+
+No delete mutation during first pilot.
+
+======================================================================
+19. STOP CONDITIONS
+======================================================================
+
+STOP immediately before later gates if:
+- wrong Shopify store/domain
+- auth fails
+- critical scope missing
+- unexpected product duplicate
+- remote identity mismatch
+- Shopify userErrors indicate schema incompatibility
+- preview stale
+- theme drift after preview
+- unexpected unrelated remote mutation
+- secret exposure detected
+- local protected file changed
+- report/checkpoint cannot persist
+
+Persist STOPPED state and exact reason.
+
+======================================================================
+20. TEST BEFORE LIVE BUTTON
+======================================================================
+
+Before enabling live pilot UI action, run:
+
+focused pilot tests
+full pytest
+compileall
+git diff --check
+CLI/UI help
+
+The code implementing Phase 4.2 may be tested with mocks first.
+
+However, the actual real write run is performed only from the existing/UI pilot workflow with explicit user confirmations.
+
+Codex should NOT bypass confirmation by calling production mutation functions directly from ad-hoc scripts.
+
+======================================================================
+21. IMPLEMENTATION SCOPE
+======================================================================
+
+If current code already supports most of Phase 4.2:
+do not rewrite it.
+
+Add only:
+- orchestration/gate wiring
+- live pilot report
+- stop conditions
+- exact limits
+- real-state verification
+- UI clarity
+- regression tests
+
+Prefer reuse of:
+Phase 3.6 pilot
+Phase 3.5 direct publisher
+Phase 3.3 collection publisher
+Phase 3.8 navigation
+Phase 3.7 brand
+Phase 3.9 homepage
+Phase 4.0 completion
+
+======================================================================
+22. REQUIRED TESTS
+======================================================================
+
+All tests use mocks, not real Shopify.
+
+Minimum:
+test_live_pilot_requires_correct_store
+test_live_pilot_preflight_read_only
+test_live_pilot_exact_max_10_products
+test_live_pilot_forces_draft
+test_live_pilot_requires_explicit_confirmation
+test_live_pilot_stops_on_identity_mismatch
+test_live_pilot_verifies_remote_product
+test_live_pilot_collection_max_3
+test_live_pilot_does_not_duplicate_existing_collection
+test_live_pilot_navigation_preserves_unrelated_items
+test_live_pilot_brand_existing_asset_nochange
+test_live_pilot_theme_requires_high_confidence
+test_live_pilot_theme_backup_required
+test_live_pilot_policies_not_written_without_business_input
+test_live_pilot_commerce_settings_read_only
+test_live_pilot_report_no_secrets
+test_live_pilot_no_delete_mutation
+test_live_pilot_stop_condition_persists
+test_live_pilot_protected_file_untouched
+
+All existing tests remain green.
+
+======================================================================
+23. PROTECTED FILE
+======================================================================
+
+stores/001_cabin_tidy.json
+
+NEVER:
+reset
+restore
+checkout
+clean
+stage
+commit
+overwrite
+
+======================================================================
+24. QUALITY GATE
+======================================================================
+
+Before commit:
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+======================================================================
+25. COMMIT / PUSH
+======================================================================
+
+Commit implementation only.
+Do not commit:
+- protected store file
+- production DB
+- live pilot reports
+- secrets
+- credentials
+- theme backups
+- generated media
+
+Suggested commit:
+git commit -m "Add controlled Cabin Tidy live pilot"
+
+Push:
+git push origin main
+
+Confirm:
+git rev-list --left-right --count main...origin/main
+= 0 0
+
+======================================================================
+26. IMPORTANT EXECUTION BOUNDARY
+======================================================================
+
+Codex should IMPLEMENT and VALIDATE the Phase 4.2 live-pilot gates first.
+
+Then report:
+LIVE PILOT UI READY
+
+Do NOT automatically perform the real Shopify write during Codex implementation.
+
+The actual 10-product DRAFT write begins only after the user opens ShopSource and explicitly confirms the live pilot in the UI.
+
+======================================================================
+27. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] baseline SHA
+[2] final SHA
+[3] live-pilot gate architecture
+[4] preflight checks
+[5] exact 10-product limit
+[6] DRAFT enforcement
+[7] remote verification
+[8] collection max-3 pilot
+[9] navigation pilot
+[10] existing brand asset behavior
+[11] homepage/theme safety
+[12] policy/business-data safety
+[13] shipping/tax/payment/domain read-only handling
+[14] report/rollback model
+[15] tests
+[16] protected file
+[17] commit/push
+[18] LIVE PILOT UI READY = YES/NO
+[19] exact buttons the user should click next in Korean
+
+Do not perform the live write automatically.
