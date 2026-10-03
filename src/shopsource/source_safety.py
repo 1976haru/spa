@@ -308,6 +308,37 @@ class SourceSafetyService:
         return {"items":allowed,"counts":{"included":len(allowed),"excluded":sum(excluded.values())},
                 "source_exclusion_counts":excluded,"package_version":"LIVE_SAFE_V2"}
 
+    def beginner_summary(self, store_id):
+        with connect(self.db) as con:
+            total=con.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+            latest=con.execute("SELECT COUNT(*) FROM source_monitoring_state WHERE freshness_status='FRESH'").fetchone()[0]
+            availability={r[0]:r[1] for r in con.execute("SELECT latest_availability,COUNT(*) FROM source_monitoring_state GROUP BY latest_availability")}
+            states={r[0]:r[1] for r in con.execute("SELECT sellability_status,COUNT(*) FROM store_product_sellability WHERE store_id=? GROUP BY sellability_status",(store_id,))}
+            changed=con.execute("SELECT COUNT(*) FROM store_product_sellability WHERE store_id=? AND price_change_amount IS NOT NULL AND price_change_amount!=0",(store_id,)).fetchone()[0]
+        blocked=sum(v for k,v in states.items() if k.startswith("BLOCKED_"))
+        attention=sum(v for k,v in states.items() if k in {"NEEDS_PRICING_POLICY","NEEDS_REVIEW"})
+        return {"targets":total,"fresh":latest,"out_of_stock":availability.get("OUT_OF_STOCK",0),
+                "attention":attention,"price_changed":changed,"blocked":blocked,
+                "sellable":states.get("SELLABLE",0),"recheck":availability.get("UNKNOWN",0)+availability.get("SOURCE_ERROR",0)}
+
+    def result_page(self, store_id, *, page=0, page_size=50, search="", filter_key="ALL"):
+        size=max(1,min(50,int(page_size))); clauses=["s.store_id=?"]; params=[store_id]
+        if search.strip(): clauses.append("(p.asin LIKE ? OR p.title LIKE ?)"); term=f"%{search.strip()}%"; params.extend((term,term))
+        filters={"SELLABLE":"s.sellability_status='SELLABLE'","OOS":"s.source_availability='OUT_OF_STOCK'",
+                 "ATTENTION":"s.sellability_status IN ('NEEDS_PRICING_POLICY','NEEDS_REVIEW','BLOCKED_SOURCE_UNKNOWN')",
+                 "PRICE":"s.price_change_amount IS NOT NULL AND s.price_change_amount!=0","BLOCKED":"s.sellability_status LIKE 'BLOCKED_%'",
+                 "RESTOCK":"m.consecutive_in_stock>=2 AND s.source_availability='IN_STOCK'"}
+        if filter_key in filters: clauses.append(filters[filter_key])
+        where=" AND ".join(clauses)
+        base=""" FROM store_product_sellability s JOIN products p ON p.id=s.product_id
+            LEFT JOIN source_monitoring_state m ON m.product_id=s.product_id"""
+        with connect(self.db) as con:
+            total=con.execute("SELECT COUNT(*)"+base+" WHERE "+where,params).fetchone()[0]
+            rows=[dict(r) for r in con.execute("""SELECT p.title,p.asin,s.source_availability,s.current_source_price,
+                s.freshness_status,s.sellability_status,s.price_change_amount,s.reasons_json,m.last_checked_at,m.consecutive_in_stock"""+
+                base+" WHERE "+where+" ORDER BY p.title,p.asin LIMIT ? OFFSET ?",[*params,size,max(0,int(page))*size])]
+        return {"rows":rows,"total":total,"page":max(0,int(page)),"page_size":size}
+
 
 class SoldOutDiagnosticService:
     """Pure read-only classification; it never infers source OOS from Shopify."""

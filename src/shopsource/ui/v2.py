@@ -41,6 +41,7 @@ from .v2_service import (
     dashboard_data, get_app_setting, list_recent_errors, list_sourcing_runs, list_stores, set_app_settings,
     open_package, product_detail, product_page,
 )
+from .beginner import BEGINNER_NAV_GROUPS, GLOBAL_UI_CSS
 
 NAV_ITEMS = [
     ("/completion", "fact_check", "스토어 완성"),
@@ -140,6 +141,7 @@ class OperatorUI:
     def _page(self, path: str, title: str):
         ui = self.ui
         init_db()
+        ui.add_head_html(GLOBAL_UI_CSS)
         logging.getLogger().setLevel(getattr(logging, str(get_app_setting("log_level", "INFO")).upper(), logging.INFO))
         if get_app_setting("theme", "Light") == "Dark":
             ui.dark_mode().enable()
@@ -147,15 +149,23 @@ class OperatorUI:
             ui.dark_mode().disable()
         ui.colors(primary="#2563eb", secondary="#475569", accent="#14b8a6",
                   positive="#16a34a", negative="#dc2626", warning="#d97706")
-        ui.query("body").classes("bg-slate-50")
+        ui.query("body").classes("bg-slate-50 ss-comfortable")
         with ui.left_drawer(value=True).classes("bg-slate-950 text-white w-64"):
             ui.label("ShopSource Studio").classes("text-xl font-bold px-3 py-5")
             ui.separator().classes("bg-slate-700")
-            for href, icon, label in NAV_ITEMS:
-                ui.link(label, href).classes(
-                    "w-full rounded-lg px-4 py-3 text-slate-200 hover:bg-slate-800"
-                    + (" bg-slate-800" if path == href else "")
-                ).props(f"icon={icon}")
+            for group, entries in BEGINNER_NAV_GROUPS:
+                if len(entries) == 1:
+                    href, icon, label = entries[0]
+                    ui.link(label, href).classes("w-full rounded-lg px-4 py-3 text-slate-200 hover:bg-slate-800" + (" bg-slate-800" if path == href else "")).props(f"icon={icon}")
+                else:
+                    with ui.expansion(group, icon=entries[0][1], value=any(path == x[0] for x in entries)).classes("w-full text-slate-200"):
+                        for href, icon, label in entries:
+                            ui.link(label, href).classes("w-full rounded-lg px-5 py-2 text-slate-200 hover:bg-slate-800" + (" bg-slate-800" if path == href else "")).props(f"icon={icon}")
+            with ui.expansion("전문가 메뉴 보기", icon="settings", value=False).classes("w-full text-slate-300"):
+                beginner_routes={entry[0] for _group,entries in BEGINNER_NAV_GROUPS for entry in entries}
+                for href, icon, label in NAV_ITEMS:
+                    if href not in beginner_routes:
+                        ui.link(label, href).classes("w-full rounded-lg px-5 py-2 text-slate-300 hover:bg-slate-800").props(f"icon={icon}")
         with ui.header().classes("bg-white text-slate-900 border-b border-slate-200 items-center"):
             ui.label(title).classes("text-lg font-semibold")
             ui.space()
@@ -163,7 +173,7 @@ class OperatorUI:
             ui.select(options, value=self.current_store, label="Store").classes("w-64").on_value_change(
                 lambda event: self._set_store(event.value, path)
             )
-        with ui.column().classes("w-full max-w-screen-2xl mx-auto p-6 gap-5"):
+        with ui.column().classes("w-full max-w-[1600px] mx-auto p-6 gap-6"):
             if path == "/completion": self._store_completion()
             elif path == "/source-safety": self._source_safety()
             elif path == "/": self._dashboard()
@@ -186,31 +196,105 @@ class OperatorUI:
 
     def _source_safety(self):
         ui = self.ui
+        from ..automation import WorkflowAutomationService, source_safety_workflow
         from ..source_safety import SourceMonitorService, SourceSafetyService
-        self._heading("소스 재고·가격 안전", "Shopify Sold out과 실제 source 품절을 구분하고 오래된 가격·재고를 차단합니다.")
-        summary = ui.label("아직 Source 안전 검사를 미리보지 않았습니다.").classes("text-lg font-semibold")
-        ui.label("검사는 먼저 대상·batch·예상 token만 보여줍니다. 실제 provider 호출은 자동 시작하지 않습니다.").classes("text-amber-800")
-        details = ui.column().classes("w-full")
+        self._heading("소스 재고·가격 안전", "Amazon/source 재고와 가격을 확인하고 Shopify 판매 위험을 자동으로 막습니다.")
+        safety=SourceSafetyService(); monitor=SourceMonitorService(); automation=WorkflowAutomationService()
+        state={"run_id":None,"preview":None,"filter":"ALL","page":0}
+        mode=ui.toggle({"AUTO":"자동","REVIEW":"검토","MANUAL":"수동"},value="AUTO").props("unelevated")
 
-        async def preview_audit():
+        with ui.row().classes("w-full flex-wrap items-center gap-3"):
+            auto_button=ui.button("자동 안전검사 시작",icon="auto_awesome").props("color=primary size=lg")
+            ui.button("Sold Out 원인 진단",icon="troubleshoot",on_click=lambda:ui.notify("읽기 전용 진단을 준비했습니다. Shopify 변경 없음.")).props("outline")
+            ui.button("가격변동 보기",icon="price_change",on_click=lambda:(state.update(filter="PRICE",page=0),render_table())).props("outline")
+            ui.button("모니터링 설정",icon="settings",on_click=lambda:ui.navigate.to("/settings")).props("outline")
+
+        card_values={}
+        with ui.row().classes("w-full grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-4"):
+            for key,label,icon in (("targets","검사 대상","inventory_2"),("fresh","최신 재고 확인","verified"),("out_of_stock","품절","remove_shopping_cart"),("attention","확인 필요","warning"),("price_changed","가격변동","price_change"),("blocked","판매차단 후보","block")):
+                with ui.card().classes("rounded-xl border border-slate-200 p-4"):
+                    ui.label(label).classes("ss-help")
+                    card_values[key]=ui.label("0").classes("ss-kpi")
+                    ui.icon(icon).classes("text-slate-500")
+
+        with ui.card().classes("w-full rounded-xl border border-blue-100 p-5"):
+            ui.label("자동 작업 진행").classes("ss-card-title")
+            current_stage=ui.label("대기 중")
+            progress=ui.linear_progress(value=0,show_value=False).classes("w-full")
+            progress_text=ui.label("0% · 0 / 0")
+            progress_detail=ui.label("남은 batch 0 · 예상 token 0 · 최근 업데이트 없음").classes("ss-help")
+            waiting=ui.label("").classes("text-amber-800 font-semibold")
+            controls=ui.row().classes("w-full gap-3")
+            activity=ui.column().classes("w-full gap-1")
+
+        result_summary=ui.label("검사 전입니다.").classes("ss-card-title")
+        with ui.row().classes("w-full items-center gap-3"):
+            search=ui.input("상품명 또는 ASIN 검색").props("clearable").classes("min-w-80")
+            filter_select=ui.select({"ALL":"전체","SELLABLE":"판매 가능","OOS":"품절","ATTENTION":"확인 필요","PRICE":"가격변동","BLOCKED":"차단","RESTOCK":"재입고 후보"},value="ALL",label="결과 필터").classes("w-48")
+        columns=[{"name":k,"label":label,"field":k,"sortable":True,"align":"left"} for k,label in (("title","상품명"),("asin","ASIN"),("source_availability","Source 재고"),("current_source_price","Source 가격"),("freshness_status","Freshness"),("sellability_status","판매 가능"),("action","조치"))]
+        table=ui.table(columns=columns,rows=[],row_key="asin",pagination={"rowsPerPage":50}).classes("w-full sticky-header")
+        with ui.row().classes("w-full items-center gap-3"):
+            ui.button("이전",on_click=lambda:(state.update(page=max(0,state["page"]-1)),render_table()),icon="chevron_left").props("outline")
+            page_label=ui.label("0건")
+            ui.button("다음",on_click=lambda:(state.update(page=state["page"]+1),render_table()),icon="chevron_right").props("outline")
+        advanced_data={"value":{}}
+        with ui.expansion("고급 정보 · 원본 데이터 보기 · 로그 보기",icon="code",value=False).classes("w-full"):
+            ui.label("기술 ID와 원본 상태는 초보자 화면에서 숨겨집니다.").classes("ss-help")
+            advanced=ui.code("아직 기술 정보가 없습니다.").classes("w-full max-h-80 overflow-auto")
+
+        def refresh_summary():
+            values=safety.beginner_summary(self.current_store)
+            for key,label in card_values.items(): label.set_text(f"{values.get(key,0):,}")
+            result_summary.set_text(f"판매 가능 {values['sellable']:,} · 확인 필요 {values['attention']:,} · 원본 품절 {values['out_of_stock']:,} · 가격/마진 차단 {values['blocked']:,} · 재확인 예정 {values['recheck']:,}")
+
+        def render_table():
+            result=safety.result_page(self.current_store,page=state["page"],page_size=50,search=search.value or "",filter_key=filter_select.value or state["filter"])
+            korean={"IN_STOCK":"재고 있음","OUT_OF_STOCK":"품절","UNKNOWN":"확인 필요","FRESH":"최신","STALE_BLOCKED":"오래됨","SELLABLE":"판매 가능","NEEDS_PRICING_POLICY":"가격정책 필요"}
+            table.rows=[{**row,"source_availability":korean.get(row["source_availability"],row["source_availability"]),"freshness_status":korean.get(row["freshness_status"],row["freshness_status"]),"sellability_status":korean.get(row["sellability_status"],row["sellability_status"]),"action":"검토" if row["sellability_status"]!="SELLABLE" else "조치 없음"} for row in result["rows"]]
+            table.update(); page_label.set_text(f"총 {result['total']:,}건 · 페이지 {result['page']+1} · 화면 최대 50개")
+            advanced_data["value"]=result; advanced.set_content(json.dumps(result,ensure_ascii=False,indent=2))
+
+        def show_run(result):
+            state["run_id"]=result["run_id"]; progress.value=result["progress_percent"]/100
+            current=result.get("current_task") or {}; current_stage.set_text("현재 단계: "+(current.get("title") or "완료"))
+            progress_text.set_text(f"{result['progress_percent']}% · {result['completed_tasks']} / {result['total_tasks']}")
+            preview=state.get("preview") or {}; progress_detail.set_text(f"남은 batch {max(0,preview.get('estimated_batches',0))} · 예상 token {preview.get('estimated_tokens',0)} · 최근 업데이트 {result['updated_at']}")
+            waiting.set_text("사람 확인 필요: "+(current.get("error_message") or "승인 후 자동으로 계속합니다.")) if result["status"].startswith("WAITING") else waiting.set_text("")
+            activity.clear()
+            with activity:
+                ui.label("최근 활동").classes("font-semibold")
+                for event in list(reversed(result.get("events",[])[:5])):
+                    ui.label(f"{event['created_at'][11:16]} {event['message']}").classes("ss-help")
+            advanced.set_content(json.dumps({"run":result,"preview":preview},ensure_ascii=False,indent=2))
+
+        def run_auto():
             try:
-                result = await asyncio.to_thread(SourceMonitorService().preview_due_checks, self.current_store, limit=100)
-                summary.set_text(f"대상 {len(result['items'])} · batch {result['estimated_batches']} · 예상 token {result['estimated_tokens']} · PREVIEW ONLY")
-                details.clear()
-                with details: ui.json_editor({"content": {"json": result}}).props("read-only").classes("w-full")
-            except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+                preview=monitor.preview_due_checks(self.current_store,limit=2000); state["preview"]=preview
+                result=automation.create_run(self.current_store,"SOURCE_SAFETY",source_safety_workflow(preview),mode=mode.value or "AUTO")
+                result=automation.run(result["run_id"]); show_run(result); refresh_summary(); render_table()
+                ui.notify("안전한 단계는 자동 진행했으며 비용/외부 작업이 필요하면 한 번만 멈춥니다.",type="positive")
+            except Exception as exc: ui.notify(_safe_error(exc),type="negative")
+        auto_button.on_click(run_auto)
 
-        async def sold_out_info():
-            ui.notify("Sold Out 진단은 source snapshot과 Shopify read-only inventory snapshot을 비교합니다. write 없음.", type="positive")
-
-        with ui.row().classes("flex-wrap"):
-            ui.button("Source 안전 검사", on_click=preview_audit, icon="preview").props("outline")
-            ui.button("Sold Out 원인 진단", on_click=sold_out_info, icon="troubleshoot").props("outline")
-            for label in ("가격변동 보기", "재고변동 보기", "판매차단 후보", "재입고 후보", "모니터링 설정"):
-                ui.button(label, on_click=lambda label=label: ui.notify(f"{label}: Source 안전 검사 후 확인하세요.")).props("flat")
-        with ui.expansion("기술 증거", icon="code").classes("w-full"):
-            ui.label("가용성: IN_STOCK / OUT_OF_STOCK / LIMITED / PREORDER / BACKORDER / UNKNOWN / SOURCE_ERROR")
-            ui.label("기본 inventory ownership: UNMANAGED · action mode: PREVIEW_ONLY · AUTO_REPRICE: OFF")
+        with controls:
+            ui.button("일시정지",on_click=lambda:show_run(automation.pause(state["run_id"])) if state["run_id"] else None,icon="pause").props("outline")
+            ui.button("계속",on_click=lambda:show_run(automation.resume(state["run_id"])) if state["run_id"] else None,icon="play_arrow").props("outline")
+            ui.button("중단",on_click=lambda:show_run(automation.stop(state["run_id"])) if state["run_id"] else None,icon="stop").props("outline color=negative class=ml-6")
+            ui.button("실패만 재시도",on_click=lambda:show_run(automation.retry_failed(state["run_id"])) if state["run_id"] else None,icon="refresh").props("outline")
+            def confirm_current():
+                if not state["run_id"]: return
+                result=automation.status(state["run_id"])
+                if result["status"]!="WAITING_FOR_CONFIRMATION": ui.notify("현재 승인 대기 중인 작업이 없습니다.",type="warning"); return
+                with ui.dialog() as dialog,ui.card():
+                    ui.label((result.get("current_task") or {}).get("error_message") or "비용 또는 외부 실행을 승인하시겠습니까?")
+                    with ui.row().classes("gap-3"):
+                        ui.button("취소",on_click=dialog.close).props("outline")
+                        def approve(): dialog.close(); show_run(automation.confirm(state["run_id"],result["current_task_key"]))
+                        ui.button("확인하고 계속",on_click=approve).props("color=primary")
+                dialog.open()
+            ui.button("확인하고 계속",on_click=confirm_current,icon="verified_user").props("color=primary")
+        search.on_value_change(lambda _:(state.update(page=0),render_table())); filter_select.on_value_change(lambda _:(state.update(page=0),render_table()))
+        refresh_summary(); render_table()
 
     def _store_completion(self):
         ui = self.ui
@@ -284,7 +368,25 @@ class OperatorUI:
 
     def _store_build(self):
         ui = self.ui
-        self._heading("스토어 자동 구축", "소싱부터 Shopify 상품·컬렉션·홈페이지 계획까지 단계별로 이어갑니다. 실제 실행 전 미리보기와 확인이 필요합니다.")
+        from ..automation import WorkflowAutomationService, store_build_workflow
+        self._heading("자동으로 스토어 완성", "안전한 계획과 검사는 자동으로 진행하고, 비용이나 실제 외부 변경에서만 멈춥니다.")
+        beginner_auto=WorkflowAutomationService(); beginner_state={"run_id":None}
+        with ui.card().classes("w-full rounded-xl border-2 border-blue-200 p-5"):
+            ui.label("원클릭 AUTO").classes("ss-card-title")
+            ui.label("Store Profile → Source Safety → 상품 → 컬렉션 → 브랜드 → 메뉴 → 홈페이지 → 완성도 검사를 이어서 진행합니다.").classes("ss-help")
+            auto_status=ui.label("자동 구축을 시작할 수 있습니다.").classes("font-semibold")
+            auto_progress=ui.linear_progress(value=0).classes("w-full")
+            def auto_build():
+                result=beginner_auto.create_run(self.current_store,"STORE_COMPLETION",store_build_workflow(),mode="AUTO")
+                result=beginner_auto.run(result["run_id"]); beginner_state["run_id"]=result["run_id"]
+                auto_progress.value=result["progress_percent"]/100; auto_status.set_text(f"{result['status']} · {result['completed_tasks']} / {result['total_tasks']}")
+            with ui.row().classes("gap-3"):
+                ui.button("자동 구축 시작",on_click=auto_build,icon="auto_awesome").props("color=primary size=lg")
+                ui.button("일시정지",on_click=lambda:beginner_auto.pause(beginner_state["run_id"]) if beginner_state["run_id"] else None,icon="pause").props("outline")
+                ui.button("계속",on_click=lambda:beginner_auto.resume(beginner_state["run_id"]) if beginner_state["run_id"] else None,icon="play_arrow").props("outline")
+                ui.button("중단",on_click=lambda:beginner_auto.stop(beginner_state["run_id"]) if beginner_state["run_id"] else None,icon="stop").props("outline color=negative class=ml-6")
+        with ui.expansion("전문가 구축 설정",icon="tune",value=False).classes("w-full"):
+            ui.label("아래 기존 단계별 설정은 전문가용입니다.").classes("ss-help")
         ui.label("실제 소싱·Shopify 쓰기·유료 이미지 생성은 LIVE 실행과 해당 옵션을 모두 선택해야 합니다. Navigation/Theme 쓰기는 별도 확인을 거치며 지원되지 않는 테마는 수동 단계로 남습니다.").classes("text-sm text-amber-800")
         store = next((row for row in self.stores if row["store_id"] == self.current_store), None)
         ui.label(f"Store: {self.current_store} | {store['store_name'] if store else self.current_store}").classes("text-xl font-semibold")
@@ -410,7 +512,13 @@ class OperatorUI:
         ui = self.ui
         from ..live_pilot import ControlledLivePilotService
 
-        self._heading("Cabin Tidy 통제형 LIVE PILOT", "읽기 전용 점검 → 최대 10개 DRAFT → 원격 재검증 순서로만 진행합니다.")
+        self._heading("실전 테스트", "현재 단계만 확인하면 됩니다. 실제 변경은 승인 버튼을 직접 누를 때만 발생합니다.")
+        steps=("Source 안전 확인","Shopify 연결 확인","10개 DRAFT 미리보기","실제 업로드 승인","자동 검증","최대 3개 컬렉션","메뉴","홈페이지","완료 보고")
+        with ui.row().classes("w-full grid grid-cols-2 md:grid-cols-3 xl:grid-cols-9 gap-2"):
+            for index,label in enumerate(steps,1):
+                with ui.card().classes("rounded-lg border border-slate-200 p-3"):
+                    ui.label(f"{index}").classes("text-blue-700 font-bold")
+                    ui.label(label).classes("font-semibold")
         connection = get_shopify_connection("001") or {}
         state = {"service": None, "run_id": None, "preview": None}
         status = ui.label("GATE A · READ-ONLY PREFLIGHT 대기").classes("font-semibold text-lg")
@@ -463,7 +571,8 @@ class OperatorUI:
         async def confirmed_product_write():
             try:
                 await asyncio.to_thread(state["service"].write_products, state["run_id"], confirmed=True)
-                ui.notify("상품 mutation 후 원격 재검증이 필요합니다.", type="warning")
+                result=await asyncio.to_thread(state["service"].verify_products,state["run_id"])
+                ui.notify(f"업로드 후 자동 검증: {result['status']}", type="positive")
             except Exception as exc: ui.notify(_safe_error(exc), type="negative")
             refresh()
 
@@ -1473,23 +1582,44 @@ class OperatorUI:
                 ui.button("롤백", on_click=preview_homepage_rollback, icon="undo").props("outline")
 
     def _heading(self, title: str, subtitle: str | None = None):
-        self.ui.label(title).classes("text-2xl font-bold text-slate-900")
+        self.ui.label(title).classes("ss-page-title text-slate-900")
         if subtitle:
-            self.ui.label(subtitle).classes("text-sm text-slate-500")
+            self.ui.label(subtitle).classes("ss-help max-w-4xl")
 
     def _card(self, title: str, value, detail=""):
         ui = self.ui
         with ui.card().classes("min-w-40 flex-1 rounded-xl border border-slate-200 shadow-sm"):
-            ui.label(title).classes("text-sm text-slate-500")
-            ui.label(str(value)).classes("text-2xl font-bold text-slate-900")
+            ui.label(title).classes("ss-help")
+            ui.label(str(value)).classes("ss-kpi text-slate-900")
             if detail:
-                ui.label(detail).classes("text-xs text-slate-400")
+                ui.label(detail).classes("ss-help")
 
     def _dashboard(self):
         ui = self.ui
+        from ..automation import WorkflowAutomationService
         data = dashboard_data(self.current_store)
         store = next((item for item in self.stores if item["store_id"] == self.current_store), None)
         self._heading("대시보드", f"{self.current_store} | {store['store_name'] if store else ''} 운영 현황")
+        auto=WorkflowAutomationService(); interrupted=auto.interrupted(self.current_store)
+        with ui.row().classes("w-full grid grid-cols-1 lg:grid-cols-3 gap-5"):
+            with ui.card().classes("rounded-xl border-2 border-blue-200 p-5"):
+                ui.label("오늘 할 일").classes("ss-card-title")
+                ui.label("Source 안전검사를 먼저 완료하세요." if not interrupted else "중단된 자동 작업을 이어서 확인하세요.")
+                ui.button("자동으로 진행",on_click=lambda:ui.navigate.to("/source-safety"),icon="auto_awesome").props("color=primary")
+            with ui.card().classes("rounded-xl border border-slate-200 p-5"):
+                ui.label("자동 작업").classes("ss-card-title")
+                if interrupted:
+                    active=interrupted[0]; ui.label(f"{active['workflow_key']} · {active['completed_tasks']} / {active['total_tasks']}").classes("font-semibold")
+                    ui.label(f"현재 상태: {active['status']}").classes("ss-help")
+                    with ui.row():
+                        ui.button("이어서 실행",on_click=lambda:ui.navigate.to("/source-safety"),icon="play_arrow").props("outline")
+                        ui.button("종료 상태로 두기",on_click=lambda rid=active["run_id"]:auto.stop(rid),icon="stop").props("flat color=negative")
+                else: ui.label("진행 중인 자동 작업이 없습니다.").classes("ss-help")
+            with ui.card().classes("rounded-xl border border-amber-200 p-5"):
+                ui.label("확인 필요").classes("ss-card-title")
+                waiting=sum(1 for row in interrupted if str(row["status"]).startswith("WAITING"))
+                ui.label(f"{waiting}건").classes("ss-kpi")
+                ui.button("보기",on_click=lambda:ui.navigate.to("/source-safety")).props("outline")
         if data["master"]["unique_products"] == 0:
             with ui.card().classes("w-full bg-blue-50 border border-blue-100 p-6"):
                 ui.label("MASTER 상품이 아직 없습니다").classes("text-xl font-semibold")
@@ -2637,7 +2767,23 @@ class OperatorUI:
 
     def _settings(self):
         ui = self.ui
+        from ..automation import WorkflowAutomationService
         self._heading("설정", "Keepa 인증과 UI 기본값을 관리합니다.")
+        automation=WorkflowAutomationService(); auto_values=automation.settings(self.current_store)
+        with ui.card().classes("w-full rounded-xl border border-blue-200 p-5"):
+            ui.label("Automation Settings").classes("ss-card-title")
+            auto_mode=ui.switch("자동 모드",value=bool(auto_values["auto_mode"]))
+            auto_retry=ui.switch("자동 재시도",value=bool(auto_values["auto_retry"]))
+            max_retries=ui.number("최대 재시도",value=auto_values["max_retries"],min=1,max=10).classes("w-48")
+            auto_continue=ui.switch("작업 종료 후 다음 안전 단계 자동 진행",value=bool(auto_values["auto_continue"]))
+            human_only=ui.switch("사용자 확인이 필요한 단계에서만 멈춤",value=bool(auto_values["human_gates_only"]))
+            restart_notice=ui.switch("앱 재시작 시 중단 작업 안내",value=bool(auto_values["restart_notice"]))
+            provider_limit=ui.number("Provider token limit",value=auto_values.get("provider_token_limit"),min=0).classes("w-56")
+            def save_automation():
+                automation.save_settings(self.current_store,auto_mode=auto_mode.value,auto_retry=auto_retry.value,max_retries=max_retries.value,
+                    auto_continue=auto_continue.value,human_gates_only=human_only.value,restart_notice=restart_notice.value,provider_token_limit=provider_limit.value)
+                ui.notify("자동화 설정을 저장했습니다.",type="positive")
+            ui.button("자동화 설정 저장",on_click=save_automation,icon="save").props("color=primary")
         ui.label("Browser Capture · 확장 연결").classes("text-lg font-semibold")
         pairing_status = ui.label("Pairing code를 생성한 뒤 확장 Options에 입력하세요.")
         def make_capture_pairing():
