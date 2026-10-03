@@ -1,0 +1,326 @@
+ShopSource Studio — Phase 3.3
+SHOPIFY COLLECTION PUBLISHER + IMAGE AUTOMATION
+
+Prerequisite:
+Phase 3.2 automated collection planner complete.
+
+Goal:
+One button creates/updates Shopify collections from the ShopSource collection plan, attaches generated collection images, and publishes collections to the selected Online Store publication.
+
+IMPORTANT:
+No real Shopify write during Codex implementation/tests.
+Real write happens only after explicit user click in UI.
+
+==================================================
+0. Current Shopify API direction
+==================================================
+
+Use current Shopify Admin GraphQL API.
+
+For collection creation/update:
+- use modern collection/sources/conditions model
+- do NOT build new integration around deprecated ruleSet if current API supports sources
+- use collectionCreate / collectionUpdate
+- publish with publishablePublish
+- collectionAddProducts is deprecated for new code; use modern collectionUpdate inclusion/selections if manual membership is needed
+
+Required scopes should be checked, not guessed:
+- write_products for collections
+- write_publications for publishing
+- file/image scope needed for file upload if using Shopify Files
+
+If exact API schema/version differs at implementation time, inspect official Shopify docs and pin a supported API version in config.
+
+==================================================
+1. Shopify connection model
+==================================================
+
+Support multiple stores.
+
+Never store Shopify tokens in git/plain config.
+
+Use OS credential store/keyring or encrypted secret provider.
+
+Store in DB only non-secret metadata:
+- store_id
+- shop domain
+- API version
+- connection status
+- last verified
+- publication IDs/names
+
+UI:
+Settings > Shopify 연결
+
+[연결 확인]
+[권한 확인]
+
+Show required scopes and missing scopes.
+
+Do not log access token.
+
+==================================================
+2. Dry-run first
+==================================================
+
+Default action:
+[Shopify 컬렉션 동기화 미리보기]
+
+Show:
+- CREATE
+- UPDATE
+- NO CHANGE
+- CONFLICT
+- SKIP
+
+Only after explicit confirmation:
+[Shopify에 컬렉션 생성/동기화]
+
+No automatic destructive delete.
+
+==================================================
+3. Idempotent sync
+==================================================
+
+Use stable mapping:
+ShopSource collection_key/handle ↔ Shopify collection ID.
+
+If already created:
+update title/description/image/conditions safely.
+
+If user manually edited Shopify collection:
+detect drift.
+Do not overwrite silently.
+Show conflict and require explicit resolution.
+
+Never duplicate collection on repeated sync.
+
+==================================================
+4. Automatic collection conditions
+==================================================
+
+Convert canonical local rules from Phase 3.2 into Shopify collection source conditions.
+
+Examples:
+TITLE CONTAINS "Trunk"
+TAG equals "shopsource:trunk-organizers"
+
+For future direct Shopify product upload, prefer ShopSource tags.
+For existing Spark-uploaded products without controlled tags, allow title conditions.
+
+Validate resulting collection member count after creation.
+
+==================================================
+5. Collection image provider abstraction
+==================================================
+
+Implement provider interface:
+
+CollectionImageProvider
+- generate(prompt, size/aspect, output_path)
+- provider_name
+- model/version
+- metadata
+
+Providers:
+A. LOCAL_PLACEHOLDER / MANUAL (always available)
+B. OPENAI_IMAGES (optional, only when user configures API credential)
+
+Do not hardcode API key.
+Use environment/credential store.
+
+Default image spec:
+- 1:1
+- photorealistic ecommerce lifestyle
+- no text/logo/watermark
+- category centered
+- consistent store look
+
+Store generated images:
+exports/collection_images/<store>/<collection_key>/<version>.png
+
+Do not commit generated images.
+
+==================================================
+6. Image generation UX
+==================================================
+
+Per collection:
+[이미지 생성]
+[다시 생성]
+[직접 파일 선택]
+
+Bulk:
+[컬렉션 이미지 모두 생성]
+
+Show thumbnail before Shopify upload.
+
+User can approve all at once or individually.
+
+No automatic paid API call until user explicitly enables:
+"이미지 자동 생성 사용"
+
+Display estimated API usage count before batch generation.
+
+==================================================
+7. Upload image to Shopify
+==================================================
+
+Use supported Shopify file/image upload flow:
+- staged upload if required
+- fileCreate if using Files
+- or collection image source URL where supported by current API
+
+Verify final collection.image URL.
+
+Alt text from Phase 3.2.
+
+Retry transient failures, but do not infinite retry.
+
+==================================================
+8. Publish collections
+==================================================
+
+After create/update:
+collections are not assumed published.
+
+Fetch available publications.
+Default selected publication:
+Online Store
+
+Use publishablePublish only after user enables:
+☑ 온라인 스토어에 공개
+
+Record:
+- Shopify collection ID
+- published publication IDs
+- synced_at
+- image URL
+- source/rule hash
+- sync result
+
+==================================================
+9. UI
+==================================================
+
+### 컬렉션 자동화
+
+Plan:
+8 collections
+
+Images:
+6 ready / 2 missing
+
+Shopify:
+CONNECTED
+
+[동기화 미리보기]
+[이미지 모두 생성]
+[Shopify에 컬렉션 생성/동기화]
+
+Result:
+Trunk Organizers      CREATED  image OK  Online Store PUBLISHED
+Seat Organizers       UPDATED  image OK  Online Store PUBLISHED
+Console Storage       NO CHANGE
+...
+
+==================================================
+10. Failure isolation
+==================================================
+
+One collection failure must not abort all.
+
+Final summary:
+created
+updated
+unchanged
+failed
+image_failed
+publish_failed
+
+Retry only failed items.
+
+==================================================
+11. Audit/report
+==================================================
+
+exports/collection_sync_reports/<store>/<run_id>/
+  sync_report.json
+  sync_report.md
+
+No secrets.
+
+Include:
+- planned collections
+- Shopify IDs
+- conditions
+- image provider
+- published status
+- userErrors
+- timings
+
+==================================================
+12. Tests
+==================================================
+
+Mock Shopify GraphQL; no real network.
+
+Required:
+test_shopify_collection_dry_run
+test_shopify_collection_create
+test_shopify_collection_update_idempotent
+test_shopify_collection_repeat_sync_no_duplicate
+test_shopify_collection_drift_conflict
+test_shopify_sources_conditions_mapping
+test_shopify_title_fallback_rule
+test_shopify_tag_preferred_rule
+test_collection_image_manual_provider
+test_collection_image_openai_provider_mock
+test_collection_image_not_generated_without_opt_in
+test_shopify_file_upload_mock
+test_collection_publish_online_store_mock
+test_one_failure_does_not_abort_batch
+test_retry_failed_collections_only
+test_tokens_not_logged
+test_tokens_not_stored_plaintext
+test_no_real_shopify_write_in_tests
+
+All existing tests PASS.
+
+==================================================
+13. Quality gate
+==================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+CLI/UI help PASS.
+
+==================================================
+14. Commit/push
+==================================================
+
+Do not commit secrets, images, exports, DB, backups, protected store file.
+
+Commit:
+git commit -m "Add Shopify collection publisher"
+
+push origin/main
+
+==================================================
+15. Completion report
+==================================================
+
+[1] Shopify connection/security
+[2] dry-run
+[3] create/update idempotency
+[4] conditions mapping
+[5] image provider
+[6] image upload
+[7] publication
+[8] UI
+[9] tests
+[10] commit SHA
+[11] exact user steps to connect Cabin Tidy without exposing token
+
+Implement, but DO NOT perform a real Shopify write.
