@@ -12,9 +12,10 @@ from typing import Callable
 from .db import connect, init_db
 from .paths import EXPORT_DIR
 
-STAGES = ("PLAN", "SOURCING", "SOURCE_VALIDATION", "PRODUCT_SYNC_PREVIEW", "PRODUCT_SYNC", "PRODUCT_VERIFY",
-          "COLLECTION_PLAN", "COLLECTION_IMAGE", "COLLECTION_SYNC_PREVIEW", "COLLECTION_SYNC",
-          "COLLECTION_VERIFY", "HOMEPAGE_PLAN", "FINAL_VERIFY", "COMPLETE")
+STAGES = ("PLAN", "BRAND_PLAN", "BRAND_ASSET_PREVIEW", "BRAND_ASSET_GENERATION", "BRAND_ASSET_APPROVAL",
+          "SOURCING", "SOURCE_VALIDATION", "PRODUCT_SYNC_PREVIEW", "PRODUCT_SYNC", "PRODUCT_VERIFY",
+          "COLLECTION_PLAN", "COLLECTION_IMAGE", "COLLECTION_SYNC_PREVIEW", "COLLECTION_SYNC", "COLLECTION_VERIFY",
+          "BRAND_APPLY_PREVIEW", "BRAND_APPLY", "HOMEPAGE_PLAN", "FINAL_VERIFY", "COMPLETE")
 STAGE_STATES = {"PENDING", "RUNNING", "COMPLETE", "COMPLETE_WITH_WARNINGS", "PAUSED", "FAILED", "MANUAL_ACTION_REQUIRED", "SKIPPED"}
 
 
@@ -63,7 +64,8 @@ class StoreBuildOrchestrator:
         options = {"auto_sourcing": True, "product_sync": True, "collection_design": True,
                    "collection_images": False, "paid_image_opt_in": False, "collection_sync": True,
                    "publish_collections": False, "homepage_plan": True, "source_target": 2000,
-                   "publish_status": "DRAFT", "media_mode": "MANUAL_MEDIA", **(options or {})}
+                   "publish_status": "DRAFT", "media_mode": "MANUAL_MEDIA", "brand_automation": False,
+                   "brand_image_opt_in": False, "brand_image_model": None, "brand_apply": False, **(options or {})}
         provider = str(provider).upper(); mode = str(mode).upper()
         if provider not in {"DIRECT_SHOPIFY", "SPARK_FALLBACK"}: raise ValueError("Unknown product route")
         if mode not in {"PREVIEW", "LIVE"}: raise ValueError("mode must be PREVIEW or LIVE")
@@ -136,6 +138,16 @@ class StoreBuildOrchestrator:
                 campaign = CampaignService(self.db).get(campaign_id) if campaign_id else None
                 if not campaign or campaign.get("status") not in {"READY_FOR_SPARK", "DONE", "SEARCH_COMPLETE", "CANDIDATE_TARGET_REACHED"}:
                     raise RuntimeError("The Phase 3.1 campaign is not complete yet; continue sourcing before resuming")
+            if expected == "brand_assets_approved":
+                from .brand_automation import list_brand_assets
+                approved={(asset["asset_type"],asset["approval_status"]) for asset in list_brand_assets(run["store_id"],db=self.db)}
+                if not all((kind,"APPROVED") in approved for kind in ("LOGO_MARK","LOGO_HORIZONTAL","FAVICON_32")):
+                    raise RuntimeError("Approve a LOGO_MARK, LOGO_HORIZONTAL, and FAVICON_32 before resuming the brand stage.")
+            if expected == "brand_theme_manual_applied":
+                from .brand_automation import BrandThemeService
+                preview_id=run["stage_data"].get("BRAND_APPLY_PREVIEW",{}).get("preview_id")
+                check=BrandThemeService(db=self.db).verify_manual_apply(preview_id) if preview_id else {"status":"NOT_FOUND"}
+                if check.get("status")!="VERIFIED":raise RuntimeError("Shopify theme settings do not yet match the approved logo/favicon preview.")
             self._set_stage(run_id, stage, "COMPLETE_WITH_WARNINGS", counts={"manual_confirmation": expected})
             run = self.get(run_id)
         elif run["status"] == "FAILED":
@@ -269,6 +281,52 @@ class StoreBuildOrchestrator:
     def _default_stage(self, stage, run):
         store_id, options, data = run["store_id"], run["options"], run["stage_data"]
         if stage == "PLAN": return {"counts": {"requested_target": int(options.get("source_target", 2000))}}
+        if stage == "BRAND_PLAN":
+            from .brand_automation import brand_profile_from_store
+            profile=brand_profile_from_store(store_id,db=self.db)
+            return {"counts":{"brand_profile_version":profile["version"]},"brand_name":profile["profile"]["brand_name"]}
+        if stage == "BRAND_ASSET_PREVIEW":
+            if not options.get("brand_automation"):return {"stage_status":"SKIPPED"}
+            return {"counts":{"image_calls":1 if options.get("brand_image_opt_in") else 0},
+                    "provider":"OPENAI_IMAGES" if options.get("brand_image_opt_in") else "MANUAL",
+                    "model":options.get("brand_image_model") or "gpt-image-1","opt_in":bool(options.get("brand_image_opt_in"))}
+        if stage == "BRAND_ASSET_GENERATION":
+            if not options.get("brand_automation"):return {"stage_status":"SKIPPED"}
+            if not options.get("brand_image_opt_in"):
+                return {"status":"MANUAL_ACTION_REQUIRED","manual_gate":"BRAND_GENERATION",
+                        "instructions":"브랜드 화면에서 로고 mark를 직접 선택하거나 이미지 자동 생성 사용을 명시적으로 켜세요."}
+            from .brand_automation import generate_logo_mark
+            from .collection_images import OpenAIImagesProvider
+            mark=generate_logo_mark(store_id,provider=OpenAIImagesProvider(model=options.get("brand_image_model")),enabled=True,db=self.db)
+            return {"status":"MANUAL_ACTION_REQUIRED","manual_gate":"BRAND_APPROVAL","asset_id":mark["asset_id"],
+                    "instructions":"생성 자산을 검토하고 가로 로고와 파비콘을 만든 뒤 필요한 자산을 모두 승인하세요."}
+        if stage == "BRAND_ASSET_APPROVAL":
+            if not options.get("brand_automation"):return {"stage_status":"SKIPPED"}
+            from .brand_automation import list_brand_assets
+            approved={(asset["asset_type"],asset["approval_status"]) for asset in list_brand_assets(store_id,db=self.db)}
+            if all((kind,"APPROVED") in approved for kind in ("LOGO_MARK","LOGO_HORIZONTAL","FAVICON_32")):
+                return {"counts":{"approved_assets":3}}
+            return {"status":"MANUAL_ACTION_REQUIRED","manual_gate":"BRAND_APPROVAL","instructions":"LOGO_MARK, LOGO_HORIZONTAL, FAVICON_32를 검토하고 승인하세요."}
+        if stage == "BRAND_APPLY_PREVIEW":
+            if not options.get("brand_apply"):return {"stage_status":"SKIPPED"}
+            from .brand_automation import list_brand_assets,BrandThemeService
+            assets=list_brand_assets(store_id,db=self.db)
+            logo=next((x for x in reversed(assets) if x["asset_type"]=="LOGO_HORIZONTAL" and x["approval_status"]=="APPROVED"),None)
+            favicon=next((x for x in reversed(assets) if x["asset_type"]=="FAVICON_32" and x["approval_status"]=="APPROVED"),None)
+            if not logo or not favicon:return {"status":"MANUAL_ACTION_REQUIRED","manual_gate":"BRAND_APPROVAL","instructions":"승인된 로고와 파비콘이 필요합니다."}
+            preview=BrandThemeService(db=self.db).preview_apply(store_id,logo_asset_id=logo["asset_id"],favicon_asset_id=favicon["asset_id"])
+            data["brand_apply_preview"]=preview
+            return {"counts":{"actions":len(preview["actions"])},"preview_id":preview["preview_id"],"preview_status":preview["status"]}
+        if stage == "BRAND_APPLY":
+            if not options.get("brand_apply"):return {"stage_status":"SKIPPED"}
+            preview=data.get("brand_apply_preview") or {}
+            if not preview.get("preview_id"):return {"status":"MANUAL_ACTION_REQUIRED","manual_gate":"BRAND_MANUAL_APPLY","instructions":"브랜드 적용 preview가 필요합니다."}
+            if not preview.get("write_themes"):
+                return {"status":"MANUAL_ACTION_REQUIRED","manual_gate":"BRAND_MANUAL_APPLY","instructions":preview.get("instructions"),"preview_id":preview["preview_id"]}
+            from .brand_automation import BrandThemeService
+            result=BrandThemeService(db=self.db).apply(preview["preview_id"],confirmed=True)
+            if result["status"]!="VERIFIED":return {"status":"MANUAL_ACTION_REQUIRED","manual_gate":"BRAND_MANUAL_APPLY","instructions":preview.get("instructions"),"result":result}
+            return {"counts":{"verified":True},"result":result}
         if stage == "SOURCING":
             if not options.get("auto_sourcing"): return {"stage_status": "SKIPPED"}
             from .capture.campaign import CampaignService
@@ -414,7 +472,8 @@ class StoreBuildOrchestrator:
     def _required_confirmation(run):
         details = run["stage_data"].get(run["stage"], {})
         return {"SOURCE_WORKER": "source_complete", "SOURCE_CAPTCHA": "amazon_challenge_resolved",
-                "SPARK_UPLOAD": "spark_upload_confirmed", "THEME_APPLY": "theme_manual_apply_confirmed"}.get(details.get("manual_gate"), "manual_action_confirmed")
+                "SPARK_UPLOAD": "spark_upload_confirmed", "THEME_APPLY": "theme_manual_apply_confirmed",
+                "BRAND_APPROVAL": "brand_assets_approved", "BRAND_MANUAL_APPLY": "brand_theme_manual_applied"}.get(details.get("manual_gate"), "manual_action_confirmed")
 
     def _default_final_status(self, run_id):
         run = self.get(run_id)

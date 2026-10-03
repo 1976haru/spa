@@ -43,11 +43,11 @@ class ManualImageProvider(CollectionImageProvider):
 class OpenAIImagesProvider(CollectionImageProvider):
     """Optional OpenAI Images API client. Tests inject a transport; callers gate opt-in."""
     provider_name = "OPENAI_IMAGES"
-    model_version = "gpt-image-2.5-sunburst"
     endpoint = "https://api.openai.com/v1/images/generations"
 
-    def __init__(self, api_key: str | None = None, *, opener=urllib.request.urlopen):
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+    def __init__(self, api_key: str | None = None, *, model: str | None = None, opener=urllib.request.urlopen):
+        self.api_key = api_key if api_key is not None else get_openai_api_key()
+        self.model_version = model or os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-1")
         self.opener = opener
 
     def generate(self, prompt: str, size: str, output_path: str | Path, *, enabled: bool = False) -> dict:
@@ -73,6 +73,17 @@ class OpenAIImagesProvider(CollectionImageProvider):
         target.write_bytes(base64.b64decode(encoded,validate=True))
         return {"path":str(target),"provider":self.provider_name,"model":self.model_version,
                 "metadata":{"size":size,"response_created":payload.get("created")}}
+
+
+def get_openai_api_key() -> str | None:
+    """Read image credentials from the environment or OS credential store only."""
+    value=os.environ.get("OPENAI_API_KEY")
+    if value:return value
+    try:
+        import keyring
+        return keyring.get_password("ShopSourceStudio", "openai-images-api-key")
+    except Exception:
+        return None
 
 
 def image_path(store_id: str, collection_key: str, version: int = 1) -> Path:
@@ -103,6 +114,15 @@ def generate_collection_image(store_id: str, definition: dict, *, provider: Coll
                               enabled: bool = False, version: int | None = None, db=None) -> dict:
     if isinstance(provider, OpenAIImagesProvider) and not enabled:
         raise RuntimeError("Enable '이미지 자동 생성 사용' before calling the paid image API")
+    prompt = definition["image_prompt"]
+    if db is not None:
+        with connect(db) as con:
+            exists=con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='brand_profiles'").fetchone()
+            brand=con.execute("SELECT profile_json FROM brand_profiles WHERE store_id=?",(store_id,)).fetchone() if exists else None
+        if brand:
+            profile=json.loads(brand["profile_json"])
+            prompt=(f"Consistent brand identity: {profile.get('personality')}; palette {profile.get('colors')}; "
+                    f"visual direction {profile.get('logo_style')}. Preserve a clean restrained aesthetic.\n\n"+prompt)
     if version is None:
         init_db(db)
         with connect(db) as con:
@@ -116,7 +136,7 @@ def generate_collection_image(store_id: str, definition: dict, *, provider: Coll
         version=int(match.group(1))+1 if match else 1
     path=image_path(store_id,definition["collection_key"],version)
     kwargs={"enabled":enabled} if isinstance(provider,OpenAIImagesProvider) else {}
-    result=provider.generate(definition["image_prompt"],"1024x1024",path,**kwargs)
+    result=provider.generate(prompt,"1024x1024",path,**kwargs)
     asset=register_image_asset(store_id,definition["collection_key"],result["path"],provider=provider.provider_name,
                                model=provider.model_version,alt_text=definition.get("image_alt_text", ""),metadata=result.get("metadata"),db=db)
     return {**asset,"preview_url":Path(asset["path"]).as_uri()}

@@ -474,7 +474,7 @@ class ShopifyFileUploader:
       fileCreate(files: $files) { files { ... on MediaImage { id status image { url altText } } ... on GenericFile { id url } } userErrors { field message } }
     }"""
     FILE_QUERY = "query FileNode($id: ID!) { node(id:$id) { ... on MediaImage { id status image { url altText } } } }"
-    def __init__(self, client): self.client = client
+    def __init__(self, client, *, staged_post=None): self.client,self.staged_post=client,staged_post
     def upload(self, path: str | Path, alt_text: str) -> dict:
         source = Path(path)
         mime = {".png":"image/png", ".jpg":"image/jpeg", ".jpeg":"image/jpeg", ".webp":"image/webp"}.get(source.suffix.lower())
@@ -489,10 +489,14 @@ class ShopifyFileUploader:
         for field in fields:
             chunks += [f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field['name']}\"\r\n\r\n{field['value']}\r\n".encode()]
         chunks += [f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{source.name}\"\r\nContent-Type: {mime}\r\n\r\n".encode(),source.read_bytes(),f"\r\n--{boundary}--\r\n".encode()]
-        req=urllib.request.Request(target["url"],data=b"".join(chunks),headers={"Content-Type":f"multipart/form-data; boundary={boundary}"})
         try:
-            with urllib.request.urlopen(req,timeout=60) as response:
-                if response.status >= 300: raise RuntimeError("Shopify staged upload failed")
+            if self.staged_post:
+                status=self.staged_post(target["url"],b"".join(chunks),f"multipart/form-data; boundary={boundary}")
+                if status>=300:raise RuntimeError("Shopify staged upload failed")
+            else:
+                req=urllib.request.Request(target["url"],data=b"".join(chunks),headers={"Content-Type":f"multipart/form-data; boundary={boundary}"})
+                with urllib.request.urlopen(req,timeout=60) as response:
+                    if response.status>=300:raise RuntimeError("Shopify staged upload failed")
         except Exception as exc: raise RuntimeError(f"Shopify staged upload failed: {type(exc).__name__}") from None
         created=self.client.execute(self.FILE_CREATE,{"files":[{"originalSource":target["resourceUrl"],"contentType":"IMAGE","alt":alt_text}]}).get("fileCreate",{})
         if created.get("userErrors"): raise RuntimeError("Shopify fileCreate rejected")
