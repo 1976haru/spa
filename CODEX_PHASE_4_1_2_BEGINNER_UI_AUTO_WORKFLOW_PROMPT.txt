@@ -1,0 +1,929 @@
+ShopSource Studio — Phase 4.1.2
+BEGINNER UX / ONE-CLICK AUTOMATION / QUEUE CONTROL UPGRADE
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+- Baseline: 7405472ae1711c9ae3badfef065ce1dacdb68b35
+
+Context
+- Phase 4.1 stress qualification: PASS
+- Phase 4.1.1 source availability/price guard: COMPLETE
+- Phase 4.2 controlled live pilot implementation exists but should not be executed automatically.
+- User feedback from actual UI:
+  1. global text is too small
+  2. current "소스 재고·가격 안전" page exposes raw JSON/tree immediately, which is not beginner-friendly
+  3. the user wants queue controls: pause / resume / stop / retry
+  4. the user strongly prefers one-click automation: "자동" should make the system do as much as safely possible on its own
+  5. manual confirmation should appear only when money, credentials, live Shopify writes, legal/business decisions, or destructive/ambiguous operations require it
+
+Goal
+Turn ShopSource Studio from a developer-facing control panel into a beginner-friendly operator UI that can run the safe workflow automatically, while preserving detailed diagnostics under an Advanced panel.
+
+NO real provider/Shopify/Amazon/Spark execution during Codex implementation.
+All external calls mocked.
+
+======================================================================
+0. UX PRINCIPLES
+======================================================================
+
+Default UI = BEGINNER MODE.
+
+The beginner should see:
+- what is happening
+- current progress
+- what succeeded
+- what needs attention
+- one primary next action
+
+Do NOT make raw JSON/tree the default user experience.
+
+Developer/technical details must live under:
+[고급 정보]
+[원본 데이터 보기]
+[로그 보기]
+
+The user should not need to understand:
+- product_id
+- snapshot_id
+- GraphQL IDs
+- internal statuses
+- JSON payloads
+for normal operation.
+
+======================================================================
+1. GLOBAL TYPOGRAPHY / SCALE
+======================================================================
+
+Increase default UI readability.
+
+Suggested desktop defaults:
+- body text: 16px minimum
+- secondary/help text: 14–15px
+- card title: 18–20px
+- page title: 26–30px
+- primary KPI numbers: 26–34px
+- buttons: 15–16px
+- sidebar items: 15–16px
+- line-height: 1.45–1.6
+
+Do not blindly hardcode per-widget inline sizes.
+Introduce shared UI tokens/theme classes.
+
+Add:
+- normal density
+- comfortable density
+
+Default = comfortable.
+
+Ensure labels remain readable at 125% Windows scaling.
+
+======================================================================
+2. LAYOUT CLEANUP
+======================================================================
+
+Current "소스 재고·가격 안전" screenshot shows:
+- tiny text
+- wide empty space
+- raw tree/table dominant
+- no obvious primary CTA
+
+Replace default layout with cards.
+
+Top:
+
+### 소스 재고·가격 안전
+
+Subtitle:
+Amazon/source 재고와 가격을 확인하고 Shopify 판매 위험을 자동으로 막습니다.
+
+Primary action:
+[자동 안전검사 시작]
+
+Secondary:
+[Sold Out 원인 진단]
+[가격변동 보기]
+[모니터링 설정]
+
+Summary cards:
+- 검사 대상
+- 최신 재고 확인
+- 품절
+- 확인 필요
+- 가격변동
+- 판매차단 후보
+
+Progress card:
+- 현재 단계
+- 진행률
+- 처리 수 / 전체
+- 예상 남은 batch
+- provider/token estimate
+- last updated
+
+Default result table:
+상품명 | ASIN | Source 재고 | Source 가격 | Freshness | 판매 가능 | 조치
+
+Technical IDs hidden.
+
+Raw JSON:
+collapsed advanced section only.
+
+======================================================================
+3. ONE-CLICK "자동" MODE
+======================================================================
+
+Add a clear automation mode.
+
+Top-level:
+[자동 실행]
+
+Optional modes:
+AUTO
+REVIEW
+MANUAL
+
+Default for beginner:
+AUTO
+
+AUTO means:
+run every safe, non-destructive, already-configured step automatically in sequence.
+
+AUTO must automatically:
+1. inspect prerequisites
+2. calculate work queue
+3. run safe read-only checks
+4. run mock/local planning
+5. run configured provider checks after required cost confirmation
+6. evaluate sellability
+7. classify results
+8. produce reports
+9. move to next safe step
+10. retry transient failures within bounded policy
+11. resume from checkpoint after restart
+12. stop only at a HUMAN GATE
+
+HUMAN GATE examples:
+- Keepa paid-token execution confirmation if cost exceeds or if provider call is chargeable
+- real Shopify write
+- theme write
+- Spark handoff/manual app operation
+- legal/business data input
+- shipping/payment/tax/domain decisions
+- ambiguous conflict
+- credentials missing
+- CAPTCHA/robot check
+- rights review
+- potentially destructive action
+
+AUTO should not stop after every harmless step just to ask "continue?".
+
+======================================================================
+4. AUTOMATION ORCHESTRATOR
+======================================================================
+
+Create a reusable operator orchestration service.
+
+Suggested:
+AutoOperatorService
+or
+WorkflowAutomationService
+
+Responsibilities:
+- determine next safe task
+- enqueue tasks
+- run task chain
+- respect checkpoints
+- pause
+- resume
+- stop
+- retry failed
+- skip optional
+- persist queue
+- survive app restart
+- expose user-friendly status
+
+Task state:
+QUEUED
+RUNNING
+PAUSED
+WAITING_FOR_CONFIRMATION
+WAITING_FOR_INPUT
+SUCCEEDED
+SUCCEEDED_WITH_WARNINGS
+FAILED
+SKIPPED
+STOPPED
+
+Do not conflate WAITING_FOR_CONFIRMATION with FAILED.
+
+======================================================================
+5. PERSISTED QUEUE
+======================================================================
+
+Implement persisted operation queue.
+
+Suggested tables:
+
+automation_runs
+- run_id
+- store_id
+- workflow_key
+- mode
+- status
+- current_task_key
+- total_tasks
+- completed_tasks
+- failed_tasks
+- warning_tasks
+- created_at
+- started_at
+- paused_at
+- finished_at
+- updated_at
+
+automation_tasks
+- id
+- run_id
+- task_key
+- title
+- stage
+- position
+- status
+- attempt_count
+- max_attempts
+- checkpoint_json
+- result_summary_json
+- error_code
+- error_message
+- requires_confirmation
+- requires_user_input
+- started_at
+- finished_at
+- updated_at
+
+Must persist to DB.
+Do not keep the queue only in memory.
+
+======================================================================
+6. QUEUE CONTROLS
+======================================================================
+
+Add clear controls:
+
+[일시정지]
+[계속]
+[중단]
+[실패만 재시도]
+
+Behavior:
+
+Pause:
+- finish current atomic/safe boundary
+- persist checkpoint
+- mark PAUSED
+- no new task starts
+
+Resume:
+- reload persisted queue
+- continue from last checkpoint
+- do not repeat successful tasks
+
+Stop:
+- stop future tasks safely
+- preserve completed work
+- mark STOPPED
+- no rollback unless explicitly chosen
+
+Retry failed:
+- only FAILED tasks
+- respect retry limits
+- do not rerun SUCCEEDED tasks
+
+On app restart:
+show:
+"중단된 자동 작업이 있습니다."
+
+Buttons:
+[이어서 실행]
+[종료 상태로 두기]
+
+======================================================================
+7. AUTOMATIC RETRY POLICY
+======================================================================
+
+Transient:
+- timeout
+- network interruption
+- 429/throttle
+- temporary provider/server error
+
+Auto retry with bounded exponential backoff.
+
+Permanent:
+- bad credential
+- missing scope
+- invalid business input
+- malformed permanent API userError
+- product conflict requiring human decision
+- CAPTCHA
+
+Do NOT endlessly retry.
+
+User-facing text:
+"일시적인 오류라 자동으로 다시 시도 중입니다. (2/4)"
+
+Do not expose stack traces by default.
+
+======================================================================
+8. HUMAN-FRIENDLY ERROR MESSAGES
+======================================================================
+
+Map technical errors to Korean operator messages.
+
+Examples:
+
+MISSING_SNAPSHOT
+→ "최신 재고 확인이 필요합니다."
+
+BLOCKED_SOURCE_OUT_OF_STOCK
+→ "원본 상품이 품절이라 판매 대상에서 제외했습니다."
+
+PREVIEW_STALE
+→ "재고 또는 가격이 바뀌어 미리보기를 다시 만들었습니다."
+
+MISSING_SCOPE
+→ "Shopify 권한이 부족합니다. 권한 확인이 필요합니다."
+
+TOKEN_BUDGET
+→ "예상 API 사용량이 설정 한도를 넘어서 잠시 멈췄습니다."
+
+Keep:
+[자세히 보기]
+for technical code/details.
+
+======================================================================
+9. SOURCE SAFETY AUTO FLOW
+======================================================================
+
+On "자동 안전검사 시작":
+
+A. local/read-only preview
+B. target count/batches/token estimate
+C. if real provider check is required:
+   one confirmation:
+   "Amazon/Keepa 최신 재고·가격을 확인합니다. 예상 X batch / Y token."
+D. after confirmation, automatically:
+   - run provider batches
+   - checkpoint
+   - retry transient failures
+   - evaluate freshness
+   - evaluate availability
+   - evaluate price deltas
+   - evaluate margin guard
+   - build Sold Out diagnosis where Shopify read permission exists
+   - create block/recheck/restock candidates
+   - generate summary
+E. show final beginner summary
+
+Do not require the user to click 5 different buttons for this normal chain.
+
+Keep individual expert buttons in Advanced mode.
+
+======================================================================
+10. SOURCE SAFETY RESULT UX
+======================================================================
+
+Final result should resemble:
+
+안전검사 완료
+
+✓ 판매 가능          1,642
+⚠ 확인 필요            91
+✕ 원본 품절            138
+✕ 가격/마진 차단        12
+⟳ 재확인 예정           94
+
+"Shopify Sold Out 73개 중"
+- 원본 품절 확인: 21
+- Shopify 재고설정 가능성: 39
+- 아직 원인 미확인: 13
+
+Primary next button:
+[문제 상품만 보기]
+
+Then:
+[Phase 4.2 준비 확인]
+
+Do not show 100 raw dicts by default.
+
+======================================================================
+11. TABLE USABILITY
+======================================================================
+
+Default table:
+- paginate
+- sortable
+- searchable
+- status filters
+- max 50 rows/page
+- sticky header if easy
+- readable row height
+- Korean status labels
+
+Useful filters:
+전체
+판매 가능
+품절
+확인 필요
+가격변동
+차단
+재입고 후보
+
+Expandable row:
+- current/previous price
+- last check
+- evidence
+- internal reason
+
+No giant JSON tree in primary view.
+
+======================================================================
+12. STORE-WIDE ONE-CLICK AUTOMATION
+======================================================================
+
+Add a top-level beginner workflow under "스토어 자동 구축":
+
+### 자동으로 스토어 완성
+
+[자동 구축 시작]
+
+AUTO workflow should orchestrate, where already implemented and safe:
+
+1. Store profile check
+2. Source safety prerequisite
+3. Sourcing/MASTER readiness
+4. Product preparation
+5. Collection plan
+6. Brand
+7. Navigation
+8. Homepage
+9. Footer/pages/SEO plans
+10. Store completion inspection
+11. Launch readiness
+
+For real external actions:
+stop at human gates, summarize exactly what confirmation is needed, then continue automatically after confirmation.
+
+Do not ask user to navigate manually between pages after each successful safe stage.
+
+======================================================================
+13. AUTO CONTINUE AFTER HUMAN GATE
+======================================================================
+
+Example:
+
+AUTO reaches Shopify live-write confirmation.
+
+Status:
+WAITING_FOR_CONFIRMATION
+
+User clicks:
+[10개 DRAFT 업로드 승인]
+
+After success:
+the orchestrator should automatically:
+- verify remote products
+- build collection preview
+- continue to next safe gate
+
+Do not force user to restart the entire workflow.
+
+======================================================================
+14. DASHBOARD
+======================================================================
+
+Main dashboard should answer:
+
+1. 지금 뭐 하면 되지?
+2. 자동 작업이 어디까지 됐지?
+3. 문제가 몇 개지?
+4. 멈춘 이유가 뭐지?
+
+Add:
+
+### 오늘 할 일
+"Source 안전검사를 먼저 완료하세요."
+[자동으로 진행]
+
+### 자동 작업
+Cabin Tidy
+68% 진행
+현재: Amazon 재고 확인 300/1,977
+
+[일시정지] [중단]
+
+### 확인 필요
+12건
+[보기]
+
+### 최근 완료
+Source Safety Audit
+Collection Plan
+...
+
+Do not make the user hunt through left navigation.
+
+======================================================================
+15. LEFT NAVIGATION CLEANUP
+======================================================================
+
+Current sidebar has many developer/module entries.
+
+Default beginner navigation should be grouped:
+
+홈
+자동 구축
+상품·소싱
+스토어 디자인
+스토어 완성
+기록
+
+Inside groups:
+- advanced module pages remain accessible
+- but not all technical pages need equal visual prominence
+
+Suggested:
+홈
+자동 구축
+상품·소싱
+  - 소스 안전
+  - 상품
+  - 컬렉션
+스토어 디자인
+  - 브랜드
+  - 메뉴
+  - 홈페이지
+스토어 완성
+  - 완성도 검사
+  - 실전 파일럿
+기록
+
+Advanced toggle:
+[전문가 메뉴 보기]
+
+Do not delete existing routes; reorganize presentation.
+
+======================================================================
+16. RESPONSIVE / SCREEN UTILIZATION
+======================================================================
+
+Screenshot shows large unused white space and a narrow data region.
+
+Use a sensible max-width:
+- content area fills available desktop width
+- cards 3–6 columns depending viewport
+- tables use horizontal space
+- sidebar fixed reasonable width
+- avoid tiny left-aligned widgets in huge blank area
+
+For 1920px-class desktop:
+use approximately 1440–1600px content max where appropriate.
+
+Do not make text stretch full-width for prose; tables may.
+
+======================================================================
+17. COLOR / STATUS CONSISTENCY
+======================================================================
+
+Use consistent semantic status design.
+
+Success
+Warning
+Danger
+Info
+Neutral
+
+Do not rely on color alone.
+Always pair:
+icon + label + color.
+
+Examples:
+✓ 정상
+⚠ 확인 필요
+✕ 차단
+⟳ 진행 중
+⏸ 일시정지
+
+Avoid excessive decorative colors.
+
+======================================================================
+18. PROGRESS
+======================================================================
+
+Every long operation should show:
+
+- percentage
+- X / Y
+- current stage
+- elapsed time
+- if estimable, remaining batches
+- current status
+
+Do not invent exact ETA if not reliable.
+
+Use:
+"남은 batch 12개"
+rather than fake "7분 13초 남음" if uncertain.
+
+======================================================================
+19. LOGGING
+======================================================================
+
+Default:
+friendly activity feed.
+
+Example:
+06:42 재고검사 시작
+06:42 100개 확인 완료
+06:43 2개 품절 감지
+06:43 다음 batch 진행
+
+Advanced:
+raw technical logs.
+
+Cap UI log rows.
+Older logs can be paginated/downloaded/exported.
+
+Do not render thousands of log lines.
+
+======================================================================
+20. CONFIRMATION POLICY
+======================================================================
+
+AUTO should only interrupt for meaningful gates.
+
+No confirmation:
+- local DB reads
+- planning
+- calculations
+- read-only Shopify inspection
+- mock/synthetic checks
+- report generation
+- safe retry
+- resume from checkpoint
+
+One confirmation:
+- paid provider call / token-consuming real audit
+- real Shopify write
+- theme write
+- Spark external handoff requiring manual app action
+
+Manual input:
+- legal/business values
+- shipping/payment/tax/domain business choices
+- rights review
+- ambiguous conflict
+
+Destructive:
+not allowed by default.
+
+======================================================================
+21. SETTINGS
+======================================================================
+
+Add simple Automation Settings:
+
+자동 모드:
+ON/OFF
+
+자동 재시도:
+ON/OFF
+
+최대 재시도:
+default 4
+
+provider 사용량 한도:
+existing token policy
+
+작업 종료 후 다음 안전 단계 자동 진행:
+ON by default
+
+사용자 확인이 필요한 단계에서만 멈춤:
+ON by default
+
+앱 재시작 시 중단 작업 안내:
+ON
+
+Do not hide cost-impacting settings.
+
+======================================================================
+22. PHASE 4.2 UX
+======================================================================
+
+Phase 4.2 Live Pilot UI should follow the same design.
+
+Default page:
+"실전 테스트"
+
+Step cards:
+
+1. Source 안전 확인
+2. Shopify 연결 확인
+3. 10개 DRAFT 미리보기
+4. 실제 업로드 승인
+5. 자동 검증
+6. 최대 3개 컬렉션
+7. 메뉴
+8. 홈페이지
+9. 완료 보고
+
+Only current/next step expanded.
+
+After user approves one live write,
+automatically run subsequent read-only verification.
+
+Do not expose raw GraphQL JSON by default.
+
+======================================================================
+23. ACCESSIBILITY / KEYBOARD
+======================================================================
+
+Use:
+- readable focus states
+- buttons with labels
+- tooltips only as secondary help
+- keyboard reachable dialogs
+- no icon-only critical buttons
+- sufficient spacing between destructive-ish and primary controls
+
+Stop button must be visually distinct but not dangerously close to Resume.
+
+======================================================================
+24. TESTS
+======================================================================
+
+Add tests for:
+
+test_beginner_mode_is_default
+test_global_typography_minimums
+test_raw_json_hidden_by_default
+test_source_safety_primary_auto_action
+test_auto_flow_runs_safe_steps_without_extra_confirmation
+test_auto_flow_stops_at_paid_provider_gate
+test_auto_flow_stops_at_shopify_write_gate
+test_queue_persists_after_restart
+test_queue_pause
+test_queue_resume
+test_queue_stop
+test_queue_retry_failed_only
+test_successful_tasks_not_repeated
+test_transient_error_auto_retry
+test_permanent_error_waits_for_user
+test_human_gate_resume_continues_next_task
+test_friendly_error_mapping
+test_source_summary_cards
+test_result_table_paginated
+test_ui_row_limit
+test_dashboard_next_action
+test_sidebar_beginner_groups
+test_advanced_menu_preserves_existing_routes
+test_phase42_wizard_beginner_mode
+test_no_real_network_in_tests
+test_protected_store_file_untouched
+
+Existing 560+ tests remain green.
+
+======================================================================
+25. STRESS
+======================================================================
+
+Simulate:
+- queue with 5,000 tasks
+- 2,000 source audit items
+- 50,000 data backend
+- app restart mid-run
+- 100 transient failures
+- mixed human gates
+
+UI must only display summaries/paged items.
+
+Queue operations should remain responsive.
+
+No O(N²) queue scans.
+
+======================================================================
+26. DOCUMENTATION
+======================================================================
+
+Create:
+docs/BEGINNER_UI_AUTOMATION.md
+docs/AUTO_WORKFLOW.md
+docs/QUEUE_CONTROL.md
+
+Write Korean beginner instructions.
+
+Explain:
+- 자동 실행
+- 일시정지
+- 계속
+- 중단
+- 실패만 재시도
+- 사람이 확인해야 하는 경우
+- app restart recovery
+
+======================================================================
+27. IMPLEMENTATION SAFETY
+======================================================================
+
+During Codex:
+NO real Keepa call
+NO Amazon batch
+NO Shopify mutation
+NO theme write
+NO inventory write
+NO Spark upload
+NO paid image call
+NO checkout/payment
+
+Mocks only.
+
+======================================================================
+28. PROTECTED FILE
+======================================================================
+
+stores/001_cabin_tidy.json
+
+NEVER:
+reset
+restore
+checkout
+clean
+stage
+commit
+overwrite
+
+======================================================================
+29. QUALITY GATE
+======================================================================
+
+Focused UI/orchestrator tests first.
+
+Then:
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+After final fix rerun full suite.
+
+======================================================================
+30. COMMIT / PUSH
+======================================================================
+
+Do not commit runtime DB/reports/logs/screenshots.
+
+Commit:
+git commit -m "Improve beginner UI and automation workflow"
+
+Push:
+git push origin main
+
+Verify:
+git rev-list --left-right --count main...origin/main
+= 0 0
+
+======================================================================
+31. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] baseline SHA
+[2] final SHA
+[3] global font/readability changes
+[4] beginner navigation
+[5] raw JSON hiding
+[6] Source Safety beginner page
+[7] one-click AUTO orchestrator
+[8] queue persistence
+[9] pause/resume/stop/retry
+[10] automatic retry policy
+[11] human-gate policy
+[12] app-restart recovery
+[13] dashboard
+[14] Phase 4.2 wizard UX
+[15] stress results
+[16] focused tests
+[17] full tests
+[18] protected file
+[19] commit/push
+[20] UX_AUTO_READY = YES/NO
+
+If YES:
+still do not start real provider audit or Shopify write.
+Wait for user.
