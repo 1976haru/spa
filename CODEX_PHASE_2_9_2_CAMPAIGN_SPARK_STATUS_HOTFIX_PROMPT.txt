@@ -1,0 +1,260 @@
+ShopSource Studio — Phase 2.9.2
+Campaign Spark Package Safe-Status Hotfix
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+
+Current main baseline:
+45d8f07f62fc63142b971b31a13e535751991d07
+Add one click sourcing planner
+
+IMPORTANT:
+The user's real LIVE 2,000 campaign already completed candidate sourcing and almost all detail/classification work.
+Do not cancel, reset, recreate, or mutate its sourcing progress.
+Do not launch Amazon.
+Do not stage or upload to Spark/Shopify automatically.
+
+Observed real failure when clicking:
+[이 캠페인 상품으로 SPARK PACKAGE 만들기]
+
+Error:
+Requested ASINs lack a matching Store Decision/status:
+B095JTXSNJ, B096VFKPLG, B09GV6C3B7, B09NBKXSLL, B0BNV8C1ZF, B0CHRXM962,
+B0CQ1SK2MB, B0CZYV9BMK, B0DG8VF34M, B0FC67296D, B0FC68B3RM, B0FC68M9JR,
+B0G1R53ZZV, B0GSTMWPQZ, B0GSYJM1PM, B0GX9YDK7X, B0H5QNN7S1, B0H5QV35K1,
+B0H7RQ34G1, B0H7WY5C47, B0H83QX7CP, B0H8XM5SYJ
+
+==================================================
+1. Confirm exact cause first
+==================================================
+
+Inspect:
+src/shopsource/capture/campaign.py
+src/shopsource/connectors/spark_handoff.py
+store decision schema/tests
+
+Current campaign.create_package appears to:
+1. select every campaign ASIN that has any store_product_decisions row
+2. build asins list without filtering final_status
+3. pass safe_statuses:
+   PRIMARY, RESERVE_A, RESERVE_B, RESERVE_C, LOW_RESERVE,
+   HIGH_RESERVE, REVIEW
+4. SparkHandoffConnector then filters rows by safe statuses
+5. explicit ASINs whose final_status is RESTRICTED/ARCHIVED (or otherwise not in safe_statuses)
+   are treated as "missing", causing the entire package creation to fail.
+
+Verify the 22 real ASINs read-only in the production DB and report their exact final_status counts.
+Do not change those decisions just to make package creation pass.
+
+If this diagnosis is not correct, stop and report the actual cause before changing logic.
+
+==================================================
+2. Correct package semantics
+==================================================
+
+Campaign package creation must export only campaign products that are both:
+
+- MASTER product exists
+- Store Decision exists for the current store
+- final_status is one of the allowed safe export statuses
+
+Allowed by default:
+PRIMARY
+RESERVE_A
+RESERVE_B
+RESERVE_C
+LOW_RESERVE
+HIGH_RESERVE
+REVIEW
+
+Excluded by default:
+RESTRICTED
+ARCHIVED
+
+Do not change RESTRICTED/ARCHIVED to another status.
+Do not delete them from MASTER/campaign history.
+
+==================================================
+3. Fix campaign.create_package
+==================================================
+
+In CampaignService.create_package():
+
+Query the campaign result set with final_status.
+
+Split into:
+- exportable ASINs
+- excluded ASINs by status
+- ASINs missing product
+- ASINs missing Store Decision
+
+Only pass exportable ASINs to SparkCenterPackageService.create().
+
+Do not pass known excluded ASINs and then rely on SparkHandoffConnector to reject them.
+
+If there are zero exportable products, fail with a clear message.
+
+==================================================
+4. Return/report exclusion summary
+==================================================
+
+Package creation result/UI should show something like:
+
+Campaign products: 1,999
+Spark exportable: 1,977
+Excluded:
+- RESTRICTED: 22
+- ARCHIVED: 0
+Missing decision: 0
+
+Actual numbers must come from DB, not be hardcoded.
+
+Save the summary in package manifest/report/history if appropriate:
+campaign_total
+campaign_exportable
+campaign_excluded_by_status
+campaign_missing_decision
+campaign_missing_product
+
+This is important evidence for the assignment.
+
+==================================================
+5. Improve misleading connector error
+==================================================
+
+In SparkHandoffConnector explicit-ASIN validation, distinguish:
+- ASIN has Store Decision but status not in selected statuses
+- ASIN has no Store Decision
+- ASIN/product missing
+
+At minimum, do not call all unmatched ASINs "lack a matching Store Decision/status" if exact reason can be determined.
+
+Keep existing safety behavior for generic callers.
+
+==================================================
+6. UI
+==================================================
+
+When user clicks campaign package button:
+
+Success notification:
+"Spark Package <id> · exportable N개 · 제외 M개"
+
+If excluded:
+show breakdown.
+
+Do not require user to manually uncheck hundreds/thousands of ASINs.
+
+Do not create package from RESTRICTED/ARCHIVED.
+
+==================================================
+7. Assignment semantics
+==================================================
+
+Keep separate:
+- sourced unique candidates = 2,000
+- MASTER/classified
+- Spark exportable
+- Spark included/excluded after Spark filtering
+- Shopify uploaded count
+
+Do not rewrite sourced 2,000 just because some products are excluded from export.
+
+==================================================
+8. Current real campaign protection
+==================================================
+
+Read-only diagnostics are allowed.
+Do not:
+- mutate campaign candidate rows
+- reclassify products merely to pass export
+- cancel/resume sourcing
+- retry Amazon
+- alter current MASTER products
+- alter store profile
+- stage package into Spark
+- upload Shopify
+
+The user will click package generation again after hotfix.
+
+==================================================
+9. Tests
+==================================================
+
+Add tests:
+
+test_campaign_package_excludes_restricted
+test_campaign_package_excludes_archived
+test_campaign_package_keeps_review
+test_campaign_package_does_not_fail_when_some_asins_excluded
+test_campaign_package_reports_excluded_status_counts
+test_campaign_package_reports_missing_decision
+test_campaign_package_preserves_restricted_decision
+test_campaign_package_preserves_archived_decision
+test_campaign_sourced_count_unchanged_after_package
+test_handoff_explicit_asin_reason_distinguishes_status_mismatch
+
+All existing tests PASS.
+
+==================================================
+10. Quality gate
+==================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+No extension change should be necessary.
+Do not bump extension version unless extension code actually changes.
+
+==================================================
+11. User dirty file
+==================================================
+
+stores/001_cabin_tidy.json
+
+Never reset/restore/stage/commit it.
+
+Do not commit:
+DB
+backups
+exports
+runtime data
+
+==================================================
+12. Commit/push
+==================================================
+
+Commit:
+git commit -m "Fix campaign Spark package status filtering"
+
+Push origin/main.
+
+Final:
+main...origin/main = 0 0
+
+==================================================
+13. Completion report
+==================================================
+
+Report:
+
+[1] exact cause
+[2] exact statuses of the 22 real ASINs, read-only
+[3] campaign total products
+[4] exportable count
+[5] excluded count and breakdown
+[6] missing decision count
+[7] code fix
+[8] tests
+[9] user dirty file preserved
+[10] commit SHA
+[11] exact user steps to retry package creation
+
+Implement now.
