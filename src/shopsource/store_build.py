@@ -16,7 +16,9 @@ STAGES = ("PLAN", "BRAND_PLAN", "BRAND_ASSET_PREVIEW", "BRAND_ASSET_GENERATION",
           "SOURCING", "SOURCE_VALIDATION", "PRODUCT_SYNC_PREVIEW", "PRODUCT_SYNC", "PRODUCT_VERIFY",
           "COLLECTION_PLAN", "COLLECTION_IMAGE", "COLLECTION_SYNC_PREVIEW", "COLLECTION_SYNC", "COLLECTION_VERIFY",
           "NAVIGATION_PLAN", "NAVIGATION_SYNC_PREVIEW", "NAVIGATION_SYNC", "NAVIGATION_VERIFY", "MEGA_MENU_PREVIEW", "MEGA_MENU_APPLY",
-          "BRAND_APPLY_PREVIEW", "BRAND_APPLY", "HOMEPAGE_PLAN", "FINAL_VERIFY", "COMPLETE")
+          "HOMEPAGE_PLAN", "HERO_ASSET_PREVIEW", "HERO_ASSET_GENERATION", "CATEGORY_SHORTCUT_PLAN",
+          "CATEGORY_ASSET_PREVIEW", "CATEGORY_ASSET_GENERATION", "HOMEPAGE_SYNC_PREVIEW", "HOMEPAGE_SYNC",
+          "HOMEPAGE_VERIFY", "BRAND_APPLY_PREVIEW", "BRAND_APPLY", "FINAL_VERIFY", "COMPLETE")
 STAGE_STATES = {"PENDING", "RUNNING", "COMPLETE", "COMPLETE_WITH_WARNINGS", "PAUSED", "FAILED", "MANUAL_ACTION_REQUIRED", "SKIPPED"}
 
 
@@ -67,7 +69,8 @@ class StoreBuildOrchestrator:
                    "publish_collections": False, "homepage_plan": True, "source_target": 2000,
                    "publish_status": "DRAFT", "media_mode": "MANUAL_MEDIA", "brand_automation": False,
                    "brand_image_opt_in": False, "brand_image_model": None, "brand_apply": False,
-                   "navigation_automation": False,"navigation_sync": False,"mega_menu_apply": False, **(options or {})}
+                   "navigation_automation": False,"navigation_sync": False,"mega_menu_apply": False,
+                   "homepage_sync": False, **(options or {})}
         provider = str(provider).upper(); mode = str(mode).upper()
         if provider not in {"DIRECT_SHOPIFY", "SPARK_FALLBACK"}: raise ValueError("Unknown product route")
         if mode not in {"PREVIEW", "LIVE"}: raise ValueError("mode must be PREVIEW or LIVE")
@@ -160,6 +163,11 @@ class StoreBuildOrchestrator:
                 plan_id=run["stage_data"].get("NAVIGATION_PLAN",{}).get("navigation_plan_id")
                 check=NavigationService(db=self.db).verify(run["store_id"],plan_id) if plan_id else {"verified":False}
                 if not check.get("verified"):raise RuntimeError("Shopify navigation does not match the current ShopSource preview.")
+            if expected == "homepage_manual_applied":
+                from .homepage_automation import HomepageAutomationService
+                preview_id=run["stage_data"].get("HOMEPAGE_PLAN",{}).get("preview_id") or run["stage_data"].get("HOMEPAGE_SYNC_PREVIEW",{}).get("preview_id")
+                check=HomepageAutomationService(db=self.db).verify(preview_id) if preview_id else {"status":"NOT_FOUND"}
+                if check.get("status")!="VERIFIED":raise RuntimeError("Shopify homepage JSON does not yet match the approved homepage preview.")
             self._set_stage(run_id, stage, "COMPLETE_WITH_WARNINGS", counts={"manual_confirmation": expected})
             run = self.get(run_id)
         elif run["status"] == "FAILED":
@@ -510,9 +518,17 @@ class StoreBuildOrchestrator:
             return {"counts":{"verified":True},"result":result}
         if stage == "HOMEPAGE_PLAN":
             if not options.get("homepage_plan"): return {"stage_status": "SKIPPED"}
-            from .homepage_collections import HomepageCollectionService, ShopifyThemeReader, build_homepage_plan
+            from .homepage_automation import (HomepageAutomationService, build_homepage_plan as build_storefront_plan,
+                                              compose_homepage_preview)
+            from .homepage_collections import ShopifyThemeReader
             from .collection_planner import CollectionPlanner
+            from .brand_automation import brand_profile_from_store, get_brand_profile
             plan = CollectionPlanner(self.db).get_plan(data["collection_plan_id"])
+            brand = get_brand_profile(store_id, db=self.db) or brand_profile_from_store(store_id, db=self.db)
+            with connect(self.db) as con:
+                handles = {row["collection_key"]: row["handle"] for row in con.execute("SELECT collection_key,handle FROM shopify_collection_mappings WHERE store_id=?", (store_id,))} if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='shopify_collection_mappings'").fetchone() else {}
+            data["storefront_homepage_plan"] = build_storefront_plan(store_id=store_id, brand=brand, collection_plan=plan,
+                                                                      collection_handles=handles, db=self.db)
             snapshot = ShopifyThemeReader(db=self.db).discover(store_id)
             if snapshot.get("status") != "CONNECTED":
                 result = {"status": "MANUAL_PATCH_MODE", "manual_patch_mode": True, "current": None, "proposed": None,
@@ -520,12 +536,55 @@ class StoreBuildOrchestrator:
             else:
                 with connect(self.db) as con:
                     handles = {row["collection_key"]: row["handle"] for row in con.execute("SELECT collection_key,handle FROM shopify_collection_mappings WHERE store_id=?", (store_id,))}
-                result = build_homepage_plan(snapshot, plan, collection_handles=handles, db=self.db)
-            if result.get("current") is not None and result.get("status") != "CONFLICT":
-                data["homepage_backup"] = HomepageCollectionService(db=self.db).save_safe_patch(result, store_id=store_id)
+                result = compose_homepage_preview(data["storefront_homepage_plan"], snapshot, plan,
+                                                  collection_handles=handles, db=self.db)
+            data["homepage_report"] = HomepageAutomationService(db=self.db).export_report(data["storefront_homepage_plan"], preview=result)
             data["homepage_plan"] = result
-            return {"status": "MANUAL_ACTION_REQUIRED", "manual_gate": "THEME_APPLY", "homepage_status": result.get("status"),
-                    "instructions": "Review the local before/proposed/diff patch (if theme files were readable). Resolve any CONFLICT first, then add/update only the listed collection sections in Shopify Theme Editor. Theme API writes are disabled in this phase."}
+            return {"status": "COMPLETE_WITH_WARNINGS", "homepage_status": result.get("status"),
+                    "instructions": "Homepage plan includes hero and category shortcuts; review the theme preview. Unsupported or uncertain fields require manual Theme Editor work."}
+        if stage in {"HERO_ASSET_PREVIEW", "CATEGORY_ASSET_PREVIEW"}:
+            if not options.get("homepage_plan"): return {"stage_status": "SKIPPED"}
+            plan = data.get("storefront_homepage_plan") or {}
+            if stage == "HERO_ASSET_PREVIEW":
+                return {"status": "NEEDS_IMAGE" if plan.get("hero", {}).get("image_status") != "READY" else "READY",
+                        "hero_status": plan.get("hero", {}).get("image_status", "NEEDS_IMAGE"), "stage_status": "COMPLETE_WITH_WARNINGS"}
+            return {"status": "READY" if plan.get("categories") else "SKIPPED",
+                    "category_count": len(plan.get("categories", [])), "stage_status": "COMPLETE_WITH_WARNINGS"}
+        if stage in {"HERO_ASSET_GENERATION", "CATEGORY_ASSET_GENERATION"}:
+            # Asset generation is a separate opt-in operation in the homepage UI.
+            return {"stage_status": "SKIPPED", "reason": "No image provider execution is started by Store Build"}
+        if stage == "CATEGORY_SHORTCUT_PLAN":
+            plan = data.get("storefront_homepage_plan") or {}
+            return {"status": "PLANNED" if plan.get("categories") else "SKIPPED", "count": len(plan.get("categories", []))}
+        if stage == "HOMEPAGE_SYNC_PREVIEW":
+            if not options.get("homepage_plan"): return {"stage_status": "SKIPPED"}
+            result = data.get("homepage_plan") or {}
+            return {"status": result.get("status", "MANUAL_ACTION_REQUIRED"), "preview_id": result.get("preview_id"), "preview_hash": (result.get("diff") or {}).get("proposed_hash"),
+                    "stage_status": "COMPLETE_WITH_WARNINGS" if result.get("status") in {"PREVIEW", "DRY_RUN"} else "COMPLETE_WITH_WARNINGS",
+                    "manual_action_required": result.get("status") not in {"PREVIEW", "DRY_RUN"}}
+        if stage == "HOMEPAGE_SYNC":
+            if not options.get("homepage_sync"): return {"stage_status": "SKIPPED"}
+            from .homepage_automation import HomepageAutomationService
+            with connect(self.db) as con:
+                row = con.execute("SELECT preview_id FROM store_homepage_previews WHERE store_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1", (store_id,)).fetchone()
+            if not row:return {"status":"MANUAL_ACTION_REQUIRED","manual_gate":"HOMEPAGE_MANUAL_APPLY","instructions":"Create a fresh homepage preview and approve its assets first."}
+            result = HomepageAutomationService(db=self.db).apply(row["preview_id"], confirmed=True,
+                approved_assets=bool(options.get("homepage_assets_approved")))
+            data["homepage_apply_result"] = result
+            if result.get("status") != "VERIFIED":
+                return {"status":"MANUAL_ACTION_REQUIRED","manual_gate":"HOMEPAGE_MANUAL_APPLY","result":result,
+                        "instructions":"Apply the reviewed homepage patch manually in Theme Editor, then resume for remote verification."}
+            return {"status":"VERIFIED","result":result}
+        if stage == "HOMEPAGE_VERIFY":
+            if not options.get("homepage_sync"):return {"status":"PREVIEW_ONLY","stage_status":"COMPLETE_WITH_WARNINGS"}
+            from .homepage_automation import HomepageAutomationService
+            with connect(self.db) as con:
+                row = con.execute("SELECT preview_id FROM store_homepage_previews WHERE store_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1", (store_id,)).fetchone()
+            verification = HomepageAutomationService(db=self.db).verify(row["preview_id"]) if row else {"status":"NOT_FOUND"}
+            if verification.get("status") != "VERIFIED":
+                return {"status":"MANUAL_ACTION_REQUIRED","manual_gate":"HOMEPAGE_MANUAL_APPLY","verification":verification,
+                        "instructions":"Remote homepage JSON does not match the approved proposal."}
+            return {"status":"VERIFIED","verification":verification}
         if stage == "FINAL_VERIFY":
             return {"counts": self._catalog_counts(store_id), "homepage_status": data.get("homepage_plan", {}).get("status", "SKIPPED")}
         if stage == "COMPLETE": return {}
@@ -537,7 +596,8 @@ class StoreBuildOrchestrator:
         return {"SOURCE_WORKER": "source_complete", "SOURCE_CAPTCHA": "amazon_challenge_resolved",
                 "SPARK_UPLOAD": "spark_upload_confirmed", "THEME_APPLY": "theme_manual_apply_confirmed",
                 "BRAND_APPROVAL": "brand_assets_approved", "BRAND_MANUAL_APPLY": "brand_theme_manual_applied",
-                "MEGA_MENU_APPLY":"mega_menu_manual_applied","NAVIGATION_SYNC":"navigation_manual_synced"}.get(details.get("manual_gate"), "manual_action_confirmed")
+                "MEGA_MENU_APPLY":"mega_menu_manual_applied","NAVIGATION_SYNC":"navigation_manual_synced",
+                "HOMEPAGE_MANUAL_APPLY":"homepage_manual_applied"}.get(details.get("manual_gate"), "manual_action_confirmed")
 
     def _default_final_status(self, run_id):
         run = self.get(run_id)

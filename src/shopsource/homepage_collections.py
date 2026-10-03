@@ -230,7 +230,8 @@ def build_homepage_plan(snapshot: dict, plan: dict, *, collection_handles: dict[
     for row in selected:
         key = row["collection_key"]
         section_id = _section_id(key)
-        handle = collection_handles.get(key) or row.get("handle")
+        # Only use a confirmed Shopify mapping. Planner handle suggestions are not remote resources.
+        handle = collection_handles.get(key)
         if not handle:
             operations.append({"action": "CONFLICT", "section_id": section_id, "collection_key": key,
                               "reason": "No Shopify collection handle is mapped; sync the collection first"})
@@ -281,7 +282,10 @@ def build_homepage_plan(snapshot: dict, plan: dict, *, collection_handles: dict[
     if not any(op["action"] == "CONFLICT" for op in operations):
         selected_order = [_section_id(row["collection_key"]) for row in selected if _section_id(row["collection_key"]) in order]
         untouched = [section_id for section_id in order if section_id not in selected_order]
-        desired_order = untouched + selected_order
+        footer_index = next((i for i, section_id in enumerate(untouched)
+                             if "footer" in str(section_id).casefold()
+                             or "footer" in str((sections.get(section_id) or {}).get("type", "")).casefold()), len(untouched))
+        desired_order = untouched[:footer_index] + selected_order + untouched[footer_index:]
         if desired_order != order:
             proposed["order"] = desired_order
             operations.append({"action": "MOVE", "section_ids": selected_order, "reason": "Place recommended collections in ranked order"})

@@ -313,7 +313,8 @@ def test_collection_image_can_use_brand_profile(env, monkeypatch):
 
 def test_store_build_brand_stage_order():
     assert STAGES.index("BRAND_PLAN") < STAGES.index("COLLECTION_PLAN")
-    assert STAGES.index("BRAND_APPLY_PREVIEW") < STAGES.index("BRAND_APPLY") < STAGES.index("HOMEPAGE_PLAN")
+    assert STAGES.index("NAVIGATION_VERIFY") < STAGES.index("HOMEPAGE_PLAN") < STAGES.index("HOMEPAGE_VERIFY")
+    assert STAGES.index("HOMEPAGE_VERIFY") < STAGES.index("BRAND_APPLY_PREVIEW") < STAGES.index("BRAND_APPLY")
 
 
 def test_protected_store_file_not_part_of_brand_storage(env):

@@ -102,12 +102,41 @@ def register_image_asset(store_id: str, collection_key: str, path: str | Path, *
         con.execute("""CREATE TABLE IF NOT EXISTS collection_image_assets (
           store_id TEXT NOT NULL,collection_key TEXT NOT NULL,path TEXT NOT NULL,provider TEXT NOT NULL,
           model TEXT NOT NULL DEFAULT '',alt_text TEXT NOT NULL DEFAULT '',metadata_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL,
+          approval_status TEXT NOT NULL DEFAULT 'NEEDS_REVIEW',
           PRIMARY KEY(store_id,collection_key))""")
+        columns={row["name"] for row in con.execute("PRAGMA table_info(collection_image_assets)")}
+        if "approval_status" not in columns:
+            con.execute("ALTER TABLE collection_image_assets ADD COLUMN approval_status TEXT NOT NULL DEFAULT 'NEEDS_REVIEW'")
         con.execute("""INSERT INTO collection_image_assets(store_id,collection_key,path,provider,model,alt_text,metadata_json,created_at)
           VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(store_id,collection_key) DO UPDATE SET path=excluded.path,
           provider=excluded.provider,model=excluded.model,alt_text=excluded.alt_text,metadata_json=excluded.metadata_json,created_at=excluded.created_at""",
           (store_id,collection_key,str(target),provider,model,alt_text,json.dumps(metadata or {},ensure_ascii=False),utc_now()))
     return {"store_id":store_id,"collection_key":collection_key,"path":str(target),"provider":provider,"model":model,"alt_text":alt_text}
+
+
+def approve_collection_image(store_id: str, collection_key: str, *, db=None) -> bool:
+    """Explicitly approve a registered collection image for storefront reuse."""
+    init_db(db)
+    with connect(db) as con:
+        exists=con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='collection_image_assets'").fetchone()
+        if not exists:return False
+        columns={row["name"] for row in con.execute("PRAGMA table_info(collection_image_assets)")}
+        if "approval_status" not in columns:
+            con.execute("ALTER TABLE collection_image_assets ADD COLUMN approval_status TEXT NOT NULL DEFAULT 'NEEDS_REVIEW'")
+        return con.execute("UPDATE collection_image_assets SET approval_status='APPROVED' WHERE store_id=? AND collection_key=?",
+                           (store_id,collection_key)).rowcount > 0
+
+
+def approved_collection_images(store_id: str, *, db=None) -> dict[str, dict]:
+    init_db(db)
+    with connect(db) as con:
+        exists=con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='collection_image_assets'").fetchone()
+        if not exists:return {}
+        columns={row["name"] for row in con.execute("PRAGMA table_info(collection_image_assets)")}
+        if "approval_status" not in columns:
+            con.execute("ALTER TABLE collection_image_assets ADD COLUMN approval_status TEXT NOT NULL DEFAULT 'NEEDS_REVIEW'")
+        return {row["collection_key"]:dict(row) for row in con.execute(
+            "SELECT * FROM collection_image_assets WHERE store_id=? AND approval_status='APPROVED'",(store_id,))}
 
 
 def generate_collection_image(store_id: str, definition: dict, *, provider: CollectionImageProvider,

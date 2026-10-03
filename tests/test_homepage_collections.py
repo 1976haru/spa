@@ -81,7 +81,9 @@ def test_theme_apply_minimal_diff():
     result = make_plan(snapshot)
     assert result["proposed"]["sections"]["hero"] == snapshot["template"]["sections"]["hero"]
     assert result["proposed"]["sections"]["footer"] == snapshot["template"]["sections"]["footer"]
-    assert result["proposed"]["order"][:2] == ["hero", "footer"]
+    assert result["proposed"]["order"][0] == "hero"
+    assert result["proposed"]["order"][-1] == "footer"
+    assert any(section_id.startswith("ss_") for section_id in result["proposed"]["order"][1:-1])
     assert all("products_to_show" not in row["settings"] for row in result["proposed"]["sections"].values() if row.get("type") == "featured-picks")
 
 

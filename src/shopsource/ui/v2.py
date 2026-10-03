@@ -15,10 +15,16 @@ from ..capture.batch import BatchSourcingService
 from ..capture.campaign import CampaignService
 from ..collection_planner import CollectionPlanner
 from ..shopify_collections import ShopifyCollectionPublisher, get_connection as get_shopify_connection, save_connection as save_shopify_connection, save_shopify_token
-from ..collection_images import ManualImageProvider, OpenAIImagesProvider, generate_collection_image
+from ..collection_images import (ManualImageProvider, OpenAIImagesProvider, approve_collection_image,
+    generate_collection_image, approved_collection_images)
 from ..classifier import classify_store
 from ..db import connect, get_store, init_db, upsert_store
 from ..homepage_collections import HomepageCollectionService, ShopifyThemeReader, build_homepage_plan
+from ..homepage_automation import (HomepageAutomationService, assignment_banner_check,
+    assignment_category_check, build_homepage_plan as build_storefront_homepage_plan,
+    build_homepage_preview as build_storefront_homepage_preview, compose_homepage_preview,
+    approve_hero_asset, generate_hero_image, latest_hero_asset, register_manual_hero_asset,
+    suggested_theme_image_ref, upload_approved_hero_asset, validate_homepage_image)
 from ..navigation import MegaMenuThemeService, NavigationService
 from ..store_build import StoreBuildOrchestrator
 from ..intelligence.keyword_engine import KeywordEngine
@@ -35,6 +41,7 @@ from .v2_service import (
 )
 
 NAV_ITEMS = [
+    ("/homepage", "web", "Homepage Automation"),
     ("/build", "rocket_launch", "스토어 자동 구축"),
     ("/pilot", "science", "Cabin Tidy 파일럿"),
     ("/brand", "palette", "브랜드·로고·파비콘"),
@@ -161,6 +168,7 @@ class OperatorUI:
             elif path == "/sourcing": self._sourcing()
             elif path == "/collections": self._collections()
             elif path == "/navigation": self._navigation()
+            elif path == "/homepage": self._homepage_automation()
             elif path == "/products": self._products()
             elif path == "/packages": self._packages()
             elif path == "/history": self._history()
@@ -177,6 +185,8 @@ class OperatorUI:
         store = next((row for row in self.stores if row["store_id"] == self.current_store), None)
         ui.label(f"Store: {self.current_store} | {store['store_name'] if store else self.current_store}").classes("text-xl font-semibold")
         with ui.card().classes("w-full border border-sky-200"):
+            homepage_sync = ui.checkbox("Apply homepage theme patch in this LIVE run", value=False)
+            homepage_assets_approved = ui.checkbox("Homepage image assets are reviewed and approved", value=False)
             mode = ui.radio({"PREVIEW": "미리보기", "LIVE": "실제 실행"}, value="PREVIEW").props("inline")
             provider = ui.radio({"DIRECT_SHOPIFY": "DIRECT_SHOPIFY (권장)", "SPARK_FALLBACK": "SPARK_FALLBACK"}, value="DIRECT_SHOPIFY").props("inline")
             with ui.expansion("고급 설정", icon="tune"):
@@ -233,7 +243,8 @@ class OperatorUI:
                                "brand_automation": bool(brand_automation.value), "brand_image_opt_in": bool(brand_paid.value),
                                "brand_image_model": brand_model.value or "gpt-image-1", "brand_apply": bool(brand_apply.value),
                                "navigation_automation":bool(navigation_automation.value),"navigation_sync":bool(navigation_sync.value),
-                               "mega_menu_apply":bool(mega_menu_apply.value)}
+                               "mega_menu_apply":bool(mega_menu_apply.value), "homepage_sync":bool(homepage_sync.value),
+                               "homepage_assets_approved":bool(homepage_assets_approved.value)}
                     service = StoreBuildOrchestrator()
                     result = service.preview(self.current_store, options=options, provider=provider.value or "DIRECT_SHOPIFY", mode=mode.value or "PREVIEW")
                     show_run(service.get(result["run_id"]))
@@ -727,6 +738,194 @@ class OperatorUI:
                 checklist
             tree;action_area;theme_area
 
+    def _homepage_automation(self):
+        ui = self.ui
+        self._heading("Homepage Automation", "BrandProfile, enabled collections, Shopify mappings, and the discovered theme schema drive this preview.")
+        ui.label("Preview is read-only. Shopify theme changes require a separate explicit confirmation; paid image generation stays off until opted in.").classes("text-sm text-amber-800")
+        state = {"plan": None, "snapshot": None, "preview": None, "collection_plan": None}
+        with ui.card().classes("w-full border-2 border-sky-200 bg-sky-50"):
+            brand_name = next((row["store_name"] for row in self.stores if row["store_id"] == self.current_store), self.current_store)
+            ui.label(f"Store: {self.current_store} | Brand: {brand_name}").classes("text-xl font-bold")
+            summary = ui.label("Hero: not planned · Categories: not planned · Theme: not checked").classes("font-medium")
+            actions = ui.column().classes("w-full gap-2")
+            preview_area = ui.column().classes("w-full gap-2")
+            hero_url = ui.input("Shopify Files hero image URL (optional)").classes("w-full")
+            hero_approved = ui.checkbox("선택한 Hero 이미지가 승인된 자산임을 확인", value=False)
+            theme_image_ref = ui.input("Theme image_picker reference (확인된 shopify://shop_images/... 값)").classes("w-full")
+            theme_ref_confirmed = ui.checkbox("Theme image_picker reference를 Theme Editor에서 확인", value=False)
+            with ui.expansion("고급 설정", icon="tune"):
+                max_categories = ui.number("카테고리 수 (4–8)", value=8, min=4, max=8).classes("w-48")
+            local_image = ui.input("배너 이미지 검사 경로").classes("w-full")
+            paid_opt_in = ui.checkbox("유료 이미지 자동 생성 사용", value=False)
+
+            async def save_hero_upload(event):
+                try:
+                    plan = state.get("plan")
+                    if not plan: raise ValueError("이미 홈페이지 자동 설계를 먼저 실행하세요.")
+                    content = await event.file.read()
+                    asset = register_manual_hero_asset(self.current_store, plan["plan_id"], event.file.name, content)
+                    ui.notify(f"Hero asset 저장 · {asset['approval_status']} · {asset['validation']['width']}×{asset['validation']['height']}", type="positive")
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            hero_upload = ui.upload(label="배너 이미지 파일 선택", auto_upload=True, on_upload=save_hero_upload).props("accept=.png,.jpg,.jpeg,.webp").classes("w-full")
+
+            def approve_latest_hero():
+                plan = state.get("plan")
+                if not plan: ui.notify("홈페이지 계획이 필요합니다.", type="warning"); return
+                asset = latest_hero_asset(self.current_store, plan["plan_id"])
+                if not asset: ui.notify("등록된 배너 이미지가 없습니다.", type="warning"); return
+                approve_hero_asset(asset["asset_id"])
+                ui.notify("배너 이미지 로컬 승인 완료. Shopify Files 업로드를 이어서 진행하세요.", type="positive")
+
+            def upload_latest_hero():
+                plan = state.get("plan")
+                if not plan: ui.notify("홈페이지 계획이 필요합니다.", type="warning"); return
+                asset = latest_hero_asset(self.current_store, plan["plan_id"])
+                if not asset: ui.notify("등록된 배너 이미지가 없습니다.", type="warning"); return
+                result = upload_approved_hero_asset(self.current_store, asset["asset_id"], alt_text=plan["hero"].get("alt_text") or "Homepage hero")
+                if result.get("status") == "READY":
+                    hero_url.set_value(result["shopify_url"])
+                    hero_approved.set_value(True)
+                    theme_image_ref.set_value(suggested_theme_image_ref(asset))
+                    state["plan"]["hero"].update(image_url=result["shopify_url"], image_asset_id=asset["asset_id"], asset_sha256=asset["sha256"], asset_approved=True, image_status="READY")
+                    state["preview"] = None
+                ui.notify("Shopify Files: " + str(result), type="positive" if result.get("status") == "READY" else "warning")
+
+            def design():
+                try:
+                    from ..brand_automation import brand_profile_from_store, get_brand_profile
+                    with connect() as con:
+                        row = con.execute("SELECT plan_id FROM store_collection_plans WHERE store_id=? ORDER BY version DESC LIMIT 1", (self.current_store,)).fetchone()
+                    if not row: raise ValueError("먼저 컬렉션 자동 설계를 완료하세요.")
+                    collection_plan = CollectionPlanner().get_plan(row["plan_id"])
+                    brand = get_brand_profile(self.current_store) or brand_profile_from_store(self.current_store)
+                    with connect() as con:
+                        has_map = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='shopify_collection_mappings'").fetchone()
+                        mappings = {item["collection_key"]: item["handle"] for item in con.execute("SELECT collection_key,handle FROM shopify_collection_mappings WHERE store_id=?", (self.current_store,))} if has_map else {}
+                    images = {key: {**asset, "approval_status": "APPROVED"} for key, asset in approved_collection_images(self.current_store).items()}
+                    plan = build_storefront_homepage_plan(store_id=self.current_store, brand=brand, collection_plan=collection_plan,
+                        collection_handles=mappings, collection_assets=images, maximum_categories=int(max_categories.value or 8))
+                    saved_hero = latest_hero_asset(self.current_store, plan["plan_id"])
+                    if saved_hero and saved_hero.get("approval_status") == "APPROVED" and saved_hero.get("shopify_url"):
+                        plan["hero"].update(image_url=saved_hero["shopify_url"], image_asset_id=saved_hero["asset_id"],
+                                            asset_sha256=saved_hero["sha256"], asset_approved=True, image_status="READY",
+                                            theme_image_ref=suggested_theme_image_ref(saved_hero),
+                                            theme_image_ref_confirmed=bool(theme_ref_confirmed.value))
+                        hero_url.set_value(saved_hero["shopify_url"])
+                        hero_approved.set_value(True)
+                        theme_image_ref.set_value(plan["hero"]["theme_image_ref"])
+                    saved_hero = latest_hero_asset(self.current_store, plan["plan_id"])
+                    if saved_hero and saved_hero.get("approval_status") == "APPROVED" and saved_hero.get("shopify_url"):
+                        plan["hero"].update(image_url=saved_hero["shopify_url"], image_asset_id=saved_hero["asset_id"], asset_approved=True, image_status="READY")
+                        hero_url.set_value(saved_hero["shopify_url"])
+                        hero_approved.set_value(True)
+                    snapshot = ShopifyThemeReader().discover(self.current_store)
+                    plan["hero"]["image_url"] = (hero_url.value or "").strip() or None
+                    plan["hero"]["asset_approved"] = bool(hero_approved.value)
+                    plan["hero"]["theme_image_ref"] = (theme_image_ref.value or "").strip() or None
+                    plan["hero"]["theme_image_ref_confirmed"] = bool(theme_ref_confirmed.value)
+                    if plan["hero"]["image_url"]: plan["hero"]["image_asset_id"] = "SHOPIFY_FILES_URL"
+                    state["plan"], state["snapshot"], state["collection_plan"] = plan, snapshot, collection_plan
+                    state["preview"] = compose_homepage_preview(plan, snapshot, collection_plan, collection_handles=mappings) if snapshot.get("status") == "CONNECTED" else None
+                    HomepageAutomationService().export_report(plan, preview=state["preview"])
+                    summary.set_text(f"Hero: NEEDS IMAGE · Categories: {plan['category_summary']['ready_count']} READY / {plan['category_summary']['skipped_count']} SKIPPED · Theme: {snapshot.get('status', 'MANUAL ACTION')}")
+                    render()
+                    ui.notify("홈페이지 계획/preview를 저장했습니다. Shopify write는 실행하지 않았습니다.", type="positive")
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            def render():
+                plan = state.get("plan")
+                if not plan: return
+                hero = plan["hero"]
+                hero["image_url"] = (hero_url.value or "").strip() or None
+                hero["asset_approved"] = bool(hero_approved.value)
+                hero["theme_image_ref"] = (theme_image_ref.value or "").strip() or None
+                hero["theme_image_ref_confirmed"] = bool(theme_ref_confirmed.value)
+                if hero["image_url"] and not hero.get("image_asset_id"): hero["image_asset_id"] = "SHOPIFY_FILES_URL"
+                checks = assignment_banner_check(plan)
+                cats = assignment_category_check(plan)
+                preview_area.clear()
+                with preview_area:
+                    with ui.card().classes("w-full border border-slate-200"):
+                        ui.label("Hero banner · assignment mode").classes("font-semibold")
+                        ui.label(f"Headline: {checks['headline']}\nBody: {checks['body']}\nCTA: {checks['cta']} → {checks['cta_link']}\nImage: {checks['image'] or 'NEEDS IMAGE'}\nAlt: {checks['alt_text']}").classes("whitespace-pre-line")
+                        ui.label("Image prompt: " + hero["image_prompt"]).classes("text-xs whitespace-pre-line")
+                        if checks["warnings"]: ui.label("Warnings: " + ", ".join(checks["warnings"])).classes("text-sm text-amber-800")
+                    with ui.card().classes("w-full border border-slate-200"):
+                        ui.label("Category shortcuts · assignment mode").classes("font-semibold")
+                        for item in cats["items"]:
+                            ui.label(f"{item['position']}. {item['title']} → {item['target'] or 'SKIP_REMOTE'} · {item['image_source']} · alt: {item['alt_text']}")
+                        for warning in cats["warnings"]: ui.label(str(warning)).classes("text-sm text-amber-800")
+                    preview = state.get("preview")
+                    if preview:
+                        ui.label(f"Theme actions: {preview['status']} · hero {preview['discovery']['hero']} · categories {preview['discovery']['category']}").classes("font-medium")
+                        for action in preview["actions"]: ui.label(str(action)).classes("text-sm")
+
+            def refresh_preview():
+                try:
+                    if not state.get("plan") or not state.get("snapshot"): raise ValueError("홈페이지 자동 설계를 먼저 실행하세요.")
+                    state["plan"]["hero"]["image_url"] = (hero_url.value or "").strip() or None
+                    state["plan"]["hero"]["asset_approved"] = bool(hero_approved.value)
+                    state["plan"]["hero"]["theme_image_ref"] = (theme_image_ref.value or "").strip() or None
+                    state["plan"]["hero"]["theme_image_ref_confirmed"] = bool(theme_ref_confirmed.value)
+                    if hero_url.value and not state["plan"]["hero"].get("image_asset_id"):
+                        state["plan"]["hero"]["image_asset_id"] = "SHOPIFY_FILES_URL"
+                    state["preview"] = compose_homepage_preview(state["plan"], state["snapshot"], state["collection_plan"])
+                    HomepageAutomationService().export_report(state["plan"], preview=state["preview"])
+                    render()
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            hero_url.on_value_change(lambda _: state.update(preview=None))
+            hero_approved.on_value_change(lambda _: state.update(preview=None))
+            theme_image_ref.on_value_change(lambda _: state.update(preview=None))
+            theme_ref_confirmed.on_value_change(lambda _: state.update(preview=None))
+
+            def inspect_image():
+                result = validate_homepage_image((local_image.value or "").strip())
+                ui.notify(f"{result}", type="positive" if result["valid"] else "warning")
+
+            def generate_hero():
+                try:
+                    if not state.get("plan"): raise ValueError("홈페이지 자동 설계를 먼저 실행하세요.")
+                    result = generate_hero_image(self.current_store, state["plan"], provider=OpenAIImagesProvider(), enabled=bool(paid_opt_in.value))
+                    ui.notify("Generated asset ready for review: " + result["path"], type="positive")
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            def show_manual():
+                ui.notify("Online Store → Themes → Customize → Hero/Image Banner: image, heading, text, button, link. Add Collection list (or equivalent), select only mapped collections, review cards and order, then Save.", type="info", multi_line=True)
+
+            def apply_confirm():
+                preview = state.get("preview")
+                if not preview: ui.notify("적용 전 최신 미리보기가 필요합니다.", type="warning"); return
+                with ui.dialog() as dialog, ui.card():
+                    ui.label("현재 미리보기의 최소 homepage JSON 변경을 Shopify theme에 적용합니다. 계속할까요?")
+                    with ui.row():
+                        ui.button("취소", on_click=dialog.close).props("outline")
+                        def perform():
+                            dialog.close()
+                            try:
+                                result = HomepageAutomationService().apply(preview["preview_id"], confirmed=True,
+                                    approved_assets=bool(hero_approved.value))
+                                ui.notify("Homepage apply: " + str(result), type="positive" if result.get("status") == "VERIFIED" else "warning")
+                            except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+                        ui.button("확인 후 적용", on_click=perform).props("color=primary")
+                dialog.open()
+
+            with ui.row():
+                ui.button("홈페이지 자동 설계", on_click=design, icon="auto_awesome").props("color=positive")
+                ui.button("메인 배너 만들기 / 문구 자동 작성", on_click=design, icon="image")
+                ui.button("카테고리 바로가기 만들기", on_click=design, icon="category")
+                ui.button("홈페이지 미리보기", on_click=refresh_preview, icon="visibility").props("outline")
+                ui.button("Shopify 적용", on_click=apply_confirm, icon="publish").props("color=primary")
+                ui.button("수동 적용 안내", on_click=show_manual, icon="help").props("outline")
+            ui.button("Check banner image", on_click=inspect_image, icon="fact_check").props("outline")
+            ui.button("Generate banner image (paid opt-in)", on_click=generate_hero, icon="auto_awesome").props("outline")
+            ui.button("Approve selected banner", on_click=approve_latest_hero, icon="verified").props("outline")
+            ui.button("Upload approved banner to Shopify Files", on_click=upload_latest_hero, icon="cloud_upload").props("outline")
+            ui.label("Paid image generation is not triggered by planning. Set opt-in in advanced settings and use the separate asset-generation workflow after review.").classes("text-xs text-slate-600")
+
+        if state.get("plan"): render()
+
     def _collections(self):
         ui = self.ui
         self._heading("컬렉션 자동화", "Store Profile, 소싱 카테고리와 MASTER 상품을 분석해 Shopify 컬렉션 초안을 로컬에서 설계합니다.")
@@ -888,6 +1087,11 @@ class OperatorUI:
                             asset = publisher._image_asset(self.current_store, key)
                             if asset:
                                 ready += 1
+                                def approve_collection(k=key, title=definition["title"]):
+                                    if approve_collection_image(self.current_store, k):
+                                        ui.notify(f"{title}: image approved for homepage reuse", type="positive")
+                                    else: ui.notify(f"{title}: image asset missing", type="warning")
+                                ui.button("Approve for homepage", on_click=approve_collection, icon="verified").props("outline dense")
                                 try:
                                     relative = Path(asset["path"]).resolve().relative_to((EXPORT_DIR / "collection_images").resolve())
                                     ui.image("/collection_images/" + relative.as_posix()).classes("w-24 h-24 object-cover rounded border")
