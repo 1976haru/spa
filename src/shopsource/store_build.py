@@ -321,7 +321,19 @@ class StoreBuildOrchestrator:
                 staged = stage_package_for_spark_desktop(package["package_id"], db=self.db)
                 return {"status": "MANUAL_ACTION_REQUIRED", "manual_gate": "SPARK_UPLOAD", "package_id": package["package_id"],
                         "staged_path": str(staged), "instructions": "Review the safe Spark Desktop staging folder, upload in SparkShopify manually, then resume after confirming upload."}
-            return {"counts": data.get("product_sync_result", {}).get("counts", {}), "verified": True}
+            product_run_id = data.get("product_sync_run_id") or data.get("product_sync_result", {}).get("run_id")
+            if not product_run_id:
+                return {"status": "FAILED", "verified": False, "instructions": "상품 동기화 실행 ID가 없어 결과를 검증할 수 없습니다."}
+            with connect(self.db) as con:
+                states = {row["status"]: row["n"] for row in con.execute(
+                    "SELECT status,COUNT(*) n FROM shopify_product_sync_items WHERE run_id=? GROUP BY status", (product_run_id,))}
+            failed = states.get("FAILED", 0) + states.get("VERIFY_FAILED", 0) + states.get("SYNCED_WITH_WARNINGS", 0)
+            pending = states.get("PENDING", 0)
+            verified = not failed and not pending
+            if not verified:
+                raise RuntimeError("Product verification failed; inspect VERIFY_FAILED/FAILED items and retry only failures.")
+            return {"counts": states, "verified": True,
+                    "instructions": "각 생성/수정 항목은 Shopify 재조회 검증 결과를 확인하세요."}
         if stage == "COLLECTION_PLAN":
             if not options.get("collection_design"): return {"stage_status": "SKIPPED"}
             from .collection_planner import CollectionPlanner
@@ -366,7 +378,15 @@ class StoreBuildOrchestrator:
             data["collection_sync_result"] = result
             return {"counts": result.get("summary", {})}
         if stage == "COLLECTION_VERIFY":
-            return {"verified": bool(data.get("collection_sync_result") or not options.get("collection_sync"))}
+            if not options.get("collection_sync"):
+                return {"verified": True, "stage_status": "SKIPPED"}
+            result = data.get("collection_sync_result") or {}
+            items = result.get("items") or []
+            failed = sum(1 for item in items if item.get("result") == "FAILED")
+            verified = bool(items) and not failed
+            if not verified:
+                raise RuntimeError("Collection verification failed; inspect collection sync results before continuing.")
+            return {"verified": True, "counts": {"verified_or_unchanged": len(items), "failed": 0}}
         if stage == "HOMEPAGE_PLAN":
             if not options.get("homepage_plan"): return {"stage_status": "SKIPPED"}
             from .homepage_collections import HomepageCollectionService, ShopifyThemeReader, build_homepage_plan

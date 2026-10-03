@@ -35,6 +35,7 @@ from .v2_service import (
 
 NAV_ITEMS = [
     ("/build", "rocket_launch", "스토어 자동 구축"),
+    ("/pilot", "science", "Cabin Tidy 파일럿"),
     ("/", "dashboard", "대시보드"),
     ("/stores", "storefront", "스토어"),
     ("/sourcing", "travel_explore", "소싱"),
@@ -151,6 +152,7 @@ class OperatorUI:
         with ui.column().classes("w-full max-w-screen-2xl mx-auto p-6 gap-5"):
             if path == "/": self._dashboard()
             elif path == "/build": self._store_build()
+            elif path == "/pilot": self._shopify_pilot()
             elif path == "/stores": self._stores()
             elif path == "/sourcing": self._sourcing()
             elif path == "/collections": self._collections()
@@ -262,6 +264,116 @@ class OperatorUI:
                 ui.button("일시정지", on_click=pause_build, icon="pause").props("outline")
                 ui.button("계속", on_click=resume_build, icon="play_arrow").props("outline")
                 ui.button("실패 항목 재시도", on_click=retry_build, icon="refresh").props("outline")
+
+    def _shopify_pilot(self):
+        ui = self.ui
+        self._heading("Cabin Tidy 실전 테스트", "최대 20개, DRAFT 상품만 대상으로 하는 통제된 Shopify 파일럿입니다.")
+        from ..shopify_pilot import ShopifyLivePilot
+        with ui.card().classes("w-full border-2 border-amber-200 bg-amber-50"):
+            connection = ui.label("Shopify: 검사 전")
+            scope_state = ui.label("상품 권한: 검사 전 · 판매가: Store pricing 값을 사용")
+            limit = ui.number("상품 수", value=10, min=1, max=20).classes("w-40")
+            ui.label("상태: DRAFT (고정) · 업로드: DIRECT_SHOPIFY · 이미지 업로드: OFF (기본)").classes("font-semibold")
+            include_images = ui.checkbox("기존 media mode 이미지 업로드 사용 (권리 확인 필수)", value=False)
+            source_rights = ui.checkbox("원본 이미지 사용 권리를 확인했습니다", value=False)
+            live_mode = ui.checkbox("LIVE MODE 활성화", value=False)
+            state = {"ready": False, "preview": None, "pilot_id": None}
+            upload_button = None
+            collection_button = None
+            def refresh_pilot_buttons():
+                if upload_button is not None:
+                    if state["ready"] and state["preview"] and live_mode.value: upload_button.enable()
+                    else: upload_button.disable()
+                if collection_button is not None:
+                    if state.get("verified"): collection_button.enable()
+                    else: collection_button.disable()
+            live_mode.on_value_change(lambda _event: refresh_pilot_buttons())
+            table = ui.table(columns=[{"name": key, "label": label, "field": key, "align": "left"} for key, label in (
+                ("source_id", "ASIN / Source ID"), ("title", "상품명"), ("source_price", "Source 가격"),
+                ("selling_price", "ShopSource 판매가"), ("currency", "통화"), ("status", "상태"),
+                ("action", "Shopify 작업"), ("collection_tags", "컬렉션 tag"), ("media_mode", "이미지"), ("warning", "주의"))], rows=[], row_key="master_product_id").classes("w-full")
+            result_label = ui.label("아직 파일럿 미리보기가 없습니다.").classes("font-medium")
+            details = ui.column().classes("w-full")
+
+            async def check_connection():
+                try:
+                    result = await asyncio.to_thread(ShopifyLivePilot().connection_preflight, self.current_store)
+                    state["ready"] = result["product_ready"]
+                    refresh_pilot_buttons()
+                    connection.set_text(f"Shopify: {'CONNECTED' if result['credential_present'] and result['shop_domain'] and result['api_version_ready'] else '미연결/버전 확인 필요'} · {result.get('shop_domain') or '도메인 없음'} · API {result.get('api_version') or '미설정'}")
+                    missing = ", ".join(result["missing_product_scopes"]) or "충족"
+                    scope_state.set_text(f"상품 권한: {'READY' if state['ready'] else '부족 — ' + missing} · 컬렉션 별도 권한: {', '.join(result['missing_collection_scopes']) or '충족'}")
+                    if result.get("errors"): ui.notify("; ".join(result["errors"]), type="warning")
+                    else: ui.notify("토큰 값은 표시하지 않고 연결/권한만 확인했습니다.", type="positive")
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            async def make_preview():
+                if not state["ready"]:
+                    ui.notify("먼저 Shopify 연결 및 read_products/write_products 권한을 확인하세요.", type="warning"); return
+                try:
+                    service = ShopifyLivePilot()
+                    state["verified"] = False
+                    media_mode = "SOURCE_MEDIA" if include_images.value else "MANUAL_MEDIA"
+                    result = await asyncio.to_thread(service.preview, self.current_store, limit=int(limit.value or 10),
+                                                     media_mode=media_mode, source_media_rights_confirmed=bool(source_rights.value))
+                    state["preview"] = result
+                    state["pilot_id"] = result["pilot_run_id"]
+                    refresh_pilot_buttons()
+                    table.rows = [{**item, "collection_tags": ", ".join(item["collection_tags"])} for item in result["items"]]
+                    table.update()
+                    actions = result["counts"]
+                    result_label.set_text(f"선택 {result['requested']} · 생성 {actions.get('CREATE', 0)} · 업데이트 {actions.get('UPDATE', 0)} · 변경 없음 {actions.get('NO CHANGE', 0)} · 건너뜀 {actions.get('SKIP', 0)} · 충돌 {actions.get('CONFLICT', 0)} · DRAFT")
+                    ui.notify("10개 파일럿 미리보기를 만들었습니다. Shopify 변경 없음.", type="positive")
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            async def execute_confirmed():
+                preview = state["preview"]
+                if not live_mode.value or not preview:
+                    ui.notify("LIVE MODE와 최신 미리보기가 필요합니다.", type="warning"); return
+                result = await asyncio.to_thread(ShopifyLivePilot().execute, preview["run_id"], live_confirmed=True)
+                result_label.set_text("파일럿 완료 · " + " · ".join(f"{key} {value}" for key, value in result.get("counts", {}).items()))
+                actual_verified = result.get("counts", {}).get("SYNCED", 0) + result.get("counts", {}).get("NO CHANGE", 0)
+                expected_verified = sum(preview.get("counts", {}).get(key, 0) for key in ("CREATE", "UPDATE", "NO CHANGE"))
+                state["verified"] = (actual_verified == expected_verified and expected_verified > 0
+                                      and not result.get("counts", {}).get("FAILED", 0)
+                                      and not result.get("counts", {}).get("VERIFY_FAILED", 0))
+                refresh_pilot_buttons()
+                details.clear()
+                with details:
+                    ui.label("Shopify에서 확인: 상품 ID · 제목 · DRAFT 상태 · 판매가 · ShopSource tag · variant 매핑").classes("text-sm")
+                ui.notify("Shopify 파일럿 동기화가 끝났습니다. 결과는 read-after-write 검증을 포함합니다.", type="positive")
+
+            async def request_live():
+                if not state["ready"] or not state["preview"] or not live_mode.value:
+                    ui.notify("연결 검사, 미리보기, LIVE MODE를 먼저 완료하세요.", type="warning"); return
+                with ui.dialog() as dialog, ui.card():
+                    ui.label(f"{self.current_store}에 DRAFT 상품 최대 {state['preview']['limit']}개를 실제 생성/수정합니다.")
+                    with ui.row():
+                        ui.button("취소", on_click=dialog.close).props("outline")
+                        async def run_live():
+                            dialog.close()
+                            try: await execute_confirmed()
+                            except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+                        ui.button("실행", on_click=run_live).props("color=negative")
+                dialog.open()
+
+            async def collection_preview():
+                pilot_id = state["pilot_id"]
+                if not pilot_id:
+                    ui.notify("먼저 pilot 상품을 업로드하고 검증해야 합니다.", type="warning"); return
+                try:
+                    result = await asyncio.to_thread(ShopifyLivePilot().collection_preview, self.current_store, pilot_id)
+                    ui.notify(f"컬렉션 미리보기 완료: {result['collection_preview']['counts']} · Shopify write 없음", type="positive")
+                except Exception as exc: ui.notify(_safe_error(exc), type="warning")
+
+            with ui.row().classes("flex-wrap"):
+                ui.button("Shopify 연결 검사", on_click=check_connection, icon="verified_user").props("outline")
+                ui.button("10개 미리보기", on_click=make_preview, icon="preview").props("outline")
+                upload_button = ui.button("10개 실제 업로드", on_click=request_live, icon="upload").props("color=primary").disable()
+                collection_button = ui.button("파일럿 컬렉션 미리보기", on_click=collection_preview, icon="collections_bookmark").props("outline").disable()
+            result_label
+            table
+            details
 
     def _collections(self):
         ui = self.ui

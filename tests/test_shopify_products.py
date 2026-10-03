@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from shopsource.db import connect, init_db
+from shopsource.db import connect, init_db, upsert_store
 from shopsource.shopify_collections import save_connection
 from shopsource.shopify_products import (
     DirectShopifyProductPublisher, PRODUCT_SET_MUTATION, collection_tag,
@@ -26,6 +26,9 @@ class FakeProductShopify:
         self.rows = {}
         self.writes = []
         self.request_bodies = []
+        self.scopes = {"read_products", "write_products"}
+        self.user_errors = False
+        self.force_mismatch = False
 
     def __call__(self, domain, token, version):
         assert domain == "fixture.myshopify.com"
@@ -37,15 +40,20 @@ class FakeProductShopify:
         variables = variables or {}
         self.request_bodies.append((query, variables))
         if "currentAppInstallation" in query:
-            return {"currentAppInstallation": {"accessScopes": [{"handle": "read_products"}, {"handle": "write_products"}]}}
+            return {"currentAppInstallation": {"accessScopes": [{"handle": scope} for scope in self.scopes]}}
         if "productByIdentifier" in query:
             ident = variables["identifier"]
             handle = ident.get("handle")
             return {"productByIdentifier": next((row for row in self.rows.values() if row["handle"] == handle), None)}
         if "ShopSourceProductById" in query:
-            return {"product": self.rows.get(variables["id"])}
+            product = self.rows.get(variables["id"])
+            if product and self.force_mismatch and self.writes:
+                product = {**product, "status": "ACTIVE"}
+            return {"product": product}
         if "productSet(" in query:
             self.writes.append("productSet")
+            if self.user_errors:
+                return {"productSet": {"product": None, "userErrors": [{"field": ["title"], "message": "rejected"}]}}
             payload = variables["input"]
             product = next((row for row in self.rows.values() if row["handle"] == payload["handle"]), None)
             if not product:
@@ -87,6 +95,9 @@ def product_setup(tmp_path, monkeypatch):
     db = tmp_path / "fixture.sqlite3"
     init_db(db)
     save_connection("store-a", "fixture.myshopify.com", db=db)
+    upsert_store({"store_id": "store-a", "store_name": "Fixture Store", "category": "Car Organization",
+                  "concept": "Synthetic pilot products", "sourcing": {"recipes": []}, "include_keywords": [],
+                  "exclude_keywords": [], "risk_rules": []}, db)
     monkeypatch.setenv("SHOPIFY_ACCESS_TOKEN", "test-token-never-log")
     with connect(db) as con:
         for idx, (asin, title, status, raw, source) in enumerate([
@@ -262,3 +273,154 @@ def test_token_never_logged(product_setup, caplog):
     assert "test-token-never-log" not in caplog.text
     fake_token = "x" * 40
     assert fake_token not in publisher._safe_error(RuntimeError(f"token {fake_token}"))
+
+
+def add_pilot_products(db, count=12, *, missing_price=False):
+    with connect(db) as con:
+        for index in range(count):
+            raw = {} if missing_price and index == count - 1 else {"shopify_selling_price": 18 + index}
+            cur = con.execute("INSERT INTO products(asin,source,source_kind,title,brand,category,price,raw_json,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                              (f"PILOT{index:06}", "amazon", "BROWSER_CAPTURE", f"Pilot item {index}", "Pilot Brand", "Storage", 3.25, json.dumps(raw), "now", "now"))
+            con.execute("INSERT INTO store_product_decisions(store_id,product_id,price_status,risk_status,auto_status,final_status,classified_at) VALUES(?,?,?,?,?,?,?)",
+                        ("store-a", cur.lastrowid, "IN_RANGE", "SAFE", "PRIMARY", "PRIMARY", "now"))
+
+
+def test_pilot_default_10(product_setup):
+    from shopsource.shopify_pilot import ShopifyLivePilot
+    db, publisher, _ = product_setup; add_pilot_products(db)
+    assert ShopifyLivePilot(db=db, publisher=publisher).preview("store-a")["requested"] == 10
+
+
+def test_pilot_max_20(product_setup):
+    from shopsource.shopify_pilot import ShopifyLivePilot
+    db, publisher, _ = product_setup
+    with pytest.raises(ValueError): ShopifyLivePilot(db=db, publisher=publisher).preview("store-a", limit=21)
+
+
+def test_pilot_draft_forced(product_setup):
+    from shopsource.shopify_pilot import ShopifyLivePilot
+    db, publisher, _ = product_setup
+    assert ShopifyLivePilot(db=db, publisher=publisher).preview("store-a", limit=1)["items"][0]["status"] == "DRAFT"
+
+
+def test_pilot_deterministic_selection(product_setup):
+    from shopsource.shopify_pilot import ShopifyLivePilot
+    db, publisher, _ = product_setup; add_pilot_products(db)
+    service = ShopifyLivePilot(db=db, publisher=publisher)
+    assert [r["source_id"] for r in service.preview("store-a")["items"]] == [r["source_id"] for r in service.preview("store-a")["items"]]
+
+
+def test_pilot_restricted_excluded(product_setup):
+    from shopsource.shopify_pilot import ShopifyLivePilot
+    db, publisher, _ = product_setup
+    rows = ShopifyLivePilot(db=db, publisher=publisher).preview("store-a", limit=20)["items"]
+    assert all(row["title"] != "Risk Product" for row in rows)
+
+
+def test_pilot_missing_price_skipped(product_setup):
+    from shopsource.shopify_pilot import ShopifyLivePilot
+    db, publisher, _ = product_setup; add_pilot_products(db, 9, missing_price=True)
+    rows = ShopifyLivePilot(db=db, publisher=publisher).preview("store-a", limit=20)["items"]
+    assert any(row["selling_price"] is None and row["action"] == "SKIP" for row in rows)
+
+
+def test_pilot_price_preview(product_setup):
+    from shopsource.shopify_pilot import ShopifyLivePilot
+    db, publisher, _ = product_setup
+    row = ShopifyLivePilot(db=db, publisher=publisher).preview("store-a", limit=1)["items"][0]
+    assert (row["source_price"], row["selling_price"], row["currency"]) == (4.2, 24.5, "USD")
+
+
+def test_pilot_requires_shopify_credentials(product_setup, monkeypatch):
+    from shopsource.shopify_pilot import ShopifyLivePilot
+    db, publisher, _ = product_setup; monkeypatch.delenv("SHOPIFY_ACCESS_TOKEN")
+    assert not ShopifyLivePilot(db=db, publisher=publisher).connection_preflight("store-a")["product_ready"]
+
+
+def test_pilot_requires_write_products(product_setup):
+    from shopsource.shopify_pilot import ShopifyLivePilot
+    db, publisher, fake = product_setup; fake.scopes.discard("write_products")
+    assert not ShopifyLivePilot(db=db, publisher=publisher).connection_preflight("store-a")["product_ready"]
+
+
+def test_pilot_preview_before_live(product_setup):
+    from shopsource.shopify_pilot import ShopifyLivePilot
+    db, publisher, fake = product_setup
+    ShopifyLivePilot(db=db, publisher=publisher).preview("store-a", limit=1)
+    assert fake.writes == []
+
+
+def test_pilot_live_confirmation_required(product_setup):
+    from shopsource.shopify_pilot import ShopifyLivePilot
+    db, publisher, _ = product_setup; service = ShopifyLivePilot(db=db, publisher=publisher)
+    preview = service.preview("store-a", limit=1)
+    with pytest.raises(RuntimeError): service.execute(preview["run_id"])
+
+
+def test_pilot_no_image_default(product_setup):
+    from shopsource.shopify_pilot import ShopifyLivePilot
+    db, publisher, fake = product_setup
+    preview = ShopifyLivePilot(db=db, publisher=publisher).preview("store-a", limit=1)
+    assert preview["items"][0]["media_mode"] == "MANUAL_MEDIA" and fake.writes == []
+
+
+def test_pilot_verify_after_write_mock(product_setup):
+    from shopsource.shopify_pilot import ShopifyLivePilot
+    db, publisher, fake = product_setup; service = ShopifyLivePilot(db=db, publisher=publisher)
+    preview = service.preview("store-a", limit=1)
+    result = service.execute(preview["run_id"], live_confirmed=True)
+    assert result["counts"].get("SYNCED") == 1 and "productSet" in fake.writes
+    assert next(iter(fake.rows.values()))["status"] == "DRAFT"
+
+
+def test_pilot_multivariant_source_skipped(product_setup):
+    db, _publisher, _fake = product_setup
+    product = {"asin": "B0001", "source": "amazon", "title": "Variants", "final_status": "PRIMARY",
+               "selling_price": 22, "source_variant_count": 2}
+    with pytest.raises(ValueError, match="MULTI_VARIANT_SOURCE"):
+        DirectShopifyProductPublisher.build_payload(product, store_id="store-a")
+
+
+def test_pilot_user_errors_fail(product_setup):
+    from shopsource.shopify_pilot import ShopifyLivePilot
+    db, publisher, fake = product_setup; fake.user_errors = True
+    service = ShopifyLivePilot(db=db, publisher=publisher); preview = service.preview("store-a", limit=1)
+    assert service.execute(preview["run_id"], live_confirmed=True)["counts"].get("FAILED") == 1
+
+
+def test_pilot_verify_mismatch_is_verify_failed(product_setup):
+    from shopsource.shopify_pilot import ShopifyLivePilot
+    db, publisher, fake = product_setup; fake.force_mismatch = True
+    service = ShopifyLivePilot(db=db, publisher=publisher); preview = service.preview("store-a", limit=1)
+    assert service.execute(preview["run_id"], live_confirmed=True)["counts"].get("VERIFY_FAILED") == 1
+
+
+def test_pilot_does_not_auto_delete(product_setup):
+    from shopsource.shopify_pilot import ShopifyLivePilot
+    db, publisher, fake = product_setup; service = ShopifyLivePilot(db=db, publisher=publisher)
+    first = service.preview("store-a", limit=1); service.execute(first["run_id"], live_confirmed=True)
+    fake.rows.clear()
+    assert service.preview("store-a", limit=1)["counts"]["CONFLICT"] == 1
+    assert not any("productDelete" in query for query, _ in fake.request_bodies)
+
+
+def test_pilot_collection_preview_after_verified(product_setup, monkeypatch):
+    from shopsource.shopify_pilot import ShopifyLivePilot
+    db, publisher, _ = product_setup; service = ShopifyLivePilot(db=db, publisher=publisher)
+    preview = service.preview("store-a", limit=1); service.execute(preview["run_id"], live_confirmed=True)
+    class Planner:
+        def __init__(self, _db): pass
+        def create_plan(self, _store, settings): return {"store_id": "store-a", "collections": []}
+    class Collections:
+        def __init__(self, db=None): pass
+        def dry_run(self, plan, publish_online_store=False): return {"counts": {"CREATE": 0}, "items": []}
+    monkeypatch.setattr("shopsource.collection_planner.CollectionPlanner", Planner)
+    monkeypatch.setattr("shopsource.shopify_collections.ShopifyCollectionPublisher", Collections)
+    assert not service.collection_preview("store-a", preview["pilot_run_id"])["writes_performed"]
+
+
+def test_no_real_shopify_write_in_tests(product_setup):
+    from shopsource.shopify_pilot import ShopifyLivePilot
+    db, publisher, fake = product_setup
+    ShopifyLivePilot(db=db, publisher=publisher).preview("store-a", limit=1)
+    assert fake.writes == []

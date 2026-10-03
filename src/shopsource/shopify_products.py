@@ -121,6 +121,11 @@ def _install_schema(db=None):
           PRIMARY KEY(store_id,master_product_id,source_image_hash)
         );
         """)
+        columns = {row["name"] for row in con.execute("PRAGMA table_info(shopify_product_mappings)")}
+        if "pilot_run_id" not in columns:
+            con.execute("ALTER TABLE shopify_product_mappings ADD COLUMN pilot_run_id TEXT")
+        if "shopify_variant_id" not in columns:
+            con.execute("ALTER TABLE shopify_product_mappings ADD COLUMN shopify_variant_id TEXT")
         columns = {row["name"] for row in con.execute("PRAGMA table_info(shopify_product_settings)")}
         if "source_media_rights_confirmed" not in columns:
             con.execute("ALTER TABLE shopify_product_settings ADD COLUMN source_media_rights_confirmed INTEGER NOT NULL DEFAULT 0")
@@ -181,6 +186,8 @@ class DirectShopifyProductPublisher(ProductPublisher):
         selling_price = product.get("selling_price")
         if not title or selling_price is None:
             raise ValueError("MISSING_TITLE_OR_CONFIGURED_SELLING_PRICE")
+        if int(product.get("source_variant_count") or 0) > 1:
+            raise ValueError("MULTI_VARIANT_SOURCE_REQUIRES_CONFIGURATION")
         try:
             amount = round(float(selling_price), 2)
         except (TypeError, ValueError):
@@ -242,15 +249,20 @@ class DirectShopifyProductPublisher(ProductPublisher):
                     except (json.JSONDecodeError, TypeError): raw = {}
                     # An explicit Shopify/store retail price only; source acquisition price is never re-used.
                     row["selling_price"] = raw.get("shopify_selling_price", raw.get("store_selling_price"))
+                    variants = raw.get("variants") or raw.get("product_variants") or []
+                    row["source_variant_count"] = len(variants) if isinstance(variants, list) else 0
                     row["selling_currency"] = raw.get("shopify_currency", "USD")
                     row["compare_at_price"] = raw.get("shopify_compare_at_price", raw.get("store_compare_at_price"))
                     row["product_type"] = row.get("category")
                     row["description_html"] = raw.get("descriptionHtml", raw.get("description_html"))
                     yield row
 
-    def _current_input_hash(self, store_id, publish_status="DRAFT"):
+    def _current_input_hash(self, store_id, publish_status="DRAFT", master_product_ids=None):
         fingerprints = []
+        selected_ids = set(master_product_ids) if master_product_ids is not None else None
         for row in self._catalog_rows(store_id):
+            if selected_ids is not None and row["master_product_id"] not in selected_ids:
+                continue
             final = str(row.get("final_status") or "").upper()
             if final not in ELIGIBLE_STATUSES or row.get("archived"):
                 fingerprints.append((row["master_product_id"], final, None))
@@ -290,8 +302,9 @@ class DirectShopifyProductPublisher(ProductPublisher):
                 chosen.append(f"shopsource-{_slug(store_id)}-{_slug(definition.get('collection_key'))}")
         return sorted(set(chosen))
 
-    def preview(self, store_id: str, *, publish_status="DRAFT", limit=100, db=None) -> dict:
+    def preview(self, store_id: str, *, publish_status="DRAFT", limit=100, db=None, master_product_ids=None) -> dict:
         _install_schema(db if db is not None else self.db)
+        selected_ids = set(master_product_ids) if master_product_ids is not None else None
         actions, prepared, source_fingerprints = {key: 0 for key in ("CREATE", "UPDATE", "NO CHANGE", "CONFLICT", "SKIP")}, [], []
         skip_reasons = {}
         mapping_by_master = {}
@@ -300,6 +313,8 @@ class DirectShopifyProductPublisher(ProductPublisher):
                 mapping_by_master[mapping["master_product_id"]] = dict(mapping)
         remote_client = None
         for row in self._catalog_rows(store_id, db=db):
+            if selected_ids is not None and row["master_product_id"] not in selected_ids:
+                continue
             final = str(row.get("final_status") or "").upper()
             if final not in ELIGIBLE_STATUSES or row.get("archived"):
                 actions["SKIP"] += 1
@@ -324,6 +339,8 @@ class DirectShopifyProductPublisher(ProductPublisher):
                             remote = self._fetch_product(remote_client, {"id": mapping["shopify_product_id"]})
                             if not remote:
                                 action, reason = "CONFLICT", "Mapped Shopify product is missing"
+                            elif mapping.get("shopify_variant_id") and ((remote.get("variants") or {}).get("nodes") or [{}])[0].get("id") != mapping["shopify_variant_id"]:
+                                action, reason = "CONFLICT", "Mapped Shopify variant identity changed"
                             elif int(((remote.get("variantsCount") or {}).get("count") or 0)) != 1:
                                 action, reason = "CONFLICT", "A single explicitly managed variant is required for configured store pricing"
                             elif self._remote_hash(remote) != mapping["last_remote_hash"]:
@@ -358,9 +375,12 @@ class DirectShopifyProductPublisher(ProductPublisher):
         with connect(db if db is not None else self.db) as con:
             con.execute("INSERT INTO shopify_product_sync_runs(run_id,store_id,status,checkpoint,input_hash,counts_json,created_at,updated_at) VALUES(?,?,'PREVIEW',0,?,?,?,?)",
                 (run_id, store_id, input_hash, json.dumps({"actions": actions, "publish_status": publish_status, "media_mode": self.media_mode(store_id),
+                                                           "master_product_ids": sorted(selected_ids) if selected_ids is not None else None,
                                                            "source_media_rights_confirmed": self.source_media_rights_confirmed(store_id)}), now, now))
             # The product queue is stored on disk; the returned UI preview contains only the requested sample.
             for row in self._catalog_rows(store_id, db=db):
+                if selected_ids is not None and row["master_product_id"] not in selected_ids:
+                    continue
                 item = next((candidate for candidate in prepared if candidate["master_product_id"] == row["master_product_id"]), None)
                 if item is None:
                     status = str(row.get("final_status") or "").upper()
@@ -401,7 +421,7 @@ class DirectShopifyProductPublisher(ProductPublisher):
             if expected_input_hash and expected_input_hash != run["input_hash"]: raise RuntimeError("Product preview is stale; create a new preview")
         try: run_options = json.loads(run["counts_json"] or "{}")
         except json.JSONDecodeError: run_options = {}
-        if self._current_input_hash(run["store_id"], run_options.get("publish_status", "DRAFT")) != run["input_hash"]:
+        if self._current_input_hash(run["store_id"], run_options.get("publish_status", "DRAFT"), run_options.get("master_product_ids")) != run["input_hash"]:
             raise RuntimeError("ShopSource products or Store Decisions changed after preview; create a new preview")
         config, client = self._client(run["store_id"])
         scopes = client.execute("query ShopSourceScopes { currentAppInstallation { accessScopes { handle } } }")
@@ -428,7 +448,7 @@ class DirectShopifyProductPublisher(ProductPublisher):
             with connect(self.db) as con:
                 con.execute("UPDATE shopify_product_sync_runs SET checkpoint=checkpoint+?,updated_at=? WHERE run_id=?", (len(rows), _now(), run_id))
         with connect(self.db) as con:
-            failed = con.execute("SELECT COUNT(*) FROM shopify_product_sync_items WHERE run_id=? AND status IN ('FAILED','SYNCED_WITH_WARNINGS')", (run_id,)).fetchone()[0]
+            failed = con.execute("SELECT COUNT(*) FROM shopify_product_sync_items WHERE run_id=? AND status IN ('FAILED','VERIFY_FAILED','SYNCED_WITH_WARNINGS')", (run_id,)).fetchone()[0]
             con.execute("UPDATE shopify_product_sync_runs SET status=?,updated_at=? WHERE run_id=?", ("COMPLETE_WITH_WARNINGS" if failed else "COMPLETE", _now(), run_id))
         summary = self._run_summary(run_id); summary["processed_this_call"] = processed
         return summary
@@ -487,17 +507,20 @@ class DirectShopifyProductPublisher(ProductPublisher):
                         except Exception as exc: media_error = self._safe_error(exc)
                     else: media_error = "GENERATED_PRODUCT_MEDIA_PROVIDER_REQUIRES_CONFIGURATION"
                 verified = self.verify(product["id"], expected_payload=payload, client=client)
-                if not verified["verified"]: raise RuntimeError("Shopify read-after-write verification did not match owned scalar fields")
+                if not verified["verified"]:
+                    return {"status": "VERIFY_FAILED", "error": "Shopify read-after-write verification did not match product ID/title/DRAFT/price/tags/variant", "remote_id": product["id"]}
                 remote_hash = self._remote_hash(verified["product"])
                 with connect(self.db) as con:
                     con.execute("""INSERT INTO shopify_product_mappings(store_id,master_product_id,source_platform,source_id,
-                      shopify_product_id,shopify_handle,last_payload_hash,last_remote_hash,sync_status,synced_at)
-                      VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(store_id,master_product_id) DO UPDATE SET
+                      shopify_product_id,shopify_handle,last_payload_hash,last_remote_hash,sync_status,synced_at,pilot_run_id,shopify_variant_id)
+                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(store_id,master_product_id) DO UPDATE SET
                       shopify_product_id=excluded.shopify_product_id,shopify_handle=excluded.shopify_handle,
                       last_payload_hash=excluded.last_payload_hash,last_remote_hash=excluded.last_remote_hash,
-                      sync_status=excluded.sync_status,synced_at=excluded.synced_at""",
+                      sync_status=excluded.sync_status,synced_at=excluded.synced_at,
+                      pilot_run_id=COALESCE(excluded.pilot_run_id,shopify_product_mappings.pilot_run_id),
+                      shopify_variant_id=excluded.shopify_variant_id""",
                       (store_id, item["master_product_id"], payload["identity"].split(":", 1)[0], item["source_id"].upper(),
-                       product["id"], product.get("handle", payload["handle"]), _stable_hash(payload), remote_hash, "SYNCED", _now()))
+                       product["id"], product.get("handle", payload["handle"]), _stable_hash({key: value for key, value in payload.items() if key != "pilot_run_id"}), remote_hash, "SYNCED", _now(), payload.get("pilot_run_id"), verified.get("variant_id")))
                 return {"status": "SYNCED_WITH_WARNINGS" if media_error else "SYNCED", "remote_id": product["id"], "action": item["action"], "error": media_error}
             except Exception as exc:
                 last_error = self._safe_error(exc)
@@ -565,11 +588,12 @@ class DirectShopifyProductPublisher(ProductPublisher):
         expected_payload = expected_payload or {}
         expected_fields = {key: expected_payload[key] for key in ("title", "descriptionHtml", "vendor", "productType", "status") if key in expected_payload}
         variants = (product.get("variants") or {}).get("nodes") or []
-        verified = (all(product.get(key) == value for key, value in expected_fields.items())
+        verified = (product.get("id") == remote_id and all(product.get(key) == value for key, value in expected_fields.items())
                     and len(variants) == 1 and variants[0].get("price") == expected_payload.get("price")
                     and (not expected_payload.get("compare_at_price") or variants[0].get("compareAtPrice") == expected_payload.get("compare_at_price"))
                     and set(expected_payload.get("owned_tags", [])).issubset(set(product.get("tags") or [])))
-        return {"verified": verified, "product": product, "inventory": "UNMANAGED", "media": "MANUAL_MEDIA"}
+        return {"verified": verified, "product": product, "variant_id": variants[0].get("id") if len(variants) == 1 else None,
+                "inventory": "UNMANAGED", "media": "MANUAL_MEDIA"}
 
     def retry_failed(self, run_id: str, *, confirmed=False, expected_input_hash=None) -> dict:
         if not confirmed: raise RuntimeError("Explicit confirmation is required before retrying Shopify writes")
