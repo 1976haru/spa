@@ -12,6 +12,7 @@ from ..connectors.spark_desktop_staging import DatasetAlreadyExists
 from ..capture.service import CaptureService
 from ..capture.batch import BatchSourcingService
 from ..capture.campaign import CampaignService
+from ..collection_planner import CollectionPlanner
 from ..classifier import classify_store
 from ..db import get_store, init_db, upsert_store
 from ..intelligence.keyword_engine import KeywordEngine
@@ -31,6 +32,7 @@ NAV_ITEMS = [
     ("/", "dashboard", "대시보드"),
     ("/stores", "storefront", "스토어"),
     ("/sourcing", "travel_explore", "소싱"),
+    ("/collections", "collections_bookmark", "컬렉션 자동화"),
     ("/products", "inventory_2", "상품"),
     ("/packages", "outbox", "패키지"),
     ("/history", "history", "기록"),
@@ -144,6 +146,7 @@ class OperatorUI:
             if path == "/": self._dashboard()
             elif path == "/stores": self._stores()
             elif path == "/sourcing": self._sourcing()
+            elif path == "/collections": self._collections()
             elif path == "/products": self._products()
             elif path == "/packages": self._packages()
             elif path == "/history": self._history()
@@ -152,6 +155,94 @@ class OperatorUI:
     def _set_store(self, store_id, path):
         self.current_store = store_id
         self.ui.navigate.to(path)
+
+    def _collections(self):
+        ui = self.ui
+        self._heading("컬렉션 자동화", "Store Profile, 소싱 카테고리와 MASTER 상품을 분석해 Shopify 컬렉션 초안을 로컬에서 설계합니다.")
+        ui.label("이 화면은 계획/미리보기만 수행합니다. Shopify, Spark, Amazon에는 쓰거나 연결하지 않습니다.").classes("text-sm text-amber-800")
+        with ui.card().classes("w-full border-2 border-violet-200 bg-violet-50"):
+            ui.label(f"{self.current_store} | {next((row['store_name'] for row in self.stores if row['store_id'] == self.current_store), '')}").classes("text-xl font-bold")
+            with ui.expansion("고급 설정", icon="tune"):
+                desired_count = ui.number("컬렉션 개수 (비우면 자동)", value=None, min=1, max=15).classes("w-64")
+                rule_strategy = ui.select({"TITLE_FALLBACK":"상품 제목 조건", "TAG_PREFERRED":"StoreSource 태그 우선", "MIXED":"태그 + 제목"}, value="TITLE_FALLBACK", label="조건 전략").classes("w-72")
+                min_products = ui.number("최소 예상 상품 수", value=3, min=0, max=100000).classes("w-64")
+                overlap_limit = ui.number("중복 경고 기준", value=80, min=0, max=100, suffix="%").classes("w-64")
+                include_empty = ui.checkbox("상품이 없어도 미래용 컬렉션 포함", value=False)
+                language = ui.select({"en":"English"}, value="en", label="설명 언어").classes("w-48")
+            summary = ui.label("아직 컬렉션 계획이 없습니다.").classes("text-sm font-medium")
+            plan_area = ui.column().classes("w-full gap-3")
+            plan_ref = {"plan": None}
+
+            def render_plan(plan):
+                plan_ref["plan"] = plan
+                summary.set_text(
+                    f"컬렉션 {plan['collection_count']}개 · 예상 포함 상품 {plan['included_product_count']:,}개 · "
+                    f"미분류 {plan['unmatched_product_count']:,}개 ({plan['unmatched_percentage']:.1f}%) · 중복 포함 허용"
+                )
+                plan_area.clear()
+                with plan_area:
+                    diff = plan.get("diff") or {}
+                    ui.label("버전 차이: " + " · ".join(f"{label} {len(diff.get(key, []))}" for key, label in
+                             (("new", "신규"), ("changed", "변경"), ("unchanged", "유지"), ("removed_or_disabled", "제외/비활성")))).classes("text-xs text-slate-600")
+                    if plan.get("warnings"):
+                        with ui.expansion(f"계획 경고 {len(plan['warnings'])}건", icon="warning").classes("w-full"):
+                            for warning in plan["warnings"]:
+                                ui.label(str(warning)).classes("text-sm text-amber-800")
+                    for collection in plan["collections"]:
+                        with ui.card().classes("w-full border border-slate-200"):
+                            ui.label(f"{collection['priority']}. {collection['title']} · 예상 {collection['estimated_product_count']:,}개 · {collection['shopify_sync_status']}").classes("font-semibold")
+                            ui.label(f"Rule: " + " OR ".join(f"{row['field']} {row['relation']} ‘{row['value']}’" for row in collection["conditions"])).classes("text-sm")
+                            ui.label(f"Title-rule specificity estimate: {collection.get('title_rule_specificity_estimate', 0):.0%} (multi-word phrase heuristic)").classes("text-xs text-slate-600")
+                            ui.label("Store status: " + ", ".join(f"{key} {value}" for key, value in collection.get("store_status_breakdown", {}).items())).classes("text-xs text-slate-600")
+                            ui.label("이미지 프롬프트: 생성됨 · 이미지 API 호출 안 함").classes("text-xs text-emerald-700")
+                            if collection["warnings"]:
+                                ui.label("경고: " + ", ".join(collection["warnings"])).classes("text-sm text-amber-800")
+                            with ui.expansion("설명 · 이미지 프롬프트 · 대표 상품 5개", icon="visibility"):
+                                ui.label(collection["description_html"]).classes("text-sm")
+                                ui.label(collection["image_prompt"]).classes("text-xs whitespace-pre-line")
+                                ui.label("Alt text: " + collection["image_alt_text"]).classes("text-xs")
+                                for sample in collection["sample_products"]:
+                                    ui.label(f"{sample['asin']} · {sample['title']} · {sample.get('brand') or '브랜드 미상'} · {sample.get('final_status') or '미분류'}").classes("text-xs")
+                    overlap = [warning for row in plan["collections"] for warning in row["warnings"] if warning.startswith("EXTREME_OVERLAP")]
+                    if overlap:
+                        ui.label(f"컬렉션 간 중복 경고 {len(overlap)}건 (중복 포함 자체는 허용)").classes("text-sm text-amber-800")
+
+            def design():
+                try:
+                    options = {"desired_collection_count": None if desired_count.value in (None, "") else int(desired_count.value),
+                               "rule_strategy": rule_strategy.value or "TITLE_FALLBACK",
+                               "min_products": int(min_products.value or 0),
+                               "max_overlap_warning": float(overlap_limit.value or 80) / 100,
+                               "include_empty": bool(include_empty.value), "language": language.value or "en"}
+                    result = CollectionPlanner().create_plan(self.current_store, settings=options)
+                    render_plan(result)
+                    ui.notify(f"컬렉션 계획 v{result['version']}을 저장했습니다. Shopify에는 쓰지 않았습니다.", type="positive")
+                except Exception as exc:
+                    ui.notify(_safe_error(exc), type="negative")
+
+            def export_plan():
+                try:
+                    plan = plan_ref.get("plan")
+                    if not plan: raise ValueError("먼저 컬렉션 자동 설계를 실행하세요.")
+                    result = CollectionPlanner().export(plan["plan_id"])
+                    ui.notify("JSON/Markdown 계획 내보내기 완료: " + result["folder"], type="positive")
+                except Exception as exc:
+                    ui.notify(_safe_error(exc), type="negative")
+
+            def preview_saved_plan():
+                try:
+                    plan = plan_ref.get("plan")
+                    if not plan: raise ValueError("미리보기할 계획이 없습니다. 먼저 자동 설계를 실행하세요.")
+                    render_plan(CollectionPlanner().get_plan(plan["plan_id"]))
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            with ui.row():
+                ui.button("컬렉션 자동 설계", on_click=design, icon="auto_awesome").props("color=positive")
+                ui.button("다시 설계", on_click=design, icon="refresh").props("outline")
+                ui.button("미리보기", on_click=preview_saved_plan, icon="visibility").props("outline")
+                ui.button("JSON/MD 내보내기", on_click=export_plan, icon="download").props("outline")
+                ui.button("Shopify에 컬렉션 생성 (Phase 3.3)", on_click=None).props("disable outline")
+                ui.button("이미지 자동 생성 (다음 단계)", on_click=None).props("disable outline")
 
     def _heading(self, title: str, subtitle: str | None = None):
         self.ui.label(title).classes("text-2xl font-bold text-slate-900")

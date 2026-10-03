@@ -185,7 +185,7 @@ def test_credential_adapter_uses_keyring_without_writing_files(monkeypatch, tmp_
     assert credentials.get_api_key() == (None, "missing")
 
 
-def test_v2_registers_seven_pages_without_replacing_tkinter():
+def test_v2_registers_eight_pages_without_replacing_tkinter():
     from shopsource.ui.v2 import NAV_ITEMS, OperatorUI
     registered = {}
     class FakeUI:
@@ -194,7 +194,7 @@ def test_v2_registers_seven_pages_without_replacing_tkinter():
     instance = OperatorUI.__new__(OperatorUI)
     instance.ui = FakeUI()
     instance._register_pages()
-    assert len(registered) == 7
+    assert len(registered) == 8
     assert {path for path, _icon, _label in NAV_ITEMS} == set(registered)
     from shopsource.ui.app import main as tkinter_main
     assert callable(tkinter_main)

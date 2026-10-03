@@ -449,6 +449,58 @@ CREATE TABLE IF NOT EXISTS store_sourcing_keywords (
     UNIQUE(category_id, keyword COLLATE NOCASE)
 );
 
+CREATE TABLE IF NOT EXISTS store_collection_plans (
+    plan_id TEXT PRIMARY KEY,
+    store_id TEXT NOT NULL,
+    sourcing_plan_id TEXT,
+    version INTEGER NOT NULL,
+    planner_version TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'DRAFT',
+    master_product_count INTEGER NOT NULL DEFAULT 0,
+    included_product_count INTEGER NOT NULL DEFAULT 0,
+    unmatched_product_count INTEGER NOT NULL DEFAULT 0,
+    unmatched_percentage REAL NOT NULL DEFAULT 0,
+    settings_json TEXT NOT NULL DEFAULT '{}',
+    diff_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(store_id, version)
+);
+CREATE TABLE IF NOT EXISTS store_collection_definitions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL REFERENCES store_collection_plans(plan_id) ON DELETE CASCADE,
+    collection_key TEXT NOT NULL,
+    source_category_id INTEGER,
+    title TEXT NOT NULL,
+    description_html TEXT NOT NULL DEFAULT '',
+    handle TEXT NOT NULL,
+    priority INTEGER NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    match_mode TEXT NOT NULL DEFAULT 'ANY',
+    rule_strategy TEXT NOT NULL DEFAULT 'TITLE_FALLBACK',
+    estimated_product_count INTEGER NOT NULL DEFAULT 0,
+    title_rule_specificity_estimate REAL NOT NULL DEFAULT 0,
+    sample_products_json TEXT NOT NULL DEFAULT '[]',
+    store_status_breakdown_json TEXT NOT NULL DEFAULT '{}',
+    warning_json TEXT NOT NULL DEFAULT '[]',
+    image_prompt TEXT NOT NULL DEFAULT '',
+    image_alt_text TEXT NOT NULL DEFAULT '',
+    shopify_collection_id TEXT,
+    shopify_sync_status TEXT NOT NULL DEFAULT 'NOT_SYNCED',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(plan_id, collection_key)
+);
+CREATE TABLE IF NOT EXISTS store_collection_conditions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    collection_definition_id INTEGER NOT NULL REFERENCES store_collection_definitions(id) ON DELETE CASCADE,
+    field TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    value TEXT NOT NULL,
+    group_operator TEXT NOT NULL DEFAULT 'OR',
+    priority INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_products_price ON products(price);
 CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);
 CREATE INDEX IF NOT EXISTS idx_decisions_store_status ON store_product_decisions(store_id, final_status);
@@ -462,6 +514,9 @@ CREATE INDEX IF NOT EXISTS idx_sourcing_runs_store_created ON sourcing_runs(stor
 CREATE INDEX IF NOT EXISTS idx_sourcing_runs_status ON sourcing_runs(status);
 CREATE INDEX IF NOT EXISTS idx_sourcing_candidates_run_asin ON sourcing_run_candidates(run_id, asin);
 CREATE INDEX IF NOT EXISTS idx_keyword_validation_store_keyword ON keyword_validation_results(store_id, keyword, checked_at);
+CREATE INDEX IF NOT EXISTS idx_collection_plans_store_version ON store_collection_plans(store_id,version DESC);
+CREATE INDEX IF NOT EXISTS idx_collection_definitions_plan_priority ON store_collection_definitions(plan_id,priority,id);
+CREATE INDEX IF NOT EXISTS idx_collection_conditions_definition_priority ON store_collection_conditions(collection_definition_id,priority,id);
 CREATE INDEX IF NOT EXISTS idx_capture_runs_store_time ON browser_capture_runs(store_id, captured_at DESC);
 CREATE INDEX IF NOT EXISTS idx_capture_candidates_run_status ON browser_capture_candidates(run_id, capture_status);
 CREATE INDEX IF NOT EXISTS idx_capture_candidates_asin ON browser_capture_candidates(asin);
