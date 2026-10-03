@@ -1,0 +1,1274 @@
+ShopSource Studio — Phase 4.1.1
+SOURCE AVAILABILITY / PRICE FRESHNESS / SELLABILITY GUARD
+Must complete BEFORE Phase 4.2 controlled live pilot
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+- Current baseline: 360538a95628810155fb0c2b5b6d87d5348aca88
+- Phase 4.1 release candidate code baseline: 4d5cd4f13bf53d4539d16e994635a21bbe04bf37
+
+Context
+- Phase 4.1 passed full stress qualification.
+- Phase 4.2 live-pilot prompt exists but MUST NOT be executed yet.
+- User observed many "Sold out" items in the Shopify collection.
+- IMPORTANT: a Shopify "Sold out" label does NOT by itself prove the Amazon source is out of stock. It can also be caused by Shopify inventory quantity/tracking/location/publication configuration.
+- Current code captures price but does not provide a complete source availability history / freshness / margin guard.
+- DirectShopifyProductPublisher currently uses UNMANAGED inventory by default.
+- The system must distinguish:
+  A. Amazon/source out of stock
+  B. Shopify inventory/configuration sold-out
+  C. price/margin risk
+  D. unknown/stale source state
+
+Goal
+Add a source-of-truth safety layer so that:
+
+1. new sourcing does NOT send known out-of-stock products to Spark/Shopify
+2. unknown/stale availability does NOT silently become sellable
+3. source price and availability are snapshotted over time
+4. pre-listing requires a fresh source check
+5. already listed products can be monitored for source stock/price changes
+6. margin-risk decisions are store-specific
+7. Amazon/source price is NEVER silently copied into Shopify selling price
+8. automatic repricing is OFF by default
+9. Shopify "Sold out" can be diagnosed as source-side vs Shopify-side
+10. Phase 4.2 cannot write even DRAFT pilot products unless the new source freshness gate passes
+
+ABSOLUTE SAFETY
+- Do NOT run real Shopify mutations during implementation.
+- Do NOT run real Keepa/API paid calls during implementation.
+- Do NOT automate Amazon CAPTCHA/WAF bypass, stealth, proxies, cookies, session extraction, or undocumented auth.
+- Browser Capture may only use normal page DOM already visible to the user.
+- All tests use mocks/fixtures.
+- Protect stores/001_cabin_tidy.json exactly as before.
+
+======================================================================
+0. FIRST: AUDIT THE CURRENT SOLD-OUT MEANING
+======================================================================
+
+Implement a read-only SoldOutDiagnosticService.
+
+The service must distinguish at least:
+
+SOURCE_IN_STOCK_SHOPIFY_AVAILABLE
+SOURCE_IN_STOCK_SHOPIFY_SOLD_OUT
+SOURCE_OUT_OF_STOCK_SHOPIFY_SOLD_OUT
+SOURCE_OUT_OF_STOCK_SHOPIFY_AVAILABLE
+SOURCE_UNKNOWN_SHOPIFY_SOLD_OUT
+SOURCE_UNKNOWN_SHOPIFY_AVAILABLE
+SHOPIFY_INVENTORY_NOT_TRACKED
+SHOPIFY_ZERO_AVAILABLE_QUANTITY
+SHOPIFY_CONTINUE_SELLING_WHEN_OOS
+SHOPIFY_NOT_PUBLISHED_OR_NOT_AVAILABLE
+MARGIN_BLOCKED
+SOURCE_STALE
+UNKNOWN
+
+Do NOT infer Amazon/source OOS just because Shopify says Sold out.
+
+For Shopify read-only diagnosis, use only currently supported official GraphQL fields discovered from the pinned API version, including where available:
+- ProductVariant.availableForSale
+- ProductVariant.inventoryQuantity
+- ProductVariant.inventoryPolicy
+- ProductVariant.inventoryItem
+- InventoryItem.tracked
+- inventory levels / "available" quantity
+- publication/product status as needed
+
+Do not invent fields.
+Keep queries read-only in this phase.
+
+Diagnostic example:
+
+Source availability | Shopify availability | Diagnosis
+IN_STOCK            | unavailable/qty 0     | SHOPIFY_INVENTORY_CONFIG_OR_ZERO
+OUT_OF_STOCK        | unavailable            | EXPECTED_SOURCE_OOS
+OUT_OF_STOCK        | available              | CRITICAL_OVERSALE_RISK
+UNKNOWN/STALE       | available              | SOURCE_NOT_VERIFIED
+IN_STOCK            | available              | OK
+
+Add UI:
+[Sold Out 원인 진단]
+
+Summary:
+- 전체
+- 실제 source OOS
+- Shopify inventory/config 문제 가능성
+- oversale risk
+- source unknown/stale
+- 정상
+
+This is a READ-ONLY diagnostic button.
+
+======================================================================
+1. SOURCE AVAILABILITY MODEL
+======================================================================
+
+Add canonical source availability states:
+
+IN_STOCK
+OUT_OF_STOCK
+LIMITED
+PREORDER
+BACKORDER
+UNKNOWN
+SOURCE_ERROR
+
+Do NOT use a single Boolean.
+
+Add confidence/evidence state:
+
+HIGH
+MEDIUM
+LOW
+UNKNOWN
+
+A source observation must include:
+- product_id / ASIN
+- source_platform
+- source_kind/provider
+- observed_at
+- source_price nullable
+- source_currency
+- availability
+- availability_confidence
+- evidence_kind
+- evidence_json (small, sanitized, no secrets)
+- source_url or provider reference where appropriate
+- check_run_id
+- provider_data_age / provider_updated_at when actually available
+- created_at
+
+Suggested table:
+
+source_product_snapshots
+- id
+- product_id
+- asin
+- source_platform
+- source_kind
+- source_price
+- source_currency
+- availability
+- availability_confidence
+- observed_at
+- provider_updated_at nullable
+- evidence_kind
+- evidence_json
+- check_run_id nullable
+- created_at
+
+Indexes:
+(product_id, observed_at DESC)
+(asin, observed_at DESC)
+(availability, observed_at DESC)
+
+Do not delete price history when product row is updated.
+
+products.price may remain the latest source price for backward compatibility,
+but source_product_snapshots becomes the historical source of truth.
+
+======================================================================
+2. MONITORING STATE
+======================================================================
+
+Add:
+
+source_monitoring_state
+- product_id PRIMARY KEY
+- last_checked_at
+- last_success_at
+- last_snapshot_id
+- latest_availability
+- latest_source_price
+- freshness_status
+- consecutive_errors
+- consecutive_in_stock
+- next_check_at
+- volatility_score nullable
+- updated_at
+
+Freshness states:
+
+FRESH
+STALE_WARNING
+STALE_BLOCKED
+NEVER_VERIFIED
+
+Freshness thresholds must be configurable per Store Profile.
+Do not hardcode them deep in business logic.
+
+Provide practical defaults in configuration only, clearly editable:
+
+PRE_LIST_MAX_AGE_MINUTES = 60
+ACTIVE_MONITOR_INTERVAL_HOURS = 4
+PRICE_WARNING_INTERVAL_HOURS = 1
+OUT_OF_STOCK_RECHECK_HOURS = 12
+RESERVE_RECHECK_HOURS = 24
+STALE_WARNING_HOURS = 8
+STALE_BLOCK_HOURS = 24
+
+Document that these are operational defaults, not immutable rules.
+
+Pre-listing check should be stricter than background monitoring.
+
+======================================================================
+3. BROWSER CAPTURE AVAILABILITY
+======================================================================
+
+Upgrade product-detail Browser Capture.
+
+Current content_product.js captures price/title/images but not canonical availability.
+
+Capture source availability only from observed page evidence.
+
+Priority:
+1. structured Product/Offer availability when present
+2. known visible availability DOM region
+3. explicit visible out-of-stock/currently-unavailable evidence
+4. otherwise UNKNOWN
+
+Recognize structured values such as schema.org:
+- InStock
+- OutOfStock
+- LimitedAvailability
+- PreOrder
+- BackOrder
+
+For DOM evidence:
+use visible Amazon US product-detail availability content such as the normal availability area.
+Do not rely solely on brittle text selectors when structured data is available.
+
+Store only a compact evidence record, for example:
+{
+  "kind": "JSON_LD_OFFER_AVAILABILITY",
+  "value": "https://schema.org/InStock"
+}
+
+or:
+{
+  "kind": "VISIBLE_AVAILABILITY_TEXT",
+  "normalized": "in stock"
+}
+
+Do not store the whole page.
+
+CAPTCHA/robot check:
+keep existing safe stop behavior.
+No bypass.
+
+Search-result capture:
+search-card availability may be captured only as a hint if clearly observed.
+It must NOT qualify a product for live sellability.
+A fresh detail/provider check is required.
+
+======================================================================
+4. KEEPA AVAILABILITY / PRICE EVIDENCE
+======================================================================
+
+Upgrade Keepa canonical mapping without inventing unsupported fields.
+
+Current mapping uses current price indices:
+BUY_BOX_SHIPPING
+AMAZON
+NEW
+
+Add a dedicated function such as:
+keepa_source_observation(raw) -> observation
+
+Rules:
+- source price and availability must be separate concepts
+- positive current NEW / eligible current purchasable-new-offer evidence may support IN_STOCK
+- a missing single price type does NOT prove whole-product OOS
+- use documented/current Keepa response fields only
+- if evidence is insufficient => UNKNOWN, not OUT_OF_STOCK
+- provider data freshness must be recorded when Keepa exposes a documented timestamp
+- if current-new-offer evidence explicitly indicates no offer / unavailable, map to OUT_OF_STOCK only when the mapping is justified by the documented price/offer semantics
+- offer-level stock data may be used only when actually requested/returned
+- do not assume stale offer objects are current
+
+Keep the existing token-budget / retry / pause behavior.
+
+Do not increase paid Keepa cost silently.
+Any deeper offer/stock query that costs additional tokens must:
+- be opt-in/configurable
+- show estimated token cost in preview
+- obey max token budget
+- checkpoint/resume
+
+For normal scheduled monitoring, prefer the lowest-cost sufficient source observation.
+
+======================================================================
+5. SOURCE CHECK RUNS
+======================================================================
+
+Add persisted source check runs:
+
+source_check_runs
+- run_id
+- store_id
+- mode
+  PRE_LIST
+  MONITOR_ACTIVE
+  MONITOR_RESERVE
+  RECHECK_OOS
+  MANUAL_AUDIT
+- provider
+- requested_count
+- checked_count
+- in_stock_count
+- out_of_stock_count
+- unknown_count
+- changed_price_count
+- failed_count
+- token_estimate
+- tokens_consumed
+- status
+- checkpoint_json
+- started_at
+- finished_at
+- error
+
+Requirements:
+- batches
+- pause
+- resume
+- retry failed only
+- bounded retries
+- deterministic selection
+- token budget preview
+- no secret logs
+
+======================================================================
+6. SELLABILITY IS STORE-SPECIFIC
+======================================================================
+
+Do NOT overload Store Decision status.
+
+PRIMARY/RESERVE/REVIEW represents store/category fit.
+Source sellability is a separate safety overlay.
+
+Add:
+
+store_product_sellability
+- store_id
+- product_id
+- snapshot_id
+- source_availability
+- freshness_status
+- current_source_price
+- source_price_at_first_seen
+- source_price_at_listing nullable
+- previous_source_price nullable
+- selling_price nullable
+- price_change_amount nullable
+- price_change_percent nullable
+- effective_source_cost nullable
+- estimated_margin_amount nullable
+- estimated_margin_percent nullable
+- margin_status
+- sellability_status
+- reasons_json
+- evaluated_at
+- expires_at
+- PRIMARY KEY(store_id, product_id)
+
+Sellability statuses:
+
+SELLABLE
+BLOCKED_SOURCE_OUT_OF_STOCK
+BLOCKED_SOURCE_UNKNOWN
+BLOCKED_SOURCE_STALE
+BLOCKED_MARGIN
+BLOCKED_SOURCE_ERROR
+NEEDS_PRICING_POLICY
+NEEDS_REVIEW
+
+Manual store-product decision must NOT silently override source safety.
+
+If a future source-safety override is implemented:
+it must be explicit, reasoned, time-limited, and separately audited.
+
+======================================================================
+7. PRICE HISTORY / DELTA
+======================================================================
+
+For every new successful source observation:
+compare against the previous successful snapshot.
+
+Track:
+- previous_source_price
+- current_source_price
+- delta_amount
+- delta_percent
+- changed_at
+
+Do not mistake currency changes for price changes.
+If currency mismatch:
+NEEDS_REVIEW.
+
+Source price drop:
+- update history
+- selling price remains unchanged by default
+- margin improves
+
+Source price small rise:
+- selling price remains unchanged by default
+- evaluate margin / warning
+
+Source price large rise:
+- selling price remains unchanged by default
+- block or warn according to configured margin policy
+
+AUTO REPRICE:
+OFF by default.
+
+Never automatically lower Shopify selling price because source price fell.
+
+Never automatically increase Shopify selling price merely because source price rose unless a future explicit bounded AUTO_REPRICE policy is enabled.
+
+======================================================================
+8. PRICING / MARGIN GUARD POLICY
+======================================================================
+
+Add a store-level SourcePriceGuardPolicy.
+
+Do NOT invent a merchant margin requirement as fact.
+
+Configuration fields:
+- enabled
+- min_margin_amount nullable
+- min_margin_percent nullable
+- source_cost_buffer_fixed
+- source_cost_buffer_percent
+- additional_cost_buffer_fixed
+- additional_cost_buffer_percent
+- warning_source_price_change_percent nullable
+- block_on_margin_breach
+- auto_reprice_enabled DEFAULT FALSE
+- max_auto_price_change_percent nullable
+- currency
+
+If min margin policy is not configured:
+- still detect source price change
+- do not claim margin is safe
+- status NEEDS_PRICING_POLICY
+- DRAFT pilot may be prepared if all other safety gates pass
+- ACTIVE publication must remain blocked until user confirms a pricing guard policy
+
+Formula:
+effective_source_cost =
+  current_source_price
+  + configured fixed buffers
+  + configured percentage buffers
+
+estimated_margin_amount =
+  selling_price - effective_source_cost
+
+estimated_margin_percent =
+  estimated_margin_amount / selling_price * 100
+
+If both min_margin_amount and min_margin_percent are configured,
+both must pass unless Store Profile explicitly defines another mode.
+
+Do not include unknown fees/taxes/shipping as zero and then call margin "fully safe".
+Report which cost components are configured vs unknown.
+
+======================================================================
+9. SOURCE SAFETY GATE FOR NEW SOURCING
+======================================================================
+
+Change live-safe sourcing/export behavior.
+
+Product may remain in MASTER DB regardless of source stock.
+
+But a product may enter a LIVE-SAFE Spark/Shopify handoff only if:
+
+- store decision is otherwise eligible
+- not RESTRICTED/ARCHIVED
+- fresh source snapshot exists
+- availability = IN_STOCK
+- freshness = FRESH
+- current source price exists if pricing guard requires it
+- no blocking currency conflict
+- margin is not BLOCKED when margin policy is configured
+
+OUT_OF_STOCK:
+keep in MASTER
+exclude from live-safe export
+queue for recheck
+
+UNKNOWN:
+keep in MASTER
+exclude from live-safe export
+queue for fresh verification
+
+SOURCE_ERROR:
+do not interpret as OOS
+keep previous snapshot
+apply stale/error rules
+
+Do not delete products because of temporary stock status.
+
+======================================================================
+10. SPARK EXPORT GUARD
+======================================================================
+
+Integrate the new sellability gate into Spark package generation.
+
+Current safe store statuses alone are no longer sufficient for LIVE packages.
+
+For LIVE_SAFE package:
+eligible store status
+AND source sellability pass
+
+Report exclusions separately:
+
+RESTRICTED
+ARCHIVED
+SOURCE_OUT_OF_STOCK
+SOURCE_UNKNOWN
+SOURCE_STALE
+SOURCE_ERROR
+MARGIN_BLOCKED
+NEEDS_PRICING_POLICY
+MISSING_SNAPSHOT
+MISSING_PRODUCT
+MISSING_DECISION
+
+Do not change or corrupt historical already-created Spark packages.
+
+Add a new package/report version.
+
+Legacy/debug export may exist only with explicit non-live labeling.
+Never label it live-safe.
+
+======================================================================
+11. DIRECT SHOPIFY PRODUCT GUARD
+======================================================================
+
+Integrate into DirectShopifyProductPublisher preview/sync.
+
+Before CREATE/UPDATE for a live pilot:
+load store_product_sellability.
+
+If not SELLABLE:
+SKIP with precise reason.
+
+Exception:
+Phase 4.2 first pilot writes DRAFT only.
+
+For DRAFT pilot:
+- fresh IN_STOCK still required
+- pricing policy may be NEEDS_PRICING_POLICY if the user explicitly allows DRAFT-only test
+- ACTIVE publication remains forbidden
+
+Never allow OUT_OF_STOCK/UNKNOWN/STALE product into even DRAFT live pilot by default.
+
+Update input hash/stale-preview logic so source snapshot changes invalidate Shopify preview.
+
+A price/availability change after preview must force PREVIEW_STALE.
+
+======================================================================
+12. PRE-LISTING FRESH CHECK
+======================================================================
+
+Add a mandatory source freshness gate immediately before Shopify write.
+
+Flow:
+Product pilot candidate selection
+→ source freshness check
+→ sellability evaluation
+→ Shopify preview
+→ user confirm
+→ write
+
+If the snapshot age exceeds PRE_LIST_MAX_AGE:
+refresh source observation before write.
+
+If refresh fails:
+STOP/SKIP product
+do not use old stale source data.
+
+This must be wired into the future Phase 4.2 live pilot.
+
+======================================================================
+13. MONITORING AFTER LISTING
+======================================================================
+
+Add SourceMonitorService.
+
+Methods:
+- preview_due_checks(store_id)
+- run_due_checks(store_id, ...)
+- evaluate_changes(store_id)
+- build_actions(store_id)
+- retry_failed(run_id)
+- status(run_id)
+
+Priority:
+1. active Shopify-mapped products
+2. price-warning / volatile products
+3. source OOS products
+4. reserves
+
+Suggested configurable intervals are from section 2.
+
+Do not require the UI/app process to stay open as the only possible scheduler.
+
+Add a CLI-safe one-shot command, e.g.:
+python -m shopsource.cli source-monitor --store 001 --due-only
+
+It should execute one due-check cycle and exit.
+
+Document that Windows Task Scheduler or another external scheduler can invoke it later.
+Do not create a persistent hidden background service during this phase unless one already exists.
+
+======================================================================
+14. SOURCE CHANGE ACTION PLAN
+======================================================================
+
+A monitoring run must create an ACTION PLAN, not immediately mutate Shopify by surprise.
+
+Actions:
+
+NO_ACTION
+WARN_PRICE_CHANGE
+BLOCK_NEW_LISTING
+PAUSE_LISTING
+RESTORE_ELIGIBLE
+RECHECK_REQUIRED
+MANUAL_REVIEW
+
+Default enforcement mode:
+PREVIEW_ONLY / ALERT_ONLY
+
+Store setting can later opt in to:
+DRAFT_ON_BLOCK
+INVENTORY_ZERO_ON_BLOCK
+
+AUTO REPRICE remains OFF.
+
+No automatic live mutation during this implementation phase.
+
+======================================================================
+15. SHOPIFY INVENTORY SAFETY DESIGN
+======================================================================
+
+Current product publisher uses inventory_policy = UNMANAGED.
+Do not pretend that source stock and Shopify stock are synchronized.
+
+Implement read-only inventory diagnosis first.
+
+Support future enforcement modes:
+
+A. DRAFT_ON_BLOCK
+- changes product status to DRAFT
+- does not require inventory tracking
+- less desirable for SEO/customer continuity but safe fallback
+
+B. INVENTORY_ZERO_ON_BLOCK
+- preferred long-term because page can remain present while unavailable
+- requires verified inventory tracking
+- requires actual InventoryItem/location mapping
+- requires current official inventory mutation
+- requires write_inventory
+- requires compare-and-set/idempotency behavior required by the pinned API version
+- must not overwrite merchant-managed inventory without explicit ownership/configuration
+
+Do NOT enable INVENTORY_ZERO_ON_BLOCK by default.
+
+Do NOT set inventory quantity in implementation tests.
+
+Add ownership setting:
+
+inventory_control_mode:
+UNMANAGED
+ALERT_ONLY
+SHOP_SOURCE_MANAGED
+
+Only SHOP_SOURCE_MANAGED can later mutate inventory.
+
+If not owned:
+read-only diagnosis and alert only.
+
+======================================================================
+16. SHOPIFY SOLD-OUT DIAGNOSTIC DETAILS
+======================================================================
+
+Implement read-only Shopify inventory snapshot:
+
+shopify_inventory_snapshots
+- store_id
+- product_id
+- shopify_product_id
+- shopify_variant_id
+- inventory_item_id nullable
+- product_status
+- available_for_sale
+- inventory_quantity nullable
+- inventory_policy
+- inventory_tracked nullable
+- available_quantity_by_location_json
+- publication_state nullable
+- observed_at
+
+Use current official Shopify API version already pinned by project.
+
+Do not assume inventoryQuantity alone explains storefront availability.
+Store the relevant evidence.
+
+Diagnostic UI per product:
+Source
+- Amazon availability
+- source price
+- last source check
+
+Shopify
+- availableForSale
+- inventory quantity
+- tracked
+- inventory policy
+- product status/publication
+
+Diagnosis
+- source problem
+- Shopify inventory/config problem
+- both
+- unknown
+
+======================================================================
+17. RECOVERY / RESTOCK HYSTERESIS
+======================================================================
+
+Do not immediately restore selling state after a single transient IN_STOCK signal.
+
+Default recovery requirement:
+- current snapshot IN_STOCK
+- freshness FRESH
+- margin not blocked
+- at least 2 consecutive successful IN_STOCK observations
+
+Make count configurable.
+
+When recovery qualifies:
+RESTORE_ELIGIBLE
+
+Do NOT automatically reactivate Shopify unless enforcement mode explicitly allows it and previous pause was ShopSource-owned.
+
+Never reactivate a product that a merchant manually disabled.
+
+Track:
+paused_by_shopsource
+pause_reason
+pause_snapshot_id
+previous_shopify_status
+paused_at
+
+======================================================================
+18. UNKNOWN / PROVIDER FAILURE POLICY
+======================================================================
+
+Provider error is not the same as OOS.
+
+On one transient provider error:
+- retain last successful snapshot
+- increment consecutive_errors
+- freshness moves according to age
+- do not immediately mark OUT_OF_STOCK
+
+For NEW listing:
+fresh verification failure = BLOCK NEW LISTING.
+
+For existing ACTIVE listing:
+- if last successful IN_STOCK snapshot is still within configured grace/freshness window, alert/retry
+- after STALE_BLOCK threshold, create PAUSE_LISTING action plan
+
+No indefinite selling from months-old source data.
+
+======================================================================
+19. EXISTING MASTER / SHOPIFY BACKFILL
+======================================================================
+
+The user has an existing MASTER catalog and existing Shopify products/collection content.
+
+Add "Source Safety Audit" workflow.
+
+UI:
+[전체 Source 재고·가격 검사]
+[Sold Out 원인 진단]
+[가격변동 보기]
+[재확인 필요만 보기]
+[판매차단 후보 보기]
+
+Before running real provider calls:
+preview:
+- products to check
+- provider
+- expected batches
+- estimated Keepa token cost
+- previous freshness coverage
+
+User must explicitly start real audit later.
+
+Batch:
+100 ASINs where supported.
+
+Checkpoint/resume.
+
+Do not automatically run the audit during Codex implementation.
+
+The historical ~2,000-product catalog must be auditable, but do not hardcode 1,999/2,000 counts.
+
+======================================================================
+20. SOURCE SAFETY DASHBOARD
+======================================================================
+
+Add top-level or Store Completion card:
+
+### 소스 재고·가격 안전
+
+Source freshness:
+- FRESH
+- STALE
+- NEVER VERIFIED
+
+Availability:
+- IN STOCK
+- OUT OF STOCK
+- UNKNOWN
+
+Price:
+- unchanged
+- changed
+- warning
+- margin blocked
+- pricing policy needed
+
+Shopify sold-out:
+- source OOS
+- Shopify inventory/config issue
+- unknown
+- oversale risk
+
+Buttons:
+[Source 안전 검사]
+[Sold Out 원인 진단]
+[가격변동 보기]
+[재고변동 보기]
+[판매차단 후보]
+[재입고 후보]
+[모니터링 설정]
+
+Beginner UI first.
+Technical evidence collapsed.
+
+======================================================================
+21. STORE COMPLETION INTEGRATION
+======================================================================
+
+Add Store Completion domain/item(s):
+
+SOURCE_AVAILABILITY
+SOURCE_FRESHNESS
+SOURCE_PRICE_GUARD
+SOURCE_MONITORING
+SHOPIFY_INVENTORY_ALIGNMENT
+
+Launch-readiness behavior:
+
+BLOCKER for ACTIVE launch:
+- source availability unknown/stale for active intended products
+- known source OOS while Shopify available
+- configured margin breach
+- no source monitoring strategy
+- source/shopify inventory mismatch with oversale risk
+
+DRAFT-only pilot:
+may proceed only with fresh IN_STOCK source check.
+
+Do not let readiness numeric score hide these blockers.
+
+======================================================================
+22. STOREBUILD INTEGRATION
+======================================================================
+
+Insert safety gates into StoreBuild:
+
+...
+SOURCING
+SOURCE_SAFETY_EVALUATION
+PRODUCTS
+...
+SOURCE_MONITOR_PREVIEW
+COMMERCE_READINESS
+FINAL_VERIFY
+
+For live product synchronization:
+SOURCE_FRESHNESS_CHECK must execute immediately before PRODUCT_SYNC_PREVIEW / write gate.
+
+If source data changes:
+invalidate downstream preview.
+
+======================================================================
+23. PHASE 4.2 DEPENDENCY
+======================================================================
+
+The existing file:
+CODEX_PHASE_4_2_CABIN_TIDY_LIVE_PILOT_PROMPT.txt
+
+must be updated as part of this implementation so that Phase 4.2 explicitly requires:
+
+- Phase 4.1.1 COMPLETE
+- fresh source snapshot for each of the 10 selected products
+- availability IN_STOCK
+- no stale/unknown source state
+- source price rechecked before Shopify preview
+- sellability gate pass
+- source snapshot hash included in preview hash
+- any source change after preview => stale preview / re-preview
+
+Phase 4.2 must also begin with a READ-ONLY Sold Out diagnosis for existing Shopify items before assuming Amazon OOS.
+
+Do not start Phase 4.2.
+
+======================================================================
+24. PRICE CHANGE NOTIFICATIONS / REPORTING
+======================================================================
+
+Create reports:
+
+exports/source_safety_reports/<store>/<run_id>/
+
+- source_check_summary.json
+- availability_changes.json
+- price_changes.json
+- sellability_changes.json
+- sold_out_diagnostics.json
+- action_plan.json
+- summary.md
+
+No secrets.
+
+Summary examples:
+
+"12 products changed from IN_STOCK → OUT_OF_STOCK"
+"8 source prices increased"
+"3 products fall below configured margin"
+"27 Shopify Sold Out items appear to be inventory/configuration-related rather than confirmed source OOS"
+"41 products need a fresh source check"
+
+Do not label diagnosis as certain when evidence is insufficient.
+
+======================================================================
+25. OPTIONAL FUTURE AUTOMATION POLICY
+======================================================================
+
+Prepare policy fields, but keep live automatic actions OFF:
+
+auto_pause_on_source_oos = false
+auto_restore_on_restock = false
+auto_reprice = false
+
+A future user opt-in can enable:
+- auto pause
+- auto restore
+- bounded repricing
+
+But Phase 4.1.1 implementation must remain preview-first.
+
+======================================================================
+26. TESTS — SOURCE MAPPING
+======================================================================
+
+Minimum tests:
+
+test_browser_detail_jsonld_instock
+test_browser_detail_jsonld_outofstock
+test_browser_detail_dom_instock
+test_browser_detail_dom_currently_unavailable
+test_browser_detail_unknown_when_no_evidence
+test_search_hint_does_not_qualify_sellability
+
+test_keepa_positive_current_new_instock
+test_keepa_missing_single_price_type_not_oos
+test_keepa_documented_no_new_offer_outofstock
+test_keepa_insufficient_evidence_unknown
+test_keepa_provider_error_not_oos
+test_keepa_snapshot_preserves_history
+
+======================================================================
+27. TESTS — SELLABILITY / PRICE
+======================================================================
+
+test_oos_kept_in_master_but_blocked_from_live_export
+test_unknown_kept_in_master_but_blocked_from_live_export
+test_fresh_instock_sellable
+test_stale_instock_blocked_for_new_listing
+test_source_error_uses_last_successful_snapshot_until_stale
+test_price_history_delta
+test_price_drop_does_not_reduce_shopify_price
+test_price_rise_does_not_auto_reprice
+test_margin_policy_unconfigured_needs_pricing_policy
+test_margin_breach_blocks_when_policy_enabled
+test_currency_mismatch_needs_review
+test_store_specific_margin_policy
+test_manual_store_decision_does_not_bypass_source_safety
+
+======================================================================
+28. TESTS — EXPORT / SHOPIFY
+======================================================================
+
+test_spark_live_safe_excludes_oos
+test_spark_live_safe_excludes_unknown
+test_spark_report_has_source_exclusion_counts
+test_shopify_preview_excludes_oos
+test_shopify_preview_excludes_stale
+test_source_change_invalidates_shopify_preview
+test_phase42_draft_requires_fresh_instock
+test_active_publish_requires_pricing_policy_when_configured
+
+======================================================================
+29. TESTS — SOLD OUT DIAGNOSTIC
+======================================================================
+
+test_source_instock_shopify_zero_inventory_diagnosis
+test_source_oos_shopify_available_oversale_risk
+test_source_oos_shopify_soldout_expected
+test_source_unknown_shopify_soldout_unknown
+test_shopify_inventory_not_tracked_diagnosis
+test_shopify_continue_policy_detected
+test_diagnostic_read_only
+test_diagnostic_preserves_unrelated_shopify_state
+
+======================================================================
+30. TESTS — MONITOR / RECOVERY
+======================================================================
+
+test_monitor_due_priority
+test_monitor_checkpoint_resume
+test_monitor_retry_failed_only
+test_monitor_provider_failure_bounded
+test_oos_creates_pause_action_not_live_mutation
+test_two_consecutive_instock_required_for_restore
+test_manual_shopify_disable_not_auto_restored
+test_stale_active_product_generates_pause_plan
+test_monitor_cli_one_shot
+test_no_background_hidden_daemon_required
+
+======================================================================
+31. TESTS — SECURITY / SCALE
+======================================================================
+
+test_source_reports_redact_secrets
+test_source_evidence_does_not_store_page_html
+test_no_cookie_session_capture
+test_no_captcha_bypass
+test_2000_product_source_audit_batches
+test_50000_snapshot_query_is_indexed_and_streamed
+test_protected_store_file_untouched
+test_no_real_network_in_tests
+
+All existing Phase 4.1 tests must remain green.
+
+======================================================================
+32. STRESS / PERFORMANCE
+======================================================================
+
+Add focused stress simulation:
+
+A. 2,000 product source safety audit
+B. 10,000 latest-snapshot/sellability evaluation
+C. 50,000 snapshot history query / latest-per-product lookup
+
+Verify:
+- no N+1 catastrophe
+- no O(N²)
+- latest snapshot lookup indexed
+- UI previews capped/paginated
+- reports do not duplicate all raw evidence unnecessarily
+
+No real Keepa or Shopify network.
+
+======================================================================
+33. DB MIGRATION
+======================================================================
+
+Migration/additive schema only.
+
+Existing:
+products
+store_product_decisions
+shopify mappings
+campaign data
+
+must remain untouched.
+
+Test migration from Phase 4.1 DB.
+
+Do not rewrite historical raw_json just to insert availability.
+
+Populate historical products as:
+NEVER_VERIFIED
+until a new valid source snapshot exists.
+
+This is safer than guessing from old missing fields.
+
+======================================================================
+34. DOCUMENTATION
+======================================================================
+
+Create:
+
+docs/SOURCE_AVAILABILITY_PRICE_GUARD.md
+docs/SOLD_OUT_DIAGNOSTICS.md
+docs/SOURCE_MONITORING.md
+
+Korean beginner explanation must include:
+
+- Shopify "Sold out" ≠ automatically Amazon sold out
+- why source stock is checked twice
+- why old source data becomes stale
+- why source price and Shopify selling price are separate
+- why repricing is off by default
+- how OOS products stay in MASTER but are blocked from live export
+- how restock recovery works
+- what inventory ownership means
+- how to run Source Safety Audit before Phase 4.2
+
+======================================================================
+35. UI USER FLOW
+======================================================================
+
+Before Phase 4.2, desired user flow:
+
+1. ShopSource 실행
+2. 001 Cabin Tidy 선택
+3. [Source 안전 검사]
+4. preview 확인
+5. if real provider call is needed:
+   user explicitly starts audit
+6. [Sold Out 원인 진단]
+7. source OOS vs Shopify inventory/config counts 확인
+8. [가격변동 보기]
+9. pricing guard policy 확인/입력
+10. source safety status READY 확인
+11. only then Phase 4.2 live pilot
+
+Codex implementation must NOT perform step 5 automatically.
+
+======================================================================
+36. NO REAL LIVE ACTIONS DURING IMPLEMENTATION
+======================================================================
+
+Absolutely no:
+- real Keepa token-consuming audit
+- real Amazon browser batch run
+- real Shopify mutation
+- real Shopify inventory write
+- real Spark upload
+- paid image call
+- payment/order/checkout
+
+Mock only.
+
+Read-only official API schema/docs inspection is okay.
+
+======================================================================
+37. PROTECTED FILE
+======================================================================
+
+stores/001_cabin_tidy.json
+
+NEVER:
+reset
+restore
+checkout
+clean
+stage
+commit
+overwrite
+
+Final working tree may still show this one known dirty file.
+
+======================================================================
+38. QUALITY GATE
+======================================================================
+
+Run focused new tests first.
+
+Then:
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Run new source-safety stress profiles.
+
+After the LAST fix, rerun the full suite.
+
+======================================================================
+39. COMMIT / PUSH
+======================================================================
+
+Do not commit:
+- protected store JSON
+- production DB
+- live reports
+- raw source payload dumps
+- secrets
+- credentials
+- runtime exports
+
+Commit:
+git commit -m "Add source availability and price guard"
+
+Push:
+git push origin main
+
+Final:
+git rev-list --left-right --count main...origin/main
+must be:
+0 0
+
+======================================================================
+40. COMPLETION REPORT
+======================================================================
+
+Report exactly:
+
+[1] baseline SHA
+[2] final SHA
+[3] source availability model
+[4] Browser Capture availability support
+[5] Keepa availability mapping
+[6] snapshot/history model
+[7] freshness policy
+[8] store-specific price/margin guard
+[9] Spark live-safe export gate
+[10] Shopify preview/live-pilot gate
+[11] Sold Out diagnostic service
+[12] monitoring/checkpoint/resume
+[13] restock recovery logic
+[14] Shopify inventory ownership/enforcement modes
+[15] Store Completion / StoreBuild integration
+[16] Phase 4.2 prompt dependency update
+[17] 2k/10k/50k stress results
+[18] focused tests
+[19] full tests
+[20] protected file
+[21] commit/push
+[22] SOURCE_SAFETY_READY = YES/NO
+[23] exact steps the user should click next BEFORE Phase 4.2
+
+If SOURCE_SAFETY_READY = NO:
+do not recommend Phase 4.2.
+
+If YES:
+still do not automatically start real provider audit or Shopify write.
+Wait for user to run Source Safety Audit from ShopSource UI.
