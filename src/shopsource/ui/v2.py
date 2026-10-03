@@ -376,6 +376,104 @@ class OperatorUI:
                 ui.button("실패 항목 재시도", on_click=retry_build, icon="refresh").props("outline")
 
     def _shopify_pilot(self):
+        """Phase 4.2 gate UI. No write button is enabled by a read/preview action."""
+        ui = self.ui
+        from ..live_pilot import ControlledLivePilotService
+
+        self._heading("Cabin Tidy 통제형 LIVE PILOT", "읽기 전용 점검 → 최대 10개 DRAFT → 원격 재검증 순서로만 진행합니다.")
+        connection = get_shopify_connection("001") or {}
+        state = {"service": None, "run_id": None, "preview": None}
+        status = ui.label("GATE A · READ-ONLY PREFLIGHT 대기").classes("font-semibold text-lg")
+        ui.label("실제 Shopify 변경은 각 단계에서 사용자가 ‘실행’을 직접 누른 뒤에만 발생합니다.").classes("text-amber-800")
+        expected_domain = ui.input("확인할 Cabin Tidy Shopify domain",
+                                   value=connection.get("shop_domain") or "").classes("w-96")
+        live_mode = ui.checkbox("LIVE PILOT 선택 (미리보기만으로는 실제 변경되지 않음)", value=False)
+        table = ui.table(columns=[{"name": key, "label": label, "field": key, "align": "left"} for key, label in (
+            ("source_id", "ASIN"), ("title", "Title"), ("source_price", "Source price"),
+            ("selling_price", "Selling price"), ("currency", "Currency"), ("status", "Status"),
+            ("action", "Action"), ("tags", "Tags"), ("warning", "Warnings"))], rows=[]).classes("w-full")
+        write_button = None
+        verify_button = None
+        collection_button = None
+
+        def refresh():
+            run = state["service"].get_run(state["run_id"]) if state["service"] and state["run_id"] else None
+            gate = run["gate"] if run else "PREFLIGHT"
+            status.set_text(f"현재 gate: {gate} · 상태: {run['status'] if run else 'PENDING'}")
+            if write_button:
+                (write_button.enable() if gate == "PRODUCT_WRITE" and live_mode.value else write_button.disable())
+            if verify_button:
+                (verify_button.enable() if gate == "PRODUCT_VERIFY" else verify_button.disable())
+            if collection_button:
+                (collection_button.enable() if gate == "COLLECTION_PREVIEW" else collection_button.disable())
+
+        async def preflight():
+            if self.current_store != "001":
+                ui.notify("Store = 001 | Cabin Tidy를 선택해야 합니다.", type="negative"); return
+            try:
+                service = ControlledLivePilotService()
+                run = await asyncio.to_thread(service.create_run, "001", expected_domain.value, store_name="Cabin Tidy")
+                await asyncio.to_thread(service.preflight, run["run_id"])
+                state.update(service=service, run_id=run["run_id"], preview=None)
+                ui.notify("도메인·인증·API·상품 권한을 읽기 전용으로 확인했습니다. 토큰은 표시하지 않습니다.", type="positive")
+            except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+            refresh()
+
+        async def product_preview():
+            if not state["service"]: ui.notify("먼저 READ-ONLY PREFLIGHT를 실행하세요.", type="warning"); return
+            try:
+                result = await asyncio.to_thread(state["service"].preview_products, state["run_id"], limit=10)
+                state["preview"] = result
+                table.rows = [{**item, "tags": ", ".join(item.get("tags") or item.get("collection_tags") or [])}
+                              for item in result["items"]]
+                table.update(); ui.notify("최대 10개 DRAFT 미리보기 완료 · 이미지 OFF · Shopify write 없음", type="positive")
+            except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+            refresh()
+
+        async def confirmed_product_write():
+            try:
+                await asyncio.to_thread(state["service"].write_products, state["run_id"], confirmed=True)
+                ui.notify("상품 mutation 후 원격 재검증이 필요합니다.", type="warning")
+            except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+            refresh()
+
+        async def request_product_write():
+            if not live_mode.value: ui.notify("LIVE PILOT을 직접 선택하세요.", type="warning"); return
+            with ui.dialog() as dialog, ui.card():
+                ui.label("Cabin Tidy에 최대 10개의 DRAFT 상품을 실제 생성/수정합니다. 실제 Shopify 변경이 발생합니다.")
+                with ui.row():
+                    ui.button("취소", on_click=dialog.close).props("outline")
+                    async def run_write(): dialog.close(); await confirmed_product_write()
+                    ui.button("실행", on_click=run_write).props("color=negative")
+            dialog.open()
+
+        async def remote_verify():
+            try:
+                result = await asyncio.to_thread(state["service"].verify_products, state["run_id"])
+                ui.notify(f"Shopify API 재조회 검증: {result['status']}", type="positive")
+            except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+            refresh()
+
+        async def collection_preview():
+            try:
+                result = await asyncio.to_thread(state["service"].preview_collections, state["run_id"])
+                ui.notify(f"최대 {len(result['items'])}개 컬렉션 미리보기 완료 · 별도 확인 전 write 없음", type="positive")
+            except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+            refresh()
+
+        with ui.row().classes("flex-wrap"):
+            ui.button("GATE A · READ-ONLY PREFLIGHT", on_click=preflight, icon="verified_user").props("outline")
+            ui.button("GATE B · 10개 DRAFT 미리보기", on_click=product_preview, icon="preview").props("outline")
+            write_button = ui.button("GATE C · 10개 실제 업로드", on_click=request_product_write, icon="upload").props("color=negative").disable()
+            verify_button = ui.button("GATE D · Shopify API 재조회 검증", on_click=remote_verify, icon="fact_check").props("outline").disable()
+            collection_button = ui.button("GATE E · 최대 3개 컬렉션 미리보기", on_click=collection_preview, icon="collections_bookmark").props("outline").disable()
+        with ui.expansion("이후 안전 gate", icon="security").classes("w-full"):
+            ui.label("GATE F Shop branch 내비게이션 → Logo/Favicon 현황 → Hero/Category 미리보기 → 별도 Theme 확인 → StoreCompletion")
+            ui.label("정책은 사업정보 누락 시 REQUIRES_BUSINESS_INPUT, Shipping/Tax/Payment/Domain은 READ ONLY입니다.")
+        table
+        refresh()
+
+    def _legacy_shopify_pilot(self):
         ui = self.ui
         self._heading("Cabin Tidy 실전 테스트", "최대 20개, DRAFT 상품만 대상으로 하는 통제된 Shopify 파일럿입니다.")
         from ..shopify_pilot import ShopifyLivePilot
