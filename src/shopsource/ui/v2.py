@@ -742,7 +742,7 @@ class OperatorUI:
         ui = self.ui
         self._heading("Homepage Automation", "BrandProfile, enabled collections, Shopify mappings, and the discovered theme schema drive this preview.")
         ui.label("Preview is read-only. Shopify theme changes require a separate explicit confirmation; paid image generation stays off until opted in.").classes("text-sm text-amber-800")
-        state = {"plan": None, "snapshot": None, "preview": None, "collection_plan": None}
+        state = {"plan": None, "snapshot": None, "preview": None, "collection_plan": None, "backup_id": None}
         with ui.card().classes("w-full border-2 border-sky-200 bg-sky-50"):
             brand_name = next((row["store_name"] for row in self.stores if row["store_id"] == self.current_store), self.current_store)
             ui.label(f"Store: {self.current_store} | Brand: {brand_name}").classes("text-xl font-bold")
@@ -906,9 +906,28 @@ class OperatorUI:
                             try:
                                 result = HomepageAutomationService().apply(preview["preview_id"], confirmed=True,
                                     approved_assets=bool(hero_approved.value))
+                                state["backup_id"] = result.get("backup_id")
                                 ui.notify("Homepage apply: " + str(result), type="positive" if result.get("status") == "VERIFIED" else "warning")
                             except Exception as exc: ui.notify(_safe_error(exc), type="negative")
                         ui.button("확인 후 적용", on_click=perform).props("color=primary")
+                dialog.open()
+
+            def rollback_homepage():
+                backup_id = state.get("backup_id")
+                if not backup_id:
+                    ui.notify("이 화면에서 확인된 적용 백업이 없습니다.", type="warning")
+                    return
+                with ui.dialog() as dialog, ui.card():
+                    ui.label("이 적용 전 homepage JSON을 Shopify에 복원합니다. 원격 drift가 있으면 복원을 거부합니다.")
+                    with ui.row():
+                        ui.button("취소", on_click=dialog.close).props("outline")
+                        def perform_rollback():
+                            dialog.close()
+                            try:
+                                result = HomepageAutomationService().rollback(backup_id, confirmed=True)
+                                ui.notify("Homepage rollback: " + str(result), type="positive" if result.get("status") == "VERIFIED" else "warning")
+                            except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+                        ui.button("확인 후 롤백", on_click=perform_rollback).props("color=negative")
                 dialog.open()
 
             with ui.row():
@@ -917,6 +936,7 @@ class OperatorUI:
                 ui.button("카테고리 바로가기 만들기", on_click=design, icon="category")
                 ui.button("홈페이지 미리보기", on_click=refresh_preview, icon="visibility").props("outline")
                 ui.button("Shopify 적용", on_click=apply_confirm, icon="publish").props("color=primary")
+                ui.button("롤백", on_click=rollback_homepage, icon="undo").props("outline")
                 ui.button("수동 적용 안내", on_click=show_manual, icon="help").props("outline")
             ui.button("Check banner image", on_click=inspect_image, icon="fact_check").props("outline")
             ui.button("Generate banner image (paid opt-in)", on_click=generate_hero, icon="auto_awesome").props("outline")
