@@ -211,6 +211,133 @@ def test_campaign_package_uses_campaign_asins(tmp_path):
     assert {json.loads(path.read_text(encoding="utf-8"))["asin"] for path in files} == {"L000000001", "L000000002"}
 
 
+def add_package_candidate(db, campaign_id, asin, status=None, *, product=True, decision=True):
+    with connect(db) as con:
+        now = utc_now()
+        product_id = None
+        if product:
+            payload = {"asin": asin, "title": f"Fixture product {asin}", "brand": "Fixture", "price": 45, "images": []}
+            product_id = con.execute("""INSERT INTO products(asin,title,price,raw_json,first_seen_at,last_seen_at)
+                VALUES(?,?,?,?,?,?)""", (asin, payload["title"], 45, json.dumps(payload), now, now)).lastrowid
+        if product_id is not None and decision:
+            con.execute("""INSERT INTO store_product_decisions(store_id,product_id,price_status,risk_status,auto_status,final_status,classified_at)
+                VALUES(?,?,?,?,?,?,?)""", ("001", product_id, status, "SAFE", status, status, now))
+        con.execute("""INSERT INTO sourcing_campaign_candidates(campaign_id,asin,capture_run_id,state,created_at,updated_at)
+            VALUES(?,?,?,'MASTER_IMPORTED',?,?)""", (campaign_id, asin, f"BC_{asin}", now, now))
+
+
+def test_campaign_package_excludes_restricted(tmp_path):
+    db, service, cid = setup_campaign(tmp_path, 2)
+    add_package_candidate(db, cid, "SAFE0000001", "PRIMARY")
+    add_package_candidate(db, cid, "BLOCK000001", "RESTRICTED")
+    result = service.create_package(cid, out_root=tmp_path / "packages")
+    assert result["product_count"] == result["campaign_exportable"] == 1
+    assert result["campaign_excluded_by_status"] == {"RESTRICTED": 1}
+    assert {json.loads(p.read_text(encoding="utf-8"))["asin"] for p in Path(result["folder"]).glob("*.json")} == {"SAFE0000001"}
+
+
+def test_campaign_package_excludes_archived(tmp_path):
+    db, service, cid = setup_campaign(tmp_path, 2)
+    add_package_candidate(db, cid, "SAFE0000002", "PRIMARY")
+    add_package_candidate(db, cid, "OLD00000001", "ARCHIVED")
+    result = service.create_package(cid, out_root=tmp_path / "packages")
+    assert result["campaign_excluded_by_status"] == {"ARCHIVED": 1}
+    assert result["product_count"] == 1
+
+
+def test_campaign_package_keeps_review(tmp_path):
+    db, service, cid = setup_campaign(tmp_path, 1)
+    add_package_candidate(db, cid, "REVIEW00001", "REVIEW")
+    result = service.create_package(cid, out_root=tmp_path / "packages")
+    assert result["product_count"] == 1
+    assert result["campaign_excluded"] == 0
+
+
+def test_campaign_package_does_not_fail_when_some_asins_excluded(tmp_path):
+    db, service, cid = setup_campaign(tmp_path, 3)
+    add_package_candidate(db, cid, "SAFE0000003", "PRIMARY")
+    add_package_candidate(db, cid, "BLOCK000003", "RESTRICTED")
+    add_package_candidate(db, cid, "BLOCK000004", "ARCHIVED")
+    result = service.create_package(cid, out_root=tmp_path / "packages")
+    assert result["product_count"] == 1
+    assert result["campaign_excluded"] == 2
+
+
+def test_campaign_package_reports_excluded_status_counts(tmp_path):
+    from shopsource.connectors.spark_center_package import list_packages
+
+    db, service, cid = setup_campaign(tmp_path, 3)
+    add_package_candidate(db, cid, "SAFE0000004", "PRIMARY")
+    add_package_candidate(db, cid, "BLOCK000005", "RESTRICTED")
+    add_package_candidate(db, cid, "OLD00000002", "ARCHIVED")
+    result = service.create_package(cid, out_root=tmp_path / "packages")
+    assert result["campaign_total"] == 3
+    assert result["campaign_exportable"] == 1
+    assert result["campaign_excluded_by_status"] == {"ARCHIVED": 1, "RESTRICTED": 1}
+    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    report = json.loads(Path(result["validation_report_path"]).read_text(encoding="utf-8"))
+    assert manifest["campaign_summary"] == report["campaign_summary"]
+    assert manifest["campaign_excluded"] == 2
+    history = list_packages("001", db=db)[0]
+    assert history["campaign_excluded_by_status"] == {"ARCHIVED": 1, "RESTRICTED": 1}
+    assert history["campaign_missing_product"] == 0
+
+
+def test_campaign_package_reports_missing_decision(tmp_path):
+    db, service, cid = setup_campaign(tmp_path, 3)
+    add_package_candidate(db, cid, "SAFE0000005", "PRIMARY")
+    add_package_candidate(db, cid, "NODECISION01", product=True, decision=False)
+    add_package_candidate(db, cid, "NOPRODUCT001", product=False)
+    result = service.create_package(cid, out_root=tmp_path / "packages")
+    assert result["campaign_missing_decision"] == 1
+    assert result["campaign_missing_product"] == 1
+    assert result["campaign_excluded"] == 2
+
+
+def test_campaign_package_preserves_restricted_decision(tmp_path):
+    db, service, cid = setup_campaign(tmp_path, 2)
+    add_package_candidate(db, cid, "SAFE0000006", "PRIMARY")
+    add_package_candidate(db, cid, "BLOCK000006", "RESTRICTED")
+    service.create_package(cid, out_root=tmp_path / "packages")
+    with connect(db) as con:
+        status = con.execute("SELECT d.final_status FROM products p JOIN store_product_decisions d ON d.product_id=p.id WHERE p.asin='BLOCK000006'").fetchone()[0]
+    assert status == "RESTRICTED"
+
+
+def test_campaign_package_preserves_archived_decision(tmp_path):
+    db, service, cid = setup_campaign(tmp_path, 2)
+    add_package_candidate(db, cid, "SAFE0000007", "PRIMARY")
+    add_package_candidate(db, cid, "OLD00000003", "ARCHIVED")
+    service.create_package(cid, out_root=tmp_path / "packages")
+    with connect(db) as con:
+        status = con.execute("SELECT d.final_status FROM products p JOIN store_product_decisions d ON d.product_id=p.id WHERE p.asin='OLD00000003'").fetchone()[0]
+    assert status == "ARCHIVED"
+
+
+def test_campaign_sourced_count_unchanged_after_package(tmp_path):
+    db, service, cid = setup_campaign(tmp_path, 2)
+    add_package_candidate(db, cid, "SAFE0000008", "PRIMARY")
+    add_package_candidate(db, cid, "BLOCK000008", "RESTRICTED")
+    with connect(db) as con:
+        now = utc_now()
+        con.execute("INSERT INTO browser_batch_runs(run_id,store_id,keyword,target_candidates,created_at,status) VALUES(?,?,?,?,?,'RUNNING')",
+                    ("BATCH_PACKAGE_TEST", "001", "detail fixture", 2, now))
+        con.execute("INSERT INTO browser_batch_items(batch_run_id,asin,capture_run_id,state,created_at,updated_at) VALUES(?,?,?,'DETAIL_OPENED',?,?)",
+                    ("BATCH_PACKAGE_TEST", "SAFE0000008", "BC_detail_fixture", now, now))
+        con.execute("UPDATE sourcing_campaign_candidates SET state='NEEDS_DETAIL',updated_at='candidate-sentinel' WHERE campaign_id=? AND asin='SAFE0000008'", (cid,))
+        con.execute("UPDATE sourcing_campaigns SET unique_candidates=2 WHERE campaign_id=?", (cid,))
+        con.execute("UPDATE sourcing_campaigns SET batch_run_id='BATCH_PACKAGE_TEST',status='DETAILING' WHERE campaign_id=?", (cid,))
+        candidate_before = tuple(con.execute("SELECT state,updated_at FROM sourcing_campaign_candidates WHERE campaign_id=? AND asin='SAFE0000008'", (cid,)).fetchone())
+        before = con.execute("SELECT unique_candidates FROM sourcing_campaigns WHERE campaign_id=?", (cid,)).fetchone()[0]
+    result = service.create_package(cid, out_root=tmp_path / "packages")
+    with connect(db) as con:
+        after = con.execute("SELECT unique_candidates FROM sourcing_campaigns WHERE campaign_id=?", (cid,)).fetchone()[0]
+        candidate_after = tuple(con.execute("SELECT state,updated_at FROM sourcing_campaign_candidates WHERE campaign_id=? AND asin='SAFE0000008'", (cid,)).fetchone())
+    assert before == after == result["campaign_total"] == 2
+    assert candidate_after == candidate_before
+
+
+
 def test_preflight_backup_created(tmp_path, monkeypatch):
     _db, service, cid = setup_campaign(tmp_path)
     from shopsource.capture import campaign as module

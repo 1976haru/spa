@@ -133,7 +133,13 @@ CREATE TABLE IF NOT EXISTS export_runs (
     desktop_hashes_json TEXT NOT NULL DEFAULT '{}',
     spark_desktop_roundtrip_verified INTEGER NOT NULL DEFAULT 0,
     spark_desktop_verified_at TEXT,
-    spark_desktop_verified_product_count INTEGER
+    spark_desktop_verified_product_count INTEGER,
+    campaign_total INTEGER,
+    campaign_exportable INTEGER,
+    campaign_excluded INTEGER,
+    campaign_excluded_by_status_json TEXT NOT NULL DEFAULT '{}',
+    campaign_missing_decision INTEGER NOT NULL DEFAULT 0,
+    campaign_missing_product INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS sourcing_runs (
@@ -478,6 +484,12 @@ EXPORT_RUN_ADDITIVE_COLUMNS = {
     "spark_desktop_roundtrip_verified": "INTEGER NOT NULL DEFAULT 0",
     "spark_desktop_verified_at": "TEXT",
     "spark_desktop_verified_product_count": "INTEGER",
+    "campaign_total": "INTEGER",
+    "campaign_exportable": "INTEGER",
+    "campaign_excluded": "INTEGER",
+    "campaign_excluded_by_status_json": "TEXT NOT NULL DEFAULT '{}'",
+    "campaign_missing_decision": "INTEGER NOT NULL DEFAULT 0",
+    "campaign_missing_product": "INTEGER NOT NULL DEFAULT 0",
 }
 
 PRODUCT_ADDITIVE_COLUMNS = {

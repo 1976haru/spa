@@ -52,6 +52,7 @@ class SparkCenterPackageResult:
     browser_capture_mapping_verified: bool = False
     observed_spark_schema_compatible: bool | None = None
     spark_desktop_roundtrip_verified: bool = False
+    campaign_summary: dict | None = None
 
     def to_dict(self) -> dict:
         result = asdict(self)
@@ -75,6 +76,7 @@ class SparkCenterPackageService:
         package_id: str | None = None,
         db: str | Path | None = None,
         allow_restricted: bool = False,
+        campaign_summary: dict | None = None,
     ) -> SparkCenterPackageResult:
         if limit < 1:
             raise ValueError("limit must be greater than zero")
@@ -124,6 +126,9 @@ class SparkCenterPackageService:
             "spark_desktop_roundtrip_verified": False,
             "shopify_upload_verified": False,
         })
+        if campaign_summary is not None:
+            manifest["campaign_summary"] = dict(campaign_summary)
+            manifest.update(campaign_summary)
         handoff.manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -134,6 +139,9 @@ class SparkCenterPackageService:
         report["spark_desktop_roundtrip_verified"] = False
         report["shopify_upload_verified"] = False
         report["portal_package_verified"] = False
+        if campaign_summary is not None:
+            report["campaign_summary"] = dict(campaign_summary)
+            report.update(campaign_summary)
         children = list(handoff.folder.iterdir())
         json_only = all(path.is_file() and path.suffix.lower() == ".json" for path in children)
         report["checks"].update({
@@ -154,6 +162,17 @@ class SparkCenterPackageService:
             json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
+        if campaign_summary is not None:
+            with connect(db) as con:
+                con.execute("""UPDATE export_runs SET campaign_total=?,campaign_exportable=?,campaign_excluded=?,
+                    campaign_excluded_by_status_json=?,campaign_missing_decision=?,campaign_missing_product=?
+                    WHERE package_id=? AND target=?""",
+                    (campaign_summary.get("campaign_total"), campaign_summary.get("campaign_exportable"),
+                     campaign_summary.get("campaign_excluded"),
+                     json.dumps(campaign_summary.get("campaign_excluded_by_status", {}), sort_keys=True),
+                     campaign_summary.get("campaign_missing_decision", 0),
+                     campaign_summary.get("campaign_missing_product", 0), package_id_value, TARGET))
+
         return SparkCenterPackageResult(
             package_id=package_id_value,
             store_id=store_id,
@@ -170,6 +189,7 @@ class SparkCenterPackageService:
             browser_capture_mapping_verified=bool(manifest.get("browser_capture_mapping_verified")),
             observed_spark_schema_compatible=manifest.get("observed_spark_schema_compatible"),
             spark_desktop_roundtrip_verified=False,
+            campaign_summary=dict(campaign_summary) if campaign_summary is not None else None,
         )
 
     @staticmethod
@@ -200,7 +220,9 @@ def list_packages(store_id: str | None = None, limit: int = 20, db=None) -> list
                    desktop_dataset_id,desktop_source_path,desktop_destination_path,
                    desktop_staged_at,desktop_product_count,desktop_hash_verified,desktop_hashes_json,
                    spark_desktop_roundtrip_verified,spark_desktop_verified_at,
-                   spark_desktop_verified_product_count
+                   spark_desktop_verified_product_count,campaign_total,campaign_exportable,
+                   campaign_excluded,campaign_excluded_by_status_json,campaign_missing_decision,
+                   campaign_missing_product
             FROM export_runs WHERE {' AND '.join(clauses)}
             ORDER BY created_at DESC,id DESC LIMIT ?
             """,
@@ -214,6 +236,7 @@ def list_packages(store_id: str | None = None, limit: int = 20, db=None) -> list
             "desktop_hash_verified": bool(row["desktop_hash_verified"]),
             "desktop_hashes": json.loads(row["desktop_hashes_json"] or "{}"),
             "spark_desktop_roundtrip_verified": bool(row["spark_desktop_roundtrip_verified"]),
+            "campaign_excluded_by_status": json.loads(row["campaign_excluded_by_status_json"] or "{}"),
         }
         for row in rows
     ]

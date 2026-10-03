@@ -249,6 +249,9 @@ class CampaignService:
                                          (result.get("batch_run_id"),)).fetchone() if result.get("batch_run_id") else None
             last_detail_success = con.execute("SELECT updated_at FROM browser_batch_items WHERE batch_run_id=? AND state IN ('DETAIL_COMPLETE','MASTER_IMPORTED') ORDER BY updated_at DESC,id DESC LIMIT 1",
                                               (result.get("batch_run_id"),)).fetchone() if result.get("batch_run_id") else None
+            package_row = con.execute("""SELECT campaign_total,campaign_exportable,campaign_excluded,
+                campaign_excluded_by_status_json,campaign_missing_decision,campaign_missing_product
+                FROM export_runs WHERE package_id=?""", (result.get("spark_package_id"),)).fetchone() if result.get("spark_package_id") else None
         result["search_stage_complete"] = (
             int(result["unique_candidates"]) >= int(result["candidate_target"])
             and result["status"] in {"CANDIDATE_TARGET_REACHED", "DETAILING", "READY_FOR_SPARK", "DONE"}
@@ -258,6 +261,14 @@ class CampaignService:
         result["detail_last_error"] = current_detail["last_error"] if current_detail else ""
         result["detail_last_success_at"] = last_detail_success["updated_at"] if last_detail_success else None
         result["detail_failure_count"] = int(batch["failed_count"]) if batch else int(result.get("failed", 0))
+        result["campaign_package_summary"] = ({
+            "campaign_total": package_row["campaign_total"],
+            "campaign_exportable": package_row["campaign_exportable"],
+            "campaign_excluded": package_row["campaign_excluded"],
+            "campaign_excluded_by_status": json.loads(package_row["campaign_excluded_by_status_json"] or "{}"),
+            "campaign_missing_decision": package_row["campaign_missing_decision"],
+            "campaign_missing_product": package_row["campaign_missing_product"],
+        } if package_row and package_row["campaign_total"] is not None else None)
         remaining = max(0, int(result["detail_target"]) - int(result["detail_complete"]))
         result["minimum_remaining_seconds"] = remaining * int(result["detail_interval_seconds"])
         return result
@@ -315,19 +326,57 @@ class CampaignService:
                 (batch["detail_complete"] + batch["master_imported"], batch["master_imported"], classified, batch["failed_count"], status, utc_now(), campaign_id))
 
     def create_package(self, campaign_id: str, out_root=None) -> dict:
-        campaign = self.get(campaign_id)
+        # Package generation must not trigger _sync(), which reconciles detail
+        # batch state back into campaign candidate rows as a side effect.
         with connect(self.db) as con:
-            rows = con.execute("""SELECT c.asin FROM sourcing_campaign_candidates c JOIN products p ON p.asin=c.asin
-                JOIN store_product_decisions d ON d.product_id=p.id AND d.store_id=?
-                WHERE c.campaign_id=? ORDER BY c.id""", (campaign["store_id"], campaign_id)).fetchall()
-        asins = [x["asin"] for x in rows]
-        if not asins:
-            raise ValueError("Campaign has no MASTER imported and classified products.")
+            campaign_row = con.execute("SELECT * FROM sourcing_campaigns WHERE campaign_id=?", (campaign_id,)).fetchone()
+        if campaign_row is None:
+            raise KeyError(campaign_id)
+        campaign = dict(campaign_row)
         safe_statuses = ["PRIMARY", "RESERVE_A", "RESERVE_B", "RESERVE_C", "LOW_RESERVE", "HIGH_RESERVE", "REVIEW"]
-        result = SparkCenterPackageService().create(store_id=campaign["store_id"], statuses=safe_statuses, limit=len(asins), asins=asins, out_root=out_root, db=self.db)
+        with connect(self.db) as con:
+            rows = con.execute("""SELECT c.asin,p.id AS product_id,d.final_status
+                FROM sourcing_campaign_candidates c
+                LEFT JOIN products p ON p.asin=c.asin
+                LEFT JOIN store_product_decisions d ON d.product_id=p.id AND d.store_id=?
+                WHERE c.campaign_id=? ORDER BY c.id""", (campaign["store_id"], campaign_id)).fetchall()
+        exportable: list[str] = []
+        excluded_by_status: dict[str, int] = {}
+        missing_product = missing_decision = 0
+        for row in rows:
+            if row["product_id"] is None:
+                missing_product += 1
+            elif row["final_status"] is None:
+                missing_decision += 1
+            elif row["final_status"] in safe_statuses:
+                exportable.append(row["asin"])
+            else:
+                status = str(row["final_status"])
+                excluded_by_status[status] = excluded_by_status.get(status, 0) + 1
+        campaign_total = len(rows)
+        excluded = campaign_total - len(exportable)
+        summary = {
+            "campaign_total": campaign_total,
+            "campaign_exportable": len(exportable),
+            "campaign_excluded": excluded,
+            "campaign_excluded_by_status": dict(sorted(excluded_by_status.items())),
+            "campaign_missing_decision": missing_decision,
+            "campaign_missing_product": missing_product,
+        }
+        if not exportable:
+            raise ValueError(
+                "Campaign has no safe exportable products. "
+                f"Campaign total {campaign_total}; excluded {excluded}; "
+                f"missing product {missing_product}; missing decision {missing_decision}; "
+                f"excluded by status {summary['campaign_excluded_by_status']}."
+            )
+        result = SparkCenterPackageService().create(
+            store_id=campaign["store_id"], statuses=safe_statuses, limit=len(exportable),
+            asins=exportable, out_root=out_root, db=self.db, campaign_summary=summary,
+        )
         with connect(self.db) as con:
             con.execute("UPDATE sourcing_campaigns SET spark_package_id=?,updated_at=? WHERE campaign_id=?", (result.package_id, utc_now(), campaign_id))
-        return result.to_dict()
+        return {**result.to_dict(), **summary}
 
     def record_outcome(self, campaign_id: str, *, spark_dataset_id: str | None = None,
                        spark_total: int | None = None, spark_included: int | None = None,
@@ -380,7 +429,9 @@ class CampaignService:
                 JOIN store_product_decisions d ON d.product_id=p.id AND d.store_id=?
                 WHERE c.campaign_id=? GROUP BY d.final_status""", (campaign["store_id"], campaign_id)).fetchall()}
             keywords = [dict(row) for row in con.execute("SELECT keyword,pages_captured,new_candidates,duplicates,exhausted FROM sourcing_campaign_keywords WHERE campaign_id=? ORDER BY position", (campaign_id,)).fetchall()]
-            package = con.execute("SELECT output_path FROM export_runs WHERE package_id=?", (campaign.get("spark_package_id"),)).fetchone() if campaign.get("spark_package_id") else None
+            package = con.execute("""SELECT output_path,campaign_total,campaign_exportable,campaign_excluded,
+                campaign_excluded_by_status_json,campaign_missing_decision,campaign_missing_product
+                FROM export_runs WHERE package_id=?""", (campaign.get("spark_package_id"),)).fetchone() if campaign.get("spark_package_id") else None
         if commit == "unknown":
             try:
                 commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=PROJECT_ROOT, text=True,
@@ -390,14 +441,28 @@ class CampaignService:
         summary = {key: campaign.get(key) for key in ("campaign_id", "name", "store_id", "started_at", "finished_at", "unique_candidates", "duplicates", "detail_complete", "master_imported", "classified", "failed", "spark_package_id", "spark_dataset_id", "spark_total", "spark_included", "spark_excluded", "shopify_upload_result", "shopify_uploaded_count")}
         summary.update({"classification_counts": classes, "package_path": package["output_path"] if package else None,
                         "commit": commit, "app_version": "0.1.0"})
+        if package and package["campaign_total"] is not None:
+            summary["campaign_package_summary"] = {
+                "campaign_total": package["campaign_total"],
+                "campaign_exportable": package["campaign_exportable"],
+                "campaign_excluded": package["campaign_excluded"],
+                "campaign_excluded_by_status": json.loads(package["campaign_excluded_by_status_json"] or "{}"),
+                "campaign_missing_decision": package["campaign_missing_decision"],
+                "campaign_missing_product": package["campaign_missing_product"],
+            }
         (folder / "assignment_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         lines = [f"# {campaign['name']}", "", f"- Campaign: {campaign_id}", f"- Store: {campaign['store_id']}",
                  f"- Unique candidates: {campaign['unique_candidates']}", f"- Duplicates: {campaign['duplicates']}",
                  f"- Detail complete: {campaign['detail_complete']}", f"- MASTER: {campaign['master_imported']}",
                  f"- Classified: {campaign['classified']}", f"- Failures: {campaign['failed']}",
+                 f"- Campaign products / Spark exportable / excluded: {summary.get('campaign_package_summary', {}).get('campaign_total', 'not packaged')} / {summary.get('campaign_package_summary', {}).get('campaign_exportable', 'not packaged')} / {summary.get('campaign_package_summary', {}).get('campaign_excluded', 'not packaged')}",
                  f"- Spark total / included / excluded: {campaign['spark_total']} / {campaign['spark_included']} / {campaign['spark_excluded']}",
                  f"- Shopify result / uploaded: {campaign['shopify_upload_result']} / {campaign['shopify_uploaded_count']}",
                  f"- Package: {campaign['spark_package_id'] or 'not created'}", f"- Commit/app: {commit} / 0.1.0", ""]
+        for status, count in summary.get("campaign_package_summary", {}).get("campaign_excluded_by_status", {}).items():
+            lines.insert(-1, f"- Campaign excluded {status}: {count}")
+        if summary.get("campaign_package_summary"):
+            lines.insert(-1, f"- Campaign missing decision / product: {summary['campaign_package_summary']['campaign_missing_decision']} / {summary['campaign_package_summary']['campaign_missing_product']}")
         (folder / "assignment_summary.md").write_text("\n".join(lines), encoding="utf-8")
         with (folder / "sourcing_counts.csv").open("w", newline="", encoding="utf-8-sig") as handle:
             writer = csv.DictWriter(handle, fieldnames=["keyword", "pages_captured", "new_candidates", "duplicates", "exhausted"])

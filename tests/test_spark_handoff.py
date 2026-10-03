@@ -115,7 +115,7 @@ def test_primary_five_export_structure_payload_and_validation(handoff_db, tmp_pa
 
 def test_status_manual_override_and_restricted_gate(handoff_db, tmp_path):
     connector = SparkHandoffConnector()
-    with pytest.raises(ValueError, match="matching Store Decision/status"):
+    with pytest.raises(ValueError, match="Store Decision status outside selected statuses"):
         connector.export(
             store_id="001", statuses=["PRIMARY"], asins=["B006"],
             out_root=tmp_path / "a", job_id="RESERVE_NOT_PRIMARY", db=handoff_db,
@@ -143,6 +143,22 @@ def test_status_manual_override_and_restricted_gate(handoff_db, tmp_path):
         out_root=tmp_path / "e", job_id="RESTRICTED_ALLOWED", db=handoff_db,
     )
     assert restricted.product_count == 1
+
+
+def test_handoff_explicit_asin_reason_distinguishes_status_mismatch(handoff_db, tmp_path):
+    with connect(handoff_db) as con:
+        now = utc_now()
+        con.execute("INSERT INTO products(asin,title,raw_json,first_seen_at,last_seen_at) VALUES(?,?,?,?,?)",
+                    ("B009", "No decision", json.dumps({"asin":"B009", "title":"No decision"}), now, now))
+    with pytest.raises(ValueError) as error:
+        SparkHandoffConnector().export(
+            store_id="001", statuses=["PRIMARY"], asins=["B007", "B009", "B010"],
+            out_root=tmp_path, job_id="REASON_DETAIL", db=handoff_db,
+        )
+    message = str(error.value)
+    assert "Store Decision status outside selected statuses (RESTRICTED: B007)" in message
+    assert "have no Store Decision (B009)" in message
+    assert "missing MASTER product (B010)" in message
 
 
 @pytest.mark.parametrize("job_id", ["../escape", "..", "bad/name", "bad\\name"])

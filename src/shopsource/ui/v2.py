@@ -357,12 +357,22 @@ class OperatorUI:
             search_health = ui.label("검색 Worker: 연결 대기").classes("text-sm")
             detail_health = ui.label("").classes("text-sm")
             search_warning = ui.label("").classes("text-sm text-red-700 font-medium")
+            package_summary_label = ui.label("").classes("text-sm text-amber-900 whitespace-pre-line")
 
             def render(campaign):
                 if not campaign: return
                 active["campaign"] = campaign
                 status.set_text(f"{campaign['campaign_id']} · {campaign['status']}")
                 counts.set_text(f"후보 목표 {campaign['candidate_target']:,} · 고유 후보 {campaign['unique_candidates']:,} · 중복 {campaign['duplicates']:,} · 검색 페이지 {campaign['search_pages']:,} · 상세 완료 {campaign['detail_complete']:,} · MASTER {campaign['master_imported']:,} · Store 분류 {campaign['classified']:,} · 실패 {campaign['failed']:,} · Spark 준비 {campaign['classified']:,}")
+                package_summary = campaign.get("campaign_package_summary")
+                if package_summary:
+                    breakdown = ", ".join(f"{key}: {value}" for key, value in package_summary["campaign_excluded_by_status"].items()) or "상태 제외 없음"
+                    package_summary_label.set_text(
+                        f"Campaign 상품 {package_summary['campaign_total']:,} · Spark exportable {package_summary['campaign_exportable']:,} · 제외 {package_summary['campaign_excluded']:,}\n"
+                        f"상태별 제외: {breakdown} · Store decision 누락 {package_summary['campaign_missing_decision']:,} · MASTER 누락 {package_summary['campaign_missing_product']:,}"
+                    )
+                else:
+                    package_summary_label.set_text("")
                 if campaign.get("search_stage_complete"):
                     search_health.set_text(f"검색 단계: COMPLETE · 후보 {campaign['unique_candidates']:,} / {campaign['candidate_target']:,}")
                     detail_health.set_text(f"상세 Worker: {campaign.get('detail_worker_status', 'UNKNOWN')} · 현재 ASIN {campaign.get('detail_current_asin') or '대기'} · 마지막 성공 {campaign.get('detail_last_success_at') or '없음'} · 상세 완료 {campaign['detail_complete']:,} / {campaign['detail_target']:,} · 실패 {campaign.get('detail_failure_count', 0)}")
@@ -407,8 +417,13 @@ class OperatorUI:
             def make_package():
                 try:
                     result = service.create_package(active["campaign"]["campaign_id"])
-                    ui.notify(f"Spark Package {result['package_id']} · {result['product_count']}개", type="positive")
-                    render(service.get(active["campaign"]["campaign_id"]))
+                    ui.notify(f"Spark Package {result['package_id']} · exportable {result['campaign_exportable']:,}개 · 제외 {result['campaign_excluded']:,}개", type="positive")
+                    updated = dict(active["campaign"])
+                    updated["spark_package_id"] = result["package_id"]
+                    updated["campaign_package_summary"] = {key: result[key] for key in (
+                        "campaign_total", "campaign_exportable", "campaign_excluded",
+                        "campaign_excluded_by_status", "campaign_missing_decision", "campaign_missing_product")}
+                    render(updated)
                 except Exception as exc: ui.notify(_safe_error(exc), type="negative")
 
             def make_report():

@@ -186,9 +186,8 @@ class SparkHandoffConnector(ExportConnector):
             selected = {row["asin"] for row in rows}
             missing = sorted(set(requested_asins) - selected)
             if missing:
-                raise ValueError(
-                    "Requested ASINs lack a matching Store Decision/status: " + ", ".join(missing)
-                )
+                details = self._unmatched_asin_reasons(store_id, missing, selected_statuses, db)
+                raise ValueError("Requested ASIN validation failed: " + "; ".join(details))
             if limit is not None:
                 rows = rows[:limit]
         if not rows:
@@ -270,6 +269,41 @@ class SparkHandoffConnector(ExportConnector):
         if report["status"] != "PASS":
             raise HandoffValidationError("Spark handoff validation failed", result)
         return result
+
+    @staticmethod
+    def _unmatched_asin_reasons(store_id: str, asins: list[str], statuses: tuple[str, ...], db) -> list[str]:
+        """Explain explicit-ASIN mismatches without weakening status filters."""
+        missing_product: list[str] = []
+        missing_decision: list[str] = []
+        mismatched: dict[str, list[str]] = {}
+        for chunk in _chunks(asins):
+            with connect(db) as con:
+                requested_sql = " UNION ALL ".join(
+                    "SELECT ? AS asin" if index == 0 else "SELECT ?"
+                    for index in range(len(chunk))
+                )
+                rows = con.execute(f"""SELECT requested.asin,p.id AS product_id,d.final_status
+                    FROM ({requested_sql}) requested
+                    LEFT JOIN products p ON p.asin=requested.asin
+                    LEFT JOIN store_product_decisions d ON d.product_id=p.id AND d.store_id=?""",
+                    [*chunk, store_id]).fetchall()
+            for row in rows:
+                if row["product_id"] is None:
+                    missing_product.append(row["asin"])
+                elif row["final_status"] is None:
+                    missing_decision.append(row["asin"])
+                elif row["final_status"] not in statuses:
+                    mismatched.setdefault(row["final_status"], []).append(row["asin"])
+        details = []
+        for status, values in sorted(mismatched.items()):
+            details.append(f"{len(values)} have Store Decision status outside selected statuses ({status}: {', '.join(values[:10])})")
+        if missing_decision:
+            details.append(f"{len(missing_decision)} have no Store Decision ({', '.join(missing_decision[:10])})")
+        if missing_product:
+            details.append(f"{len(missing_product)} missing MASTER product ({', '.join(missing_product[:10])})")
+        if not details:
+            details.append("requested ASINs do not match the selected Store Decision filters")
+        return details
 
     @staticmethod
     def _select_products(store_id, statuses, asins, limit, db):
