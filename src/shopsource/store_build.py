@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +10,7 @@ from typing import Callable
 
 from .db import connect, init_db
 from .paths import EXPORT_DIR
+from .security import redact_value
 
 STAGES = ("PLAN", "BRAND_PLAN", "BRAND_ASSET_PREVIEW", "BRAND_ASSET_GENERATION", "BRAND_ASSET_APPROVAL",
           "SOURCING", "SOURCE_VALIDATION", "PRODUCT_SYNC_PREVIEW", "PRODUCT_SYNC", "PRODUCT_VERIFY",
@@ -39,10 +39,7 @@ def _hash(value): return hashlib.sha256(json.dumps(value, sort_keys=True, ensure
 
 
 def _sanitize(value):
-    if isinstance(value, dict): return {key: _sanitize(item) for key, item in value.items()}
-    if isinstance(value, list): return [_sanitize(item) for item in value]
-    if isinstance(value, str): return re.sub(r"shpat_[A-Za-z0-9]+|(?:access|api)[_-]?token\s*[:=]\s*[^\s,;]+", "[REDACTED]", value, flags=re.I)[:500]
-    return value
+    return redact_value(value)
 
 
 class StoreBuildOrchestrator:

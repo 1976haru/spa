@@ -28,6 +28,7 @@ from ..homepage_automation import (HomepageAutomationService, assignment_banner_
 from ..navigation import MegaMenuThemeService, NavigationService
 from ..store_build import StoreBuildOrchestrator
 from ..store_completion import DOMAINS, StoreCompletionService
+from ..security import redact_text
 from ..intelligence.keyword_engine import KeywordEngine
 from ..paths import AMAZON_INBOX_DIR, EXPORT_DIR, STORE_DIR
 from ..importer import import_amazon_source
@@ -63,7 +64,7 @@ PRODUCT_SOURCE_OPTIONS = ["ALL", "BROWSER_CAPTURE", "SPARK_STORAGE", "AMAZON_SOU
 
 
 def _safe_error(exc: Exception) -> str:
-    return str(exc)
+    return redact_text(exc, limit=500)
 
 
 def product_row_from_event_args(args) -> dict:

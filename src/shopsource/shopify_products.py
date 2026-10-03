@@ -17,6 +17,7 @@ from typing import Any, Callable, Iterable
 
 from .db import connect, init_db
 from .shopify_collections import SHOPIFY_API_VERSION, ShopifyGraphQLClient, get_connection, get_shopify_token
+from .security import redact_text
 
 ELIGIBLE_STATUSES = {"PRIMARY", "RESERVE_A", "RESERVE_B", "RESERVE_C", "LOW_RESERVE", "HIGH_RESERVE", "REVIEW"}
 IDENTITY_NAMESPACE = "shopsource"
@@ -368,6 +369,8 @@ class DirectShopifyProductPublisher(ProductPublisher):
                 # Only show a bounded sample; all eligible actions are retained persistently below on run creation.
                 pass
         # Add ineligible rows as queue items too, then persist bounded batches and checkpoints.
+        # A dictionary avoids an O(N²) scan when the catalog contains tens of thousands of products.
+        prepared_by_master = {candidate["master_product_id"]: candidate for candidate in prepared}
         input_hash = _stable_hash({"fingerprints": source_fingerprints, "publish_status": publish_status, "media_mode": self.media_mode(store_id),
                                    "source_media_rights_confirmed": self.source_media_rights_confirmed(store_id)})
         run_id = "PSR_" + secrets.token_hex(10)
@@ -381,7 +384,7 @@ class DirectShopifyProductPublisher(ProductPublisher):
             for row in self._catalog_rows(store_id, db=db):
                 if selected_ids is not None and row["master_product_id"] not in selected_ids:
                     continue
-                item = next((candidate for candidate in prepared if candidate["master_product_id"] == row["master_product_id"]), None)
+                item = prepared_by_master.get(row["master_product_id"])
                 if item is None:
                     status = str(row.get("final_status") or "").upper()
                     action, payload, error = "SKIP", {}, status if status not in ELIGIBLE_STATUSES else "MISSING_OR_INVALID_DATA"
@@ -628,9 +631,7 @@ class DirectShopifyProductPublisher(ProductPublisher):
     @staticmethod
     def _safe_error(exc):
         # GraphQL transport suppresses headers; additionally redact anything token-shaped.
-        message = str(exc)
-        message = re.sub(r"shpat_[A-Za-z0-9]+|[A-Za-z0-9_-]{35,}", "[REDACTED]", message)
-        return message[:400]
+        return redact_text(exc, limit=400)
 
     def _run_summary(self, run_id):
         with connect(self.db) as con:

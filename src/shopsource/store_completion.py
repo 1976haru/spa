@@ -16,6 +16,7 @@ from typing import Iterable, TypedDict
 
 from .db import connect, init_db
 from .paths import EXPORT_DIR
+from .security import redact_value
 
 DOMAINS = (
     "PRODUCTS", "COLLECTIONS", "PRICING", "INVENTORY_POLICY", "BRAND",
@@ -387,19 +388,23 @@ class StoreCompletionService:
 
     def _references(self, store_id: str) -> dict:
         queries = {
-            "brand_profile_id": ("brand_profiles", "profile_id"), "collection_plan_id": ("collection_plans", "plan_id"),
-            "navigation_plan_id": ("navigation_plans", "plan_id"), "homepage_plan_id": ("store_homepage_plans", "plan_id"),
-            "product_sync_run_id": ("shopify_product_sync_runs", "run_id"),
+            "brand_profile_id": (("brand_profiles", "profile_id"),),
+            "collection_plan_id": (("store_collection_plans", "plan_id"), ("collection_plans", "plan_id")),
+            "navigation_plan_id": (("store_navigation_plans", "plan_id"), ("navigation_plans", "plan_id")),
+            "homepage_plan_id": (("store_homepage_plans", "plan_id"),),
+            "product_sync_run_id": (("shopify_product_sync_runs", "run_id"),),
         }
         refs = {}
         with connect(self.db) as con:
-            for key, (table, column) in queries.items():
-                if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
-                    continue
-                columns = {row["name"] for row in con.execute(f"PRAGMA table_info({table})")}
-                if "store_id" not in columns or column not in columns: continue
-                row = con.execute(f"SELECT {column} AS value FROM {table} WHERE store_id=? ORDER BY rowid DESC LIMIT 1", (store_id,)).fetchone()
-                if row: refs[key] = row["value"]
+            for key, candidates in queries.items():
+                for table, column in candidates:
+                    if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone(): continue
+                    columns = {row["name"] for row in con.execute(f"PRAGMA table_info({table})")}
+                    if "store_id" not in columns or column not in columns: continue
+                    row = con.execute(f"SELECT {column} AS value FROM {table} WHERE store_id=? ORDER BY rowid DESC LIMIT 1", (store_id,)).fetchone()
+                    if row:
+                        refs[key] = row["value"]
+                        break
         return refs
 
     def inspect(self, store_id: str, snapshot: dict | None = None) -> dict:
@@ -469,7 +474,10 @@ class StoreCompletionService:
         with connect(self.db) as con:
             products = con.execute("SELECT COUNT(*) FROM store_product_decisions WHERE store_id=? AND final_status IN ('PRIMARY','RESERVE_A','RESERVE_B')", (store_id,)).fetchone()[0]
             collections = 0
-            if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='collection_plan_items'").fetchone():
+            if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='store_collection_definitions'").fetchone():
+                row = con.execute("SELECT plan_id FROM store_collection_plans WHERE store_id=? ORDER BY version DESC,rowid DESC LIMIT 1", (store_id,)).fetchone()
+                if row: collections = con.execute("SELECT COUNT(*) FROM store_collection_definitions WHERE plan_id=? AND enabled=1", (row["plan_id"],)).fetchone()[0]
+            if not collections and con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='collection_plan_items'").fetchone():
                 columns = {row["name"] for row in con.execute("PRAGMA table_info(collection_plan_items)")}
                 if "store_id" in columns: collections = con.execute("SELECT COUNT(*) FROM collection_plan_items WHERE store_id=?", (store_id,)).fetchone()[0]
                 elif con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='collection_plans'").fetchone():
@@ -536,6 +544,10 @@ class StoreCompletionService:
 
     def apply_safe(self, plan_id: str, selected_items: Iterable[str]) -> dict:
         plan = self.get_plan(plan_id); selected = set(selected_items)
+        with connect(self.db) as con:
+            latest = con.execute("SELECT plan_id FROM store_completion_plans WHERE store_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1", (plan["store_id"],)).fetchone()
+        if latest and latest["plan_id"] != plan_id:
+            return {"status": "CONFLICT", "reason": "A newer completion plan exists; preview safe fixes again", "applied": [], "refused": [], "remote_writes": 0}
         applied, refused = [], []
         for item in plan["items"]:
             if item["id"] not in selected: continue
@@ -556,7 +568,8 @@ class StoreCompletionService:
         blockers = [item for item in plan["items"] if item["status"] == "BLOCKED"]
         manuals = [item for item in plan["items"] if item["status"] == "MANUAL_ACTION_REQUIRED"]
         warnings = [{"area": item["area"], "details": item["details"]} for item in manuals]
-        safe_summary = {**summary, "plan_id": plan_id, "store_id": plan["store_id"], "references": plan["references"]}
+        safe_summary = redact_value({**summary, "plan_id": plan_id, "store_id": plan["store_id"], "references": plan["references"]})
+        blockers, manuals, warnings = redact_value(blockers), redact_value(manuals), redact_value(warnings)
         (root / "readiness_summary.json").write_text(json.dumps(safe_summary, ensure_ascii=False, indent=2), encoding="utf-8")
         (root / "blockers.json").write_text(json.dumps(blockers, ensure_ascii=False, indent=2), encoding="utf-8")
         (root / "warnings.json").write_text(json.dumps(warnings, ensure_ascii=False, indent=2), encoding="utf-8")
