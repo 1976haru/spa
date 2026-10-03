@@ -1,0 +1,728 @@
+ShopSource Studio — Phase 3.7
+BRAND IDENTITY + LOGO/FAVICON AUTOMATION
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+- Baseline: 6a938e4dd1adba3dd89af84a75ecc7f2df00fea7
+
+Context
+- Phase 3.1–3.6 are implemented.
+- One-click store build, Shopify direct product sync, collection planning/publishing, homepage collection planning, and controlled live pilot already exist.
+- User has a real Shopify assignment flow for logo/favicon:
+  AI generates brand logo → AI creates matching favicon → Shopify Theme Editor uploads logo/favicon → Save → verify header/tab.
+- Long-term goal: make the same process reusable across 100–200 Shopify stores with minimal manual work.
+
+Goal
+Automate brand identity planning, logo creation, favicon creation, validation, Shopify asset upload, theme-application preview, safe apply/manual fallback, verification, and integration into Store Build.
+
+IMPORTANT:
+During implementation/tests:
+- NO real paid image generation
+- NO real Shopify write
+- NO live theme modification
+- NO Amazon run
+- NO Spark upload
+
+Use mocks/fixtures only.
+
+======================================================================
+0. FINAL USER EXPERIENCE
+======================================================================
+
+Store: 001 | Cabin Tidy
+
+### 브랜드 자동화
+
+Brand:
+Cabin Tidy
+
+Brand style:
+Clean / Practical / Premium automotive organization
+
+[브랜드 자동 설계]
+
+Logo:
+READY / MISSING / NEEDS_REVIEW
+
+Favicon:
+READY / MISSING / NEEDS_REVIEW
+
+[로고 생성]
+[파비콘 생성]
+[둘 다 생성]
+[브랜드 적용 미리보기]
+[Shopify에 적용]
+[수동 적용 안내]
+
+Default live behavior:
+- preview first
+- paid image generation requires opt-in
+- theme write requires explicit confirmation and current permission
+- otherwise MANUAL_ACTION_REQUIRED
+
+======================================================================
+1. BRAND PROFILE
+======================================================================
+
+Create a reusable per-store BrandProfile.
+
+Suggested persisted fields:
+- store_id
+- brand_name
+- tagline nullable
+- target_country
+- target_customer
+- primary_category
+- brand_keywords
+- brand_personality
+- primary_color
+- secondary_color
+- accent_color
+- background_preference
+- typography_style
+- logo_style
+- icon_style
+- avoid_styles
+- visual_identity_version
+- source_hash
+- approved_at
+- created_at
+- updated_at
+
+Inputs:
+- existing Store Profile
+- store name
+- sourcing/category plan
+- target market
+- user overrides
+
+For stores with an existing name such as Cabin Tidy:
+do NOT rename automatically.
+
+For stores without a brand name:
+optional brand-name suggestion workflow only.
+Never auto-select a legal/trademark-safe name as “cleared”.
+Show domain/trademark review required.
+
+======================================================================
+2. CABIN TIDY FIXTURE EXPECTATION
+======================================================================
+
+Synthetic/fixture BrandProfile should be able to express roughly:
+
+Brand name:
+Cabin Tidy
+
+Category:
+car interior organization / storage / cleanup
+
+Market:
+United States
+
+Direction:
+clean, practical, trustworthy, modern premium lifestyle
+
+Suggested palette family:
+deep navy / white / warm neutral
+
+Avoid:
+childish styling
+busy car illustrations
+3D mockups
+overly complex gradients
+thin details that fail at small sizes
+
+This is a fixture expectation, NOT hardcoded production logic.
+
+======================================================================
+3. BRAND ASSET MODEL
+======================================================================
+
+Persist metadata, not binary image blobs in DB.
+
+BrandAsset:
+- asset_id
+- store_id
+- asset_type
+  LOGO_HORIZONTAL
+  LOGO_MARK
+  FAVICON_MASTER
+  FAVICON_32
+- version
+- provider
+- provider_model
+- prompt_hash
+- source_asset_id nullable
+- width
+- height
+- format
+- transparent_background
+- local_path
+- sha256
+- approval_status
+- generation_status
+- shopify_file_id nullable
+- shopify_url nullable
+- created_at
+
+Do not commit generated assets.
+
+Suggested runtime/export path:
+exports/brand_assets/<store>/<version>/
+
+======================================================================
+4. LOGO GENERATION STRATEGY
+======================================================================
+
+Primary design goal:
+professional horizontal Shopify header logo with exact readable brand name.
+
+Important reliability rule:
+Do NOT depend on image generation alone to spell the brand name correctly.
+
+Implement two-stage logo pipeline:
+
+A. BRAND MARK GENERATION
+- optional AI-generated simple symbol / mark
+- no words in the AI mark generation prompt
+- simple silhouette
+- transparent or easily removable background
+- small-screen legibility
+
+B. DETERMINISTIC WORDMARK COMPOSITION
+- compose exact brand_name text programmatically
+- combine approved/generated mark + exact text
+- deterministic layout
+- exact spelling guaranteed
+- export PNG and, where practical, SVG
+- use bundled/system-approved font strategy with graceful fallback
+- do NOT commit font files
+- record actual font family used
+
+This architecture is preferred over asking the image model to render “CABIN TIDY” text.
+
+Support manual uploaded mark/logo as provider fallback.
+
+======================================================================
+5. LOGO OUTPUTS
+======================================================================
+
+Generate at minimum:
+
+logo_horizontal.png
+- transparent background where possible
+- wide/header-friendly ratio
+- sufficient padding
+- exact brand name
+- readable on desktop/mobile
+
+logo_mark.png
+- square/simple symbol only
+- no full brand text
+
+Optional:
+logo_horizontal_dark.png
+logo_horizontal_light.png
+only if BrandProfile/theme requires them.
+
+Add local validation:
+- dimensions
+- non-empty alpha/content bounds
+- safe padding
+- exact file existence
+- max file size threshold
+- readable wordmark scale heuristic
+
+No AI call in tests.
+
+======================================================================
+6. FAVICON GENERATION STRATEGY
+======================================================================
+
+Favicon must inherit the same identity.
+
+Preferred source:
+approved LOGO_MARK.
+
+Do not generate an unrelated second logo.
+
+Pipeline:
+approved mark
+→ square master
+→ simplify if needed
+→ center/pad
+→ favicon_master.png
+→ resize with high-quality downsampling
+→ favicon_32.png
+
+Final assignment-compatible output:
+32×32 PNG.
+
+Also allow 48/64/180/192/512 derivative generation for future use,
+but 32×32 is mandatory.
+
+Validation:
+- exactly 32×32 for FAVICON_32
+- no tiny unreadable wordmark
+- sufficient contrast
+- non-transparent meaningful content
+- safe padding
+- same brand palette as logo
+
+======================================================================
+7. IMAGE PROVIDER REUSE
+======================================================================
+
+Reuse/generalize the image-provider infrastructure created in Phase 3.3 where reasonable.
+
+Providers:
+- MANUAL
+- OPENAI_IMAGES optional
+
+Do not duplicate secret handling.
+
+OPENAI_API_KEY:
+environment/credential source only.
+Never store plaintext in DB/Git/report.
+
+Do not hardcode an unverified image-model name.
+Inspect the currently supported OpenAI Images API/model configuration already used by the project and make model configurable.
+
+Paid generation requires:
+☑ 이미지 자동 생성 사용
+
+Before batch generation show:
+- number of image calls
+- estimated call count
+- provider/model
+- opt-in status
+
+======================================================================
+8. PROMPT GENERATION
+======================================================================
+
+Generate prompts from BrandProfile.
+
+LOGO MARK prompt should include:
+- brand category
+- brand personality
+- palette
+- style
+- avoid list
+- simple symbol
+- no text
+- no letters unless explicitly requested
+- no mockup
+- no 3D
+- no watermark
+- isolated mark
+- strong small-size legibility
+
+FAVICON AI edit/generation is optional.
+Default deterministic favicon should derive from LOGO_MARK to preserve identity.
+
+Store prompt + prompt_hash for reproducibility.
+
+======================================================================
+9. USER APPROVAL / VERSIONING
+======================================================================
+
+Never silently replace an approved logo/favicon.
+
+States:
+DRAFT
+GENERATED
+NEEDS_REVIEW
+APPROVED
+REJECTED
+SUPERSEDED
+
+Regeneration creates a new version.
+
+UI:
+[승인]
+[다시 생성]
+[직접 파일 선택]
+
+Only APPROVED assets may be used for Shopify live apply by default.
+
+======================================================================
+10. SHOPIFY ASSET UPLOAD
+======================================================================
+
+Reuse secure Shopify connection from Phase 3.3/3.5.
+
+Upload approved logo/favicon through current supported Shopify Files/staged upload flow where appropriate.
+
+Verify:
+- file ID
+- HTTPS URL
+- checksum/local mapping when possible
+
+One asset failure must not abort the other.
+
+Do not assume upload alone applies theme settings.
+
+======================================================================
+11. THEME SETTINGS DISCOVERY
+======================================================================
+
+Reuse Phase 3.4 theme reading infrastructure.
+
+Inspect:
+- published theme
+- config/settings_schema.json
+- config/settings_data.json
+- relevant theme sections/settings
+- image_picker settings
+
+Detect semantic settings for:
+- logo
+- favicon
+
+Do not hardcode Dawn-only setting IDs.
+
+Use:
+- labels
+- setting types
+- common IDs
+- schema grouping
+- confidence score
+
+Return:
+FOUND_HIGH_CONFIDENCE
+FOUND_REVIEW_REQUIRED
+NOT_FOUND
+
+If uncertain:
+MANUAL PATCH MODE.
+
+Never overwrite unrelated theme settings.
+
+======================================================================
+12. APPLY PREVIEW
+======================================================================
+
+Before any theme write produce:
+
+current setting
+proposed setting
+asset mapping
+confidence
+diff
+
+Actions:
+SET_LOGO
+SET_FAVICON
+NO_CHANGE
+CONFLICT
+MANUAL_ACTION_REQUIRED
+
+Show exact current/proposed values.
+
+If theme API write permission/exception is unavailable:
+do not fail the whole brand stage.
+Generate manual instructions matching the assignment:
+
+Online Store
+→ Customize
+→ Theme settings
+→ Logo
+→ Select/upload
+→ Favicon
+→ Select/upload
+→ Save
+→ View store
+
+======================================================================
+13. APPLY / THEME SAFETY
+======================================================================
+
+Live apply only if:
+- Shopify connection verified
+- assets APPROVED
+- current preview valid
+- logo/favicon settings confidence high
+- required theme write capability available
+- user explicitly confirms
+
+Before write:
+backup relevant theme files/settings.
+
+Write smallest possible patch.
+
+Re-fetch and verify after write.
+
+Provide rollback from backup.
+
+If theme write capability unavailable:
+MANUAL_ACTION_REQUIRED
+with exact asset file paths and click-by-click instructions.
+
+Do NOT automate Theme Editor browser clicks.
+
+======================================================================
+14. VERIFICATION
+======================================================================
+
+Logo verification:
+- theme setting points to expected uploaded asset
+- header/theme setting mapping re-read matches
+- if actual rendered storefront HTML can be safely read, optionally verify referenced asset URL
+
+Favicon verification:
+- theme setting points to expected asset
+- optionally fetch storefront HTML/head and inspect favicon reference if available
+
+Do not claim success solely because upload succeeded.
+
+Statuses:
+VERIFIED
+APPLIED_NOT_RENDER_VERIFIED
+VERIFY_FAILED
+MANUAL_ACTION_REQUIRED
+
+======================================================================
+15. UI
+======================================================================
+
+Add a simple card:
+
+### 브랜드 · 로고 · 파비콘
+
+브랜드:
+Cabin Tidy
+
+브랜드 방향:
+Clean · Practical · Premium
+
+로고:
+READY / MISSING
+
+파비콘:
+READY / MISSING
+
+Shopify 테마:
+CONNECTED / MANUAL ACTION
+
+Buttons:
+[브랜드 자동 설계]
+[로고 생성]
+[파비콘 생성]
+[둘 다 생성]
+[승인]
+[적용 미리보기]
+[Shopify에 적용]
+[수동 적용 안내]
+
+Advanced collapsed:
+- colors
+- typography
+- generation provider/model
+- logo padding
+- mark placement
+- dark/light variant
+- theme mapping details
+
+======================================================================
+16. STORE BUILD INTEGRATION
+======================================================================
+
+Extend Phase 3.5 StoreBuildRun with brand stages.
+
+Recommended stage placement:
+
+PLAN
+BRAND_PLAN
+BRAND_ASSET_PREVIEW
+BRAND_ASSET_GENERATION
+BRAND_ASSET_APPROVAL
+SOURCING
+SOURCE_VALIDATION
+PRODUCT_SYNC_PREVIEW
+PRODUCT_SYNC
+PRODUCT_VERIFY
+COLLECTION_PLAN
+COLLECTION_IMAGE
+COLLECTION_SYNC_PREVIEW
+COLLECTION_SYNC
+COLLECTION_VERIFY
+BRAND_APPLY_PREVIEW
+BRAND_APPLY
+HOMEPAGE_PLAN
+FINAL_VERIFY
+COMPLETE
+
+Important:
+BrandProfile should be available before collection image generation so Phase 3.2/3.3 collection imagery can reuse brand visual identity.
+
+If paid generation opt-in is off:
+BRAND_ASSET_GENERATION may be MANUAL_ACTION_REQUIRED or use approved manual assets.
+
+If brand assets are not approved:
+do not auto-apply.
+
+Theme write limitations remain honest:
+do not falsely mark BRAND_APPLY COMPLETE.
+
+======================================================================
+17. MANUAL ASSIGNMENT MODE
+======================================================================
+
+Add a “과제 모드” helper specifically for beginner use.
+
+For Cabin Tidy, if logo/favicon already exist manually:
+
+[로고 파일 선택]
+[파비콘 파일 선택]
+[파일 검사]
+[Shopify 적용 미리보기]
+
+File checks:
+- logo valid PNG/JPG/SVG supported by flow
+- favicon 32×32 PNG preferred
+- readable image
+- no zero-byte/broken file
+
+Then display click-by-click manual instructions if theme write unavailable.
+
+This lets the user finish the current assignment first,
+then reuse the same assets in automation.
+
+======================================================================
+18. REPORTS
+======================================================================
+
+exports/brand_reports/<store>/<run_id>/
+  brand_profile.json
+  assets.json
+  apply_preview.json
+  summary.md
+
+No secrets.
+Do not commit reports/assets.
+
+Include:
+- brand profile version
+- asset hashes
+- provider/model metadata
+- approval state
+- Shopify file IDs/URLs if uploaded
+- theme mapping confidence
+- apply/verify status
+- manual action required
+
+======================================================================
+19. TESTS
+======================================================================
+
+All external calls mocked.
+
+Required minimum tests:
+
+test_brand_profile_from_store_profile
+test_existing_brand_name_not_renamed
+test_logo_mark_prompt_has_no_brand_text
+test_wordmark_exact_brand_spelling
+test_logo_horizontal_validation
+test_logo_asset_versioning
+test_favicon_derived_from_logo_mark
+test_favicon_exact_32x32
+test_favicon_palette_identity_preserved
+test_generated_assets_require_approval
+test_openai_brand_generation_requires_opt_in
+test_brand_provider_secret_not_logged
+test_shopify_brand_file_upload_mock
+test_theme_logo_setting_detected_by_schema
+test_theme_favicon_setting_detected_by_schema
+test_theme_unknown_mapping_manual_fallback
+test_brand_apply_preview_no_write
+test_brand_apply_minimal_patch
+test_brand_apply_backup_before_write
+test_brand_apply_rollback
+test_brand_verify_after_apply
+test_store_build_brand_stage_order
+test_collection_image_can_use_brand_profile
+test_assignment_manual_asset_mode
+test_no_real_network_in_tests
+test_protected_store_file_untouched
+
+All existing tests PASS.
+
+======================================================================
+20. QUALITY GATE
+======================================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+======================================================================
+21. PROTECTED FILE
+======================================================================
+
+stores/001_cabin_tidy.json
+
+Existing dirty user file:
+NEVER reset
+NEVER restore
+NEVER checkout
+NEVER clean
+NEVER stage
+NEVER commit
+
+======================================================================
+22. COMMIT / PUSH
+======================================================================
+
+Do not commit:
+- protected store file
+- DB/runtime state
+- generated brand assets
+- exports/reports
+- credentials
+- API keys
+- theme backups
+
+Commit:
+git commit -m "Add brand logo and favicon automation"
+
+Push:
+git push origin main
+
+Final:
+git rev-list --left-right --count main...origin/main
+must be:
+0 0
+
+======================================================================
+23. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] BrandProfile architecture
+[2] logo mark generation
+[3] deterministic wordmark composition
+[4] favicon generation
+[5] image provider/opt-in
+[6] asset approval/versioning
+[7] Shopify file upload
+[8] theme logo/favicon detection
+[9] apply preview and theme gate
+[10] verification/rollback
+[11] assignment mode
+[12] StoreBuild integration
+[13] tests
+[14] protected file
+[15] commit SHA
+[16] push state
+[17] exact next user steps for Cabin Tidy assignment
+
+Implement now, but DO NOT perform a real paid image call, Shopify write, or live theme modification during Codex execution.
