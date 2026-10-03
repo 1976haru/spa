@@ -328,6 +328,9 @@ CREATE TABLE IF NOT EXISTS sourcing_campaigns (
     ,current_page INTEGER NOT NULL DEFAULT 0
     ,last_search_capture_at TEXT
     ,last_search_error TEXT NOT NULL DEFAULT ''
+    ,campaign_type TEXT NOT NULL DEFAULT 'LIVE_2000'
+    ,plan_id TEXT NOT NULL DEFAULT ''
+    ,search_complete INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS sourcing_campaign_keywords (
@@ -343,6 +346,13 @@ CREATE TABLE IF NOT EXISTS sourcing_campaign_keywords (
     exhausted INTEGER NOT NULL DEFAULT 0,
     last_url TEXT NOT NULL DEFAULT '',
     next_url TEXT NOT NULL DEFAULT '',
+    category_id INTEGER,
+    category_quota INTEGER NOT NULL DEFAULT 0,
+    max_pages INTEGER NOT NULL DEFAULT 5,
+    max_unique INTEGER NOT NULL DEFAULT 300,
+    keyword_score REAL NOT NULL DEFAULT 0.5,
+    historical_yield REAL NOT NULL DEFAULT 0,
+    exhaustion_reason TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL,
     UNIQUE(campaign_id, keyword)
 );
@@ -513,9 +523,17 @@ CAMPAIGN_ADDITIVE_COLUMNS = {
     "current_page": "INTEGER NOT NULL DEFAULT 0",
     "last_search_capture_at": "TEXT",
     "last_search_error": "TEXT NOT NULL DEFAULT ''",
+    "campaign_type": "TEXT NOT NULL DEFAULT 'LIVE_2000'",
+    "plan_id": "TEXT NOT NULL DEFAULT ''",
+    "search_complete": "INTEGER NOT NULL DEFAULT 0",
 }
 
-CAMPAIGN_KEYWORD_ADDITIVE_COLUMNS = {"next_url": "TEXT NOT NULL DEFAULT ''"}
+CAMPAIGN_KEYWORD_ADDITIVE_COLUMNS = {
+    "next_url": "TEXT NOT NULL DEFAULT ''", "category_id": "INTEGER",
+    "category_quota": "INTEGER NOT NULL DEFAULT 0", "max_pages": "INTEGER NOT NULL DEFAULT 5",
+    "max_unique": "INTEGER NOT NULL DEFAULT 300", "keyword_score": "REAL NOT NULL DEFAULT 0.5",
+    "historical_yield": "REAL NOT NULL DEFAULT 0", "exhaustion_reason": "TEXT NOT NULL DEFAULT ''",
+}
 
 
 def utc_now() -> str:

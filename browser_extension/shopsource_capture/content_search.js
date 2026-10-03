@@ -125,8 +125,9 @@
     if(message?.type==='shopsource-campaign-capture') { explicitCampaignRequested=true; submit(message.campaignId).then(sendResponse); return true; }
     if(message?.type==='shopsource-capture-now') { submit('').then(sendResponse); return true; }
   });
-  const campaignId=new URLSearchParams(location.hash.slice(1)).get('shopsource_campaign');
-  if(campaignId&&/^LC_[a-f0-9]{20}$/i.test(campaignId)) setTimeout(()=>{
-    if(!explicitCampaignRequested) submit(campaignId);
-  },4000);
+  // Campaign capture is initiated only by the explicit background content-script handshake.
+  const recoveryCampaignId=new URLSearchParams(location.hash.slice(1)).get('shopsource_campaign');
+  if(recoveryCampaignId&&/^(?:LC|AC)_[a-f0-9]{20}$/i.test(recoveryCampaignId)) setTimeout(()=>{
+    if(!explicitCampaignRequested) submit(recoveryCampaignId);
+  },15000);
 })();

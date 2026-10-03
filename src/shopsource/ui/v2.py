@@ -469,7 +469,7 @@ class OperatorUI:
                     except Exception as exc: ui.notify(_safe_error(exc), type="negative")
                 ui.button("확인 결과 저장", on_click=save_outcome, icon="save").props("outline")
             ui.label("CAPTCHA/확인 화면, 확장 연결 끊김 또는 반복 준비 실패 시 자동 일시정지하며 우회하지 않습니다. Spark에서 전체/포함/제외와 Shopify 업로드 결과를 확인 후 기록하세요.").classes("text-xs text-slate-600")
-            ui.label("ShopSource Capture v0.1.6을 다시 로드한 뒤 이 기존 캠페인에서 '과제 2,000 계속'을 누르세요.").classes("text-xs font-medium text-amber-800")
+            ui.label("ShopSource Capture v0.1.7을 다시 로드한 뒤 이 기존 캠페인에서 '과제 2,000 계속'을 누르세요.").classes("text-xs font-medium text-amber-800")
             if active["campaign"]: render(active["campaign"])
             def poll():
                 if active.get("campaign"):
@@ -593,7 +593,7 @@ class OperatorUI:
         ui = self.ui
         with ui.card().classes("w-full border-2 border-emerald-200 bg-emerald-50"):
             ui.label("스토어 자동 소싱 계획").classes("text-xl font-bold")
-            ui.label("목표 수량만 입력하면 카테고리, keyword pool, 우선순위와 quota를 로컬에서 계획합니다. 실제 수집은 Phase 3.1에서 연결됩니다.").classes("text-sm")
+            ui.label("목표 수량을 바탕으로 카테고리와 quota를 계획합니다. 실제 Amazon 수집은 아래 [자동 소싱 시작]을 직접 눌렀을 때만 시작됩니다.").classes("text-sm")
             with ui.row().classes("items-end"):
                 target = ui.number("후보 목표", value=10000, min=1, max=50000).classes("w-48")
                 mode = ui.select({"fast": "빠르게", "balanced": "균형", "deep": "깊게"}, value="balanced", label="모드").classes("w-40")
@@ -605,6 +605,18 @@ class OperatorUI:
                 unique_cap = ui.number("keyword별 고유 후보 상한", value=300, min=1, max=5000).classes("w-64")
             summary = ui.label("계획을 만들면 축약 미리보기가 표시됩니다.").classes("text-sm")
             preview = ui.column().classes("w-full gap-1")
+            plan_ref = {"plan": None, "campaign": None}
+            execution_status = ui.label("실행 대기 · Amazon 검색은 시작되지 않았습니다.").classes("text-sm font-medium")
+            persisted_auto = CampaignService().active(self.current_store, "AUTO_STORE")
+            if persisted_auto:
+                plan_ref["campaign"] = persisted_auto
+                execution_status.set_text(
+                    f"{persisted_auto['campaign_id']} · {persisted_auto['status']} · 후보 {persisted_auto['unique_candidates']:,}/{persisted_auto['candidate_target']:,} · "
+                    f"중복 {persisted_auto['duplicates']:,} · 검색 {persisted_auto['search_pages']:,}p · 상세 {persisted_auto['detail_complete']:,} · "
+                    f"MASTER {persisted_auto['master_imported']:,} · 분류 {persisted_auto['classified']:,} · 실패 {persisted_auto['failed']:,} · "
+                    f"현재 {persisted_auto.get('current_keyword') or '대기'} / p{persisted_auto.get('current_page') or 0} · "
+                    f"Worker {persisted_auto.get('search_worker_status')} · 오류 {persisted_auto.get('last_search_error') or '없음'}"
+                )
 
             def create_plan():
                 try:
@@ -616,6 +628,7 @@ class OperatorUI:
                                   "stale_pages": int(stale_pages.value),
                                   "max_unique_candidates_per_keyword": int(unique_cap.value)},
                     )
+                    plan_ref["plan"] = plan
                     summary.set_text(f"v{plan['version']} · 목표 {plan['total_candidate_target']:,} · 상세 {plan['detail_target']:,} · 카테고리 {len(plan['categories'])} · keyword pool {plan['keyword_pool_total']:,} · 기본 활성 {plan['active_keyword_count']:,}")
                     preview.clear()
                     with preview:
@@ -626,7 +639,73 @@ class OperatorUI:
                 except Exception as exc:
                     ui.notify(_safe_error(exc), type="negative")
 
+            def render_execution(campaign):
+                plan_ref["campaign"] = campaign
+                execution_status.set_text(
+                    f"{campaign['campaign_id']} · {campaign['status']} · 후보 {campaign['unique_candidates']:,}/{campaign['candidate_target']:,} · "
+                    f"중복 {campaign['duplicates']:,} · 검색 {campaign['search_pages']:,}p · 상세 {campaign['detail_complete']:,} · "
+                    f"MASTER {campaign['master_imported']:,} · 분류 {campaign['classified']:,} · 실패 {campaign['failed']:,} · "
+                    f"현재 {campaign.get('current_keyword') or '대기'} / p{campaign.get('current_page') or 0} · "
+                    f"Worker {campaign.get('search_worker_status')} · 오류 {campaign.get('last_search_error') or '없음'}"
+                )
+
+            def run_auto(action="START"):
+                try:
+                    campaign = plan_ref.get("campaign")
+                    if campaign is None:
+                        plan = plan_ref.get("plan")
+                        if plan is None: raise ValueError("먼저 자동 소싱 계획을 만드세요.")
+                        campaign = CampaignService().create_auto_store(plan["plan_id"])
+                    campaign = CampaignService().action(campaign["campaign_id"], action)
+                    render_execution(campaign)
+                    if action in {"START", "RESUME", "RETRY"}:
+                        message = {"source":"shopsource-studio-ui", "type":"campaign-command",
+                                   "campaignId":campaign["campaign_id"], "action":"RESUME"}
+                        ui.run_javascript("window.postMessage(" + json.dumps(message) + ", window.location.origin)")
+                    ui.notify("검색 Worker에 명시적으로 시작 명령을 보냈습니다." if action in {"START", "RESUME", "RETRY"} else "캠페인을 취소했습니다.", type="positive")
+                except Exception as exc:
+                    ui.notify(_safe_error(exc), type="negative")
+
+            def pause_auto():
+                try:
+                    campaign = plan_ref.get("campaign")
+                    if not campaign: raise ValueError("실행 중인 자동 소싱 캠페인이 없습니다.")
+                    render_execution(CampaignService().action(campaign["campaign_id"], "PAUSE"))
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            def auto_cancel():
+                try:
+                    campaign = plan_ref.get("campaign")
+                    if not campaign: raise ValueError("취소할 자동 소싱 캠페인이 없습니다.")
+                    render_execution(CampaignService().action(campaign["campaign_id"], "CANCEL"))
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            def auto_package():
+                try:
+                    campaign = plan_ref.get("campaign")
+                    if not campaign: raise ValueError("먼저 자동 소싱을 시작하세요.")
+                    result = CampaignService().create_package(campaign["campaign_id"])
+                    ui.notify(f"Spark package 생성 완료 · 안전 포함 {result['campaign_exportable']:,} · 제외 {result['campaign_excluded']:,}. Desktop staging은 실행하지 않았습니다.", type="positive")
+                    render_execution(CampaignService().get(campaign["campaign_id"]))
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            def auto_report():
+                try:
+                    campaign = plan_ref.get("campaign")
+                    if not campaign: raise ValueError("먼저 자동 소싱을 시작하세요.")
+                    result = CampaignService().report(campaign["campaign_id"])
+                    ui.notify("소싱 summary report 생성: " + result["folder"], type="positive")
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
             ui.button("자동 소싱 계획 만들기", on_click=create_plan, icon="auto_awesome")
+            with ui.row():
+                ui.button("자동 소싱 시작", on_click=lambda: run_auto("START"), icon="play_arrow").props("color=positive")
+                ui.button("일시정지", on_click=pause_auto, icon="pause").props("outline")
+                ui.button("재개 / Worker 연결", on_click=lambda: run_auto("RESUME"), icon="resume").props("outline")
+                ui.button("실패 상세 재시도", on_click=lambda: run_auto("RETRY"), icon="refresh").props("outline")
+                ui.button("캠페인 취소", on_click=auto_cancel, icon="cancel").props("outline color=negative")
+                ui.button("Spark Package 생성", on_click=auto_package, icon="inventory_2").props("outline")
+                ui.button("Summary report", on_click=auto_report, icon="description").props("outline")
 
     @staticmethod
     def _run_status_text(run):

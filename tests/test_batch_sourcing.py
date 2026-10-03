@@ -139,7 +139,7 @@ def test_extension_batch_marker_and_all_rendered_dom_policy():
     assert "h2 a[aria-label]" in search and "sponsored" in search
     assert "shopsource_capture" in detail_script and "autoCapturePromise" in detail_script
     assert "tabs" in manifest["permissions"]
-    assert manifest["version"] == "0.1.6"
+    assert manifest["version"] == "0.1.7"
     assert not set(manifest["permissions"]).intersection({"cookies", "webRequest", "history", "downloads", "proxy", "nativeMessaging"})
     assert "document.cookie" not in search + detail_script
     assert "localStorage" not in search + detail_script and "sessionStorage" not in search + detail_script

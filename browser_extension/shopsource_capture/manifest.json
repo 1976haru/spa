@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ShopSource Capture",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Capture user-visible Amazon product information to local ShopSource Studio.",
   "permissions": ["storage", "activeTab", "tabs"],
   "host_permissions": ["https://www.amazon.com/*", "http://127.0.0.1/*"],

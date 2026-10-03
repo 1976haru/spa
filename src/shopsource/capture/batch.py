@@ -17,8 +17,8 @@ class BatchSourcingService:
         keyword = str(keyword or "").strip()[:300]
         if not keyword:
             raise ValueError("A search keyword is required.")
-        if isinstance(target_candidates, bool) or int(target_candidates) < 1 or int(target_candidates) > 10000:
-            raise ValueError("Target must be between 1 and 10,000.")
+        if isinstance(target_candidates, bool) or int(target_candidates) < 1 or int(target_candidates) > 50000:
+            raise ValueError("Target must be between 1 and 50,000.")
         target_mode = str(target_mode).upper()
         if target_mode not in {"CANDIDATES", "PRIMARY"}:
             raise ValueError("Invalid target mode.")
@@ -40,8 +40,8 @@ class BatchSourcingService:
         keyword = str(keyword or "").strip()[:300]
         if not keyword:
             raise ValueError("A search keyword is required.")
-        if isinstance(target_candidates, bool) or int(target_candidates) < 1 or int(target_candidates) > 10000:
-            raise ValueError("Target must be between 1 and 10,000.")
+        if isinstance(target_candidates, bool) or int(target_candidates) < 1 or int(target_candidates) > 50000:
+            raise ValueError("Target must be between 1 and 50,000.")
         get_store(store_id, self.db)
         active_statuses = ("PENDING", "RUNNING", "PAUSED", "PAUSED_NEEDS_USER")
         with connect(self.db) as con:

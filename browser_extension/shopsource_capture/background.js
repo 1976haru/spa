@@ -232,7 +232,7 @@ async function triggerCampaignSearchCapture(tabId,campaignId) {
   let campaignState;
   try { campaignState=await api(`/api/capture/campaigns/${encodeURIComponent(campaignId)}`,undefined,'GET'); }
   catch(_error) { return; }
-  if(campaignState.status!=='RUNNING') return;
+  if(!['RUNNING','RUNNING_SEARCH'].includes(campaignState.status)) return;
   const record=await validSearchWorker(campaignId);
   if(!record||record.tabId!==tabId) return;
   let tab;
@@ -254,7 +254,7 @@ async function triggerCampaignSearchCapture(tabId,campaignId) {
         await saveSearchWorker(campaignId,tabId,tab.url,latest.createdAt,{captureInFlight:false,lastCaptureAt:Date.now(),lastCapturedUrl:pageUrl});
         await sendCampaignEvent(campaignId,'SEARCH_CAPTURE_ACK',{keyword:parsed.searchParams.get('k')||'',page:Number(parsed.searchParams.get('page'))||1});
         const campaign=response.result?.campaign;
-        if(campaign?.status==='RUNNING'&&campaign.search_instruction) {
+        if(['RUNNING','RUNNING_SEARCH'].includes(campaign?.status)&&campaign.search_instruction) {
           const instruction=campaign.search_instruction;
           setTimeout(()=>navigateCampaign(instruction),Math.max(6000,Number(instruction.delay_seconds||8)*1000));
         } else if(campaign?.batch_run_id&&campaign.status==='DETAILING') {
