@@ -18,7 +18,17 @@ STAGES = ("PLAN", "BRAND_PLAN", "BRAND_ASSET_PREVIEW", "BRAND_ASSET_GENERATION",
           "NAVIGATION_PLAN", "NAVIGATION_SYNC_PREVIEW", "NAVIGATION_SYNC", "NAVIGATION_VERIFY", "MEGA_MENU_PREVIEW", "MEGA_MENU_APPLY",
           "HOMEPAGE_PLAN", "HERO_ASSET_PREVIEW", "HERO_ASSET_GENERATION", "CATEGORY_SHORTCUT_PLAN",
           "CATEGORY_ASSET_PREVIEW", "CATEGORY_ASSET_GENERATION", "HOMEPAGE_SYNC_PREVIEW", "HOMEPAGE_SYNC",
-          "HOMEPAGE_VERIFY", "BRAND_APPLY_PREVIEW", "BRAND_APPLY", "FINAL_VERIFY", "COMPLETE")
+          "HOMEPAGE_VERIFY", "BRAND_APPLY_PREVIEW", "BRAND_APPLY",
+          "PRODUCT_TEMPLATE", "COLLECTION_TEMPLATE", "STATIC_PAGES", "POLICIES", "FOOTER", "SEO",
+          "SEARCH", "CART", "QUALITY_AUDIT", "COMMERCE_READINESS", "FINAL_VERIFY",
+          "LAUNCH_READINESS", "COMPLETE")
+
+# Stable public ordering for the Phase 4.0 high-level completion view.  The
+# detailed Phase 3.x stages above remain intact for checkpoint compatibility.
+COMPLETION_STAGES = ("PLAN", "BRAND", "SOURCING", "PRODUCTS", "COLLECTIONS", "NAVIGATION", "HOMEPAGE",
+                     "PRODUCT_TEMPLATE", "COLLECTION_TEMPLATE", "STATIC_PAGES", "POLICIES", "FOOTER", "SEO",
+                     "SEARCH", "CART", "QUALITY_AUDIT", "COMMERCE_READINESS", "FINAL_VERIFY",
+                     "LAUNCH_READINESS", "COMPLETE")
 STAGE_STATES = {"PENDING", "RUNNING", "COMPLETE", "COMPLETE_WITH_WARNINGS", "PAUSED", "FAILED", "MANUAL_ACTION_REQUIRED", "SKIPPED"}
 
 
@@ -585,6 +595,35 @@ class StoreBuildOrchestrator:
                 return {"status":"MANUAL_ACTION_REQUIRED","manual_gate":"HOMEPAGE_MANUAL_APPLY","verification":verification,
                         "instructions":"Remote homepage JSON does not match the approved proposal."}
             return {"status":"VERIFIED","verification":verification}
+        if stage in {"PRODUCT_TEMPLATE", "COLLECTION_TEMPLATE", "STATIC_PAGES", "POLICIES", "FOOTER", "SEO",
+                     "SEARCH", "CART", "QUALITY_AUDIT", "COMMERCE_READINESS", "LAUNCH_READINESS"}:
+            from .store_completion import StoreCompletionService
+            service = StoreCompletionService(db=self.db, export_dir=self.export_dir)
+            plan_id = data.get("completion_plan_id")
+            if not plan_id:
+                completion = service.build_plan(store_id, snapshot=options.get("completion_snapshot") or {})
+                plan_id = completion["plan_id"]
+                data["completion_plan_id"] = plan_id
+            completion = service.get_plan(plan_id)
+            stage_areas = {
+                "PRODUCT_TEMPLATE": {"PRODUCT_TEMPLATE"}, "COLLECTION_TEMPLATE": {"COLLECTION_TEMPLATE"},
+                "STATIC_PAGES": {"STATIC_PAGES", "CONTACT_SUPPORT"}, "POLICIES": {"POLICIES"},
+                "FOOTER": {"FOOTER"}, "SEO": {"SEO"}, "SEARCH": {"SEARCH"}, "CART": {"CART"},
+                "QUALITY_AUDIT": {"ACCESSIBILITY", "MOBILE", "BROKEN_LINKS", "MEDIA_QUALITY"},
+                "COMMERCE_READINESS": {"MARKETS_CURRENCY", "DOMAIN_SSL", "SHIPPING", "TAX", "PAYMENT", "CHECKOUT", "ANALYTICS", "LAUNCH_STATE"},
+                "LAUNCH_READINESS": set(),
+            }
+            selected = [item for item in completion["items"] if item["area"] in stage_areas[stage]]
+            result = {"completion_plan_id": plan_id, "completion_status": completion["status"],
+                      "readiness_score": completion["readiness_score"],
+                      "counts": {"verified": sum(x["status"] == "VERIFIED" for x in selected),
+                                 "manual": sum(x["status"] == "MANUAL_ACTION_REQUIRED" for x in selected),
+                                 "blocked": sum(x["status"] == "BLOCKED" for x in selected)},
+                      "stage_status": "COMPLETE_WITH_WARNINGS" if completion["status"] != "READY" else "COMPLETE"}
+            if stage == "LAUNCH_READINESS":
+                result["verification"] = service.verify(plan_id)
+                result["report"] = service.generate_report(plan_id, run_id=run["run_id"])
+            return result
         if stage == "FINAL_VERIFY":
             return {"counts": self._catalog_counts(store_id), "homepage_status": data.get("homepage_plan", {}).get("status", "SKIPPED")}
         if stage == "COMPLETE": return {}

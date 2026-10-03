@@ -27,6 +27,7 @@ from ..homepage_automation import (HomepageAutomationService, assignment_banner_
     suggested_theme_image_ref, upload_approved_hero_asset, validate_homepage_image)
 from ..navigation import MegaMenuThemeService, NavigationService
 from ..store_build import StoreBuildOrchestrator
+from ..store_completion import DOMAINS, StoreCompletionService
 from ..intelligence.keyword_engine import KeywordEngine
 from ..paths import AMAZON_INBOX_DIR, EXPORT_DIR, STORE_DIR
 from ..importer import import_amazon_source
@@ -41,6 +42,7 @@ from .v2_service import (
 )
 
 NAV_ITEMS = [
+    ("/completion", "fact_check", "스토어 완성"),
     ("/homepage", "web", "Homepage Automation"),
     ("/build", "rocket_launch", "스토어 자동 구축"),
     ("/pilot", "science", "Cabin Tidy 파일럿"),
@@ -160,7 +162,8 @@ class OperatorUI:
                 lambda event: self._set_store(event.value, path)
             )
         with ui.column().classes("w-full max-w-screen-2xl mx-auto p-6 gap-5"):
-            if path == "/": self._dashboard()
+            if path == "/completion": self._store_completion()
+            elif path == "/": self._dashboard()
             elif path == "/build": self._store_build()
             elif path == "/pilot": self._shopify_pilot()
             elif path == "/brand": self._brand_automation()
@@ -177,6 +180,76 @@ class OperatorUI:
     def _set_store(self, store_id, path):
         self.current_store = store_id
         self.ui.navigate.to(path)
+
+    def _store_completion(self):
+        ui = self.ui
+        self._heading("스토어 완성", "샵 전체 요소를 한 곳에서 검사합니다. 점수보다 차단 요소가 우선입니다.")
+        state = {"plan": None, "filter": "ALL"}
+        overall = ui.label("아직 검사하지 않았습니다.").classes("text-2xl font-bold")
+        cards = ui.column().classes("w-full gap-2")
+
+        def render():
+            cards.clear()
+            plan = state["plan"]
+            if not plan:
+                return
+            labels = {"VERIFIED": "완료", "MANUAL_ACTION_REQUIRED": "수동 작업", "BLOCKED": "차단"}
+            colors = {"VERIFIED": "text-green-700", "MANUAL_ACTION_REQUIRED": "text-amber-700", "BLOCKED": "text-red-700"}
+            overall.set_text(f"{plan['readiness_score']} / 100 · {plan['status']}")
+            with cards:
+                for item in plan["items"]:
+                    if state["filter"] == "MANUAL" and item["status"] != "MANUAL_ACTION_REQUIRED": continue
+                    if state["filter"] == "BLOCKED" and item["status"] != "BLOCKED": continue
+                    with ui.card().classes("w-full py-2"):
+                        with ui.row().classes("w-full items-center"):
+                            ui.label(item["title"]).classes("font-semibold")
+                            ui.space()
+                            ui.label(labels[item["status"]]).classes(colors[item["status"]])
+                        with ui.expansion("고급 설정 · 기술 정보").classes("w-full text-xs"):
+                            ui.code(json.dumps({"item_id": item["id"], "source": item["source_component"],
+                                                "remote_reference": item["remote_reference"], "details": item["details"]},
+                                               ensure_ascii=False, indent=2))
+
+        def inspect_all():
+            state["plan"] = StoreCompletionService().build_plan(self.current_store)
+            render(); ui.notify("전체 스토어 검사가 완료되었습니다.", type="positive")
+
+        def design_missing():
+            if not state["plan"]: inspect_all()
+            result = StoreCompletionService().preview_fixes(state["plan"]["plan_id"])
+            ui.notify(f"로컬 안전 설계 {len(result['fixes'])}건 · 외부 쓰기 0건")
+
+        def preview_completion():
+            if not state["plan"]: inspect_all()
+            ui.notify("완성 미리보기는 읽기 전용이며 실제 Shopify 변경을 하지 않습니다.")
+
+        def apply_safe():
+            if not state["plan"]: inspect_all()
+            selected = [x["id"] for x in state["plan"]["items"] if x["automation_mode"] == "AUTO_SAFE"]
+            result = StoreCompletionService().apply_safe(state["plan"]["plan_id"], selected)
+            ui.notify(f"로컬 안전 항목 {len(result['applied'])}건 처리 · 원격 쓰기 {result['remote_writes']}건")
+
+        def verify():
+            if not state["plan"]: inspect_all()
+            result = StoreCompletionService().verify(state["plan"]["plan_id"])
+            ui.notify(f"검증: {result['status']} · blocker {result['blocker_count']}건")
+
+        def launch_readiness():
+            if not state["plan"]: inspect_all()
+            result = StoreCompletionService().generate_report(state["plan"]["plan_id"])
+            ui.notify(f"Launch Readiness 보고서 생성: {result['status']}", type="positive")
+
+        with ui.row().classes("gap-2"):
+            ui.button("전체 스토어 검사", on_click=inspect_all, icon="fact_check").props("color=primary")
+            ui.button("누락 요소 자동 설계", on_click=design_missing, icon="auto_awesome").props("outline")
+            ui.button("완성 미리보기", on_click=preview_completion, icon="preview").props("outline")
+            ui.button("안전한 항목 적용", on_click=apply_safe, icon="shield").props("outline")
+            ui.button("검증", on_click=verify, icon="verified").props("outline")
+            ui.button("Launch Readiness", on_click=launch_readiness, icon="rocket_launch").props("color=positive")
+        with ui.row():
+            ui.button("수동 작업만 보기", on_click=lambda: (state.update(filter="MANUAL"), render())).props("flat")
+            ui.button("차단 요소만 보기", on_click=lambda: (state.update(filter="BLOCKED"), render())).props("flat")
+            ui.button("전체 보기", on_click=lambda: (state.update(filter="ALL"), render())).props("flat")
 
     def _store_build(self):
         ui = self.ui
