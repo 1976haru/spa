@@ -1,0 +1,19 @@
+# Direct Shopify product sync
+
+ShopSource supports `DIRECT_SHOPIFY` and retains `SPARK_FALLBACK`. The direct provider pins Shopify Admin GraphQL API `2026-07`. Current authoritative documentation says `productSet` list inputs replace the entire list (notably variants, metafields, collections, and tags), while omitted scalar fields are preserved. Therefore ShopSource's `productSet` input is allowlisted to handle/title/description/vendor/product type/status. Price is updated on the one explicitly targeted Shopify variant with `productVariantsBulkUpdate`; products with more than one variant are a conflict. Shopify-created products are not assigned invented stock: inventory stays `UNMANAGED`.
+
+Product identity is the source platform + source ID (ASIN for current imports), with a deterministic source-derived Shopify handle and a durable per-store/Master ID mapping. An existing unmapped product at that handle is a conflict, never silently adopted. ShopSource tags are appended with `tagsAdd`, preserving merchant tags; generated taxonomy conditions can include `shopsource:collection:<handle>` plus the backward-compatible Phase 3.2 tag. Collection plans for the direct route are generated with tag-preferred rules before the product preview. Existing Spark products retain title-based fallback.
+
+Eligibility remains Store Decision based: PRIMARY, RESERVE_A/B/C, LOW_RESERVE, HIGH_RESERVE, and REVIEW can proceed; RESTRICTED and ARCHIVED are skipped. Title and explicitly known store fields are required. `products.price` is the source/acquisition price and is never treated as a Shopify retail price. The current data model has no configured store selling-price field, so direct sync skips products until an explicit `shopify_selling_price` / `store_selling_price` value is present in the source record or a future approved pricing configuration supplies it. Compare-at price is only used when an explicit value is greater than the configured selling price.
+
+Preview persists a bounded display sample and a disk-backed per-product queue, hashes the catalog/decisions/settings, checks current remote mappings/handles, and reports CREATE/UPDATE/NO CHANGE/CONFLICT/SKIP. Live sync requires explicit confirmation, current input hash, verified read/write scopes, GraphQL `userErrors` checks, bounded retries, remote drift recheck immediately before mutation, read-after-write verification, and a persisted checkpoint. Failed-item retry targets only FAILED queue rows. Source/generated/manual/mixed media modes are stored per store; the safe default is MANUAL_MEDIA because image reuse rights and a configured Shopify media adapter must be reviewed. An injected media adapter's single-item failure is isolated from the product batch.
+
+Official API references:
+
+- [productSet, API 2026-07](https://shopify.dev/docs/api/admin-graphql/2026-07/mutations/productSet) — external catalog upsert, identifiers and authoritative list-field behavior.
+- [ProductSetInput, API 2026-07](https://shopify.dev/docs/api/admin-graphql/2026-07/input-objects/ProductSetInput) — product scalar/list fields and tag replacement behavior.
+- [ProductSetIdentifiers](https://shopify.dev/docs/api/admin-graphql/2026-07/input-objects/ProductSetIdentifiers) — stable custom ID/handle/id identifiers.
+- [productByIdentifier](https://shopify.dev/docs/api/admin-graphql/2026-07/queries/productByIdentifier) — lookup with `read_products`.
+- [tagsAdd](https://shopify.dev/docs/api/admin-graphql/2026-07/mutations/tagsAdd) — append owned tags without replacing merchant tags.
+- [productVariantsBulkUpdate](https://shopify.dev/docs/api/admin-graphql/2026-07/mutations/productVariantsBulkUpdate) — targeted variant updates.
+- [productCreateMedia](https://shopify.dev/docs/api/admin-graphql/2026-07/mutations/productCreateMedia) — append product media and verify asynchronous media readiness.

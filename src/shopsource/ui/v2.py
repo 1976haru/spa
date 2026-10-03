@@ -19,6 +19,7 @@ from ..collection_images import ManualImageProvider, OpenAIImagesProvider, gener
 from ..classifier import classify_store
 from ..db import connect, get_store, init_db, upsert_store
 from ..homepage_collections import HomepageCollectionService, ShopifyThemeReader, build_homepage_plan
+from ..store_build import StoreBuildOrchestrator
 from ..intelligence.keyword_engine import KeywordEngine
 from ..paths import AMAZON_INBOX_DIR, EXPORT_DIR, STORE_DIR
 from ..importer import import_amazon_source
@@ -33,6 +34,7 @@ from .v2_service import (
 )
 
 NAV_ITEMS = [
+    ("/build", "rocket_launch", "스토어 자동 구축"),
     ("/", "dashboard", "대시보드"),
     ("/stores", "storefront", "스토어"),
     ("/sourcing", "travel_explore", "소싱"),
@@ -148,6 +150,7 @@ class OperatorUI:
             )
         with ui.column().classes("w-full max-w-screen-2xl mx-auto p-6 gap-5"):
             if path == "/": self._dashboard()
+            elif path == "/build": self._store_build()
             elif path == "/stores": self._stores()
             elif path == "/sourcing": self._sourcing()
             elif path == "/collections": self._collections()
@@ -159,6 +162,106 @@ class OperatorUI:
     def _set_store(self, store_id, path):
         self.current_store = store_id
         self.ui.navigate.to(path)
+
+    def _store_build(self):
+        ui = self.ui
+        self._heading("스토어 자동 구축", "소싱부터 Shopify 상품·컬렉션·홈페이지 계획까지 단계별로 이어갑니다. 실제 실행 전 미리보기와 확인이 필요합니다.")
+        ui.label("실제 소싱·Shopify 쓰기·유료 이미지 생성은 [실제 실행]을 선택한 뒤 시작할 때만 가능합니다. Theme 적용 및 Spark 업로드는 수동 확인 단계입니다.").classes("text-sm text-amber-800")
+        store = next((row for row in self.stores if row["store_id"] == self.current_store), None)
+        ui.label(f"Store: {self.current_store} | {store['store_name'] if store else self.current_store}").classes("text-xl font-semibold")
+        with ui.card().classes("w-full border border-sky-200"):
+            mode = ui.radio({"PREVIEW": "미리보기", "LIVE": "실제 실행"}, value="PREVIEW").props("inline")
+            provider = ui.radio({"DIRECT_SHOPIFY": "DIRECT_SHOPIFY (권장)", "SPARK_FALLBACK": "SPARK_FALLBACK"}, value="DIRECT_SHOPIFY").props("inline")
+            with ui.expansion("고급 설정", icon="tune"):
+                auto_source = ui.checkbox("자동소싱", value=True)
+                product_sync = ui.checkbox("Shopify 상품 자동 업로드", value=True)
+                collection_design = ui.checkbox("컬렉션 자동 설계", value=True)
+                images = ui.checkbox("컬렉션 이미지 자동 생성", value=False)
+                image_paid_opt_in = ui.checkbox("유료 이미지 생성 opt-in", value=False)
+                collection_sync = ui.checkbox("Shopify 컬렉션 자동 생성", value=True)
+                publish_collections = ui.checkbox("Online Store 공개", value=False)
+                homepage = ui.checkbox("홈페이지 컬렉션 계획", value=True)
+                target = ui.number("소싱 목표", value=2000, min=1, max=10000).classes("w-48")
+                product_status = ui.select({"DRAFT": "DRAFT (권장)", "ACTIVE": "ACTIVE"}, value="DRAFT", label="Shopify 상품 상태").classes("w-56")
+                product_media = ui.select({"MANUAL_MEDIA": "수동 이미지 (권장)", "SOURCE_MEDIA": "SOURCE_MEDIA", "GENERATED_MEDIA": "GENERATED_MEDIA", "MIXED": "MIXED"}, value="MANUAL_MEDIA", label="상품 미디어 정책").classes("w-72")
+                source_rights = ui.checkbox("원본 상품 이미지 재사용 권리 확인", value=False)
+                confirmation = ui.select({"source_complete": "Amazon 소싱 worker 완료 확인", "amazon_challenge_resolved": "Amazon 확인 화면을 직접 해결 완료", "spark_upload_confirmed": "SparkShopify 업로드 완료 확인", "theme_manual_apply_confirmed": "Theme patch 수동 적용 완료 확인"}, label="수동 단계 확인", value=None).classes("w-96")
+            current = {"run_id": None}
+            status_label = ui.label("Run: 미리보기 전").classes("font-medium")
+            timeline = ui.column().classes("w-full gap-1")
+
+            def show_run(result):
+                current["run_id"] = result["run_id"]
+                status_label.set_text(f"{result['status']} · run {result['run_id']} · stage {result.get('stage', 'PLAN')}")
+                timeline.clear()
+                with timeline:
+                    for name, state in result.get("stages", {}).items():
+                        ui.label(f"{name.replace('_', ' ')} · {state}").classes("text-sm text-amber-800" if state in {"FAILED", "MANUAL_ACTION_REQUIRED"} else "text-sm")
+                    if result.get("last_error"):
+                        ui.label("오류: " + result["last_error"]).classes("text-sm text-red-700")
+                    details = result.get("stage_data", {}).get(result.get("stage"), {})
+                    if details.get("instructions"):
+                        ui.label(details["instructions"]).classes("text-sm text-amber-800")
+
+            latest = StoreBuildOrchestrator().latest(self.current_store)
+            if latest:
+                show_run(latest)
+
+            async def create_preview():
+                try:
+                    options = {"auto_sourcing": bool(auto_source.value), "product_sync": bool(product_sync.value),
+                               "collection_design": bool(collection_design.value), "collection_images": bool(images.value),
+                               "paid_image_opt_in": bool(image_paid_opt_in.value), "collection_sync": bool(collection_sync.value),
+                               "publish_collections": bool(publish_collections.value), "homepage_plan": bool(homepage.value),
+                               "source_target": int(target.value or 2000), "publish_status": product_status.value or "DRAFT",
+                               "media_mode": product_media.value or "MANUAL_MEDIA",
+                               "source_media_rights_confirmed": bool(source_rights.value)}
+                    service = StoreBuildOrchestrator()
+                    result = service.preview(self.current_store, options=options, provider=provider.value or "DIRECT_SHOPIFY", mode=mode.value or "PREVIEW")
+                    show_run(service.get(result["run_id"]))
+                    ui.notify(f"미리보기 run 생성: {result['run_id']} · 외부 쓰기 없음", type="positive")
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            async def start_build():
+                if not current["run_id"]:
+                    ui.notify("먼저 최신 미리보기를 만드세요.", type="warning"); return
+                if mode.value != "LIVE":
+                    ui.notify("실제 실행 모드를 선택해야 시작할 수 있습니다.", type="warning"); return
+                try:
+                    service = StoreBuildOrchestrator()
+                    result = await asyncio.to_thread(service.start, current["run_id"], live_confirmed=True)
+                    show_run(result)
+                    ui.notify("Store Build 단계가 실행/수동 게이트까지 진행되었습니다.", type="positive" if result["status"] != "FAILED" else "negative")
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            async def pause_build():
+                if current["run_id"] and StoreBuildOrchestrator().pause(current["run_id"]):
+                    show_run(StoreBuildOrchestrator().get(current["run_id"]))
+                    ui.notify("현재 단계의 체크포인트에서 일시정지합니다.", type="warning")
+                else: ui.notify("일시정지할 실행 중인 run이 없습니다.", type="warning")
+
+            async def resume_build():
+                if not current["run_id"]: return
+                try:
+                    result = await asyncio.to_thread(StoreBuildOrchestrator().resume, current["run_id"], manual_confirmation=confirmation.value)
+                    show_run(result)
+                    ui.notify("Store Build를 이어갔습니다.", type="positive")
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            async def retry_build():
+                if not current["run_id"]: return
+                try:
+                    result = await asyncio.to_thread(StoreBuildOrchestrator().retry_failed, current["run_id"], live_confirmed=(mode.value == "LIVE"))
+                    show_run(result)
+                    ui.notify("실패 단계 재시도를 마쳤습니다.", type="positive")
+                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            with ui.row().classes("flex-wrap"):
+                ui.button("스토어 자동 구축 미리보기", on_click=create_preview, icon="preview").props("outline")
+                ui.button("스토어 자동 구축 시작", on_click=start_build, icon="rocket_launch").props("color=primary")
+                ui.button("일시정지", on_click=pause_build, icon="pause").props("outline")
+                ui.button("계속", on_click=resume_build, icon="play_arrow").props("outline")
+                ui.button("실패 항목 재시도", on_click=retry_build, icon="refresh").props("outline")
 
     def _collections(self):
         ui = self.ui
