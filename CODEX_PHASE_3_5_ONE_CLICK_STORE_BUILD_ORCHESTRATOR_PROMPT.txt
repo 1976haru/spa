@@ -1,0 +1,593 @@
+ShopSource Studio — Phase 3.5
+ONE-CLICK STORE LAUNCH ORCHESTRATOR + DIRECT SHOPIFY PRODUCT SYNC
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+- Baseline: ec0dcdb8330e47212fe7965ca868aa95138ad758
+
+Context
+- Phase 3.1 one-click auto sourcing executor is complete.
+- Phase 3.2 automated collection planner is complete.
+- Phase 3.3 Shopify collection publisher + image provider is complete.
+- Phase 3.4 homepage featured-collection planner is complete and intentionally SAFE/DRY-RUN for theme writes.
+- Existing Spark Desktop route must remain available as a fallback.
+- The long-term goal is one user action per store, with resumable checkpoints and clear manual gates only where Shopify permissions make them unavoidable.
+
+Goal
+Build the final orchestration layer and add a DIRECT_SHOPIFY product publisher so ShopSource can move from sourcing results to Shopify products without requiring Spark Desktop for normal production use.
+
+IMPORTANT: During implementation and tests, DO NOT perform any real Amazon run, Shopify write, paid OpenAI image generation, Spark upload, or live theme write.
+
+======================================================================
+0. FINAL USER EXPERIENCE
+======================================================================
+
+Store: 001 | Cabin Tidy
+
+[스토어 자동 구축 미리보기]
+[스토어 자동 구축 시작]
+
+Options:
+☑ 자동 소싱
+☑ Shopify 상품 직접 동기화
+☑ 컬렉션 자동 설계
+☑ 컬렉션 이미지 자동 생성
+☑ Shopify 컬렉션 동기화
+☑ Online Store 컬렉션 공개
+☑ 홈페이지 추천 컬렉션 계획
+
+Advanced:
+- sourcing target
+- product publish status: DRAFT / ACTIVE
+- image automation opt-in
+- collection count
+- homepage top N
+- product publisher: DIRECT_SHOPIFY / SPARK_FALLBACK
+
+Progress:
+1. Sourcing              5,000/5,000 COMPLETE
+2. Product validation    4,372 ready / 628 skipped
+3. Shopify products      4,331 synced / 41 failed
+4. Collections           8 planned
+5. Collection images     8/8 ready
+6. Shopify collections   8/8 synced
+7. Homepage plan         READY
+8. Theme apply           MANUAL_ACTION_REQUIRED or READY
+
+Final result:
+COMPLETE
+COMPLETE_WITH_WARNINGS
+PAUSED
+MANUAL_ACTION_REQUIRED
+FAILED
+
+======================================================================
+1. PROTECT EXISTING DATA
+======================================================================
+
+Never reset/restore/checkout/clean/stage/commit:
+stores/001_cabin_tidy.json
+
+Do not mutate existing LIVE campaigns during tests.
+
+No production DB destructive migrations.
+Schema migrations must be backward-compatible.
+
+Do not remove or break:
+- Spark package generation
+- safe Spark Desktop staging
+- existing Phase 3.1 sourcing
+- collection planner/publisher
+- homepage planner
+
+======================================================================
+2. DIRECT SHOPIFY PRODUCT PUBLISHER
+======================================================================
+
+Add a provider abstraction:
+
+ProductPublisher
+- preview(...)
+- sync(...)
+- retry_failed(...)
+- verify(...)
+- provider_name
+
+Providers:
+A. DIRECT_SHOPIFY
+B. SPARK_FALLBACK
+
+DIRECT_SHOPIFY uses Shopify Admin GraphQL API 2026-07.
+
+Use the current supported Shopify product APIs. Prefer productSet for external catalog synchronization where it fits, and use current bulk/variant/media APIs as needed after inspecting official 2026-07 docs.
+
+Important productSet rule:
+list fields are authoritative when supplied. Never accidentally delete Shopify list data by sending incomplete variants/collections/metafields/media lists. Only send fields ShopSource intentionally owns.
+
+Required base scope:
+write_products
+and read_products for verification if current API requires it.
+
+No real Shopify network writes in tests.
+
+======================================================================
+3. PRODUCT IDENTITY / IDEMPOTENCY
+======================================================================
+
+Never identify products only by title.
+
+Stable ShopSource identity:
+- source platform
+- source product ID / ASIN
+- store ID
+
+Maintain local mapping:
+store_id
+master_product_id
+source_id
+shopify_product_id
+shopify_handle
+last_payload_hash
+last_remote_hash
+sync_status
+synced_at
+
+Prefer a ShopSource-owned metafield or another stable supported identifier in Shopify for reconciliation.
+
+Repeated runs:
+- CREATE first time
+- UPDATE when owned fields changed
+- NO CHANGE when payload hash unchanged
+- CONFLICT if remote manually changed an owned field and conflict cannot be safely resolved
+- never duplicate the same source product
+
+Never automatically delete Shopify products.
+
+======================================================================
+4. PRODUCT ELIGIBILITY
+======================================================================
+
+Only sync Store Decisions in safe statuses already supported by ShopSource:
+PRIMARY
+RESERVE_A
+RESERVE_B
+RESERVE_C
+LOW_RESERVE
+HIGH_RESERVE
+REVIEW
+
+Never sync:
+RESTRICTED
+ARCHIVED
+
+Respect existing risk/prohibited logic.
+
+Skip and report products missing minimum publish requirements.
+
+Do not invent missing product data.
+
+======================================================================
+5. PRODUCT PAYLOAD MAPPING
+======================================================================
+
+Map only verified ShopSource data.
+
+Support where available:
+- title
+- description / descriptionHtml
+- vendor / brand
+- product type
+- ShopSource-controlled tags
+- options
+- variants
+- price
+- compare-at price only when valid
+- media/images
+- alt text
+- status
+- relevant owned metafields
+
+Do NOT fake inventory quantities.
+
+If inventory/location data is not safely known:
+- leave inventory fields untouched or use a documented safe policy
+- report inventory as UNMANAGED / REQUIRES_CONFIGURATION
+
+Store-specific pricing comes from existing ShopSource pricing/store decision logic.
+Do not recalculate with new hidden rules.
+
+======================================================================
+6. SHOPSource TAGS FOR COLLECTION AUTOMATION
+======================================================================
+
+Before direct Shopify sync, derive deterministic ShopSource tags from Phase 3.2 taxonomy.
+
+Examples:
+shopsource:collection:trunk-organizers
+shopsource:collection:seat-organizers
+
+Tags must be:
+- deterministic
+- normalized
+- stable across reruns
+- owned by ShopSource
+
+Phase 3.2/3.3 should prefer tag rules for DIRECT_SHOPIFY products, while retaining TITLE_FALLBACK for existing Spark-uploaded catalog.
+
+Do not overwrite unrelated merchant tags.
+
+======================================================================
+7. PRODUCT MEDIA
+======================================================================
+
+Use supported Shopify media/file flows for product images.
+
+Preserve source ordering where available.
+
+Do not download/store copyrighted source images beyond what the current project already allows without making a claim of reuse rights.
+
+Add a per-store setting:
+SOURCE_MEDIA
+GENERATED_MEDIA
+MANUAL_MEDIA
+MIXED
+
+Default should preserve current behavior and flag reuse-rights review when source image rights are unclear.
+
+Failures on one product image must not abort the entire product batch.
+
+======================================================================
+8. PREVIEW / DRY-RUN
+======================================================================
+
+Before any real Shopify product write, generate a product-sync preview:
+
+CREATE
+UPDATE
+NO CHANGE
+CONFLICT
+SKIP
+
+Summary:
+ready
+restricted
+missing data
+duplicate mapping
+conflict
+estimated API operations
+
+The actual live button remains disabled until:
+- Shopify connection verified
+- required scopes verified
+- preview is current
+- user explicitly confirms
+
+If input data changes after preview, invalidate preview.
+
+======================================================================
+9. LARGE CATALOG EXECUTION
+======================================================================
+
+Target practical scale:
+2,000–10,000 products per store initially.
+
+Design for 50,000 without loading all payloads into UI memory.
+
+Use:
+- batching
+- persisted checkpoints
+- rate-limit aware retries
+- exponential backoff for transient failures
+- retry_failed only
+- resumable jobs
+
+No infinite retries.
+
+A process restart must be able to resume from the last committed checkpoint.
+
+======================================================================
+10. END-TO-END ORCHESTRATOR
+======================================================================
+
+Add a persisted StoreBuildRun / StoreLaunchRun.
+
+Stages:
+
+PLAN
+SOURCING
+SOURCE_VALIDATION
+PRODUCT_SYNC_PREVIEW
+PRODUCT_SYNC
+PRODUCT_VERIFY
+COLLECTION_PLAN
+COLLECTION_IMAGE
+COLLECTION_SYNC_PREVIEW
+COLLECTION_SYNC
+COLLECTION_VERIFY
+HOMEPAGE_PLAN
+FINAL_VERIFY
+COMPLETE
+
+Each stage:
+PENDING
+RUNNING
+COMPLETE
+COMPLETE_WITH_WARNINGS
+PAUSED
+FAILED
+MANUAL_ACTION_REQUIRED
+SKIPPED
+
+Persist:
+run_id
+store_id
+stage
+checkpoint
+counts
+started_at
+updated_at
+last_error
+retry_count
+input_hash
+output_hash
+
+======================================================================
+11. ONE-BUTTON RULES
+======================================================================
+
+Button:
+[스토어 자동 구축 시작]
+
+Must orchestrate existing components rather than duplicate their logic.
+
+Call Phase 3.1 sourcing executor.
+Then direct product sync or Spark fallback.
+Then Phase 3.2 collection planner.
+Then Phase 3.3 images/collection publisher.
+Then Phase 3.4 homepage planner.
+
+Paid image generation:
+only if user previously opted in.
+
+Actual Shopify writes:
+only after the user selected live mode and a current dry-run exists.
+
+Theme write:
+Phase 3.4 limitations remain.
+If write_themes exception/approval is unavailable, orchestration ends with:
+MANUAL_ACTION_REQUIRED
+and exact manual patch instructions.
+Do not mark the full theme stage COMPLETE falsely.
+
+======================================================================
+12. SPARK FALLBACK
+======================================================================
+
+Retain:
+DIRECT_SHOPIFY
+SPARK_FALLBACK
+
+SPARK_FALLBACK flow:
+sourcing
+→ MASTER/classification
+→ Spark package
+→ safe Spark Desktop staging
+→ PAUSED / MANUAL_ACTION_REQUIRED for Spark upload/Shopify confirmation
+→ resume collection stages after user confirms catalog uploaded
+
+Do not automate Spark GUI clicks.
+
+======================================================================
+13. VERIFICATION
+======================================================================
+
+After product sync, verify from Shopify read API:
+- product exists
+- mapping is correct
+- title/status are expected
+- variant/price where managed
+- media state where managed
+
+Do not call a product synced merely because mutation returned HTTP 200.
+Inspect GraphQL userErrors and re-fetch verification.
+
+Collections likewise use existing Phase 3.3 verification.
+
+Final run report must distinguish:
+requested
+eligible
+created
+updated
+unchanged
+conflict
+skipped
+failed
+verified
+
+======================================================================
+14. UI
+======================================================================
+
+Add one main card above advanced modules:
+
+### 스토어 자동 구축
+
+Store: 001 Cabin Tidy
+
+Mode:
+[미리보기] [실제 실행]
+
+Product route:
+DIRECT_SHOPIFY
+or SPARK_FALLBACK
+
+[스토어 자동 구축 미리보기]
+[스토어 자동 구축 시작]
+[일시정지]
+[계속]
+[실패 항목 재시도]
+
+Progress stage timeline.
+
+Default UI stays beginner-friendly.
+Advanced technical details collapsed.
+
+Never show access token/API keys.
+
+======================================================================
+15. SAFETY / AUDIT
+======================================================================
+
+No destructive product deletion.
+No destructive collection deletion.
+No theme writes without the separate Phase 3.4 gate.
+
+Every live mutation should produce an audit record with:
+- run_id
+- store_id
+- entity type
+- local entity ID
+- remote ID
+- action
+- result
+- timestamp
+- sanitized error
+
+Never store secrets in reports.
+
+======================================================================
+16. FINAL REPORT
+======================================================================
+
+exports/store_build_reports/<store>/<run_id>/
+  summary.json
+  summary.md
+  failures.json
+
+No secrets.
+
+Include:
+- sourcing counts
+- eligibility counts
+- Shopify product sync counts
+- collection plan/sync counts
+- image counts
+- homepage status
+- manual action required
+- duration
+- retry counts
+
+Do not commit reports.
+
+======================================================================
+17. TESTS
+======================================================================
+
+All Shopify/OpenAI/Amazon network calls mocked.
+
+Required tests at minimum:
+
+test_direct_product_preview_create_update_nochange_skip
+test_direct_product_idempotent_no_duplicates
+test_direct_product_restricted_never_synced
+test_product_identity_uses_source_id_not_title
+test_product_payload_does_not_overwrite_unowned_fields
+test_productSet_list_fields_not_accidentally_cleared
+test_product_tags_preserve_unowned_tags
+test_collection_tags_deterministic
+test_product_media_failure_isolated
+test_product_graphql_user_errors_handled
+test_product_verify_after_write
+test_large_catalog_checkpoint_resume
+test_retry_failed_products_only
+test_store_build_orchestrates_existing_components
+test_store_build_pause_resume
+test_store_build_preview_invalidated_when_inputs_change
+test_store_build_spark_fallback_manual_gate
+test_store_build_theme_manual_gate_not_false_complete
+test_paid_image_generation_requires_opt_in
+test_no_real_network_in_tests
+test_token_never_logged
+test_protected_store_file_untouched
+
+Scale synthetic test:
+10,000 products planning/queue/checkpoint path without full live network.
+
+All existing tests PASS.
+
+======================================================================
+18. DOCUMENTATION
+======================================================================
+
+Create:
+docs/ONE_CLICK_STORE_BUILD.md
+docs/DIRECT_SHOPIFY_PRODUCT_SYNC.md
+
+Beginner section:
+- what user clicks
+- preview vs real run
+- how to connect Shopify
+- how to pause/resume
+- what MANUAL_ACTION_REQUIRED means
+
+======================================================================
+19. QUALITY GATE
+======================================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+======================================================================
+20. COMMIT / PUSH
+======================================================================
+
+Do not commit:
+stores/001_cabin_tidy.json
+DB
+backups
+exports
+generated images
+credentials
+runtime state
+
+Commit:
+git commit -m "Add one-click store build orchestrator"
+
+Push:
+git push origin main
+
+Final:
+git rev-list --left-right --count main...origin/main
+must be:
+0 0
+
+======================================================================
+21. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] direct Shopify product publisher architecture
+[2] product identity/idempotency
+[3] product mapping
+[4] collection tag integration
+[5] large batch/checkpoint/resume
+[6] orchestration stages
+[7] Spark fallback
+[8] dry-run/live gates
+[9] UI
+[10] final reports
+[11] tests
+[12] protected file
+[13] commit SHA
+[14] push state
+[15] what remains before a REAL Cabin Tidy one-click production run
+
+Implement now, but DO NOT perform a real Amazon run, Shopify write, paid image generation, Spark upload, or live theme write during Codex execution.
