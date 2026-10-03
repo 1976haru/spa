@@ -1,0 +1,1098 @@
+ShopSource Studio — Phase 4.0
+SHOP COMPLETION MASTER / FULL STOREFRONT COMPLETION
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+- Baseline: ee78ddd32fdb38042676fddae7747c36c8b876bb
+
+Context
+- Phase 3.1–3.9 are COMPLETE.
+- Current capabilities include:
+  sourcing, Store Decisions, Spark fallback, DIRECT_SHOPIFY product sync, collections, collection images, logo/favicon, navigation/mega menu, hero banner, category shortcuts, homepage featured collections, theme discovery, dry-run/apply/rollback patterns, StoreBuild orchestration, controlled live pilot.
+- Next user-approved sequence is:
+  Phase 4.0 = complete every remaining store element
+  → Phase 4.1 = code consistency + stress/simulation
+  → Phase 4.2 = real Cabin Tidy live pilot
+- This phase must NOT become a stress test yet.
+- This phase must inventory, design, implement, and integrate every remaining element required for a practically launchable Shopify storefront, with automation where safe and MANUAL_ACTION_REQUIRED where Shopify permissions or business decisions require human input.
+
+Goal
+Transform ShopSource from a collection of automation modules into a COMPLETE STORE BUILDER with a single authoritative Store Completion Plan, readiness gates, missing-element detection, safe generation/preview/apply flows, and final launch-readiness report.
+
+IMPORTANT during implementation/tests:
+- NO real Shopify write
+- NO real theme write
+- NO real paid image generation
+- NO Amazon run
+- NO Spark upload
+- NO live payments/shipping/domain changes
+- ALL external calls mocked/synthetic
+
+======================================================================
+0. FINAL USER EXPERIENCE
+======================================================================
+
+### 스토어 완성도
+
+Store:
+001 | Cabin Tidy
+
+Overall:
+92 / 100
+NOT READY FOR LAUNCH
+
+Core commerce
+✓ Products
+✓ Collections
+✓ Product pricing policy
+△ Inventory policy requires review
+
+Brand
+✓ Brand profile
+✓ Logo
+✓ Favicon
+
+Navigation
+✓ Main menu
+✓ Mega menu plan
+△ Footer menu
+
+Homepage
+✓ Hero
+✓ Category shortcuts
+✓ Featured collections
+
+Pages
+△ About Us
+△ Contact
+△ FAQ
+△ Shipping
+△ Returns
+△ Privacy
+△ Terms
+
+Storefront quality
+△ Product detail template
+△ Collection template
+△ Search
+△ Cart
+△ Mobile
+△ Accessibility
+△ SEO metadata
+△ Broken-link scan
+
+Commerce readiness
+△ Markets/currency
+△ Shipping settings
+△ Tax state
+△ Payments state
+△ Domain state
+△ Checkout readiness
+
+[전체 스토어 검사]
+[누락 요소 자동 설계]
+[완성 미리보기]
+[안전한 항목 적용]
+[수동 작업 보기]
+[최종 Launch Readiness 검사]
+
+Final statuses:
+READY
+READY_WITH_WARNINGS
+NOT_READY
+MANUAL_ACTION_REQUIRED
+
+Never mark READY while blocking launch requirements remain unresolved.
+
+======================================================================
+1. STORE COMPLETION PLAN — SINGLE SOURCE OF TRUTH
+======================================================================
+
+Create a persistent StoreCompletionPlan that references existing phase outputs rather than duplicating them.
+
+Suggested models:
+
+store_completion_plans
+- plan_id
+- store_id
+- planner_version
+- source_hash
+- status
+- readiness_score
+- blocking_count
+- warning_count
+- created_at
+- updated_at
+
+store_completion_items
+- id
+- plan_id
+- area
+- item_key
+- title
+- required_level
+  REQUIRED
+  RECOMMENDED
+  OPTIONAL
+- automation_mode
+  AUTO_SAFE
+  AUTO_WITH_CONFIRMATION
+  MANUAL_REQUIRED
+  INSPECTION_ONLY
+- status
+  NOT_CHECKED
+  MISSING
+  PLANNED
+  READY
+  NEEDS_REVIEW
+  MANUAL_ACTION_REQUIRED
+  VERIFIED
+  BLOCKED
+  SKIPPED
+- source_component
+- remote_reference nullable
+- details_json
+- blocking_reason nullable
+- updated_at
+
+Do not duplicate existing phase data blobs.
+Reference existing Brand/Profile/Collection/Navigation/Homepage/Product sync models.
+
+======================================================================
+2. REQUIRED COMPLETION DOMAINS
+======================================================================
+
+Phase 4.0 must cover all of these domains:
+
+A. Catalog / Products
+B. Collections
+C. Pricing
+D. Inventory policy / availability
+E. Brand identity
+F. Header/navigation/mega menu
+G. Homepage
+H. Product detail template
+I. Collection/listing template
+J. Search
+K. Cart
+L. Footer
+M. Static pages
+N. Legal/policy pages
+O. Contact/support
+P. SEO
+Q. Accessibility
+R. Mobile/responsive
+S. Broken links / navigation integrity
+T. Images/media quality
+U. Markets / country / currency
+V. Domain / SSL state
+W. Shipping configuration readiness
+X. Tax configuration readiness
+Y. Payment configuration readiness
+Z. Checkout readiness
+AA. Analytics / tracking readiness
+AB. Store status/password/launch state
+AC. Final storefront verification
+
+Each domain must end in:
+VERIFIED
+MANUAL_ACTION_REQUIRED
+or BLOCKED
+
+No silent omissions.
+
+======================================================================
+3. PRODUCT DETAIL PAGE COMPLETION
+======================================================================
+
+Add ProductTemplatePlan and inspector.
+
+Inspect/theme-detect:
+- product title
+- media gallery
+- price
+- compare-at price if valid
+- variant selector
+- quantity selector
+- add-to-cart button
+- dynamic checkout button if present
+- description
+- vendor/brand display
+- inventory/availability messaging
+- shipping/returns summary area if theme supports it
+- collapsible rows/tabs if supported
+- related/recommended products if supported
+
+Do not hardcode Dawn-only section IDs.
+
+Generate safe recommended structure from theme schema.
+
+Do NOT fabricate:
+- reviews
+- star ratings
+- countdown timers
+- guarantees
+- scarcity
+- free shipping promises
+unless supported by actual store policy/data.
+
+Product template preview:
+MISSING_SECTION
+PRESENT
+NEEDS_REVIEW
+CONFLICT
+MANUAL_ACTION_REQUIRED
+
+Theme apply remains safe/dry-run first.
+
+======================================================================
+4. COLLECTION / LISTING PAGE COMPLETION
+======================================================================
+
+Inspect:
+- collection title/description
+- image/banner where available
+- product grid
+- pagination/infinite behavior
+- sort controls
+- filters
+- mobile grid behavior
+- empty state
+
+If Shopify Search & Discovery/native filtering configuration is externally required, represent it honestly as MANUAL_ACTION_REQUIRED or supported configuration path.
+
+No fake filters.
+
+Verify collection links from navigation/category shortcuts actually resolve to existing collection resources.
+
+======================================================================
+5. SEARCH COMPLETION
+======================================================================
+
+Inspect theme/store support for:
+- search route
+- header search icon
+- search template
+- empty result state
+- product result cards
+- predictive search if theme supports it
+
+Do not require predictive search to mark basic search ready.
+Basic search availability is REQUIRED.
+Predictive search is RECOMMENDED.
+
+Add SearchReadiness status.
+
+======================================================================
+6. CART COMPLETION
+======================================================================
+
+Inspect:
+- add-to-cart path
+- cart page or drawer
+- quantity change
+- remove item
+- subtotal
+- checkout button
+- empty cart state
+- mobile behavior
+
+No actual checkout/payment during tests.
+
+Add synthetic theme/cart integration test paths where possible.
+
+If theme supports cart drawer, detect via schema.
+Do not force drawer over cart page.
+
+======================================================================
+7. FOOTER AUTOMATION
+======================================================================
+
+Create FooterPlan.
+
+Suggested default groups, data-driven and editable:
+
+Customer Care
+- Contact Us
+- FAQ
+- Shipping
+- Returns
+
+Company
+- About Us
+
+Legal
+- Privacy Policy
+- Terms of Service
+- Refund/Return Policy as applicable
+
+Shop
+- Shop / Collections
+
+Do not create a link until the destination exists/planned.
+
+Reuse navigation service patterns.
+Preserve unrelated merchant footer links.
+
+Detect actual theme footer menus/settings.
+
+Actions:
+CREATE
+UPDATE
+NO_CHANGE
+CONFLICT
+SKIP
+MANUAL_ACTION_REQUIRED
+
+======================================================================
+8. STATIC CONTENT PAGE AUTOMATION
+======================================================================
+
+Add PagePlan/ContentPageService.
+
+Required/recommended page types:
+- ABOUT_US
+- CONTACT
+- FAQ
+- SHIPPING
+- RETURNS
+- PRIVACY
+- TERMS
+- REFUND_POLICY if separate
+- optional TRACK_ORDER only if real tracking workflow exists
+
+Generate store-specific draft copy from:
+- Store Profile
+- BrandProfile
+- target market
+- actual known policies/configuration
+
+Critical rule:
+Do NOT invent business/legal facts.
+
+For unknown factual fields:
+use placeholders/status variables and mark:
+REQUIRES_BUSINESS_INPUT
+
+Examples:
+- support email
+- return window
+- return address
+- processing time
+- shipping time
+- shipping fees
+- company legal name
+- business address
+- governing law
+- contact phone
+
+Privacy/Terms:
+prefer Shopify-generated policy sources/templates when available.
+ShopSource may structure and audit them, but must not present generated legal text as legal advice.
+
+All policy content requires user review before live apply.
+
+======================================================================
+9. CONTACT PAGE
+======================================================================
+
+Detect/create Contact page plan.
+
+Include:
+- title
+- concise support copy
+- theme contact form template when supported
+- support email only if explicitly configured
+- expected response-time text only if configured
+- no fake phone/address
+
+Verification:
+- page route
+- form/template mapping
+- footer/header link
+
+======================================================================
+10. FAQ PAGE
+======================================================================
+
+Generate FAQ only from known store policies/features.
+
+Topics may include:
+- ordering
+- shipping
+- returns
+- product questions
+- contact
+
+Unknown answers:
+do not invent.
+Mark NEEDS_BUSINESS_INPUT.
+
+Use accordion/collapsible theme section only when schema safely supports it; otherwise standard page content.
+
+======================================================================
+11. SHIPPING / RETURNS CONTENT
+======================================================================
+
+Separate:
+A. storefront explanatory page
+B. actual Shopify admin shipping settings
+
+Storefront page may only claim what actual configured ShippingPolicy supports.
+
+Create readiness check:
+CONTENT_CONFIG_MATCH
+
+If page says free shipping but Shopify shipping configuration does not confirm it:
+BLOCK / CONFLICT.
+
+If return window in text is unknown:
+REQUIRES_BUSINESS_INPUT.
+
+======================================================================
+12. POLICY / LEGAL READINESS
+======================================================================
+
+Add PolicyReadiness.
+
+Track:
+- Privacy
+- Terms
+- Refund/Returns
+- Shipping where applicable
+
+For each:
+MISSING
+DRAFT
+NEEDS_REVIEW
+CONFIGURED
+VERIFIED
+
+Do not auto-certify legal compliance.
+
+Do not invent company identity or regulatory claims.
+
+If Shopify exposes policy URLs/data through supported API/read path, inspect safely.
+Actual live policy writes only behind explicit confirmation and supported official APIs.
+
+======================================================================
+13. SEO AUTOMATION
+======================================================================
+
+Add StoreSEOPlan.
+
+Cover:
+- store/homepage title
+- homepage meta description
+- product SEO title/description presence
+- collection SEO
+- page SEO
+- canonical awareness/duplicate handle detection
+- image alt text completeness
+- internal link coverage
+- heading hierarchy heuristic
+- sitemap/robots presence inspection where Shopify provides standard behavior
+- social sharing image presence
+
+Generate concise metadata from actual content.
+
+Rules:
+- no keyword stuffing
+- no fabricated claims
+- no unsupported location claims
+- preserve existing user-edited metadata unless managed and confirmed
+
+Add length heuristics/warnings, not hard failure for arbitrary pixel-perfect SEO rules.
+
+======================================================================
+14. ACCESSIBILITY READINESS
+======================================================================
+
+Add automated heuristics for:
+- missing image alt
+- icon-only controls without accessible labels when inspectable
+- obvious duplicate heading issues
+- contrast metadata only where colors are known
+- keyboard/navigation structure only where theme code/schema allows static inspection
+- link text quality
+- form labels where inspectable
+
+Do not claim WCAG compliance from heuristic tests.
+
+Statuses:
+BASIC_CHECK_PASS
+WARNINGS
+MANUAL_AUDIT_REQUIRED
+
+Manual accessibility audit remains RECOMMENDED/REQUIRED before scale launch.
+
+======================================================================
+15. MOBILE / RESPONSIVE READINESS
+======================================================================
+
+Use theme schema/assets and generated preview metadata to inspect:
+- hero mobile crop plan
+- logo width
+- navigation/mega menu mobile fallback
+- collection grid mobile columns
+- product media behavior
+- text overflow heuristics
+- CTA labels length
+- category shortcut layout
+- footer stacking
+
+No real browser screenshot automation required in Phase 4.0 unless existing tooling safely supports it.
+
+Generate MobileReadinessPlan.
+
+Actual browser/device visual test will be Phase 4.1/4.2.
+
+======================================================================
+16. MEDIA QUALITY / ASSET READINESS
+======================================================================
+
+Aggregate image assets from:
+- products
+- collections
+- brand
+- hero
+- category shortcuts
+
+Checks:
+- missing image
+- broken local reference
+- duplicate unrelated reuse warning
+- dimensions
+- aspect suitability
+- alt text
+- file size heuristic
+- source/rights-review status
+
+Do not claim copyright/reuse rights.
+Track:
+RIGHTS_CONFIRMED
+RIGHTS_REVIEW_REQUIRED
+GENERATED
+MANUAL
+
+A launch can be blocked by user-configured rights policy if desired.
+
+======================================================================
+17. BROKEN LINK / RESOURCE INTEGRITY
+======================================================================
+
+Create StoreLinkInspector.
+
+Inspect planned/known internal links:
+- main navigation
+- mega menu
+- footer
+- hero CTA
+- category shortcuts
+- featured collections
+- static pages
+- policy links
+- product/collection references
+
+Detect:
+- missing target
+- duplicate wrong target
+- stale handle
+- missing remote ID
+- placeholder link
+- "#" / blank
+- link loops where meaningful
+
+During tests use fixtures/mocks.
+No broad external crawling in Phase 4.0.
+
+======================================================================
+18. MARKETS / COUNTRY / CURRENCY READINESS
+======================================================================
+
+Read-only readiness inspector for:
+- primary market
+- target country
+- active currency/presentment state
+- store currency
+- relevant publication/market connection when available
+
+Do NOT change Markets live during Phase 4.0 implementation.
+
+For Cabin Tidy target United States:
+plan should be able to flag if store settings contradict target market.
+
+Statuses:
+MATCH
+NEEDS_REVIEW
+MANUAL_ACTION_REQUIRED
+
+======================================================================
+19. DOMAIN / SSL / STORE ACCESS READINESS
+======================================================================
+
+Inspect/store metadata when supported:
+- primary domain configured
+- myshopify fallback
+- SSL state if exposed
+- store password/launch protection state if exposed
+- published theme presence
+
+Do not mark custom domain REQUIRED for technical operation.
+Distinguish:
+CUSTOM_DOMAIN_RECOMMENDED
+MYSHOPIFY_VALID
+DOMAIN_BLOCKED
+
+Store-launch password removal is an explicit manual/live gate.
+
+======================================================================
+20. SHIPPING SETTINGS READINESS
+======================================================================
+
+Read-only readiness inspector for actual Shopify shipping setup where supported.
+
+Check:
+- shipping origin/location presence
+- target market served
+- at least one applicable shipping rate/profile path
+- product shipping eligibility assumptions
+- content/config consistency
+
+Do NOT invent or modify rates in Phase 4.0 tests.
+
+Unknown/configuration-sensitive:
+MANUAL_ACTION_REQUIRED
+
+Shipping must be blocking if no valid shipping path exists for target market.
+
+======================================================================
+21. TAX READINESS
+======================================================================
+
+Read-only status/inspection where official APIs expose enough information.
+
+Do not provide tax/legal advice.
+Do not auto-configure tax obligations.
+
+Track:
+CONFIGURED
+NEEDS_REVIEW
+MANUAL_ACTION_REQUIRED
+UNKNOWN
+
+Tax readiness is a launch checklist gate, not automatic legal certification.
+
+======================================================================
+22. PAYMENT READINESS
+======================================================================
+
+Read-only / user-confirmed readiness.
+
+Check whether store has an enabled payment path if official API/metadata permits.
+If not inspectable, create explicit manual confirmation checklist.
+
+Never ask Codex/test code to perform a real payment.
+
+Blocking requirement:
+one confirmed usable payment method before READY FOR LAUNCH.
+
+======================================================================
+23. CHECKOUT READINESS
+======================================================================
+
+Create CheckoutReadiness checklist:
+- cart reaches checkout link
+- shipping applicable
+- payment readiness confirmed
+- market/currency consistent
+- required contact/customer settings known
+- no known blocking store password/plan state
+
+Do not modify checkout settings unless future explicitly scoped.
+
+No real order creation/payment.
+
+======================================================================
+24. ANALYTICS / TRACKING READINESS
+======================================================================
+
+Track presence/status only:
+- Shopify analytics baseline
+- optional GA/pixel integration
+- consent/privacy considerations
+
+Do not require external analytics for launch.
+Core Shopify analytics:
+RECOMMENDED baseline.
+
+Do not inject tracking scripts automatically in Phase 4.0.
+
+======================================================================
+25. STOREFRONT HEADER / BRAND / NAVIGATION CONSISTENCY
+======================================================================
+
+Cross-check:
+- chosen brand name
+- logo wordmark
+- homepage copy
+- navigation naming
+- collection titles
+- About page brand name
+- policy/store name references
+
+Detect mismatch:
+"Cabin Tidy" vs stale/old placeholder brand.
+
+Do not rewrite silently.
+Generate a consistency diff.
+
+======================================================================
+26. STORE COMPLETION INSPECTOR
+======================================================================
+
+Implement:
+
+StoreCompletionService
+- inspect(store_id)
+- build_plan(store_id)
+- preview_fixes(plan_id)
+- apply_safe(plan_id, selected_items)
+- verify(plan_id)
+- generate_report(plan_id)
+
+Only call existing services where possible:
+- product publisher
+- collection planner/publisher
+- brand
+- navigation
+- homepage
+- theme
+- image providers
+
+Do not duplicate Phase 3.x logic.
+
+======================================================================
+27. READINESS SCORE
+======================================================================
+
+Provide a human-friendly score, but DO NOT let score override blockers.
+
+Example weighting:
+- core commerce 25
+- storefront structure 20
+- content/policies 15
+- UX/quality 15
+- commerce configuration 20
+- verification 5
+
+But READY is determined by blocking gates, not numeric score.
+
+Required blockers examples:
+- no valid product path
+- no cart/checkout path
+- no payment confirmation
+- no shipping path for target market
+- broken main navigation
+- missing critical legal/privacy policy required by configured store flow
+- unresolved remote conflicts in managed critical resources
+
+Keep scoring deterministic and documented.
+
+======================================================================
+28. SAFE AUTO-FIX VS MANUAL
+======================================================================
+
+AUTO_SAFE examples:
+- missing alt text derived from known category/title
+- generating draft page plan
+- building footer plan
+- creating dry-run metadata
+- fixing managed internal link plan before live sync
+
+AUTO_WITH_CONFIRMATION:
+- Shopify page create/update
+- footer menu sync
+- SEO metadata update
+- managed theme section changes
+
+MANUAL_REQUIRED:
+- legal/business policy values
+- payment setup
+- tax decisions
+- domain purchase
+- shipping business choices
+- Shopify permissions/approvals not available
+- checkout/business verification
+- ambiguous theme mapping
+
+Never convert MANUAL_REQUIRED into fake automation.
+
+======================================================================
+29. COMPLETION UI
+======================================================================
+
+Add top-level:
+
+### 스토어 완성
+
+[전체 스토어 검사]
+[누락 요소 자동 설계]
+[완성 미리보기]
+[안전한 항목 적용]
+[검증]
+[Launch Readiness]
+
+Domains shown as compact status cards.
+
+Beginner mode:
+show only:
+- 완료
+- 확인 필요
+- 수동 작업
+- 차단
+
+Advanced:
+technical IDs/diffs/APIs collapsed.
+
+Provide:
+[수동 작업만 보기]
+[차단 요소만 보기]
+
+======================================================================
+30. STORE BUILD MASTER INTEGRATION
+======================================================================
+
+Extend StoreBuildRun to incorporate completion domains.
+
+Do not create an unmaintainable giant function.
+Use sub-services and stage registry.
+
+Suggested high-level final stages:
+
+PLAN
+BRAND
+SOURCING
+PRODUCTS
+COLLECTIONS
+NAVIGATION
+HOMEPAGE
+PRODUCT_TEMPLATE
+COLLECTION_TEMPLATE
+STATIC_PAGES
+POLICIES
+FOOTER
+SEO
+SEARCH
+CART
+QUALITY_AUDIT
+COMMERCE_READINESS
+FINAL_VERIFY
+LAUNCH_READINESS
+COMPLETE
+
+Each high-level stage may aggregate existing granular stages.
+
+StoreBuild should preserve resume/checkpoint semantics.
+
+======================================================================
+31. FINAL LAUNCH READINESS REPORT
+======================================================================
+
+exports/store_completion_reports/<store>/<run_id>/
+- readiness_summary.json
+- readiness_summary.md
+- blockers.json
+- manual_actions.md
+- warnings.json
+
+No secrets.
+
+Report:
+- readiness score
+- blocking items
+- manual actions
+- verified items
+- warnings
+- unresolved conflicts
+- target market
+- product count
+- collection count
+- navigation state
+- homepage state
+- brand state
+- policy state
+- shipping/payment/tax/domain status
+- next recommended action
+
+Do not commit reports.
+
+======================================================================
+32. NO REAL LIVE ACTIONS IN PHASE 4.0
+======================================================================
+
+This phase is implementation/completion architecture only.
+
+During Codex execution:
+- no Shopify live writes
+- no theme writes
+- no page/policy live writes
+- no payment/shipping/domain changes
+- no Amazon run
+- no Spark upload
+- no paid image generation
+- no real order/checkout
+
+Mocks/synthetic fixtures only.
+
+======================================================================
+33. TESTS
+======================================================================
+
+All external calls mocked.
+
+Required minimum tests:
+
+test_completion_plan_includes_all_domains
+test_completion_plan_reuses_existing_phase_outputs
+test_required_blocker_prevents_ready
+test_score_cannot_override_blocker
+test_product_template_detects_core_sections
+test_product_template_does_not_generate_fake_reviews
+test_collection_template_integrity
+test_search_basic_required_predictive_optional
+test_cart_core_controls_detected
+test_footer_plan_preserves_existing_links
+test_static_page_unknown_business_facts_not_invented
+test_contact_page_no_fake_phone_address
+test_faq_unknown_answer_requires_input
+test_shipping_content_config_conflict_blocks
+test_policy_requires_user_review
+test_seo_preserves_unmanaged_metadata
+test_accessibility_does_not_claim_wcag_compliance
+test_mobile_readiness_plan
+test_media_rights_unknown_flagged
+test_broken_link_placeholder_detected
+test_market_target_mismatch_warning
+test_domain_myshopify_not_false_blocked
+test_shipping_missing_target_rate_blocks
+test_tax_unknown_manual_review
+test_payment_requires_confirmation
+test_checkout_not_ready_without_shipping_payment
+test_analytics_optional
+test_brand_name_consistency_detects_stale_placeholder
+test_apply_safe_never_runs_manual_required
+test_store_build_completion_stage_order
+test_store_build_resume_after_manual_gate
+test_report_contains_blockers_and_manual_actions
+test_no_real_network_in_tests
+test_protected_store_file_untouched
+
+Also keep all existing tests PASS.
+
+Synthetic full-store fixture:
+- at least 1,000 products
+- 8 collections
+- complete brand/navigation/homepage
+- static pages/policies mixed ready/missing
+- commerce readiness mixed statuses
+
+Do NOT stress to 50,000 here; that belongs to Phase 4.1.
+
+======================================================================
+34. DOCUMENTATION
+======================================================================
+
+Create:
+docs/STORE_COMPLETION_MASTER.md
+docs/LAUNCH_READINESS.md
+docs/MANUAL_ACTIONS_GUIDE.md
+
+Explain in Korean for beginner users:
+- what “READY” means
+- what must still be done manually
+- what ShopSource can safely automate
+- what ShopSource intentionally does not auto-decide
+- how Phase 4.1 stress testing and Phase 4.2 live test will follow
+
+======================================================================
+35. PROTECTED FILE
+======================================================================
+
+stores/001_cabin_tidy.json
+
+Existing dirty user file:
+NEVER reset
+NEVER restore
+NEVER checkout
+NEVER clean
+NEVER stage
+NEVER commit
+
+======================================================================
+36. QUALITY GATE
+======================================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Run focused new Phase 4.0 tests first, then full suite.
+
+======================================================================
+37. COMMIT / PUSH
+======================================================================
+
+Do not commit:
+- protected store file
+- DB/runtime state
+- reports/exports
+- generated images
+- theme backups
+- secrets/credentials
+- temp files
+
+Commit:
+git commit -m "Add store completion master"
+
+Push:
+git push origin main
+
+Final:
+git rev-list --left-right --count main...origin/main
+must be:
+0 0
+
+======================================================================
+38. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] StoreCompletionPlan architecture
+[2] all completion domains covered
+[3] product/collection template readiness
+[4] search/cart readiness
+[5] footer/static page automation
+[6] policies/business-input safety
+[7] SEO/accessibility/mobile/media checks
+[8] broken-link/resource integrity
+[9] markets/domain/shipping/tax/payment/checkout readiness
+[10] readiness score + blocker logic
+[11] UI
+[12] StoreBuild integration
+[13] report outputs
+[14] tests
+[15] protected file
+[16] commit SHA
+[17] push state
+[18] exact known items that Phase 4.1 must stress-test
+[19] exact items that must remain manual before Phase 4.2 live test
+
+Implement now, but DO NOT perform real Shopify writes, theme writes, commerce-setting changes, paid image generation, Amazon execution, Spark upload, or checkout/payment.
