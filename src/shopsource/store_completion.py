@@ -25,9 +25,13 @@ DOMAINS = (
     "SEO", "ACCESSIBILITY", "MOBILE", "BROKEN_LINKS", "MEDIA_QUALITY",
     "MARKETS_CURRENCY", "DOMAIN_SSL", "SHIPPING", "TAX", "PAYMENT", "CHECKOUT",
     "ANALYTICS", "LAUNCH_STATE", "FINAL_VERIFICATION",
+    "SOURCE_AVAILABILITY", "SOURCE_FRESHNESS", "SOURCE_PRICE_GUARD",
+    "SOURCE_MONITORING", "SHOPIFY_INVENTORY_ALIGNMENT",
 )
 FINAL_DOMAIN_STATUSES = {"VERIFIED", "MANUAL_ACTION_REQUIRED", "BLOCKED"}
-REQUIRED_BLOCKERS = {"PRODUCTS", "NAVIGATION", "SEARCH", "CART", "POLICIES", "SHIPPING", "PAYMENT", "CHECKOUT"}
+REQUIRED_BLOCKERS = {"PRODUCTS", "NAVIGATION", "SEARCH", "CART", "POLICIES", "SHIPPING", "PAYMENT", "CHECKOUT",
+                     "SOURCE_AVAILABILITY", "SOURCE_FRESHNESS", "SOURCE_PRICE_GUARD", "SOURCE_MONITORING",
+                     "SHOPIFY_INVENTORY_ALIGNMENT"}
 AUTO_SAFE_AREAS = {"FOOTER", "STATIC_PAGES", "SEO", "ACCESSIBILITY", "MOBILE", "BROKEN_LINKS", "MEDIA_QUALITY"}
 WEIGHTS = {
     "PRODUCTS": 8, "COLLECTIONS": 4, "PRICING": 4, "INVENTORY_POLICY": 3, "BRAND": 6,
@@ -37,6 +41,8 @@ WEIGHTS = {
     "BROKEN_LINKS": 4, "MEDIA_QUALITY": 3, "MARKETS_CURRENCY": 3, "DOMAIN_SSL": 2,
     "SHIPPING": 6, "TAX": 2, "PAYMENT": 6, "CHECKOUT": 5, "ANALYTICS": 1,
     "LAUNCH_STATE": 2, "FINAL_VERIFICATION": 1,
+    "SOURCE_AVAILABILITY": 5, "SOURCE_FRESHNESS": 4, "SOURCE_PRICE_GUARD": 4,
+    "SOURCE_MONITORING": 3, "SHOPIFY_INVENTORY_ALIGNMENT": 4,
 }
 
 
@@ -464,6 +470,13 @@ class StoreCompletionService:
             "ANALYTICS": final(bool(snapshot.get("shopify_analytics", True)), manual=True, details={"external_tracking_required": False}),
             "LAUNCH_STATE": final(bool(snapshot.get("published_theme")) and not bool(snapshot.get("launch_blocked")), manual=True),
             "FINAL_VERIFICATION": final(bool(snapshot.get("final_verification")), manual=True),
+            # Legacy synthetic snapshots remain readable.  Real Phase 4.1.1
+            # callers provide source_safety; explicit unsafe states block.
+            "SOURCE_AVAILABILITY": final((snapshot.get("source_safety") or {}).get("availability_ready", True), reason="Source availability unknown/OOS"),
+            "SOURCE_FRESHNESS": final((snapshot.get("source_safety") or {}).get("freshness_ready", True), reason="Source data stale or never verified"),
+            "SOURCE_PRICE_GUARD": final((snapshot.get("source_safety") or {}).get("price_guard_ready", True), reason="Source margin/currency guard blocked"),
+            "SOURCE_MONITORING": final((snapshot.get("source_safety") or {}).get("monitoring_ready", True), reason="Source monitoring strategy missing"),
+            "SHOPIFY_INVENTORY_ALIGNMENT": final((snapshot.get("source_safety") or {}).get("inventory_alignment_ready", True), reason="Source/Shopify oversale risk"),
         }
         assert set(items) == set(DOMAINS)
         return {"store_id": store_id, "references": self._references(store_id), "items": items,

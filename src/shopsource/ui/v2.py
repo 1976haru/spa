@@ -44,6 +44,7 @@ from .v2_service import (
 
 NAV_ITEMS = [
     ("/completion", "fact_check", "스토어 완성"),
+    ("/source-safety", "health_and_safety", "소스 재고·가격 안전"),
     ("/homepage", "web", "Homepage Automation"),
     ("/build", "rocket_launch", "스토어 자동 구축"),
     ("/pilot", "science", "Cabin Tidy 파일럿"),
@@ -164,6 +165,7 @@ class OperatorUI:
             )
         with ui.column().classes("w-full max-w-screen-2xl mx-auto p-6 gap-5"):
             if path == "/completion": self._store_completion()
+            elif path == "/source-safety": self._source_safety()
             elif path == "/": self._dashboard()
             elif path == "/build": self._store_build()
             elif path == "/pilot": self._shopify_pilot()
@@ -181,6 +183,34 @@ class OperatorUI:
     def _set_store(self, store_id, path):
         self.current_store = store_id
         self.ui.navigate.to(path)
+
+    def _source_safety(self):
+        ui = self.ui
+        from ..source_safety import SourceMonitorService, SourceSafetyService
+        self._heading("소스 재고·가격 안전", "Shopify Sold out과 실제 source 품절을 구분하고 오래된 가격·재고를 차단합니다.")
+        summary = ui.label("아직 Source 안전 검사를 미리보지 않았습니다.").classes("text-lg font-semibold")
+        ui.label("검사는 먼저 대상·batch·예상 token만 보여줍니다. 실제 provider 호출은 자동 시작하지 않습니다.").classes("text-amber-800")
+        details = ui.column().classes("w-full")
+
+        async def preview_audit():
+            try:
+                result = await asyncio.to_thread(SourceMonitorService().preview_due_checks, self.current_store, limit=100)
+                summary.set_text(f"대상 {len(result['items'])} · batch {result['estimated_batches']} · 예상 token {result['estimated_tokens']} · PREVIEW ONLY")
+                details.clear()
+                with details: ui.json_editor({"content": {"json": result}}).props("read-only").classes("w-full")
+            except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+        async def sold_out_info():
+            ui.notify("Sold Out 진단은 source snapshot과 Shopify read-only inventory snapshot을 비교합니다. write 없음.", type="positive")
+
+        with ui.row().classes("flex-wrap"):
+            ui.button("Source 안전 검사", on_click=preview_audit, icon="preview").props("outline")
+            ui.button("Sold Out 원인 진단", on_click=sold_out_info, icon="troubleshoot").props("outline")
+            for label in ("가격변동 보기", "재고변동 보기", "판매차단 후보", "재입고 후보", "모니터링 설정"):
+                ui.button(label, on_click=lambda label=label: ui.notify(f"{label}: Source 안전 검사 후 확인하세요.")).props("flat")
+        with ui.expansion("기술 증거", icon="code").classes("w-full"):
+            ui.label("가용성: IN_STOCK / OUT_OF_STOCK / LIMITED / PREORDER / BACKORDER / UNKNOWN / SOURCE_ERROR")
+            ui.label("기본 inventory ownership: UNMANAGED · action mode: PREVIEW_ONLY · AUTO_REPRICE: OFF")
 
     def _store_completion(self):
         ui = self.ui

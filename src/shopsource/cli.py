@@ -109,6 +109,11 @@ def main(argv=None) -> int:
     p = sub.add_parser("source-cancel", help="Cancel an automated sourcing run")
     p.add_argument("--run", required=True)
 
+    p = sub.add_parser("source-monitor", help="Preview one source-safety monitoring cycle")
+    p.add_argument("--store", required=True)
+    p.add_argument("--due-only", action="store_true", help="preview only; never calls a provider")
+    p.add_argument("--limit", type=int, default=100)
+
     args = parser.parse_args(argv)
     db = args.db
 
@@ -186,6 +191,12 @@ def main(argv=None) -> int:
         print(json.dumps(SourcingEngine().resume(args.run, db), ensure_ascii=False, indent=2))
     elif args.cmd == "source-cancel":
         print(json.dumps(SourcingEngine.cancel(args.run, db), ensure_ascii=False, indent=2))
+    elif args.cmd == "source-monitor":
+        from .source_safety import SourceMonitorService
+        # Phase 4.1.1 is deliberately one-shot and preview-only unless a future
+        # caller explicitly injects/configures a provider execution contract.
+        result = SourceMonitorService(db).preview_due_checks(args.store, limit=args.limit)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 

@@ -26,6 +26,27 @@
       } catch (_error) { /* malformed structured data: use DOM fallback */ }
     }
     const offer = product?.offers && (Array.isArray(product.offers) ? product.offers[0] : product.offers);
+    const structuredAvailability = offer?.availability || null;
+    const availabilityMap = {instock:'IN_STOCK',outofstock:'OUT_OF_STOCK',limitedavailability:'LIMITED',preorder:'PREORDER',backorder:'BACKORDER'};
+    const structuredKey = String(structuredAvailability || '').replace(/\/$/,'').split('/').pop().toLowerCase();
+    const availabilityText = first(['#availability span', '#availability', '#outOfStock']) || '';
+    const normalizedAvailabilityText = availabilityText.toLowerCase().replace(/\s+/g,' ').trim().slice(0,160);
+    let sourceAvailability = availabilityMap[structuredKey] || 'UNKNOWN';
+    let availabilityEvidence = structuredAvailability
+      ? {kind:'JSON_LD_OFFER_AVAILABILITY',value:String(structuredAvailability)}
+      : {kind:'NO_AVAILABILITY_EVIDENCE'};
+    let availabilityConfidence = structuredAvailability && sourceAvailability !== 'UNKNOWN' ? 'HIGH' : 'UNKNOWN';
+    if (sourceAvailability === 'UNKNOWN' && normalizedAvailabilityText) {
+      if (/currently unavailable|out of stock/.test(normalizedAvailabilityText)) sourceAvailability = 'OUT_OF_STOCK';
+      else if (/in stock/.test(normalizedAvailabilityText)) sourceAvailability = 'IN_STOCK';
+      else if (/pre-?order/.test(normalizedAvailabilityText)) sourceAvailability = 'PREORDER';
+      else if (/backorder/.test(normalizedAvailabilityText)) sourceAvailability = 'BACKORDER';
+      else if (/limited/.test(normalizedAvailabilityText)) sourceAvailability = 'LIMITED';
+      if (sourceAvailability !== 'UNKNOWN') {
+        availabilityConfidence = 'MEDIUM';
+        availabilityEvidence = {kind:'VISIBLE_AVAILABILITY_TEXT',normalized:normalizedAvailabilityText};
+      }
+    }
     const rawImages = product?.image ? (Array.isArray(product.image) ? product.image : [product.image]) : [];
     const imageDimensions = {};
     const domImage = document.querySelector('#landingImage');
@@ -61,6 +82,7 @@
       rating:Number((String(ratingText || '').match(/[0-9]+(?:\.[0-9]+)?/) || [])[0]) || null,
       reviewCount:Number((String(reviewText || '').replace(/,/g, '').match(/[0-9]+/) || [])[0]) || null,
       options, quantity:null, tags:[], _imageDimensions:imageDimensions,
+      sourceAvailability, availabilityConfidence, availabilityEvidence,
       _sourceUrl:location.href.split('#')[0], _listPage:null, _collectedAt:new Date().toISOString()};
   }
   function productDataReady() {

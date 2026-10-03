@@ -2,6 +2,14 @@ ShopSource Studio — Phase 4.2
 CABIN TIDY CONTROLLED LIVE PILOT
 Real Shopify Read/Write Validation With Small, Reversible Gates
 
+PHASE 4.1.1 SOURCE SAFETY PREREQUISITE (MANDATORY)
+- Phase 4.1.1 must be COMPLETE before this pilot can start.
+- Begin with a READ-ONLY Sold Out diagnosis; a Shopify Sold Out label never proves Amazon/source OOS.
+- Every selected product requires a fresh source snapshot, IN_STOCK availability, FRESH status, refreshed source price, and source sellability gate pass.
+- Include the latest source snapshot fingerprint in the Shopify preview hash.
+- Any source price, availability, timestamp, or snapshot change after preview makes it PREVIEW_STALE and requires a new preview.
+- UNKNOWN, SOURCE_ERROR, OUT_OF_STOCK, and stale source data block even DRAFT pilot writes.
+
 Repository
 - Local: D:\shop\001_so_amazon
 - Remote: https://github.com/1976haru/spa.git

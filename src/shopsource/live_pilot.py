@@ -73,6 +73,26 @@ class ExistingServicesAdapter:
     def preview_products(self, store_id: str, limit: int) -> dict:
         return self.product_pilot.preview(store_id, limit=limit, media_mode="MANUAL_MEDIA")
 
+    def source_safety_gate(self, store_id: str, preview: dict) -> dict:
+        from .source_safety import SourceSafetyService
+        safety = SourceSafetyService(self.db)
+        results = []
+        for item in preview.get("items", []):
+            product_id = item.get("master_product_id")
+            result = safety.evaluate(store_id, product_id, selling_price=item.get("selling_price"), pre_list=True)
+            if result["source_availability"] != "IN_STOCK" or result["freshness_status"] != "FRESH":
+                raise RuntimeError(f"SOURCE_FRESHNESS_CHECK 실패: product {product_id}")
+            if result["sellability_status"] not in {"SELLABLE", "NEEDS_PRICING_POLICY"}:
+                raise RuntimeError(f"source sellability 차단: {result['sellability_status']}")
+            results.append(result)
+        ids = [item.get("master_product_id") for item in preview.get("items", [])]
+        return {"items": results, "snapshot_fingerprint": safety.snapshot_fingerprint(store_id, ids)}
+
+    def current_source_fingerprint(self, store_id: str, preview: dict):
+        from .source_safety import SourceSafetyService
+        ids = [item.get("master_product_id") for item in preview.get("items", [])]
+        return SourceSafetyService(self.db).snapshot_fingerprint(store_id, ids)
+
     def write_products(self, sync_run_id: str) -> dict:
         return self.product_pilot.execute(sync_run_id, live_confirmed=True)
 
@@ -280,6 +300,8 @@ class ControlledLivePilotService:
         data.update({"items": items, "limit": limit, "max_products": self.MAX_PRODUCTS,
                      "publish_status": "DRAFT", "images_enabled": False,
                      "writes_performed": False, "preview_hash": _hash(items)})
+        if hasattr(self.adapter, "source_safety_gate"):
+            data["source_safety"] = self.adapter.source_safety_gate(run["store_id"], data)
         self._write_json(run, "product_preview.json", data)
         self._update(run_id, gate="PRODUCT_WRITE", status="AWAITING_CONFIRMATION",
                      checkpoint={"product_preview": data})
@@ -295,6 +317,11 @@ class ControlledLivePilotService:
             self.stop(run_id, "유효하지 않은 상품 미리보기")
         if preview.get("preview_hash") != _hash(preview.get("items", [])):
             self.stop(run_id, "stale preview")
+        if hasattr(self.adapter, "current_source_fingerprint"):
+            expected = (preview.get("source_safety") or {}).get("snapshot_fingerprint")
+            current = self.adapter.current_source_fingerprint(run["store_id"], preview)
+            if expected != current:
+                self.stop(run_id, "PREVIEW_STALE: source snapshot changed")
         sync_run_id = preview.get("run_id") or preview.get("sync_run_id")
         try:
             result = self.adapter.write_products(sync_run_id, preview=preview)
