@@ -17,7 +17,8 @@ from ..collection_planner import CollectionPlanner
 from ..shopify_collections import ShopifyCollectionPublisher, get_connection as get_shopify_connection, save_connection as save_shopify_connection, save_shopify_token
 from ..collection_images import ManualImageProvider, OpenAIImagesProvider, generate_collection_image
 from ..classifier import classify_store
-from ..db import get_store, init_db, upsert_store
+from ..db import connect, get_store, init_db, upsert_store
+from ..homepage_collections import HomepageCollectionService, ShopifyThemeReader, build_homepage_plan
 from ..intelligence.keyword_engine import KeywordEngine
 from ..paths import AMAZON_INBOX_DIR, EXPORT_DIR, STORE_DIR
 from ..importer import import_amazon_source
@@ -262,7 +263,7 @@ class OperatorUI:
             with ui.expansion("Shopify 연결 설정 (토큰은 Windows 자격 증명에만 저장)", icon="lock"):
                 shop_domain = ui.input("Shopify shop domain (*.myshopify.com)", value=config.get("shop_domain", "") if config else "").classes("w-96")
                 shop_token = ui.input("Admin API access token (저장 후 화면에서 지워짐)").props("type=password autocomplete=new-password").classes("w-96")
-                ui.label("Required scopes: read_products, write_products, read_publications; publication: write_publications; Files: write_files").classes("text-xs text-slate-600")
+                ui.label("Scopes: read_products, write_products, read_publications; homepage theme read: read_themes. Shopify theme write needs write_themes plus Shopify exemption; this phase never performs theme writes.").classes("text-xs text-slate-600")
                 def save_shopify_config():
                     try:
                         save_shopify_connection(self.current_store, shop_domain.value or "")
@@ -386,6 +387,97 @@ class OperatorUI:
                 ui.button("컬렉션 이미지 모두 생성", on_click=generate_all_images, icon="collections").props("outline")
                 ui.button("Shopify에 컬렉션 생성/동기화", on_click=confirm_shopify_sync, icon="cloud_upload").props("color=primary")
             ui.label("Collection sync report에는 조건, 결과, Shopify ID가 기록됩니다. secrets는 포함되지 않습니다.").classes("text-xs text-slate-500")
+
+        ui.separator()
+        with ui.card().classes("w-full border border-indigo-200 bg-indigo-50"):
+            ui.label("홈페이지 컬렉션 배치").classes("text-lg font-semibold")
+            ui.label("테마 구성은 read_themes 권한으로만 읽습니다. 적용 버튼은 SAFE / DRY-RUN이며 Shopify theme API를 호출하지 않습니다.").classes("text-sm text-amber-800")
+            theme_status = ui.label("Theme: 확인 전 · 현재 published theme").classes("font-medium")
+            homepage_status = ui.label("홈페이지 계획: 아직 미리보기 전").classes("text-sm")
+            homepage_result = {"value": None}
+            homepage_area = ui.column().classes("w-full gap-1")
+
+            def homepage_preview():
+                try:
+                    plan = plan_ref.get("plan")
+                    if not plan:
+                        raise ValueError("먼저 컬렉션 자동 설계를 실행하세요.")
+                    snapshot = ShopifyThemeReader().discover(self.current_store)
+                    theme = snapshot.get("theme") or {}
+                    theme_status.set_text(f"Theme: {theme.get('name', snapshot['status'])} · {theme.get('role', '')} · {theme.get('id', '')}")
+                    if snapshot.get("status") != "CONNECTED":
+                        homepage_status.set_text("MANUAL PATCH MODE · " + str(snapshot.get("warning") or "Theme read scope unavailable"))
+                        homepage_result["value"] = None
+                        ui.notify("read_themes 권한 또는 published theme 확인이 필요합니다. live write는 수행하지 않습니다.", type="warning")
+                        return
+                    publisher = ShopifyCollectionPublisher()
+                    image_ready = {row["collection_key"] for row in plan.get("collections", [])
+                                   if publisher._image_asset(self.current_store, row["collection_key"])}
+                    with connect() as con:
+                        mappings = {row["collection_key"]: row["handle"] for row in con.execute(
+                            "SELECT collection_key,handle FROM shopify_collection_mappings WHERE store_id=?", (self.current_store,))}
+                    result = build_homepage_plan(snapshot, plan, collection_handles=mappings, image_ready=image_ready)
+                    homepage_result["value"] = result
+                    homepage_status.set_text(f"{result['status']} · 제안 {sum(op.get('action') == 'CREATE SECTION' for op in result.get('operations', []))}개 section · ratio {result.get('image_ratio', 'Theme default')}")
+                    homepage_area.clear()
+                    with homepage_area:
+                        for operation in result.get("operations", []):
+                            ui.label(f"{operation.get('action')} · {operation.get('collection') or operation.get('reason', '')}").classes(
+                                "text-sm text-amber-800" if operation.get("action") == "CONFLICT" else "text-sm")
+                        for warning in result.get("warnings", []):
+                            ui.label("경고: " + warning).classes("text-sm text-amber-800")
+                        ui.label("추천 컬렉션: " + ", ".join(op.get("collection", "") for op in result.get("operations", []) if op.get("collection"))).classes("text-sm")
+                        ui.label(f"상품 표시 수: {result.get('products_per_section', '테마 기본값')} · 적용 위치: {result.get('template_filename', '수동 계획')}").classes("text-xs text-slate-600")
+                    ui.notify("홈페이지 JSON 미리보기를 만들었습니다. 테마에는 변경을 쓰지 않았습니다.", type="positive")
+                except Exception as exc:
+                    homepage_status.set_text("미리보기 실패: " + _safe_error(exc))
+                    ui.notify(_safe_error(exc), type="negative")
+
+            def homepage_diff():
+                result = homepage_result.get("value")
+                if not result:
+                    ui.notify("먼저 홈페이지 미리보기를 실행하세요.", type="warning")
+                    return
+                with ui.dialog() as dialog, ui.card().classes("w-[1000px] max-w-[95vw] max-h-[85vh] overflow-auto"):
+                    ui.label("Homepage JSON 변경사항 · SAFE DRY RUN").classes("text-lg font-bold")
+                    ui.label(json.dumps(result.get("operations", []), ensure_ascii=False, indent=2)).classes("whitespace-pre-wrap text-xs")
+                    ui.label("제안 JSON").classes("font-semibold")
+                    ui.label(json.dumps(result.get("proposed"), ensure_ascii=False, indent=2)).classes("whitespace-pre-wrap text-xs")
+                    ui.button("닫기", on_click=dialog.close).props("flat")
+                dialog.open()
+
+            def safe_apply_homepage():
+                result = homepage_result.get("value")
+                if not result:
+                    ui.notify("먼저 홈페이지 미리보기를 실행하세요.", type="warning")
+                    return
+                try:
+                    saved = HomepageCollectionService().save_safe_patch(result, store_id=self.current_store)
+                    ui.notify(f"SAFE/DRY-RUN 완료 · 로컬 백업/수동 패치 저장: {saved['folder']} · Shopify write 0", type="positive")
+                    homepage_status.set_text("MANUAL PATCH MODE · 로컬 백업 생성 · 실제 theme write 없음")
+                except Exception as exc:
+                    ui.notify(_safe_error(exc), type="negative")
+
+            def preview_homepage_rollback():
+                try:
+                    rollback = HomepageCollectionService().latest_backup(self.current_store)
+                    if not rollback:
+                        ui.notify("롤백 계획을 만들 백업이 없습니다.", type="warning")
+                        return
+                    with ui.dialog() as dialog, ui.card().classes("w-[900px] max-w-[95vw]"):
+                        ui.label("롤백 계획 · 수동 적용만 가능 (theme write 없음)").classes("font-bold")
+                        ui.label(f"Backup {rollback['backup_id']} · before.json을 Shopify Theme Editor에서 검토하세요.")
+                        ui.label(json.dumps(rollback["before"], ensure_ascii=False, indent=2)).classes("whitespace-pre-wrap text-xs max-h-[65vh] overflow-auto")
+                        ui.button("닫기", on_click=dialog.close).props("flat")
+                    dialog.open()
+                except Exception as exc:
+                    ui.notify(_safe_error(exc), type="negative")
+
+            with ui.row().classes("flex-wrap"):
+                ui.button("홈페이지 미리보기", on_click=homepage_preview, icon="visibility").props("outline")
+                ui.button("변경사항 보기", on_click=homepage_diff, icon="difference").props("outline")
+                ui.button("홈페이지 추천 컬렉션 적용 (SAFE/DRY-RUN)", on_click=safe_apply_homepage, icon="shield").props("color=primary")
+                ui.button("롤백", on_click=preview_homepage_rollback, icon="undo").props("outline")
 
     def _heading(self, title: str, subtitle: str | None = None):
         self.ui.label(title).classes("text-2xl font-bold text-slate-900")
