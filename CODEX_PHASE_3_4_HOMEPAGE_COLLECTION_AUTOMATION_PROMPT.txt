@@ -1,0 +1,161 @@
+ShopSource Studio — Phase 3.4
+SHOPIFY HOMEPAGE FEATURED COLLECTION AUTOMATION
+
+Prerequisite:
+Phase 3.2 collection planner and Phase 3.3 Shopify collection publisher complete.
+
+Goal:
+Automate the second half of the collection mission:
+place selected collections on the Shopify home page as Featured Collection sections.
+
+This is theme-sensitive and must be safer than product/collection API sync.
+
+==================================================
+0. Safety
+==================================================
+
+Never edit live theme blindly.
+
+Before any change:
+- identify current published theme
+- download/read relevant theme JSON/schema
+- create backup snapshot
+- dry-run proposed JSON diff
+- user explicit confirmation required
+
+Do not perform live theme write during Codex implementation/tests.
+
+==================================================
+1. Shopify scopes/API
+==================================================
+
+Check official current Shopify API requirements for theme read/write.
+Do not assume scope availability.
+
+If write_themes is unavailable/not approved:
+fall back to:
+- generate exact theme change plan
+- export patch/manual instructions
+- do not use browser-click automation as default
+
+==================================================
+2. Theme detection
+==================================================
+
+Identify published theme and templates/index.json or equivalent.
+
+Inspect available section types/schema.
+
+Find a section type that corresponds to:
+- featured collection
+- collection
+- collection list
+
+Do not assume Dawn schema on all stores.
+
+==================================================
+3. Homepage plan
+==================================================
+
+From Phase 3.2 collection priority, select default top 3–5 collections.
+
+User UI:
+Featured homepage collections:
+☑ Trunk Organizers
+☑ Seat Organizers
+☑ Console Storage
+☑ Cargo & Travel
+
+Image ratio:
+[Square] default
+
+Product cards per section:
+theme-supported default.
+
+==================================================
+4. Dry-run diff
+==================================================
+
+Generate:
+- current theme JSON snapshot
+- proposed theme JSON
+- structured diff
+- sections to add
+- collection handles/IDs
+- order
+
+No write yet.
+
+==================================================
+5. Apply
+==================================================
+
+Only explicit button:
+[홈페이지 추천 컬렉션 적용]
+
+On apply:
+- backup current theme config
+- write smallest possible change
+- re-fetch/verify
+- provide rollback button using backup
+
+No unrelated theme formatting changes.
+
+==================================================
+6. Idempotency
+==================================================
+
+Repeated apply must not duplicate the same Featured Collection section.
+
+Map ShopSource section IDs in theme settings where possible.
+
+If user manually moved/edited section:
+detect drift and show conflict.
+
+==================================================
+7. UI
+==================================================
+
+### 홈페이지 컬렉션 배치
+
+Theme: <name>
+Status: CONNECTED
+
+[미리보기]
+[변경사항 보기]
+[적용]
+[롤백]
+
+Show:
+section order
+collection
+image ratio
+products shown
+
+==================================================
+8. Tests
+==================================================
+
+Mock theme API/files.
+
+Required:
+test_theme_detect_featured_collection_schema
+test_theme_dry_run_no_write
+test_theme_backup_before_write
+test_theme_apply_minimal_diff
+test_theme_repeat_apply_no_duplicate
+test_theme_drift_conflict
+test_theme_rollback
+test_theme_unsupported_falls_back_to_manual_plan
+test_no_live_theme_write_in_tests
+
+==================================================
+9. Commit/push
+==================================================
+
+Commit:
+git commit -m "Add homepage collection automation"
+
+push origin/main
+
+Implement but DO NOT write the live theme during Codex execution.
