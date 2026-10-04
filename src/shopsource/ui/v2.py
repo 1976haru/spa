@@ -35,7 +35,7 @@ from ..runtime_doctor import PIL_MISSING_KO, dependency_doctor, repair_runtime_d
 from ..navigation import MegaMenuThemeService, NavigationService
 from ..store_build import StoreBuildOrchestrator
 from ..store_completion import DOMAINS, StoreCompletionService
-from ..production import GATES, ProductionGoldenPathService
+from ..production import GATE_LABELS_KO, ProductionGoldenPathService
 from ..security import redact_text
 from ..intelligence.keyword_engine import KeywordEngine
 from ..paths import AMAZON_INBOX_DIR, EXPORT_DIR, STORE_DIR
@@ -312,6 +312,7 @@ class OperatorUI:
         service = ProductionGoldenPathService()
         state = {"run": None}
         summary = ui.label("아직 production 점검 run이 없습니다.").classes("ss-card-title")
+        progress_report_label = ui.label("현재 단계: 아직 시작 전").classes("ss-help")
         with ui.row().classes("w-full flex-wrap gap-3"):
             start = ui.button("실전 스토어 자동 구축 시작", icon="rocket_launch").props("color=primary size=lg")
             ui.button("기존 점검 다시 열기", icon="history", on_click=lambda: load_latest()).props("outline size=lg")
@@ -319,13 +320,23 @@ class OperatorUI:
         cards = ui.column().classes("w-full gap-2")
         def render(run):
             state["run"] = run
-            summary.set_text(f"판정: {run['status']} · 확인된 gate {run['summary'].get('completion_percent', 0)}% · 미해결 {run['summary'].get('blocker_count', 0)}")
+            progress_state = service.progress_report(run["run_id"])
+            summary.set_text(f"실전 진행률: {progress_state['production_readiness_percent']}% · 판정: {run['status']} · 미해결 {run['summary'].get('blocker_count', 0)}")
+            progress_report_label.set_text(
+                f"현재 단계: {progress_state['current_stage_label']}\n완료: {', '.join(progress_state['completed_labels']) or '없음'}\n"
+                f"남은 것: {', '.join(progress_state['remaining_labels']) or '없음'}\n"
+                f"현재 blocker/risk: {progress_state['blockers'][0]['reasons'] if progress_state['blockers'] else '확인된 blocker 없음'}\n"
+                f"다음 실행: {progress_state['next_action']}"
+            )
             cards.clear()
             with cards:
                 for gate in run["gates"]:
                     with ui.card().classes("w-full p-4 border border-slate-200"):
-                        ui.label(f"{gate['position'] + 1:02d}. {gate['gate_key']}").classes("ss-card-title")
-                        ui.label(gate["status"]).classes("font-semibold")
+                        ui.label(f"{gate['position'] + 1:02d}. {GATE_LABELS_KO.get(gate['gate_key'], gate['gate_key'])}").classes("ss-card-title")
+                        status_ko = {"NOT_STARTED": "아직 확인 전", "READY": "준비됨", "READY_WITH_WARNINGS": "주의와 함께 준비됨",
+                                     "VERIFIED": "검증 완료", "REVIEW_REQUIRED": "확인 필요", "WAITING_FOR_INPUT": "정보 입력 필요",
+                                     "WAITING_FOR_CONFIRMATION": "사용자 확인 대기", "BLOCKED": "차단", "RUNNING": "진행 중"}
+                        ui.label(status_ko.get(gate["status"], gate["status"])).classes("font-semibold")
                         for reason in gate["blockers"][:5]: ui.label(f"• {reason}").classes("ss-help")
         def load_latest():
             with connect() as con:

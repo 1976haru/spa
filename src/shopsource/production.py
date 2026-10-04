@@ -25,13 +25,20 @@ GATES = (
     "COMMERCE_READINESS", "CONTROLLED_LIVE_PILOT", "BATCH_EXPANSION",
     "FINAL_LAUNCH_READINESS",
 )
+GATE_LABELS_KO = dict(zip(GATES, (
+    "스토어 연결·환경", "상품 소싱 품질", "원본 재고·가격 안전", "상품 설명 품질", "상품 이미지·사용 권리",
+    "판매가·마진", "컬렉션 구성", "컬렉션·카테고리 이미지", "브랜드·로고·메뉴", "홈페이지",
+    "상품·컬렉션 화면 구성", "페이지·정책", "검색 노출·접근성·모바일", "배송·결제 등 판매 설정",
+    "10개 상품 안전 파일럿", "상품 업로드 단계 확대", "최종 출시 확인",
+)))
 GATE_STATES = {"NOT_STARTED", "RUNNING", "READY", "READY_WITH_WARNINGS", "REVIEW_REQUIRED",
                "WAITING_FOR_INPUT", "WAITING_FOR_CONFIRMATION", "BLOCKED", "VERIFIED"}
 PRODUCTION_CLASSES = {"PRODUCTION_CANDIDATE", "RESERVE", "REVIEW_REQUIRED", "REJECT_FOR_STORE", "RESTRICTED"}
 MEDIA_POLICIES = {"SUPPLIER_AUTHORIZED", "MERCHANT_OWNED", "LICENSED", "GENERATED_LIFESTYLE_ONLY",
                   "MANUAL_REVIEW_REQUIRED", "NO_RIGHTS_CONFIRMED"}
 ALLOWED_PRODUCT_MEDIA = {"SUPPLIER_AUTHORIZED", "MERCHANT_OWNED", "LICENSED"}
-ROLLOUT = (10, 50, 200)
+ROLLOUT_STAGE_NAMES = ("PILOT", "VALIDATION_BATCH", "MAIN_CATALOG")
+ROLLOUT_VALIDATION_DEFAULT = 100
 
 
 def _now():
@@ -63,8 +70,11 @@ def _install(db):
           PRIMARY KEY(store_id,product_id));
         CREATE TABLE IF NOT EXISTS production_rollouts(
           store_id TEXT PRIMARY KEY,batch_index INTEGER NOT NULL DEFAULT 0,last_verified_count INTEGER NOT NULL DEFAULT 0,
-          critical_mismatches INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL);
+          critical_mismatches INTEGER NOT NULL DEFAULT 0,expected_batch_count INTEGER,updated_at TEXT NOT NULL);
         """)
+        rollout_columns = {row["name"] for row in con.execute("PRAGMA table_info(production_rollouts)")}
+        if "expected_batch_count" not in rollout_columns:
+            con.execute("ALTER TABLE production_rollouts ADD COLUMN expected_batch_count INTEGER")
 
 
 def inspect_product(product: dict, *, safety: dict | None = None, media_policy: str | None = None,
@@ -239,6 +249,25 @@ class ProductionGoldenPathService:
                             "blockers": json.loads(g.pop("blockers_json") or "[]")} for g in gates]
         return result
 
+    def progress_report(self, run_id: str) -> dict:
+        """Human-facing progress is gate evidence only, never implementation/test progress."""
+        run = self.get(run_id)
+        passed = {"READY", "READY_WITH_WARNINGS", "VERIFIED"}
+        completed = [gate["gate_key"] for gate in run["gates"] if gate["status"] in passed]
+        remaining = [gate["gate_key"] for gate in run["gates"] if gate["status"] not in passed]
+        current = next((gate for gate in run["gates"] if gate["status"] not in passed), None)
+        blockers = [{"gate": gate["gate_key"], "status": gate["status"], "reasons": gate["blockers"]}
+                    for gate in run["gates"] if gate["status"] in {"BLOCKED", "REVIEW_REQUIRED", "WAITING_FOR_INPUT", "WAITING_FOR_CONFIRMATION"}]
+        return {"production_readiness_percent": run["summary"].get("completion_percent", 0),
+                "current_stage": current["gate_key"] if current else "COMPLETE",
+                "current_stage_label": GATE_LABELS_KO.get(current["gate_key"], "완료") if current else "완료",
+                "completed": completed, "remaining": remaining, "blockers": blockers,
+                "completed_labels": [GATE_LABELS_KO[x] for x in completed],
+                "remaining_labels": [GATE_LABELS_KO[x] for x in remaining],
+                "next_action": (current["blockers"][0] if current and current["blockers"] else
+                                ("이 gate의 실제 근거를 확인하고 연결하세요." if current else "최종 launch readiness를 검토하세요.")),
+                "code_complete_does_not_imply_launch_ready": True}
+
     def update(self, run_id: str, evidence_by_gate: dict[str, dict]) -> dict:
         run = self.get(run_id)
         unknown = set(evidence_by_gate) - set(GATES)
@@ -372,8 +401,10 @@ class ProductionGoldenPathService:
         self.write_report(run_id, evidence, findings)
         return result
 
-    def rollout(self, store_id: str, *, verified=True, critical_mismatch=False, explicit_confirmed=False) -> dict:
-        """Enforce 10→50→200 DRAFT batches; never changes ACTIVE or calls Shopify."""
+    def rollout(self, store_id: str, *, validation_batch_size=ROLLOUT_VALIDATION_DEFAULT,
+                main_catalog_count=None, validation_evidence: dict | None = None,
+                verified=True, critical_mismatch=False, explicit_confirmed=False) -> dict:
+        """Plan Pilot→one validation batch→main catalog; never calls Shopify."""
         if critical_mismatch:
             target = self._record_rollout(store_id, mismatch=True)
             return {"status": "BLOCKED", "batch_size": 0, "next_batch": target, "reason": "CRITICAL_MISMATCH"}
@@ -381,25 +412,48 @@ class ProductionGoldenPathService:
         if current["critical_mismatches"]:
             return {"status": "BLOCKED", "batch_size": 0, "reason": "CRITICAL_MISMATCH"}
         index = current["batch_index"]
-        if index >= len(ROLLOUT): return {"status": "REVIEW_REQUIRED", "batch_size": 0, "next_batch": None, "reason": "LARGER_BATCH_REQUIRES_REVIEW"}
-        if not explicit_confirmed: return {"status": "WAITING_FOR_CONFIRMATION", "batch_size": ROLLOUT[index], "publish_status": "DRAFT", "write_performed": False}
+        if index >= len(ROLLOUT_STAGE_NAMES): return {"status": "REVIEW_REQUIRED", "batch_size": 0, "stage": "COMPLETE", "reason": "ROLLOUT_COMPLETE"}
+        if index == 0: batch_size = 10
+        elif index == 1:
+            batch_size = int(validation_batch_size)
+            if not 100 <= batch_size <= 200: raise ValueError("Validation batch must be between 100 and 200")
+            evidence = validation_evidence or {}
+            missing = [key for key in ("source_fresh", "media_ready", "api_safe") if evidence.get(key) is not True]
+            if missing: return {"status": "WAITING_FOR_INPUT", "stage": ROLLOUT_STAGE_NAMES[index], "batch_size": batch_size,
+                                "reason": "VALIDATION_READINESS_REQUIRED", "missing_evidence": missing}
+        else:
+            if main_catalog_count is None: return {"status": "WAITING_FOR_INPUT", "stage": ROLLOUT_STAGE_NAMES[index], "batch_size": 0,
+                                                  "reason": "REMAINING_PRODUCTION_APPROVED_COUNT_REQUIRED"}
+            batch_size = int(main_catalog_count)
+            if batch_size < 1: return {"status": "REVIEW_REQUIRED", "stage": ROLLOUT_STAGE_NAMES[index], "batch_size": 0,
+                                       "reason": "NO_REMAINING_PRODUCTION_APPROVED_PRODUCTS"}
+        if not explicit_confirmed: return {"status": "WAITING_FOR_CONFIRMATION", "stage": ROLLOUT_STAGE_NAMES[index], "batch_size": batch_size, "publish_status": "DRAFT", "write_performed": False}
         if not verified: return {"status": "BLOCKED", "batch_size": 0, "reason": "PREVIOUS_BATCH_NOT_VERIFIED"}
-        return {"status": "READY_FOR_EXPLICIT_WRITE", "batch_size": ROLLOUT[index], "publish_status": "DRAFT", "write_performed": False,
-                "next_batch": None}
+        self._set_rollout_expected(store_id, batch_size)
+        return {"status": "READY_FOR_EXPLICIT_WRITE", "stage": ROLLOUT_STAGE_NAMES[index], "batch_size": batch_size,
+                "publish_status": "DRAFT", "write_performed": False, "next_batch": None}
 
     def record_batch_verification(self, store_id: str, *, expected_count: int, verified_count: int,
+                                  write_confirmed=False, remote_reread_verified=False,
                                   critical_mismatch=False) -> dict:
         """Advance rollout checkpoint only after matching remote reread evidence."""
         current = self._get_rollout(store_id)
         index = current["batch_index"]
-        if current["critical_mismatches"] or index >= len(ROLLOUT):
+        if current["critical_mismatches"] or index >= len(ROLLOUT_STAGE_NAMES):
             return {"status": "BLOCKED", "reason": "ROLLOUT_STOPPED_OR_COMPLETE"}
-        if critical_mismatch or int(expected_count) != ROLLOUT[index] or int(verified_count) != int(expected_count):
+        expected_count = int(expected_count)
+        if not write_confirmed or not remote_reread_verified:
+            return {"status": "BLOCKED", "reason": "EXPLICIT_WRITE_CONFIRMATION_AND_REMOTE_REREAD_REQUIRED"}
+        if current.get("expected_batch_count") is None:
+            return {"status": "BLOCKED", "reason": "BATCH_NOT_AUTHORIZED"}
+        stage_size_valid = current.get("expected_batch_count") == expected_count and (expected_count == 10 if index == 0 else
+                            100 <= expected_count <= 200 if index == 1 else expected_count > 0)
+        if critical_mismatch or not stage_size_valid or int(verified_count) != expected_count:
             self._record_rollout(store_id, mismatch=True)
             return {"status": "BLOCKED", "reason": "CRITICAL_MISMATCH", "next_batch": None}
         saved = self._record_rollout(store_id, verified_count=int(verified_count))
-        next_size = ROLLOUT[saved["batch_index"]] if saved["batch_index"] < len(ROLLOUT) else None
-        return {"status": "VERIFIED", "verified_count": int(verified_count), "next_batch": next_size}
+        next_stage = ROLLOUT_STAGE_NAMES[saved["batch_index"]] if saved["batch_index"] < len(ROLLOUT_STAGE_NAMES) else "COMPLETE"
+        return {"status": "VERIFIED", "stage": ROLLOUT_STAGE_NAMES[index], "verified_count": int(verified_count), "next_stage": next_stage}
 
     def active_publication_gate(self, *, blockers: list[str], explicit_confirmed=False) -> dict:
         if blockers: return {"status": "BLOCKED", "reasons": list(blockers), "publish_status": "DRAFT", "write_performed": False}
@@ -411,13 +465,19 @@ class ProductionGoldenPathService:
             row = con.execute("SELECT * FROM production_rollouts WHERE store_id=?", (str(store_id),)).fetchone()
         return dict(row) if row else {"store_id": str(store_id), "batch_index": 0, "last_verified_count": 0, "critical_mismatches": 0}
 
+    def _set_rollout_expected(self, store_id, expected_count):
+        with connect(self.db) as con:
+            con.execute("INSERT INTO production_rollouts(store_id,batch_index,last_verified_count,critical_mismatches,expected_batch_count,updated_at) "
+                        "VALUES(?,0,0,0,?,?) ON CONFLICT(store_id) DO UPDATE SET expected_batch_count=excluded.expected_batch_count,updated_at=excluded.updated_at",
+                        (str(store_id), int(expected_count), _now()))
+
     def _record_rollout(self, store_id, *, verified_count=0, mismatch=False):
         state = self._get_rollout(store_id)
         now = _now()
         with connect(self.db) as con:
-            con.execute("INSERT INTO production_rollouts(store_id,batch_index,last_verified_count,critical_mismatches,updated_at) VALUES(?,?,?,?,?) "
-                        "ON CONFLICT(store_id) DO UPDATE SET batch_index=excluded.batch_index,last_verified_count=excluded.last_verified_count,critical_mismatches=excluded.critical_mismatches,updated_at=excluded.updated_at",
-                        (str(store_id), state["batch_index"] if mismatch else min(state["batch_index"] + 1, len(ROLLOUT)),
+            con.execute("INSERT INTO production_rollouts(store_id,batch_index,last_verified_count,critical_mismatches,expected_batch_count,updated_at) VALUES(?,?,?,?,NULL,?) "
+                        "ON CONFLICT(store_id) DO UPDATE SET batch_index=excluded.batch_index,last_verified_count=excluded.last_verified_count,critical_mismatches=excluded.critical_mismatches,expected_batch_count=NULL,updated_at=excluded.updated_at",
+                        (str(store_id), state["batch_index"] if mismatch else min(state["batch_index"] + 1, len(ROLLOUT_STAGE_NAMES)),
                          state["last_verified_count"] if mismatch else int(verified_count), state["critical_mismatches"] + int(mismatch), now))
         return self._get_rollout(store_id)
 
@@ -427,7 +487,8 @@ class ProductionGoldenPathService:
         target.mkdir(parents=True, exist_ok=True)
         findings = findings if findings is not None else no_placeholder_audit(evidence)
         report = {"run_id": run_id, "store_id": run["store_id"], "status": run["status"],
-                  "summary": run["summary"], "gates": run["gates"], "blockers": findings,
+                  "summary": run["summary"], "production_progress": self.progress_report(run_id),
+                  "gates": run["gates"], "blockers": findings,
                   "provider_calls": 0, "shopify_writes": 0, "theme_writes": 0}
         files = {
             "production_summary.json": report, "blockers.json": findings,
@@ -452,6 +513,9 @@ class ProductionGoldenPathService:
         (target / "final_launch_report.md").write_text(
             "# Cabin Tidy 실전 스토어 최종 점검\n\n"
             f"- 판정: {run['status']}\n- 완료 gate: {run['summary'].get('completion_percent', 0)}%\n"
+            f"- 현재 단계: {self.progress_report(run_id)['current_stage_label']}\n"
+            f"- 남은 gate: {', '.join(self.progress_report(run_id)['remaining_labels']) or '없음'}\n"
+            f"- 다음 작업: {self.progress_report(run_id)['next_action']}\n"
             f"- 차단/확인 항목: {len(findings)}\n- Shopify 변경: 없음\n- 실제 provider 실행: 없음\n\n"
             + "\n".join(f"- [{item['severity']}] {item['entity']}: {item['code']} — 다음 작업을 확인하세요." for item in findings),
             encoding="utf-8")

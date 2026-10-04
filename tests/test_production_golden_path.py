@@ -33,6 +33,10 @@ def test_all_production_gates_are_persisted_and_unknown_is_not_ready(tmp_path):
     assert run["summary"]["completion_percent"] == 0
     assert run["checkpoint"]["store_build_mode"] == "PREVIEW"
     assert run["checkpoint"]["store_build_run_id"].startswith("SBR_")
+    report = ProductionGoldenPathService(db=tmp_path / "prod.sqlite3").progress_report(run["run_id"])
+    assert report["production_readiness_percent"] == 0
+    assert report["current_stage"] == "ENVIRONMENT_STORE_IDENTITY"
+    assert report["remaining"] and report["blockers"]
 
 
 def test_gate_prerequisites_block_false_ready_and_blocker_overrides_score(tmp_path):
@@ -104,15 +108,24 @@ def test_business_facts_are_never_fabricated_and_report_is_secret_safe(tmp_path)
     assert "support email" in text or "PAGES_POLICIES" in text
 
 
-def test_rollout_is_10_50_200_confirmed_draft_and_mismatch_stops(tmp_path):
+def test_rollout_is_three_stages_pilot_validation_main_and_mismatch_stops(tmp_path):
     svc = ProductionGoldenPathService(db=tmp_path / "rollout.sqlite3")
     first = svc.rollout("001")
     assert first["batch_size"] == 10 and first["publish_status"] == "DRAFT" and not first["write_performed"]
-    assert svc.record_batch_verification("001", expected_count=10, verified_count=10)["next_batch"] == 50
-    assert svc.rollout("001", explicit_confirmed=True)["batch_size"] == 50
-    assert svc.record_batch_verification("001", expected_count=50, verified_count=50)["next_batch"] == 200
-    assert svc.rollout("001", explicit_confirmed=True)["batch_size"] == 200
-    assert svc.record_batch_verification("001", expected_count=200, verified_count=199)["status"] == "BLOCKED"
+    assert svc.record_batch_verification("001", expected_count=10, verified_count=10, write_confirmed=True, remote_reread_verified=True)["status"] == "BLOCKED"
+    assert svc.rollout("001", explicit_confirmed=True)["stage"] == "PILOT"
+    assert svc.record_batch_verification("001", expected_count=10, verified_count=10, write_confirmed=True, remote_reread_verified=True)["next_stage"] == "VALIDATION_BATCH"
+    assert svc.rollout("001")["batch_size"] == 100
+    with pytest.raises(ValueError): svc.rollout("001", validation_batch_size=250)
+    assert svc.rollout("001")["status"] == "WAITING_FOR_INPUT"
+    validation_evidence = {"source_fresh": True, "media_ready": True, "api_safe": True}
+    assert svc.rollout("001", validation_evidence=validation_evidence)["batch_size"] == 100
+    assert svc.rollout("001", validation_evidence=validation_evidence, validation_batch_size=150, explicit_confirmed=True)["stage"] == "VALIDATION_BATCH"
+    assert svc.record_batch_verification("001", expected_count=150, verified_count=150, write_confirmed=True, remote_reread_verified=True)["next_stage"] == "MAIN_CATALOG"
+    assert svc.rollout("001")["status"] == "WAITING_FOR_INPUT"
+    assert svc.rollout("001", main_catalog_count=1900)["batch_size"] == 1900
+    assert svc.rollout("001", main_catalog_count=1900, explicit_confirmed=True)["stage"] == "MAIN_CATALOG"
+    assert svc.record_batch_verification("001", expected_count=1900, verified_count=1899, write_confirmed=True, remote_reread_verified=True)["status"] == "BLOCKED"
     assert svc.rollout("001", critical_mismatch=True)["status"] == "BLOCKED"
 
 
