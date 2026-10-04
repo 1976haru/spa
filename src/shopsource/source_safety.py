@@ -266,6 +266,89 @@ class SourceSafetyService:
                 (store_id,product_id,result["snapshot_id"],availability,freshness,current,first[0] if first else None,previous_price,selling_price,delta,delta_pct,effective,margin,margin_pct,margin_status,status,json.dumps(reasons),_now()))
         return result
 
+    def evaluate_many(self, store_id, product_ids):
+        """Recompute sellability for a batch with bounded indexed reads/writes."""
+        ids = sorted({int(value) for value in product_ids})
+        if not ids: return []
+        settings = self.settings(store_id); policy = settings["price_policy"]; freshness_policy = settings["freshness"]
+        snapshots = {}; latest_anys = {}; product_data = {}; first_prices = {}
+        # Stay below SQLite's variable limit while avoiding one lookup per product.
+        with connect(self.db) as con:
+            for start in range(0, len(ids), 500):
+                group = ids[start:start + 500]; marks = ",".join("?" for _ in group)
+                query = f"""SELECT * FROM (SELECT s.*,ROW_NUMBER() OVER(PARTITION BY product_id ORDER BY observed_at DESC,id DESC) rank
+                    FROM source_product_snapshots s WHERE product_id IN ({marks}) AND availability!='SOURCE_ERROR') WHERE rank<=2 ORDER BY product_id,rank"""
+                for row in con.execute(query, group): snapshots.setdefault(row["product_id"], []).append(dict(row))
+                query = f"""SELECT * FROM (SELECT s.*,ROW_NUMBER() OVER(PARTITION BY product_id ORDER BY observed_at DESC,id DESC) rank
+                    FROM source_product_snapshots s WHERE product_id IN ({marks})) WHERE rank=1"""
+                latest_anys.update({row["product_id"]: dict(row) for row in con.execute(query, group)})
+                for row in con.execute(f"SELECT id,raw_json FROM products WHERE id IN ({marks})", group): product_data[row["id"]] = row["raw_json"]
+                query = f"""SELECT * FROM (SELECT product_id,source_price,ROW_NUMBER() OVER(PARTITION BY product_id ORDER BY observed_at,id) rank
+                    FROM source_product_snapshots WHERE product_id IN ({marks}) AND source_price IS NOT NULL) WHERE rank=1"""
+                first_prices.update({row["product_id"]: row["source_price"] for row in con.execute(query, group)})
+        now_dt = datetime.now(timezone.utc); now = _now(); writes = []; results = []
+        for product_id in ids:
+            history = snapshots.get(product_id, [])
+            latest_any = latest_anys.get(product_id)
+            successful = history[0] if history else None
+            previous = history[1] if len(history) > 1 else None
+            availability = successful["availability"] if successful else "UNKNOWN"
+            observed = _dt(successful["observed_at"]) if successful else None
+            if observed is None: freshness = "NEVER_VERIFIED"
+            elif now_dt-observed > timedelta(hours=float(freshness_policy["stale_block_hours"])): freshness = "STALE_BLOCKED"
+            elif now_dt-observed > timedelta(hours=float(freshness_policy["stale_warning_hours"])): freshness = "STALE_WARNING"
+            else: freshness = "FRESH"
+            reasons=[]
+            if latest_any and latest_any["availability"] == "SOURCE_ERROR" and not successful: status="BLOCKED_SOURCE_ERROR"; reasons.append("SOURCE_ERROR")
+            elif availability == "OUT_OF_STOCK": status="BLOCKED_SOURCE_OUT_OF_STOCK"; reasons.append("SOURCE_OUT_OF_STOCK")
+            elif availability != "IN_STOCK": status="BLOCKED_SOURCE_UNKNOWN"; reasons.append("SOURCE_UNKNOWN")
+            elif freshness != "FRESH": status="BLOCKED_SOURCE_STALE"; reasons.append("SOURCE_STALE")
+            else: status="SELLABLE"
+            try:
+                raw = json.loads(product_data.get(product_id) or "{}")
+                if not isinstance(raw, dict): raw = {}
+                selling = raw.get("shopify_selling_price", raw.get("store_selling_price"))
+                if selling is not None: selling=float(selling)
+            except (TypeError, ValueError, json.JSONDecodeError): selling=None
+            current = successful.get("source_price") if successful else None
+            currency = successful.get("source_currency") if successful else None
+            previous_price = previous.get("source_price") if previous else None
+            delta = current-previous_price if current is not None and previous_price is not None else None
+            delta_pct = delta/previous_price*100 if delta is not None and previous_price else None
+            effective=margin=margin_pct=None; margin_status="NOT_CONFIGURED"
+            configured=policy.get("enabled") and (policy.get("min_margin_amount") is not None or policy.get("min_margin_percent") is not None)
+            if status=="SELLABLE" and currency and currency != policy.get("currency", "USD"):
+                status="NEEDS_REVIEW"; reasons.append("CURRENCY_MISMATCH"); margin_status="CURRENCY_MISMATCH"
+            elif status=="SELLABLE" and not configured:
+                status="NEEDS_PRICING_POLICY"; reasons.append("NEEDS_PRICING_POLICY")
+            elif status=="SELLABLE":
+                if current is None or selling is None: status="NEEDS_REVIEW"; reasons.append("MISSING_PRICE"); margin_status="UNKNOWN"
+                else:
+                    effective=current+float(policy.get("source_cost_buffer_fixed") or 0)+current*float(policy.get("source_cost_buffer_percent") or 0)/100
+                    effective+=float(policy.get("additional_cost_buffer_fixed") or 0)+current*float(policy.get("additional_cost_buffer_percent") or 0)/100
+                    margin=selling-effective; margin_pct=margin/selling*100 if selling else None
+                    passed=(policy.get("min_margin_amount") is None or margin>=float(policy["min_margin_amount"])) and (policy.get("min_margin_percent") is None or margin_pct>=float(policy["min_margin_percent"]))
+                    margin_status="PASS" if passed else "BLOCKED"
+                    if not passed and policy.get("block_on_margin_breach",True): status="BLOCKED_MARGIN"; reasons.append("MARGIN_BLOCKED")
+            result={"store_id":store_id,"product_id":product_id,"snapshot_id":successful["id"] if successful else None,
+                    "source_availability":availability,"freshness_status":freshness,"current_source_price":current,
+                    "previous_source_price":previous_price,"selling_price":selling,"price_change_amount":delta,
+                    "price_change_percent":delta_pct,"effective_source_cost":effective,"estimated_margin_amount":margin,
+                    "estimated_margin_percent":margin_pct,"margin_status":margin_status,"sellability_status":status,"reasons":reasons}
+            results.append(result)
+            writes.append((store_id,product_id,result["snapshot_id"],availability,freshness,current,first_prices.get(product_id),previous_price,selling,delta,delta_pct,effective,margin,margin_pct,margin_status,status,json.dumps(reasons),now))
+        with connect(self.db) as con:
+            con.executemany("""INSERT INTO store_product_sellability(store_id,product_id,snapshot_id,source_availability,freshness_status,current_source_price,
+                source_price_at_first_seen,previous_source_price,selling_price,price_change_amount,price_change_percent,effective_source_cost,
+                estimated_margin_amount,estimated_margin_percent,margin_status,sellability_status,reasons_json,evaluated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(store_id,product_id) DO UPDATE SET snapshot_id=excluded.snapshot_id,
+                source_availability=excluded.source_availability,freshness_status=excluded.freshness_status,current_source_price=excluded.current_source_price,
+                source_price_at_first_seen=excluded.source_price_at_first_seen,previous_source_price=excluded.previous_source_price,selling_price=excluded.selling_price,
+                price_change_amount=excluded.price_change_amount,price_change_percent=excluded.price_change_percent,effective_source_cost=excluded.effective_source_cost,
+                estimated_margin_amount=excluded.estimated_margin_amount,estimated_margin_percent=excluded.estimated_margin_percent,
+                margin_status=excluded.margin_status,sellability_status=excluded.sellability_status,reasons_json=excluded.reasons_json,evaluated_at=excluded.evaluated_at""", writes)
+        return results
+
     def snapshot_fingerprint(self, store_id, product_ids):
         if not product_ids: return []
         marks=",".join("?" for _ in product_ids)
@@ -367,7 +450,7 @@ class SourceMonitorService:
     def __init__(self, db=None, provider=None, reports_root="exports/source_safety_reports"):
         self.db=db; self.provider=provider; self.safety=SourceSafetyService(db); self.reports_root=Path(reports_root)
 
-    def preview_due_checks(self, store_id, *, limit=100):
+    def preview_due_checks(self, store_id, *, limit=100, offset=0):
         with connect(self.db) as con:
             mapped = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='shopify_product_mappings'").fetchone()
             if mapped:
@@ -375,17 +458,19 @@ class SourceMonitorService:
                     CASE WHEN m.shopify_product_id IS NOT NULL THEN 1 WHEN sm.latest_availability='OUT_OF_STOCK' THEN 3 ELSE 4 END priority,
                     sm.freshness_status FROM products p LEFT JOIN source_monitoring_state sm ON sm.product_id=p.id
                     LEFT JOIN shopify_product_mappings m ON m.store_id=? AND m.master_product_id=p.id
-                    WHERE sm.next_check_at IS NULL OR sm.next_check_at<=? ORDER BY priority,p.id LIMIT ?""",(store_id,_now(),limit)).fetchall()
+                    WHERE sm.next_check_at IS NULL OR sm.next_check_at<=? ORDER BY priority,p.id LIMIT ? OFFSET ?""",(store_id,_now(),limit,offset)).fetchall()
             else:
                 rows=con.execute("""SELECT p.id product_id,p.asin,
                     CASE WHEN sm.latest_availability='OUT_OF_STOCK' THEN 3 ELSE 4 END priority,sm.freshness_status
                     FROM products p LEFT JOIN source_monitoring_state sm ON sm.product_id=p.id
-                    WHERE sm.next_check_at IS NULL OR sm.next_check_at<=? ORDER BY priority,p.id LIMIT ?""",(_now(),limit)).fetchall()
+                    WHERE sm.next_check_at IS NULL OR sm.next_check_at<=? ORDER BY priority,p.id LIMIT ? OFFSET ?""",(_now(),limit,offset)).fetchall()
         return {"store_id":store_id,"items":[dict(r) for r in rows],"preview_only":True,"batch_size":100,
-                "estimated_batches":math.ceil(len(rows)/100),"estimated_tokens":len(rows)}
+                "estimated_batches":math.ceil(len(rows)/100),"estimated_tokens":len(rows),"offset":offset,
+                "estimated_cost_usd":None,"cost_estimate_available":False,
+                "cost_estimate_note":"Provider-specific cost is unavailable until a provider adapter supplies a quote."}
 
-    def run_due_checks(self, store_id, *, observations=None, max_retries=3, limit=100):
-        preview=self.preview_due_checks(store_id,limit=limit); run_id="SOURCE_"+secrets.token_hex(8); now=_now()
+    def run_due_checks(self, store_id, *, observations=None, max_retries=3, limit=100, offset=0):
+        preview=self.preview_due_checks(store_id,limit=limit,offset=offset); run_id="SOURCE_"+secrets.token_hex(8); now=_now()
         with connect(self.db) as con:
             con.execute("INSERT INTO source_check_runs(run_id,store_id,mode,provider,requested_count,token_estimate,status,checkpoint_json,started_at) VALUES(?,?,?,?,?,?,?,'{}',?)",
                         (run_id,store_id,"MANUAL_AUDIT","INJECTED" if observations is not None else "CONFIGURED",len(preview["items"]),preview["estimated_tokens"],"RUNNING",now))
@@ -401,13 +486,21 @@ class SourceMonitorService:
             query="SELECT i.*,p.asin FROM source_check_items i JOIN products p ON p.id=i.product_id WHERE i.run_id=?"
             if failed_only: query+=" AND i.status='FAILED'"
             items=con.execute(query+" ORDER BY i.priority,i.product_id",(run_id,)).fetchall()
+        freshness_settings=self.safety.settings(run["store_id"])["freshness"]
         for item in items:
             try:
                 obs=observations.get(item["product_id"])
                 if isinstance(obs, Exception): raise obs
                 if not obs: raise RuntimeError("missing observation")
                 self.safety.record_snapshot(item["product_id"],item["asin"],obs,check_run_id=run_id)
-                with connect(self.db) as con: con.execute("UPDATE source_check_items SET status='COMPLETE',attempts=attempts+1,error=NULL WHERE run_id=? AND product_id=?",(run_id,item["product_id"]))
+                availability=str(obs.get("availability") or "UNKNOWN").upper()
+                interval_hours=(freshness_settings["out_of_stock_recheck_hours"] if availability=="OUT_OF_STOCK" else
+                                freshness_settings["reserve_recheck_hours"] if availability in {"LIMITED","PREORDER","BACKORDER"} else
+                                freshness_settings["active_monitor_interval_hours"] if availability=="IN_STOCK" else 0.0)
+                due=(datetime.now(timezone.utc)+timedelta(hours=float(interval_hours))).isoformat()
+                with connect(self.db) as con:
+                    con.execute("UPDATE source_monitoring_state SET next_check_at=? WHERE product_id=?",(due,item["product_id"]))
+                    con.execute("UPDATE source_check_items SET status='COMPLETE',attempts=attempts+1,error=NULL WHERE run_id=? AND product_id=?",(run_id,item["product_id"]))
             except Exception as exc:
                 attempts=int(item["attempts"])+1
                 with connect(self.db) as con: con.execute("UPDATE source_check_items SET status=?,attempts=?,error=? WHERE run_id=? AND product_id=?",("FAILED",attempts,str(exc)[:300],run_id,item["product_id"]))

@@ -321,6 +321,11 @@ class OperatorUI:
             ui.button("기존 점검 다시 열기", icon="history", on_click=lambda: load_latest()).props("outline size=lg")
         notice = ui.label("이 버튼은 로컬 gate/checkpoint만 준비합니다. Amazon·Keepa·Shopify·Theme 호출이나 실제 변경은 하지 않습니다.").classes("ss-help")
         cards = ui.column().classes("w-full gap-2")
+        action_label = ui.label("현재 필요한 확인 작업이 여기에 표시됩니다.").classes("ss-card-title")
+        action_button = ui.button("현재 단계 확인", icon="task_alt").props("color=primary size=lg")
+        with ui.dialog() as action_dialog, ui.card().classes("w-[min(95vw,900px)] max-h-[85vh] overflow-auto"):
+            ui.label("실전 점검에서 필요한 확인").classes("ss-card-title")
+            action_content = ui.column().classes("w-full gap-3")
         def render(run):
             state["run"] = run
             progress_state = service.progress_report(run["run_id"])
@@ -331,6 +336,15 @@ class OperatorUI:
                 f"현재 blocker/risk: {progress_state['blockers'][0]['reasons'] if progress_state['blockers'] else '확인된 blocker 없음'}\n"
                 f"다음 실행: {progress_state['next_action']}"
             )
+            current_key = progress_state["current_stage"]
+            action_names = {"ENVIRONMENT_STORE_IDENTITY": "Shopify 연결 확인", "SOURCE_SAFETY": "실제 Source 안전검사 승인",
+                "PRODUCT_MEDIA": "상품 이미지 권리 검토", "PRICING_MARGIN": "가격마진 정책 설정",
+                "COLLECTION_CATEGORY_MEDIA": "부족한 이미지 준비", "HOMEPAGE": "홈페이지 미리보기 확인",
+                "PAGES_POLICIES": "페이지정책 확인", "SEO_ACCESSIBILITY_MOBILE": "데스크톱/모바일 최종 확인",
+                "COMMERCE_READINESS": "판매 설정 확인", "READY_FOR_PILOT": "10개 DRAFT 파일럿 준비"}
+            action_label.set_text(f"다음으로 할 일: {action_names.get(current_key, '현재 gate 확인')}")
+            action_button.set_text(action_names.get(current_key, "현재 단계 확인"))
+            action_button.set_visibility(True)
             cards.clear()
             with cards:
                 for gate in run["gates"]:
@@ -350,6 +364,126 @@ class OperatorUI:
             run = runner.run(self.current_store)
             render(run)
             ui.notify("읽기 전용 production evidence 확인을 진행했습니다. Shopify 쓰기는 실행되지 않았습니다.", type="positive")
+        def open_gate_action():
+            run = state.get("run")
+            if not run:
+                ui.notify("먼저 실전 점검 자동 진행을 눌러 주세요.", type="warning"); return
+            key = service.progress_report(run["run_id"])["current_stage"]
+            action_content.clear()
+            with action_content:
+                if key == "SOURCE_SAFETY":
+                    preview = runner._source(str(run["store_id"]))
+                    ui.label(f"대상 {preview.get('target_count', 0)}개 · batch {preview.get('estimated_batches', 0)}개 · 추정 token {preview.get('estimated_tokens', 0)} · 금액 비용 견적은 provider 미연결 시 확인 불가")
+                    ui.label("승인 시 설정된 source provider를 호출합니다. provider 미설정이면 외부 호출 없이 멈춥니다.").classes("ss-help")
+                    async def approve_source():
+                        try:
+                            result = await asyncio.to_thread(runner.confirm_source_audit, run["run_id"], confirmed=True)
+                            render(result["production_run"])
+                        except Exception as exc: ui.notify(f"실행 전 중단: {exc}", type="warning")
+                    ui.button("실제 Source 안전검사 승인", on_click=approve_source).props("color=negative")
+                    with ui.row().classes("gap-2"):
+                        ui.button("일시정지", on_click=lambda: runner.source_audit_control(run["run_id"], "PAUSE")).props("outline")
+                        async def resume_source():
+                            try:
+                                result = await asyncio.to_thread(runner.source_audit_control, run["run_id"], "RESUME")
+                                render(result["production_run"])
+                            except Exception as exc: ui.notify(f"재개하지 못했습니다: {exc}", type="warning")
+                        ui.button("계속", on_click=resume_source).props("outline")
+                        ui.button("중단", on_click=lambda: runner.source_audit_control(run["run_id"], "STOP")).props("outline color=negative")
+                        async def retry_source():
+                            try:
+                                result = await asyncio.to_thread(runner.source_audit_control, run["run_id"], "RETRY_FAILED")
+                                render(result["production_run"])
+                            except Exception as exc: ui.notify(f"재시도하지 못했습니다: {exc}", type="warning")
+                        ui.button("실패 항목 재시도", on_click=retry_source).props("outline")
+                elif key == "PRODUCT_MEDIA":
+                    checks = {}
+                    for row in runner._catalog_rows(str(run["store_id"]))[:50]:
+                        with ui.row().classes("items-center"):
+                            checks[row["product_id"]] = ui.checkbox()
+                            ui.label(f"{row.get('asin') or 'ASIN 없음'} · {row.get('product_id')} · {row.get('classification')}")
+                    policy = ui.select(["SUPPLIER_AUTHORIZED", "MERCHANT_OWNED", "LICENSED", "MANUAL_REVIEW_REQUIRED", "NO_RIGHTS_CONFIRMED"], value="MANUAL_REVIEW_REQUIRED", label="선택 상품의 검토 결과")
+                    notes = ui.input(label="검토 메모 (선택)")
+                    def save_rights():
+                        selected = [pid for pid, box in checks.items() if box.value]
+                        if not selected: ui.notify("검토할 상품을 선택하세요.", type="warning"); return
+                        result = runner.review_media_rights(run["run_id"], selected, policy.value, confirmed=True,
+                                                           notes={pid: notes.value or "" for pid in selected})
+                        render(result["production_run"])
+                    ui.button("선택한 상품의 권리 검토 저장", on_click=save_rights).props("color=primary")
+                    ui.label("전체 승인 기능은 없습니다. GENERATED_LIFESTYLE_ONLY는 상품 이미지 권리를 대신하지 않습니다.").classes("ss-help")
+                elif key == "PRICING_MARGIN":
+                    fields = {name: ui.input(label=label, value=value) for name, label, value in (
+                        ("currency", "통화", "USD"), ("source_cost_buffer_fixed", "원가 고정 buffer", "0"),
+                        ("source_cost_buffer_percent", "원가 비율 buffer", "0"), ("min_margin_amount", "최소 마진 금액", ""),
+                        ("min_margin_percent", "최소 마진 %", ""), ("unknown_fee_handling", "알 수 없는 수수료 처리", "BLOCK"),
+                        ("warning_source_price_change_percent", "원본 가격 변동 경고 %", ""))}
+                    ui.label("추천/초기값은 승인된 정책이 아닙니다. 자동 가격 변경은 사용할 수 없습니다.").classes("ss-help")
+                    def save_price():
+                        try:
+                            payload = {name: (box.value if name in {"currency", "unknown_fee_handling"} else float(box.value)) for name, box in fields.items()}
+                            payload["auto_reprice_enabled"] = False
+                            render(runner.save_pricing_policy(run["run_id"], payload, confirmed=True))
+                        except Exception as exc: ui.notify(f"정책을 저장하지 못했습니다: {exc}", type="warning")
+                    ui.button("가격 정책 저장 및 재검사", on_click=save_price).props("color=primary")
+                elif key == "PAGES_POLICIES":
+                    evidence = next(g["evidence"] for g in run["gates"] if g["gate_key"] == key)
+                    ui.label("Shopify에서 읽은 페이지/정책 상태").classes("ss-card-title")
+                    for name, item in (evidence.get("items") or {}).items():
+                        ui.label(f"{name}: {item.get('status')} · {item.get('count', 0)}개 remote 항목")
+                    ui.label("필요한 사업정보는 추측하지 않습니다. 아래 값은 로컬에만 저장되며 Shopify에는 쓰지 않습니다.").classes("ss-help")
+                    local_inputs = {}
+                    fields = (("support_email", "지원 이메일"), ("legal_name", "사업자/법인명"),
+                              ("business_address", "사업장 주소"), ("phone", "전화번호"),
+                              ("return_window", "반품 기간"), ("return_address", "반품 주소"),
+                              ("processing_time", "처리 시간"), ("shipping_time", "배송 기간"),
+                              ("shipping_fee", "배송비"), ("governing_law", "준거법"))
+                    for name, label in fields:
+                        local_inputs[name] = ui.input(label=label)
+                    def save_business_inputs():
+                        saved = runner.save_business_inputs(str(run["store_id"]),
+                            {name: field.value for name, field in local_inputs.items()}, confirmed=True)
+                        ui.notify(f"{len(saved['saved_fields'])}개 항목을 로컬에 저장했습니다. 원격 변경은 없습니다.", type="positive")
+                    ui.button("사업정보를 로컬에 저장", on_click=save_business_inputs).props("outline")
+                    checks = {name: ui.checkbox(name) for name in ("Contact", "About", "Shipping", "Returns/Refund", "Privacy", "Terms")}
+                    def save_pages():
+                        payload = {name: box.value for name, box in checks.items()}
+                        if not all(payload.values()): ui.notify("각 항목을 검토한 후 체크해 주세요.", type="warning"); return
+                        result = runner.save_manual_evidence(run["run_id"], key, "PAGES_POLICIES_SIGNOFF", payload, confirmed=True)
+                        render(result["production_run"])
+                    ui.button("페이지/정책 검토 완료", on_click=save_pages).props("color=primary")
+                    ui.label("이 확인은 페이지를 게시하거나 법률 적합성을 보증하지 않습니다.").classes("ss-help")
+                elif key == "SEO_ACCESSIBILITY_MOBILE":
+                    evidence = next(g["evidence"] for g in run["gates"] if g["gate_key"] == key)
+                    fingerprint = evidence.get("visual_signoff_fingerprint")
+                    checks = {name: ui.checkbox(label) for name, label in (("desktop", "데스크톱"), ("mobile", "모바일"),
+                        ("hero_crop", "배너 잘림"), ("category_cards", "카테고리 카드"), ("menu", "메뉴"), ("footer", "푸터"), ("readability", "읽기 쉬움"))}
+                    def save_visual():
+                        result = runner.save_manual_evidence(run["run_id"], key, "VISUAL_SIGNOFF",
+                            {name: box.value for name, box in checks.items()}, confirmed=True, fingerprint=fingerprint)
+                        render(result["production_run"])
+                    ui.button("현재 테마의 시각 검수 저장", on_click=save_visual).props("color=primary")
+                    ui.label("자동 검사는 WCAG 완전 준수를 인증하지 않습니다.").classes("ss-help")
+                elif key == "COMMERCE_READINESS":
+                    evidence = next(g["evidence"] for g in run["gates"] if g["gate_key"] == key)
+                    items = evidence.get("manual_verification_required") or ["US market", "shipping", "tax", "payment", "checkout", "store password"]
+                    checks = {name: ui.checkbox(name) for name in items}
+                    def save_commerce():
+                        result = runner.save_manual_evidence(run["run_id"], key, "COMMERCE_SIGNOFF",
+                                                             {name: box.value for name, box in checks.items()}, confirmed=True)
+                        render(result["production_run"])
+                    ui.button("판매 설정 수동확인 저장", on_click=save_commerce).props("color=primary")
+                elif key == "READY_FOR_PILOT":
+                    ui.label("G0~G13 사전 증거가 준비되었습니다. 이는 출시 완료가 아닙니다. 이 점검은 상품을 Shopify에 올리지 않습니다.").classes("ss-help")
+                    ui.button("별도 10개 DRAFT 파일럿 화면 열기", on_click=lambda: ui.navigate.to("/pilot")).props("color=primary")
+                elif key == "ENVIRONMENT_STORE_IDENTITY":
+                    ui.button("Shopify 연결 다시 확인", on_click=begin).props("color=primary")
+                else:
+                    ui.label("기존 해당 기능에서 항목을 준비한 뒤 실전 점검을 다시 실행하세요.").classes("ss-help")
+                    if key in {"COLLECTION_CATEGORY_MEDIA", "HOMEPAGE"}:
+                        ui.button("홈페이지/이미지 화면 열기", on_click=lambda: ui.navigate.to("/homepage")).props("outline")
+            action_dialog.open()
+        action_button.on_click(open_gate_action)
         start.on_click(begin)
         def create_confirmed_run():
             run = runner.start_or_resume(self.current_store, new_run=True, confirmed=True)

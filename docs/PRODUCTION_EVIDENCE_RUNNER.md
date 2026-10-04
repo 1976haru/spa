@@ -24,3 +24,15 @@ The runner stops at `READY_FOR_PILOT` after G0–G13 are verified. It never invo
 The percentage is the number of evidence-verified G0–G13 gates divided by fourteen. A blocker does not become ready just because a score is high. The same store's unfinished run is resumed; a separate run requires explicit confirmation. Evidence input fingerprints are stored per gate so a changed input can be audited on the next run. The pilot remains a separately confirmed, DRAFT-only action.
 
 Runtime Shopify reads use the project's existing credential and GraphQL integration. Unit tests inject fake collectors and do not access the network.
+# Phase 5.2 evidence completion
+
+Phase 5.2 completes the production gate adapters and explicit human workflows:
+
+- G2 runs an explicitly approved configured source adapter in checkpointed batches; provider errors remain source errors.
+- G4 records rights only for selected, explicitly confirmed products, with reviewer timestamp and notes.
+- G5 stores only an operator-confirmed pricing policy; automatic repricing stays off.
+- G11 reads Shopify pages/policies where the configured API and granted scopes expose them. Content presence is not legal approval.
+- G12 combines local/theme read-only checks with a human visual sign-off tied to a theme fingerprint.
+- G13 keeps API evidence separate from manual commerce confirmations and does not change shipping, tax, payment, market, domain, or checkout settings.
+
+See [PRODUCTION_HUMAN_GATES.md](PRODUCTION_HUMAN_GATES.md) for the beginner-facing decision checklist. `READY_FOR_PILOT` means only that pre-pilot evidence is complete; it does not run G14 or publish products.
