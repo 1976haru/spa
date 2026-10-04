@@ -1,0 +1,713 @@
+ShopSource Studio — Phase 5.1
+PRODUCTION EVIDENCE RUNNER — REAL READ-ONLY VERIFICATION FROM G0 TO PILOT GATE
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+- Baseline: 043decb9c1dab5d05653c804331180b6d94d352b
+
+User-visible issue confirmed from actual UI
+- "실전 스토어 완성" shows 0% / NOT_READY / 17 unresolved.
+- G0 says: "로컬 Store ID만으로 Shopify 연결/도메인/권한/테마를 확인할 수 없습니다."
+- Current [실전 스토어 자동 구축 시작] only calls ProductionGoldenPathService.start(), creates local gates/checkpoints, and prepares a PREVIEW StoreBuild run.
+- It does NOT actually collect real read-only evidence.
+- This is truthful, but insufficient for the user's production goal and misleading as an "자동 구축" action.
+
+Production requirement
+- From now on progress means REAL production evidence only.
+- Do not raise progress from code/tests/mock evidence.
+- Do not guess missing information.
+- Do not silently pass a gate.
+- No real write until the explicit pilot stage.
+
+Primary goal
+Turn the current production page into a REAL evidence-driven read-only production audit:
+G0 → G13 should automatically collect every safe local/read-only evidence source available,
+stop only when a true human/cost/credential gate is reached,
+and preserve/reuse the SAME production run.
+
+======================================================================
+0. IMPORTANT SAFETY
+======================================================================
+
+During Codex implementation/tests:
+- NO real Shopify mutation
+- NO theme mutation
+- NO Amazon/Keepa paid/live call
+- NO Spark upload
+- NO inventory write
+- NO payment/shipping/tax mutation
+- NO paid image generation
+
+Mocks/fakes/local only in tests.
+
+Runtime feature MAY perform explicit read-only Shopify checks using the already configured official integration.
+Runtime source/provider audit MAY run only after explicit user confirmation because it may consume provider tokens.
+
+Protected file:
+stores/001_cabin_tidy.json
+NEVER reset/restore/checkout/clean/stage/commit/overwrite.
+
+======================================================================
+1. DO NOT CREATE DUPLICATE PRODUCTION RUNS
+======================================================================
+
+Current production page creates a new run whenever the start button is clicked.
+
+Change behavior:
+- if there is an unfinished latest production run for the same store, default to RESUME it
+- offer:
+  [기존 실전 점검 이어서]
+  [새 점검 시작]
+- starting a new run requires explicit confirmation
+- never silently create duplicate concurrent production runs
+
+Persist run ownership/lock so only one active production evidence runner per store executes at a time.
+
+======================================================================
+2. UI ACTIONS
+======================================================================
+
+Rename/reframe beginner actions:
+
+Primary:
+[실전 점검 자동 진행]
+
+Secondary:
+[기존 점검 다시 열기]
+[새 점검 시작]
+
+The primary button should:
+- reuse latest active run
+- inspect current gate
+- execute safe read-only/local checks
+- continue to subsequent gates automatically
+- stop only at a real HUMAN GATE
+- update cards live
+
+User should not need to manually visit expert module pages just to gather routine evidence.
+
+======================================================================
+3. PRODUCTION EVIDENCE RUNNER
+======================================================================
+
+Create a reusable service, e.g.:
+ProductionEvidenceRunner
+
+Responsibilities:
+- load production run
+- determine current gate
+- collect gate evidence from existing services
+- update gate
+- continue while safe
+- persist checkpoints
+- stop at human gate
+- resume after confirmation/input
+- no duplicate work when evidence is still valid
+- invalidate downstream evidence when an upstream fingerprint changes
+
+Runner states:
+RUNNING
+WAITING_FOR_CONFIRMATION
+WAITING_FOR_INPUT
+WAITING_FOR_CREDENTIALS
+BLOCKED
+READY_FOR_PILOT
+FAILED_TRANSIENT
+
+Expected normal flow:
+G0 read-only Shopify/environment
+→ G1 local sourcing quality audit
+→ G2 source safety
+→ G3 product content
+→ G4 product media/rights
+→ G5 pricing/margin
+→ G6 collection architecture
+→ G7 collection/category media
+→ G8 brand/header/navigation
+→ G9 homepage
+→ G10 product/collection templates
+→ G11 pages/policies
+→ G12 SEO/accessibility/mobile
+→ G13 commerce readiness
+→ stop before G14 until all required evidence is verified
+
+======================================================================
+4. G0 — REAL STORE / CONNECTION / ENVIRONMENT READ-ONLY CHECK
+======================================================================
+
+Use existing ShopSource Shopify connection services and current official API version already used in the project.
+Do not create a second credential system.
+
+Check actual evidence where available:
+- Store 001 mapping
+- Shopify shop domain
+- token/credential presence WITHOUT revealing it
+- API connection success
+- current granted access scopes using supported official endpoint/service
+- published/main theme readable
+- domain / primary domain read-only status when supported
+- SSL/host status when supported
+- local DB integrity
+- Pillow/runtime
+- image bridge health
+
+Important:
+- Local Image Studio generator NOT being configured must NOT block G0 because prompt/manual fallback exists.
+- Missing Shopify credential/scope should become WAITING_FOR_CREDENTIALS/INPUT with exact UI action.
+- Network timeout is transient, not credential failure.
+- Never log token values.
+
+On success:
+G0 -> VERIFIED or READY_WITH_WARNINGS with evidence.
+
+Show beginner summary:
+✓ Shopify 연결
+✓ Store 확인
+✓ API 권한 읽기
+✓ Theme 읽기
+✓ 로컬 DB
+✓ 이미지 기능
+
+If a field cannot be verified through supported API:
+mark the specific field MANUAL_REVIEW_REQUIRED; do not invent a result.
+
+======================================================================
+5. G1 — REAL LOCAL SOURCING QUALITY AUDIT
+======================================================================
+
+This is safe/local and should run automatically after G0.
+
+Reuse ProductionGoldenPathService.audit_master and existing Store Decision/MASTER data.
+
+But improve evidence so gate reports actual counts:
+- total MASTER candidates relevant to store
+- PRODUCTION_CANDIDATE count
+- RESERVE
+- REVIEW_REQUIRED
+- REJECT_FOR_STORE
+- RESTRICTED
+- duplicate/identity conflicts
+- missing source refs
+- variant/bundle/fitment review
+- underfilled collection coverage
+- unmatched rate
+
+Do not classify as production candidate solely because Store Decision is PRIMARY.
+
+Persist report/fingerprint.
+
+If zero usable candidates:
+BLOCKED.
+If candidates exist but source-safety evidence is not fresh:
+G1 can be READY_WITH_WARNINGS only if G1 itself is genuinely complete; G2 handles freshness.
+
+======================================================================
+6. G2 — REAL SOURCE SAFETY HUMAN/COST GATE
+======================================================================
+
+Use existing SourceSafetyService / SourceMonitorService.
+
+First run a ZERO-COST preview:
+- target count
+- batches
+- stale/never verified counts
+- provider needed
+- estimated Keepa token usage if calculable
+
+If fresh source evidence already exists and meets policy:
+reuse it.
+
+If real provider checks are required:
+STOP at:
+WAITING_FOR_CONFIRMATION
+
+Show:
+"최신 Amazon/source 재고·가격 확인이 필요합니다."
+- 대상 X
+- batch Y
+- 예상 token Z
+- Fresh 현재 A / Stale B / Never verified C
+
+Button:
+[실제 Source 안전검사 승인]
+
+Only after explicit user confirmation may runtime call the configured provider.
+No confirmation per batch; one confirmation for the run/budget is enough.
+
+Then automatically:
+- execute batches
+- checkpoint
+- bounded retry
+- no CAPTCHA bypass
+- calculate fresh/stock/price/margin-related source evidence
+- update G2
+
+Provider error != OOS.
+
+======================================================================
+7. G3 — PRODUCT CONTENT EVIDENCE
+======================================================================
+
+Run automatically after G2 if safe.
+
+Audit actual production-eligible catalog:
+- title normalization readiness
+- description evidence
+- feature evidence
+- variant normalization
+- SEO
+- handle stability
+
+Show counts:
+READY / REVIEW_REQUIRED / BLOCKED
+
+Never fabricate missing facts.
+
+If transformations are deterministic/local and already implemented:
+prepare previews automatically.
+Do not write Shopify yet.
+
+======================================================================
+8. G4 — PRODUCT MEDIA / RIGHTS
+======================================================================
+
+This gate must NOT be auto-passed.
+
+First audit actual media:
+- exact product image presence
+- quality/size metadata where available
+- duplicate image evidence
+- existing media policy
+- reviewed rights state
+
+Then if rights are missing:
+WAITING_FOR_INPUT
+
+Beginner UI must explain:
+"Amazon에 보이는 이미지는 재사용 권리가 자동으로 확인되는 것이 아닙니다."
+
+Provide a bulk review workflow, not product-by-product raw DB editing.
+
+Support evidence policies:
+SUPPLIER_AUTHORIZED
+MERCHANT_OWNED
+LICENSED
+MANUAL_REVIEW_REQUIRED
+NO_RIGHTS_CONFIRMED
+
+GENERATED_LIFESTYLE_ONLY cannot satisfy exact product media.
+
+Do not auto-mark rights from source visibility.
+
+======================================================================
+9. G5 — PRICING / MARGIN
+======================================================================
+
+Inspect existing SourcePriceGuardPolicy.
+
+If no policy:
+WAITING_FOR_INPUT
+
+Show one beginner form:
+- target currency
+- pricing formula/buffer
+- minimum margin amount
+- minimum margin %
+- unknown-fee treatment
+- price-change warning threshold
+
+Do NOT invent policy.
+
+After user supplies/approves policy:
+evaluate all production candidates automatically.
+
+Report:
+safe / warning / blocked / missing selling price.
+
+AUTO_REPRICE remains OFF unless user explicitly enables later.
+
+======================================================================
+10. G6 — COLLECTION ARCHITECTURE
+======================================================================
+
+Reuse existing CollectionPlanner / prerequisite resolver.
+
+Automatically inspect or create local plan if safe.
+
+Show:
+- production collections
+- count each
+- overlap
+- unmatched
+- empty collections
+- wrong rules
+
+Do not require remote Shopify collections to design the plan.
+Remote mapping is checked later for actual apply/readiness.
+
+======================================================================
+11. G7 — COLLECTION / CATEGORY MEDIA
+======================================================================
+
+Reuse approved image registry + PromptAssetService + Local Image Studio + manual fallback.
+
+Automatically determine:
+- collections with approved image
+- missing image
+- duplicate unrelated image
+- invalid ratio/size
+- category shortcut asset readiness
+
+If missing:
+WAITING_FOR_INPUT
+with one action:
+[부족한 이미지 준비]
+
+This action should:
+- generate/export prompts automatically
+- use local generator only if READY
+- otherwise show copy-paste/manual upload flow
+
+No paid image generation without explicit opt-in.
+
+======================================================================
+12. G8 — BRAND / HEADER / NAVIGATION READ-ONLY
+======================================================================
+
+Use existing BrandProfile, NavigationService, MegaMenuThemeService and Shopify read-only APIs.
+
+Verify actual remote state when possible:
+- logo/favicon mapping
+- menu exists
+- collection links resolve
+- no '#' links
+- no temporary Trunk placeholder duplicates
+- mobile menu structure inspectable
+- footer links
+
+Do not write.
+
+If remote read cannot verify some field:
+manual-review status only for that field.
+
+======================================================================
+13. G9 — HOMEPAGE READ-ONLY
+======================================================================
+
+Use HomepageAutomationService/Theme reader.
+
+Read actual current published homepage/theme.
+
+Verify:
+- Hero section
+- image
+- CTA
+- CTA target
+- category shortcuts
+- each target
+- featured collections
+- approved asset correspondence
+- no wrong duplicate target
+- no placeholder link
+
+Do not theme-write.
+
+If changes are needed:
+prepare preview/diff automatically and set WAITING_FOR_CONFIRMATION for later theme apply.
+Do not apply yet.
+
+======================================================================
+14. G10 — PRODUCT / COLLECTION TEMPLATES READ-ONLY
+======================================================================
+
+Inspect current published theme/schema using existing reader.
+
+Verify only supported/known schema evidence:
+- product title
+- price
+- media
+- variant selector
+- add to cart
+- collection grid
+- sold-out representation
+- relevant links
+
+Unknown schema => MANUAL_ACTION_REQUIRED, not guessed READY.
+
+======================================================================
+15. G11 — PAGES / POLICIES READ-ONLY
+======================================================================
+
+Read actual Shopify pages/policies where official/current project integration supports it.
+
+Verify presence/readiness of:
+- Contact
+- About
+- Shipping
+- Returns/Refund
+- Privacy
+- Terms
+
+Never fabricate business facts.
+
+Missing required business-specific values:
+WAITING_FOR_INPUT
+
+Provide one consolidated form/checklist, not six separate scattered pages.
+
+======================================================================
+16. G12 — SEO / ACCESSIBILITY / MOBILE
+======================================================================
+
+Automatically gather safe evidence:
+- titles/meta
+- alt text
+- duplicate handles
+- broken internal links
+- missing images/alts
+- basic heading structure where inspectable
+- mobile hero crop status evidence
+- obvious contrast/layout warnings where supported
+
+Final visual mobile/desktop sign-off remains HUMAN REVIEW.
+
+Do not claim full WCAG compliance.
+
+======================================================================
+17. G13 — COMMERCE READINESS READ-ONLY
+======================================================================
+
+Read what official/current Shopify integration can safely verify:
+- market/currency
+- domain
+- SSL
+- password state if available
+- shipping config presence where supported
+- tax config presence where supported
+- payment provider/readiness where supported
+- checkout readiness where supported
+
+Do not invent unsupported API fields.
+Do not mutate anything.
+
+For settings that Shopify API cannot safely expose:
+show exact manual checklist and mark WAITING_FOR_INPUT/REVIEW.
+
+======================================================================
+18. STOP BEFORE PILOT
+======================================================================
+
+When G0–G13 are all verified/ready as defined:
+runner status:
+READY_FOR_PILOT
+
+Show:
+[10개 DRAFT 파일럿 준비]
+
+Do NOT automatically perform G14 write.
+
+Pilot remains explicit human confirmation.
+
+======================================================================
+19. PROGRESS / UX
+======================================================================
+
+Progress must remain gate-evidence based.
+
+Each card shows:
+- status
+- verified evidence summary
+- issue count
+- next action
+
+Top summary:
+실전 진행률
+현재 단계
+완료
+남은 것
+blocker/risk
+다음 행동
+
+The current "next action" must be actionable, not simply repeat the blocker text.
+
+Examples:
+- [Shopify 연결 확인]
+- [Source 안전검사 승인]
+- [이미지 권리 검토]
+- [가격 정책 입력]
+- [부족한 이미지 준비]
+- [정책 정보 입력]
+- [모바일/데스크톱 최종 확인]
+- [10개 DRAFT 파일럿 준비]
+
+======================================================================
+20. AUTOMATIC CONTINUE
+======================================================================
+
+After resolving a human gate, automatically continue through subsequent safe gates.
+
+Examples:
+- user confirms source audit -> audit -> G2 update -> G3 automatically
+- user enters pricing policy -> G5 evaluate -> G6 automatically
+- user approves missing collection assets -> G7 recheck -> G8 automatically
+
+Do not force restarting the whole production audit.
+
+======================================================================
+21. EVIDENCE FRESHNESS / INVALIDATION
+======================================================================
+
+Persist fingerprints for major upstream evidence:
+- Shopify connection/theme
+- source snapshots
+- pricing policy
+- collection plan
+- approved assets
+- navigation/homepage remote reads
+
+If fingerprint changes:
+invalidate only affected downstream gates.
+Do not reset unrelated completed gates.
+
+======================================================================
+22. NETWORK / ERROR SAFETY
+======================================================================
+
+Read-only network failures:
+- timeout -> transient retry bounded
+- 429/throttle -> bounded retry/backoff
+- auth failure -> WAITING_FOR_CREDENTIALS
+- missing scope -> WAITING_FOR_INPUT
+- permanent API error -> BLOCKED/REVIEW_REQUIRED
+
+No endless retry.
+No raw secrets/logs in UI.
+
+======================================================================
+23. TESTS
+======================================================================
+
+Add tests:
+- unfinished production run is resumed, not duplicated
+- explicit new run confirmation
+- G0 real-read adapter mocked success
+- G0 missing credential
+- G0 missing scope
+- G0 timeout transient
+- G1 local audit actual counts
+- G2 zero-cost preview
+- G2 paid/provider confirmation gate
+- G2 confirmation resumes automatically
+- provider error not OOS
+- G3 content evidence
+- G4 rights never auto-assigned
+- G5 pricing policy input gate
+- G6 collection local plan
+- G7 missing image workflow
+- G8 navigation read-only
+- G9 homepage read-only
+- G10 template unknown schema manual
+- G11 legal facts not fabricated
+- G12 human visual signoff remains
+- G13 unsupported commerce field not guessed
+- G0-G13 runner stops READY_FOR_PILOT
+- runner never performs G14 write
+- downstream fingerprint invalidation
+- restart/resume
+- no real network in unit tests
+- protected file untouched
+
+Existing full suite remains green.
+
+======================================================================
+24. PERFORMANCE
+======================================================================
+
+Do not let full suite regress into multi-hour runtime.
+
+Add durations/benchmarks for new runner tests.
+No real sleeps in tests.
+No N+1 provider/DB loops.
+Use bulk reads and existing indexes.
+
+======================================================================
+25. DOCUMENTATION
+======================================================================
+
+Create:
+docs/PRODUCTION_EVIDENCE_RUNNER.md
+
+Korean beginner documentation:
+- what is automatically checked
+- what remains human input
+- why source audit may consume tokens
+- why product image rights are not guessed
+- why pilot is DRAFT-only
+- how progress percentage is calculated
+
+======================================================================
+26. QUALITY GATE
+======================================================================
+
+Focused tests first.
+Then:
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+If full suite exceeds a clearly abnormal duration, diagnose before waiting for hours.
+
+======================================================================
+27. COMMIT / PUSH
+======================================================================
+
+Commit:
+git commit -m "Add production evidence runner"
+
+Push:
+git push origin main
+
+Verify:
+git rev-list --left-right --count main...origin/main
+= 0 0
+
+Do not commit runtime DB/reports/logs/secrets/generated assets/protected JSON.
+
+======================================================================
+28. COMPLETION REPORT
+======================================================================
+
+Report:
+[1] baseline/final SHA
+[2] duplicate-run prevention
+[3] production evidence runner
+[4] G0 live read-only verification
+[5] G1 sourcing audit
+[6] G2 source safety gate
+[7] G3 content audit
+[8] G4 media rights gate
+[9] G5 pricing gate
+[10] G6 collections
+[11] G7 collection media
+[12] G8 navigation
+[13] G9 homepage
+[14] G10 templates
+[15] G11 policies/pages
+[16] G12 SEO/mobile/accessibility
+[17] G13 commerce readiness
+[18] auto-continue behavior
+[19] evidence invalidation
+[20] focused tests
+[21] full tests and runtime
+[22] protected file
+[23] commit/push
+[24] PRODUCTION_EVIDENCE_RUNNER_READY = YES/NO
+
+If YES, do NOT perform the 10-product pilot write automatically.
+Wait for the user in UI.
