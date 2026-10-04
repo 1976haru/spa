@@ -27,7 +27,8 @@ from ..homepage_automation import (HomepageAutomationService, assignment_banner_
     approve_hero_asset, generate_hero_image, latest_hero_asset, register_manual_hero_asset,
     suggested_theme_image_ref, upload_approved_hero_asset, validate_homepage_image)
 from ..homepage_assignment import HomepageAssignmentService, homepage_assignment_workflow
-from ..automation import AutomationTaskError, WorkflowAutomationService
+from ..automation import AutomationTaskError, WorkflowAutomationService, collection_prerequisite_workflow
+from ..collection_prerequisite import CollectionPrerequisiteService, prepare_homepage_prerequisites
 from ..prompt_assets import PromptAssetService
 from ..local_image_studio import LocalImageStudioProvider
 from ..runtime_doctor import PIL_MISSING_KO, dependency_doctor, repair_runtime_dependencies
@@ -156,9 +157,18 @@ def _workflow_service():
         return {"asset_id": asset_row["asset_id"] if asset.get("asset_type") == "HERO_BANNER" else str(asset["collection_key"]),
                 "candidate_id": candidate_id, "message": "추천 이미지 승인 및 로컬 자산 등록을 완료했습니다."}
 
+    def ensure_collection(task):
+        store_id = str((task.get("checkpoint") or {}).get("store_id") or
+                       WorkflowAutomationService().status(task["run_id"])["store_id"])
+        result = CollectionPrerequisiteService().ensure_collection_plan(store_id)
+        if result.status != "READY" or not result.plan:
+            raise AutomationTaskError("BUSINESS_INPUT", result.reason or "LOCAL_CATALOG_OR_CATEGORY_INPUT_REQUIRED")
+        return {"plan_id": result.plan["plan_id"], "source": result.source,
+                "created_at": result.created_at, "collection_count": result.plan["collection_count"]}
+
     return WorkflowAutomationService(handlers={"THEME_WRITE": apply_homepage, "VERIFY": verify_homepage,
         "LOCAL_IMAGE_GENERATE": generate_local_image, "LOCAL_IMAGE_VALIDATE": validate_local_image,
-        "LOCAL_IMAGE_APPROVAL": approve_local_image})
+        "LOCAL_IMAGE_APPROVAL": approve_local_image, "ENSURE_COLLECTION_PLAN": ensure_collection})
 STATUS_OPTIONS = ["ALL", "PRIMARY", "RESERVE_A", "RESERVE_B", "RESERVE_C", "LOW_RESERVE",
                   "HIGH_RESERVE", "REVIEW", "RESTRICTED", "ARCHIVED"]
 PRODUCT_SOURCE_OPTIONS = ["ALL", "BROWSER_CAPTURE", "SPARK_STORAGE", "AMAZON_SOURCE_FOLDER", "KEEPA"]
@@ -1048,6 +1058,33 @@ class OperatorUI:
                         for child in item.get("items",[]):add(child,depth+1)
                     for item in items:add(item)
 
+            def ensure_collection_plan_from_queue():
+                automation = _workflow_service()
+                active = next((item for item in automation.interrupted(self.current_store)
+                    if item.get("workflow_key") == "HOMEPAGE_COLLECTION_PREREQUISITE"), None)
+                if active and active.get("status") == "WAITING_FOR_INPUT":
+                    status = automation.confirm(active["run_id"], "ENSURE_COLLECTION_PLAN", user_input={"continue": True})
+                    run_id = active["run_id"]
+                elif active:
+                    run_id = active["run_id"]
+                    status = automation.run(run_id)
+                else:
+                    run = automation.create_run(self.current_store, "HOMEPAGE_COLLECTION_PREREQUISITE", collection_prerequisite_workflow(self.current_store))
+                    run_id = run["run_id"]
+                    status = automation.run(run_id)
+                state["collection_prerequisite_run_id"] = run_id
+                if status.get("status") in {"WAITING_FOR_INPUT", "FAILED"}:
+                    return {"status": "WAITING_FOR_INPUT", "reason": (status.get("current_task") or {}).get("error_message")}
+                result = automation.task_result(run_id, "ENSURE_COLLECTION_PLAN").get("result") or {}
+                plan_id = result.get("plan_id")
+                plan = CollectionPlanner().get_plan(plan_id) if plan_id else None
+                return {"status": "READY" if plan else "WAITING_FOR_INPUT", "plan": plan,
+                        "source": result.get("source"), "created_at": result.get("created_at")}
+
+            def show_prerequisite_status(collection_status="○ Collection Plan"):
+                end = "✓ Homepage Plan   ✓ Prompt Set" if state.get("plan") and state.get("prompt_set") else "○ Homepage Plan   ○ Prompt Set"
+                prereq_status.set_text(f"✓ Brand Profile   {collection_status}   {end}")
+
             def design():
                 try:
                     plan=nav.build_plan(self.current_store,options={"parent_label":parent.value or "Shop","parent_url":parent_url.value or "/collections/all"})
@@ -1159,6 +1196,7 @@ class OperatorUI:
             brand_name = next((row["store_name"] for row in self.stores if row["store_id"] == self.current_store), self.current_store)
             ui.label(f"Store: {self.current_store} | Brand: {brand_name}").classes("text-xl font-bold")
             summary = ui.label("Hero: not planned · Categories: not planned · Theme: not checked").classes("font-medium")
+            prereq_status = ui.label("○ Brand Profile   ○ Collection Plan   ○ Homepage Plan   ○ Prompt Set").classes("ss-help")
             actions = ui.column().classes("w-full gap-2")
             preview_area = ui.column().classes("w-full gap-2")
             hero_url = ui.input("Shopify Files hero image URL (optional)").classes("w-full")
@@ -1203,13 +1241,56 @@ class OperatorUI:
                     state["preview"] = None
                 ui.notify("Shopify Files: " + str(result), type="positive" if result.get("status") == "READY" else "warning")
 
-            def design():
+            def resolve_homepage_collection_plan():
+                automation = _workflow_service()
+                active = next((item for item in automation.interrupted(self.current_store)
+                    if item.get("workflow_key") == "HOMEPAGE_COLLECTION_PREREQUISITE"), None)
+                if active and active.get("status") == "WAITING_FOR_INPUT":
+                    status = automation.confirm(active["run_id"], "ENSURE_COLLECTION_PLAN", user_input={"continue": True})
+                    run_id = active["run_id"]
+                elif active:
+                    run_id = active["run_id"]
+                    status = automation.run(run_id)
+                else:
+                    run = automation.create_run(self.current_store, "HOMEPAGE_COLLECTION_PREREQUISITE", collection_prerequisite_workflow())
+                    run_id = run["run_id"]
+                    status = automation.run(run_id)
+                state["collection_prerequisite_run_id"] = run_id
+                if status.get("status") in {"WAITING_FOR_INPUT", "FAILED"}:
+                    return {"status": "WAITING_FOR_INPUT", "reason": (status.get("current_task") or {}).get("error_message")}
+                result = automation.task_result(run_id, "ENSURE_COLLECTION_PLAN").get("result") or {}
+                plan_id = result.get("plan_id")
+                plan = CollectionPlanner().get_plan(plan_id) if plan_id else None
+                return {"status": "READY" if plan else "WAITING_FOR_INPUT", "plan": plan,
+                        "source": result.get("source"), "created_at": result.get("created_at")}
+
+            def update_homepage_prerequisite_status(collection_ready=False):
+                collection_status = "✓ Collection Plan" if collection_ready else "○ Collection Plan"
+                later = "✓ Homepage Plan   ✓ Prompt Set" if state.get("plan") and state.get("prompt_set") else "○ Homepage Plan   ○ Prompt Set"
+                prereq_status.set_text(f"✓ Brand Profile   {collection_status}   {later}")
+
+            def design(discover_theme=True):
                 try:
                     from ..brand_automation import brand_profile_from_store, get_brand_profile
+                    brand = get_brand_profile(self.current_store) or brand_profile_from_store(self.current_store)
+                    prereq_status.set_text("✓ Brand Profile   ⟳ Collection Plan 자동 준비 중   ○ Homepage Plan   ○ Prompt Set")
+                    prereq_status.update()
+                    prerequisite = resolve_homepage_collection_plan()
+                    if prerequisite["status"] != "READY":
+                        store_row = next((item for item in self.stores if item["store_id"] == self.current_store), {"store_name": self.current_store})
+                        prepared = prepare_homepage_prerequisites(self.current_store, store=store_row,
+                            brand_profile=brand, maximum_categories=int(max_categories.value or 8))
+                        state.update(plan=prepared["homepage_plan"], snapshot={"status": "NOT_CHECKED", "theme_files": {}, "template": {"sections": {}}},
+                            collection_plan=None, brand=prepared["brand"], prompt_set=prepared["prompt_set"],
+                            preview=None, assignment_preview=None)
+                        update_homepage_prerequisite_status(False)
+                        render()
+                        ui.notify("배너/헤더 프롬프트는 준비했습니다. 컬렉션/카테고리 프롬프트는 컬렉션 설계 후 자동 추가됩니다.", type="warning", multi_line=True)
+                        return
                     with connect() as con:
                         row = con.execute("SELECT plan_id FROM store_collection_plans WHERE store_id=? ORDER BY version DESC LIMIT 1", (self.current_store,)).fetchone()
                     if not row: raise ValueError("먼저 컬렉션 자동 설계를 완료하세요.")
-                    collection_plan = CollectionPlanner().get_plan(row["plan_id"])
+                    collection_plan = prerequisite["plan"]
                     brand = get_brand_profile(self.current_store) or brand_profile_from_store(self.current_store)
                     with connect() as con:
                         has_map = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='shopify_collection_mappings'").fetchone()
@@ -1233,7 +1314,7 @@ class OperatorUI:
                         plan["hero"].update(image_url=saved_hero["shopify_url"], image_asset_id=saved_hero["asset_id"], asset_approved=True, image_status="READY")
                         hero_url.set_value(saved_hero["shopify_url"])
                         hero_approved.set_value(True)
-                    snapshot = ShopifyThemeReader().discover(self.current_store)
+                    snapshot = ShopifyThemeReader().discover(self.current_store) if discover_theme else {"status": "NOT_CHECKED", "theme_files": {}, "template": {"sections": {}}}
                     plan["hero"]["image_url"] = (hero_url.value or "").strip() or None
                     plan["hero"]["asset_approved"] = bool(hero_approved.value)
                     plan["hero"]["theme_image_ref"] = (theme_image_ref.value or "").strip() or None
@@ -1258,6 +1339,7 @@ class OperatorUI:
                         collection_plan=collection_plan, mappings=assignment_mappings,
                         approved_images=images, theme=theme_assignment, hero_asset=hero_asset)
                     HomepageAutomationService().export_report(plan, preview=state["preview"])
+                    update_homepage_prerequisite_status(True)
                     summary.set_text(f"Hero: NEEDS IMAGE · Categories: {plan['category_summary']['ready_count']} READY / {plan['category_summary']['skipped_count']} SKIPPED · Theme: {snapshot.get('status', 'MANUAL ACTION')}")
                     render()
                     ui.notify("홈페이지 계획/preview를 저장했습니다. Shopify write는 실행하지 않았습니다.", type="positive")
@@ -1266,6 +1348,9 @@ class OperatorUI:
             def auto_complete():
                 """One beginner action: finish safe preview work, then wait at the write gate."""
                 design()
+                if not state.get("collection_plan"):
+                    ui.notify("배너/헤더 프롬프트는 준비했습니다. 컬렉션/카테고리 프롬프트는 컬렉션 계획이 준비된 뒤 이어집니다.", type="warning")
+                    return
                 if not state.get("plan"):
                     return
                 tasks = homepage_assignment_workflow(state["assignment_preview"],
@@ -1367,19 +1452,29 @@ class OperatorUI:
                     ui.notify("Generated asset ready for review: " + result["path"], type="positive")
                 except Exception as exc: ui.notify(_safe_error(exc), type="negative")
 
+            def continue_after_collection_design():
+                design(discover_theme=False)
+                if state.get("prompt_set"):
+                    build_prompts()
+
             def build_prompts():
                 try:
-                    if not state.get("collection_plan"):
-                        design()
-                    if not state.get("collection_plan"):
-                        return
                     if not state.get("prompt_set"):
-                        state["prompt_set"] = PromptAssetService().build(
+                        design(discover_theme=False)
+                    if not state.get("prompt_set"):
+                        prepared = prepare_homepage_prerequisites(self.current_store,
                             store=next((item for item in self.stores if item["store_id"] == self.current_store), {"store_name": self.current_store}),
-                            brand=state.get("brand"), collection_plan=state["collection_plan"], homepage_plan=state.get("plan"))
+                            maximum_categories=int(max_categories.value or 8))
+                        state["plan"], state["collection_plan"], state["brand"], state["prompt_set"] = (
+                            prepared["homepage_plan"], prepared["collection_plan"], prepared["brand"], prepared["prompt_set"])
                     prompt_set = state["prompt_set"]
                     prompt_area.clear()
                     with prompt_area:
+                        if prompt_set.get("groups", {}).get("collection", {}).get("status") == "WAITING_FOR_COLLECTION_PLAN":
+                            ui.label("배너/헤더 프롬프트는 준비했습니다.").classes("ss-card-title")
+                            ui.label("컬렉션/카테고리 프롬프트는 컬렉션 설계 후 자동 추가됩니다.").classes("ss-help")
+                            ui.button("현재 프롬프트 보기", on_click=lambda: ui.notify("아래 Hero·Header 프롬프트를 확인하세요.", type="info")).props("outline")
+                            ui.button("컬렉션 자동 설계 후 이어서", on_click=continue_after_collection_design, icon="auto_awesome").props("color=primary")
                         ui.label(f"복사해 외부 이미지 도구에서 사용할 수 있는 prompt {len(prompt_set['assets'])}개").classes("ss-help")
                         for item in prompt_set["assets"]:
                             with ui.expansion(f"{item['title']} · {item['suggested_size']}", icon="image"):

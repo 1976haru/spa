@@ -33,6 +33,13 @@ FRIENDLY_ERRORS = {
 def _now(): return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def collection_prerequisite_workflow(store_id=None):
+    """Persistent local-only collection prerequisite task for homepage flows."""
+    return [{"task_key": "ENSURE_COLLECTION_PLAN", "title": "Ensure Collection Plan",
+             "stage": "Local planning", "max_attempts": 1,
+             "checkpoint": {"store_id": store_id} if store_id else {}}]
+
+
 class AutomationTaskError(RuntimeError):
     def __init__(self, code, detail="", *, transient=False):
         super().__init__(detail or code); self.code=code; self.detail=detail or code

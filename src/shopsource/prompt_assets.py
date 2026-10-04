@@ -116,10 +116,22 @@ class PromptAssetService:
             "notes_for_local_generator": "Do not send the logo through image generation; reuse the approved source asset.",
             "notes_for_shopify_placement": "Preserve approved logo and favicon mappings; preview before any explicit theme apply."})
         run_id = "AP_" + secrets.token_hex(8)
+        has_collection_plan = bool(collection_plan and collection_plan.get("collections"))
+        groups = {
+            "hero": {"status": "READY", "asset_types": ["HERO_BANNER", "HERO_MOBILE_CROP_GUIDE", "HERO_ALT_TEXT"]},
+            "collection": {"status": "READY" if has_collection_plan else "WAITING_FOR_COLLECTION_PLAN",
+                           "asset_types": ["COLLECTION_IMAGE"]},
+            "category_shortcut": {"status": "READY" if has_collection_plan else "WAITING_FOR_COLLECTION_PLAN",
+                                  "asset_types": ["CATEGORY_SHORTCUT"]},
+            "header_section": {"status": "READY", "asset_types": ["HEADER_SUPPORT", "FEATURED_SUPPORT", "ABOUT_BRAND", "CONTACT_SUPPORT", "BRAND_REUSE_GUIDANCE"]},
+        }
         return {"schema_version": "1.0", "run_id": run_id, "store": context["store_name"], "assets": records,
+                "groups": groups,
                 "summary": {"total": len(records), "hero": 1,
                             "collections": sum(x["asset_type"] == "COLLECTION_IMAGE" for x in records),
-                            "categories": sum(x["asset_type"] == "CATEGORY_SHORTCUT" for x in records)}}
+                            "categories": sum(x["asset_type"] == "CATEGORY_SHORTCUT" for x in records),
+                            "collection_status": groups["collection"]["status"],
+                            "category_status": groups["category_shortcut"]["status"]}}
 
     def export(self, prompt_set: dict, *, store_id: str, output_root: str | Path | None = None) -> dict:
         root = Path(output_root or EXPORT_DIR) / "asset_prompts" / _slug(store_id) / prompt_set["run_id"]
