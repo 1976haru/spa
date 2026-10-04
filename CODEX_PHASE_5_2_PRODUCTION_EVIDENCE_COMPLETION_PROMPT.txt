@@ -1,0 +1,567 @@
+ShopSource Studio — Phase 5.2
+PRODUCTION EVIDENCE COMPLETION — SOURCE EXECUTION + PAGES/POLICIES + SEO/MOBILE + COMMERCE ADAPTERS
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+- Baseline: ab347f5d4ce8861e6b408871dbad8e72229f661c
+
+Context confirmed from Phase 5.1 completion:
+- ProductionEvidenceRunner exists.
+- G0–G10 have real/local/read-only evidence paths.
+- G2 has a preview and confirmation concept, but confirmed UI/provider execution is NOT wired.
+- G11 actual pages/policies read-only adapter is incomplete.
+- G12 actual SEO/accessibility/mobile evidence adapter is incomplete.
+- G13 actual commerce-readiness read-only adapter is incomplete.
+- PRODUCTION_EVIDENCE_RUNNER_READY = NO.
+- The user requires production-grade accuracy: unknown/unsupported fields must remain REVIEW/WAITING, never guessed READY.
+
+Primary goal
+Finish the evidence runner so a real Cabin Tidy production audit can progress from G0 through G13 with:
+- explicit confirmation for source/provider cost,
+- real official read-only Shopify evidence where supported,
+- truthful manual-review fallback where APIs do not expose enough,
+- actionable beginner UI for every human gate,
+- automatic continuation on the same run after each resolved gate,
+- no real write before G14.
+
+======================================================================
+0. SAFETY / NON-NEGOTIABLE
+======================================================================
+
+During implementation/tests:
+- NO real Shopify mutation
+- NO theme mutation
+- NO product write
+- NO navigation write
+- NO inventory write
+- NO Spark upload
+- NO payment/shipping/tax mutation
+- NO paid image generation
+- NO real source/provider call from pytest
+
+Runtime:
+- read-only Shopify calls are allowed through existing official/current project clients
+- real source/provider check is allowed ONLY after explicit user approval in UI
+- do not invent unsupported Shopify API fields
+- do not fall back to scraping Shopify admin/browser UI
+- do not expose tokens/secrets
+
+Protected file:
+stores/001_cabin_tidy.json
+NEVER reset/restore/checkout/clean/stage/commit/overwrite.
+
+======================================================================
+1. G2 — WIRE REAL SOURCE AUDIT EXECUTION
+======================================================================
+
+Current limitation:
+ProductionEvidenceRunner.confirm_source_audit() accepts observations, but the UI has no real provider execution adapter.
+
+Goal:
+Use the existing source-safety/provider pipeline instead of creating a second sourcing system.
+
+Reuse:
+- SourceMonitorService
+- SourceSafetyService
+- existing Keepa credential/provider code
+- existing browser-capture evidence where applicable
+- source_check_runs/items checkpoint/retry state
+
+Add a runtime service/action:
+confirm_and_run_source_audit(run_id, confirmed=True, budget_confirmation=...)
+
+Flow:
+1. recompute zero-cost preview
+2. verify preview fingerprint/freshness
+3. show target_count, batch_count, estimated token/cost when available
+4. one explicit confirmation
+5. execute existing configured provider checks in batches
+6. checkpoint/resume
+7. bounded retry transient failures
+8. CAPTCHA/provider challenge -> WAITING_FOR_INPUT, never bypass
+9. map real observations into source snapshots
+10. recalc sellability/freshness
+11. update G2
+12. auto-continue ProductionEvidenceRunner from G3 onward
+
+Important:
+- provider error != OUT_OF_STOCK
+- missing Keepa one price type != OOS
+- do not mark success if only a subset completed unless policy explicitly allows partial and unresolved products remain blocked
+- preserve estimated token budget and actual consumed metadata if provider supplies it
+- never print API key/token
+
+UI on Production page:
+[실제 Source 안전검사 승인]
+
+Dialog:
+- 대상
+- batch
+- 예상 token/cost
+- currently FRESH / STALE / NEVER_VERIFIED
+- provider
+- warning that real provider usage may consume quota
+
+After approval:
+show progress and queue controls:
+[일시정지] [계속] [중단] [실패만 재시도]
+
+Do not require batch-by-batch confirmation.
+
+======================================================================
+2. G4 — ACTIONABLE PRODUCT MEDIA RIGHTS WORKFLOW
+======================================================================
+
+Phase 5.1 correctly refuses auto-assignment, but production must be operable.
+
+Add a beginner bulk review page/dialog from the production gate:
+[상품 이미지 권리 검토]
+
+Show paginated rows:
+- product title
+- ASIN
+- image count/primary image
+- current media policy
+- source
+- review status
+- note
+
+Allow bulk setting ONLY after user deliberately selects evidence/policy:
+SUPPLIER_AUTHORIZED
+MERCHANT_OWNED
+LICENSED
+MANUAL_REVIEW_REQUIRED
+NO_RIGHTS_CONFIRMED
+
+Do NOT provide a "mark all authorized" default.
+Bulk action must require explicit selection + confirmation.
+
+GENERATED_LIFESTYLE_ONLY is informational and cannot satisfy exact product image rights.
+
+Persist reviewed_at and notes.
+After save:
+- reevaluate G4 automatically
+- continue runner when all production candidates satisfy policy.
+
+======================================================================
+3. G5 — ACTIONABLE PRICING/MARGIN POLICY UI
+======================================================================
+
+Add:
+[가격·마진 정책 설정]
+
+Use existing SourcePriceGuardPolicy storage/service.
+
+Beginner fields:
+- currency
+- fixed buffer
+- percent buffer
+- min margin amount
+- min margin percent
+- unknown fee handling
+- warning threshold
+- auto_reprice (default OFF)
+
+Require user confirmation before saving.
+Do not invent defaults as approved policy.
+You may prefill suggestions visually, but they remain unapproved until user confirms.
+
+After save:
+- recalc price/margin status for production candidates
+- update G5
+- auto-continue runner.
+
+======================================================================
+4. G11 — REAL PAGES / POLICIES READ-ONLY ADAPTER
+======================================================================
+
+Implement a current official Shopify read-only adapter using the project's configured API/version.
+
+Read ONLY fields/endpoints that are actually supported by current official Shopify APIs and available scopes.
+
+Target evidence:
+- pages list / identifiable pages where API supports it
+- legal policies where official API exposes them
+- store contact/support fields only if official API exposes them
+
+Required production concepts:
+- Contact
+- About
+- Shipping
+- Returns/Refund
+- Privacy
+- Terms
+
+Map evidence carefully:
+- PRESENT_VERIFIED
+- PRESENT_NEEDS_REVIEW
+- MISSING
+- API_NOT_EXPOSED
+- SCOPE_MISSING
+
+Do NOT infer policy quality merely from title existence.
+Do NOT fabricate business-specific values.
+Do NOT assume a page is Contact/About from fuzzy title unless mapping confidence is high; otherwise review required.
+
+If a required concept cannot be read via official API:
+show a manual verification item, not READY.
+
+Production UI:
+[페이지·정책 확인]
+
+One consolidated card/table:
+Concept | Remote status | Missing fields | Action
+
+If business-specific data is required:
+[사업·정책 정보 입력]
+with explicit inputs, but do NOT write remotely yet.
+This phase can save local approved inputs for later theme/page write preview.
+
+======================================================================
+5. G12 — SEO / ACCESSIBILITY / MOBILE EVIDENCE ADAPTER
+======================================================================
+
+Implement real evidence collection from existing local catalog + read-only Shopify/theme data.
+
+Safe automatic evidence:
+- homepage title/meta when readable
+- product title/meta presence
+- collection title/meta presence
+- missing image alt where readable
+- duplicate handles
+- broken internal collection/menu links
+- missing images
+- hero mobile-crop review state
+- basic heading/schema evidence where theme files expose it
+- obvious oversized image metadata if locally available
+- existing no-placeholder findings
+
+Do not claim:
+- full WCAG compliance
+- visual perfection
+- keyboard compliance if not actually tested
+
+Require explicit final human signoff:
+Desktop preview checked
+Mobile preview checked
+
+UI:
+[데스크톱/모바일 최종 확인]
+
+Checklist with:
+- desktop
+- mobile
+- hero crop
+- category cards
+- menu
+- footer
+- readability
+
+Human visual signoff should be persisted with timestamp/user-confirmed flag.
+Changing homepage/theme fingerprint invalidates relevant visual signoff.
+
+G12 can be VERIFIED only if:
+- automated critical checks pass
+- required human visual signoff is current.
+
+======================================================================
+6. G13 — COMMERCE READINESS READ-ONLY ADAPTER
+======================================================================
+
+Use only official/current Shopify APIs already supported by the project or add carefully version-compatible read-only calls.
+
+Evidence categories:
+- shop currency
+- Markets/current target market if available
+- primary domain/domain verification if supported
+- SSL status if supported
+- storefront/password state if supported
+- shipping profile/config presence if supported
+- tax config/readiness if supported
+- payment/checkout readiness if supported
+
+Critical rule:
+If Shopify Admin API does NOT expose a required operational setting in a reliable read-only form:
+DO NOT invent an API field.
+Return:
+API_NOT_EXPOSED / MANUAL_VERIFICATION_REQUIRED
+
+UI:
+[판매 설정 확인]
+
+One consolidated checklist:
+- US Market
+- Currency
+- Domain
+- SSL
+- Storefront password
+- Shipping
+- Tax
+- Payment
+- Checkout
+
+Each item:
+VERIFIED
+NEEDS_INPUT
+MANUAL_VERIFY
+UNSUPPORTED_READ
+BLOCKED
+
+Persist manual confirmations separately from API evidence.
+Manual confirmation is explicit human evidence, not API evidence.
+
+Do not automatically mutate any commerce setting.
+
+======================================================================
+7. G0 DOMAIN/SSL CLEANUP
+======================================================================
+
+Phase 5.1 currently leaves primary domain/SSL manual even when other G0 checks pass.
+
+If current official Shopify API/version provides reliable domain/SSL read-only evidence:
+wire it into G0.
+
+If not:
+keep manual review and move those operational checks into G13 rather than unnecessarily blocking the basic G0 environment connection gate.
+
+G0 should represent:
+"Can ShopSource safely identify/connect/read the intended store/theme?"
+
+G13 should represent:
+"Is the commerce configuration ready to sell?"
+
+Do not let unsupported domain/SSL fields prevent all later safe local audits.
+
+======================================================================
+8. HUMAN GATE ACTION CENTER
+======================================================================
+
+On /production add one contextual action area.
+
+Based on current gate show exactly one primary action:
+- G0: [Shopify 연결 확인]
+- G2: [실제 Source 안전검사 승인]
+- G4: [상품 이미지 권리 검토]
+- G5: [가격·마진 정책 설정]
+- G7: [부족한 이미지 준비]
+- G9: [홈페이지 미리보기 확인]
+- G11: [페이지·정책 확인]
+- G12: [데스크톱/모바일 최종 확인]
+- G13: [판매 설정 확인]
+- READY_FOR_PILOT: [10개 DRAFT 파일럿 준비]
+
+Secondary:
+[세부 문제 보기]
+
+Do not require navigating to expert menus for normal production flow.
+
+======================================================================
+9. AUTO-CONTINUE SAME RUN
+======================================================================
+
+After user resolves any gate:
+- persist evidence
+- re-run current gate
+- continue through subsequent safe gates
+- stop at next human gate
+- reuse SAME run_id
+
+Do not create new production run.
+Do not repeat already verified expensive work if fingerprint unchanged.
+
+======================================================================
+10. REPORTING / PROGRESS
+======================================================================
+
+Production progress remains based on G0–G13 evidence only before pilot.
+
+Use 14 evidence gates for pre-pilot readiness.
+
+Do not count:
+- code completion
+- unit tests
+- mock success
+- implementation existence
+
+Top summary always:
+실전 진행률: X%
+현재 단계:
+완료:
+남은 것:
+현재 blocker/risk:
+다음 실행:
+
+When G0–G13 pass:
+pre-pilot readiness = 100%
+status = READY_FOR_PILOT
+
+After that, final store launch progress is tracked separately including G14–G16.
+Do not call the store 100% launch-ready merely because pre-pilot audit is complete.
+
+======================================================================
+11. SOURCE AUDIT SCALE / PERFORMANCE
+======================================================================
+
+User does not want unnecessary visible staging.
+
+For source audit:
+- internal batches/checkpoints are okay
+- user sees one audit operation
+- one confirmation
+- one progress view
+
+No repeated manual approvals per 100 items.
+
+Use bulk DB operations.
+No N+1 source snapshot queries.
+No real sleeps in tests.
+
+======================================================================
+12. TESTS
+======================================================================
+
+Add focused tests:
+
+G2:
+- source confirmation calls configured adapter only after approval
+- no provider call before approval
+- provider error != OOS
+- partial failure keeps unresolved blocked
+- checkpoint/resume
+- pause/resume/stop/retry failed
+
+G4:
+- rights cannot be auto-assigned
+- bulk rights explicit selection/confirmation
+- generated lifestyle cannot satisfy exact media
+- reviewed_at persisted
+
+G5:
+- pricing policy explicit save
+- auto-reprice default off
+- reevaluation after save
+
+G11:
+- pages/policies adapter mocked official read
+- API not exposed stays manual
+- missing scope
+- no fabricated legal facts
+
+G12:
+- SEO checks
+- broken link detection
+- human desktop/mobile signoff
+- fingerprint change invalidates signoff
+- no WCAG false claim
+
+G13:
+- supported commerce evidence
+- unsupported field remains manual
+- manual confirmation stored distinctly
+- no commerce mutation
+
+Integration:
+- G0 no longer blocked by unsupported domain/SSL if core connection/theme is verified
+- runner automatically continues after G2/G4/G5/G11/G12/G13 resolution
+- G0-G13 can reach READY_FOR_PILOT in fully-evidenced mock
+- G14 write still never auto-runs
+- no real network in tests
+- protected file untouched
+
+Existing full suite remains green.
+
+======================================================================
+13. FULL-SUITE RUNTIME GUARD
+======================================================================
+
+Last full suite was ~327 seconds.
+
+Do not accept multi-hour regression.
+
+Run focused first with --durations=30.
+Then full suite with --durations=30.
+
+If full suite exceeds 2x recent normal runtime without clear machine load reason:
+stop, identify slow test, fix regression before waiting for hours.
+
+Do not hardcode brittle 327-second assertion in pytest.
+
+======================================================================
+14. DOCUMENTATION
+======================================================================
+
+Update:
+docs/PRODUCTION_EVIDENCE_RUNNER.md
+
+Add:
+docs/PRODUCTION_HUMAN_GATES.md
+
+Explain in Korean:
+- what each human gate means
+- source provider cost confirmation
+- media rights review
+- pricing policy
+- page/policy manual evidence
+- desktop/mobile signoff
+- commerce manual verification
+- why unsupported fields remain unresolved
+
+======================================================================
+15. QUALITY GATE
+======================================================================
+
+Focused tests first.
+
+Then:
+python -m compileall -q src tests
+python -m pytest -q --durations=30
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+======================================================================
+16. COMMIT / PUSH
+======================================================================
+
+Commit:
+git commit -m "Complete production evidence gates"
+
+Push:
+git push origin main
+
+Verify:
+git rev-list --left-right --count main...origin/main
+= 0 0
+
+Do not commit runtime DB/reports/logs/generated assets/secrets/protected JSON.
+
+======================================================================
+17. COMPLETION REPORT
+======================================================================
+
+Report:
+[1] baseline/final SHA
+[2] G2 provider execution wiring
+[3] G4 rights workflow
+[4] G5 pricing policy workflow
+[5] G11 pages/policies adapter
+[6] G12 SEO/mobile/accessibility adapter
+[7] G13 commerce adapter
+[8] G0 domain/SSL handling
+[9] production action center
+[10] auto-continue same run
+[11] evidence/manual confirmation separation
+[12] focused tests
+[13] full tests + runtime
+[14] protected file
+[15] commit/push
+[16] PRE_PILOT_EVIDENCE_READY = YES/NO
+
+Even if YES:
+- do not run actual provider audit automatically
+- do not run 10-product Shopify write
+- wait for explicit user action in UI.
