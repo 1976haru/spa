@@ -819,3 +819,60 @@ Report:
 
 If YES, still do NOT start real provider/Shopify/Theme writes.
 Wait for explicit user action in the UI.
+
+======================================================================
+31. USER-REQUESTED PRODUCTION PROGRESS REPORTING STANDARD
+======================================================================
+
+From this phase onward, progress must be reported ONLY against real production readiness,
+not against code completion or assignment completion.
+
+Every relevant status report must include:
+- 실전 진행률 (%): actual readiness to operate a real Cabin Tidy store
+- 현재 단계
+- 완료한 것
+- 남은 것
+- 현재 blocker/risk
+- 다음 실행 단계
+
+Do not inflate progress because tests pass.
+Code complete != production ready.
+Mock verified != live verified.
+DRAFT uploaded != launch ready.
+
+If a critical production blocker exists, explicitly state it even when the numeric score is high.
+
+======================================================================
+32. SIMPLIFIED LIVE UPLOAD SCALE
+======================================================================
+
+Do NOT split real Shopify upload into too many stages.
+
+Default production rollout should use only THREE operational stages:
+
+Stage 1 — PILOT
+- up to 10 highest-confidence DRAFT products
+- full reread/reconciliation after write
+- any critical mismatch stops progression
+
+Stage 2 — VALIDATION BATCH
+- default up to 100–200 DRAFT products in one batch
+- choose size based on current source freshness, media readiness, and API safety
+- full reconciliation sampling plus critical-field aggregate checks
+- any systemic mismatch stops progression
+
+Stage 3 — MAIN CATALOG
+- remaining production-approved catalog
+- checkpoint/resume internally is allowed
+- the UI should present this as ONE main upload stage, not many user-facing mini stages
+- batch/chunk internally only for API reliability/throttling, without forcing repeated user approvals unless a new risk/preview change occurs
+
+Do NOT force 10 → 50 → 200 → many more visible approval stages by default.
+
+A user-facing extra stage is allowed only when:
+- the previous stage finds a material mismatch,
+- API/provider behavior requires a smaller batch for safety,
+- source/price/media conditions changed enough to invalidate preview,
+- or the user explicitly requests another validation step.
+
+ACTIVE publication remains a separate final human gate after DRAFT catalog verification.
