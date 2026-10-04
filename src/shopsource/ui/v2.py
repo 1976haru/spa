@@ -35,6 +35,7 @@ from ..runtime_doctor import PIL_MISSING_KO, dependency_doctor, repair_runtime_d
 from ..navigation import MegaMenuThemeService, NavigationService
 from ..store_build import StoreBuildOrchestrator
 from ..store_completion import DOMAINS, StoreCompletionService
+from ..production import GATES, ProductionGoldenPathService
 from ..security import redact_text
 from ..intelligence.keyword_engine import KeywordEngine
 from ..paths import AMAZON_INBOX_DIR, EXPORT_DIR, STORE_DIR
@@ -51,6 +52,7 @@ from .v2_service import (
 from .beginner import BEGINNER_NAV_GROUPS, GLOBAL_UI_CSS
 
 NAV_ITEMS = [
+    ("/production", "rocket_launch", "실전 스토어 완성"),
     ("/completion", "fact_check", "스토어 완성"),
     ("/source-safety", "health_and_safety", "소스 재고·가격 안전"),
     ("/homepage", "web", "Homepage Automation"),
@@ -284,6 +286,7 @@ class OperatorUI:
             )
         with ui.column().classes("w-full max-w-[1600px] mx-auto p-6 gap-6"):
             if path == "/completion": self._store_completion()
+            elif path == "/production": self._production_golden_path()
             elif path == "/source-safety": self._source_safety()
             elif path == "/": self._dashboard()
             elif path == "/build": self._store_build()
@@ -302,6 +305,39 @@ class OperatorUI:
     def _set_store(self, store_id, path):
         self.current_store = store_id
         self.ui.navigate.to(path)
+
+    def _production_golden_path(self):
+        ui = self.ui
+        self._heading("실전 스토어 완성", "Cabin Tidy의 소싱부터 출시 전 점검까지 증거가 확인된 항목만 통과시킵니다. 확인되지 않은 내용은 준비 완료로 추정하지 않습니다.")
+        service = ProductionGoldenPathService()
+        state = {"run": None}
+        summary = ui.label("아직 production 점검 run이 없습니다.").classes("ss-card-title")
+        with ui.row().classes("w-full flex-wrap gap-3"):
+            start = ui.button("실전 스토어 자동 구축 시작", icon="rocket_launch").props("color=primary size=lg")
+            ui.button("기존 점검 다시 열기", icon="history", on_click=lambda: load_latest()).props("outline size=lg")
+        notice = ui.label("이 버튼은 로컬 gate/checkpoint만 준비합니다. Amazon·Keepa·Shopify·Theme 호출이나 실제 변경은 하지 않습니다.").classes("ss-help")
+        cards = ui.column().classes("w-full gap-2")
+        def render(run):
+            state["run"] = run
+            summary.set_text(f"판정: {run['status']} · 확인된 gate {run['summary'].get('completion_percent', 0)}% · 미해결 {run['summary'].get('blocker_count', 0)}")
+            cards.clear()
+            with cards:
+                for gate in run["gates"]:
+                    with ui.card().classes("w-full p-4 border border-slate-200"):
+                        ui.label(f"{gate['position'] + 1:02d}. {gate['gate_key']}").classes("ss-card-title")
+                        ui.label(gate["status"]).classes("font-semibold")
+                        for reason in gate["blockers"][:5]: ui.label(f"• {reason}").classes("ss-help")
+        def load_latest():
+            with connect() as con:
+                row = con.execute("SELECT run_id FROM production_runs WHERE store_id=? ORDER BY updated_at DESC LIMIT 1", (self.current_store,)).fetchone()
+            if row: render(service.get(row["run_id"]))
+            else: ui.notify("이 스토어의 저장된 production 점검이 없습니다.", type="info")
+        def begin():
+            run = service.start(self.current_store)
+            render(run)
+            ui.notify("로컬 production gate를 만들었습니다. 연결/권한 등 확인 전에는 다음 gate가 통과되지 않습니다.", type="warning")
+        start.on_click(begin)
+        if self.current_store == "001": load_latest()
 
     def _source_safety(self):
         ui = self.ui
@@ -2020,6 +2056,8 @@ class OperatorUI:
         with ui.row().classes("w-full grid grid-cols-1 lg:grid-cols-3 gap-5"):
             with ui.card().classes("rounded-xl border-2 border-blue-200 p-5"):
                 ui.label("오늘 할 일").classes("ss-card-title")
+                ui.label("Cabin Tidy 실전 스토어 만들기").classes("ss-card-title")
+                ui.button("실전 스토어 자동 구축 시작",on_click=lambda:ui.navigate.to("/production"),icon="rocket_launch").props("color=primary size=lg")
                 ui.label("Source 안전검사를 먼저 완료하세요." if not interrupted else "중단된 자동 작업을 이어서 확인하세요.")
                 ui.button("자동으로 진행",on_click=lambda:ui.navigate.to("/source-safety"),icon="auto_awesome").props("color=primary")
                 ui.button("홈페이지 자동 완성",on_click=lambda:ui.navigate.to("/homepage"),icon="web").props("outline")

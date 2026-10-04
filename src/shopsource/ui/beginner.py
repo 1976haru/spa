@@ -20,7 +20,7 @@ BEGINNER_NAV_GROUPS = (
     ("자동 구축", (("/build","auto_awesome","자동 구축"),)),
     ("상품·소싱", (("/source-safety","health_and_safety","소스 안전"),("/products","inventory_2","상품"),("/collections","collections_bookmark","컬렉션"))),
     ("스토어 디자인", (("/brand","palette","브랜드"),("/navigation","account_tree","메뉴"),("/homepage","web","홈페이지"))),
-    ("스토어 완성", (("/completion","fact_check","완성도 검사"),("/pilot","science","실전 파일럿"))),
+    ("스토어 완성", (("/production","rocket_launch","실전 스토어 완성"),("/completion","fact_check","완성도 검사"),("/pilot","science","실전 파일럿"))),
     ("기록", (("/history","history","기록"),)),
 )
 
