@@ -23,8 +23,11 @@ from ..homepage_collections import HomepageCollectionService, ShopifyThemeReader
 from ..homepage_automation import (HomepageAutomationService, assignment_banner_check,
     assignment_category_check, build_homepage_plan as build_storefront_homepage_plan,
     build_homepage_preview as build_storefront_homepage_preview, compose_homepage_preview,
+    discover_homepage_sections,
     approve_hero_asset, generate_hero_image, latest_hero_asset, register_manual_hero_asset,
     suggested_theme_image_ref, upload_approved_hero_asset, validate_homepage_image)
+from ..homepage_assignment import HomepageAssignmentService, homepage_assignment_workflow
+from ..automation import WorkflowAutomationService
 from ..navigation import MegaMenuThemeService, NavigationService
 from ..store_build import StoreBuildOrchestrator
 from ..store_completion import DOMAINS, StoreCompletionService
@@ -1051,9 +1054,10 @@ class OperatorUI:
 
     def _homepage_automation(self):
         ui = self.ui
-        self._heading("Homepage Automation", "BrandProfile, enabled collections, Shopify mappings, and the discovered theme schema drive this preview.")
+        self._heading("홈페이지 자동 완성", "배너, 카테고리, 추천 컬렉션과 링크를 한 번에 준비하고 실제 적용 직전에만 멈춥니다.")
         ui.label("Preview is read-only. Shopify theme changes require a separate explicit confirmation; paid image generation stays off until opted in.").classes("text-sm text-amber-800")
-        state = {"plan": None, "snapshot": None, "preview": None, "collection_plan": None, "backup_id": None}
+        state = {"plan": None, "snapshot": None, "preview": None, "assignment_preview": None,
+                 "collection_plan": None, "backup_id": None}
         with ui.card().classes("w-full border-2 border-sky-200 bg-sky-50"):
             brand_name = next((row["store_name"] for row in self.stores if row["store_id"] == self.current_store), self.current_store)
             ui.label(f"Store: {self.current_store} | Brand: {brand_name}").classes("text-xl font-bold")
@@ -1112,7 +1116,9 @@ class OperatorUI:
                     brand = get_brand_profile(self.current_store) or brand_profile_from_store(self.current_store)
                     with connect() as con:
                         has_map = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='shopify_collection_mappings'").fetchone()
-                        mappings = {item["collection_key"]: item["handle"] for item in con.execute("SELECT collection_key,handle FROM shopify_collection_mappings WHERE store_id=?", (self.current_store,))} if has_map else {}
+                        mapping_rows = [dict(item) for item in con.execute("SELECT collection_key,handle,shopify_collection_id,image_url FROM shopify_collection_mappings WHERE store_id=?", (self.current_store,))] if has_map else []
+                        mappings = {item["collection_key"]: item["handle"] for item in mapping_rows}
+                        assignment_mappings = {item["collection_key"]: {**item, "remote_id": item["shopify_collection_id"], "status": "VERIFIED"} for item in mapping_rows}
                     images = {key: {**asset, "approval_status": "APPROVED"} for key, asset in approved_collection_images(self.current_store).items()}
                     plan = build_storefront_homepage_plan(store_id=self.current_store, brand=brand, collection_plan=collection_plan,
                         collection_handles=mappings, collection_assets=images, maximum_categories=int(max_categories.value or 8))
@@ -1138,11 +1144,62 @@ class OperatorUI:
                     if plan["hero"]["image_url"]: plan["hero"]["image_asset_id"] = "SHOPIFY_FILES_URL"
                     state["plan"], state["snapshot"], state["collection_plan"] = plan, snapshot, collection_plan
                     state["preview"] = compose_homepage_preview(plan, snapshot, collection_plan, collection_handles=mappings) if snapshot.get("status") == "CONNECTED" else None
+                    discovered = discover_homepage_sections(snapshot.get("theme_files") or {})
+                    category_schema = discovered.get("category") or {}
+                    theme_assignment = {"sections": ([{"mode": category_schema.get("mode")}] if category_schema else []),
+                                        "builder": snapshot.get("page_builder") or ""}
+                    hero_asset = saved_hero if saved_hero and saved_hero.get("approval_status") == "APPROVED" else None
+                    if hero_asset:
+                        hero_asset = {**hero_asset, "asset_id": hero_asset.get("asset_id"), "path": hero_asset.get("local_path"),
+                                      "url": hero_asset.get("shopify_url"), "provider": hero_asset.get("provider") or "MANUAL"}
+                    state["assignment_preview"] = HomepageAssignmentService().build(
+                        homepage={"hero": plan["hero"], "unrelated_sections": (snapshot.get("template") or {}).get("sections", {})},
+                        collection_plan=collection_plan, mappings=assignment_mappings,
+                        approved_images=images, theme=theme_assignment, hero_asset=hero_asset)
                     HomepageAutomationService().export_report(plan, preview=state["preview"])
                     summary.set_text(f"Hero: NEEDS IMAGE · Categories: {plan['category_summary']['ready_count']} READY / {plan['category_summary']['skipped_count']} SKIPPED · Theme: {snapshot.get('status', 'MANUAL ACTION')}")
                     render()
                     ui.notify("홈페이지 계획/preview를 저장했습니다. Shopify write는 실행하지 않았습니다.", type="positive")
                 except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            def auto_complete():
+                """One beginner action: finish safe preview work, then wait at the write gate."""
+                design()
+                if not state.get("plan"):
+                    return
+                tasks = homepage_assignment_workflow(state["assignment_preview"])
+                run = WorkflowAutomationService().create_run(self.current_store, "HOMEPAGE_AUTO_COMPLETE", tasks)
+                status = WorkflowAutomationService().run(run["run_id"])
+                ui.notify(f"안전한 단계 완료 · {status['progress_percent']}% · 실제 적용 승인 대기", type="positive")
+
+            def assignment_ready_check():
+                plan = state.get("plan")
+                if not plan:
+                    ui.notify("먼저 홈페이지 자동 완성을 실행하세요.", type="warning")
+                    return
+                hero = assignment_banner_check(plan)
+                categories = assignment_category_check(plan)
+                items = categories["items"]
+                duplicate = len({x.get("target") for x in items if x.get("target")}) != len([x for x in items if x.get("target")])
+                checks = [
+                    ("Hero 표시", bool(plan.get("hero", {}).get("enabled", True))),
+                    ("제목/설명", bool(hero.get("headline") and hero.get("body"))),
+                    ("CTA와 실제 링크", bool(hero.get("cta") and hero.get("cta_link") not in {None, "", "#"})),
+                    ("승인된 배너 이미지", bool(hero.get("image") and plan["hero"].get("asset_approved"))),
+                    ("Category shortcut 4개 이상", len([x for x in items if x.get("target")]) >= 4),
+                    ("각 shortcut 이미지", bool(items) and all(x.get("image_asset") for x in items)),
+                    ("정확한 컬렉션 연결", not categories["warnings"]),
+                    ("# / blank 링크 없음", all(x.get("target") not in {None, "", "#"} for x in items)),
+                    ("잘못된 중복 target 없음", not duplicate),
+                    ("Desktop / mobile 확인", False),
+                ]
+                with ui.dialog() as dialog, ui.card().classes("w-[680px] max-w-full"):
+                    ui.label("과제 제출용 확인").classes("ss-card-title")
+                    for label, passed in checks:
+                        ui.label(("✓ " if passed else "확인 필요 · ") + label).classes("text-green-700" if passed else "text-amber-800")
+                    ui.label("Desktop/mobile 화면은 실제 Theme 미리보기에서 사람이 마지막으로 확인해야 합니다.").classes("ss-help")
+                    ui.button("닫기", on_click=dialog.close).props("outline")
+                dialog.open()
 
             def render():
                 plan = state.get("plan")
@@ -1241,11 +1298,16 @@ class OperatorUI:
                         ui.button("확인 후 롤백", on_click=perform_rollback).props("color=negative")
                 dialog.open()
 
+            with ui.card().classes("w-full border-2 border-indigo-200 bg-indigo-50"):
+                ui.label("초보자 자동화").classes("ss-card-title")
+                ui.label("안전한 설계와 검사는 연속 실행하고, 실제 Theme write는 한 번만 승인받습니다.").classes("ss-help")
+                ui.button("홈페이지 자동 완성", on_click=auto_complete, icon="auto_awesome").props("color=primary size=lg")
             with ui.row():
                 ui.button("홈페이지 자동 설계", on_click=design, icon="auto_awesome").props("color=positive")
-                ui.button("메인 배너 만들기 / 문구 자동 작성", on_click=design, icon="image")
-                ui.button("카테고리 바로가기 만들기", on_click=design, icon="category")
+                ui.button("메인 배너 자동 만들기", on_click=design, icon="image")
+                ui.button("카테고리 바로가기 자동 만들기", on_click=design, icon="category")
                 ui.button("홈페이지 미리보기", on_click=refresh_preview, icon="visibility").props("outline")
+                ui.button("과제 제출용 확인", on_click=assignment_ready_check, icon="checklist").props("outline")
                 ui.button("Shopify 적용", on_click=apply_confirm, icon="publish").props("color=primary")
                 ui.button("롤백", on_click=rollback_homepage, icon="undo").props("outline")
                 ui.button("수동 적용 안내", on_click=show_manual, icon="help").props("outline")
@@ -1606,6 +1668,7 @@ class OperatorUI:
                 ui.label("오늘 할 일").classes("ss-card-title")
                 ui.label("Source 안전검사를 먼저 완료하세요." if not interrupted else "중단된 자동 작업을 이어서 확인하세요.")
                 ui.button("자동으로 진행",on_click=lambda:ui.navigate.to("/source-safety"),icon="auto_awesome").props("color=primary")
+                ui.button("홈페이지 자동 완성",on_click=lambda:ui.navigate.to("/homepage"),icon="web").props("outline")
             with ui.card().classes("rounded-xl border border-slate-200 p-5"):
                 ui.label("자동 작업").classes("ss-card-title")
                 if interrupted:

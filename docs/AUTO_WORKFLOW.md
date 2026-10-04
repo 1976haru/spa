@@ -8,3 +8,4 @@ timeout, 연결 중단, 429와 일시적인 server/provider 오류는 설정된 
 
 Automation Settings에서 자동 모드, 자동 재시도, 최대 횟수, 다음 안전 단계 자동 진행, 재시작 안내와 provider token limit을 변경할 수 있습니다.
 
+홈페이지 자동 workflow는 `HERO → CATEGORY_SHORTCUTS → FEATURED_COLLECTIONS → LINK_CHECK → THEME_PREVIEW`까지 자동 처리한 후 `THEME_WRITE`에서 한 번만 확인을 기다립니다. 승인 뒤에는 원격 검증과 과제 제출용 확인으로 계속됩니다. 외부 페이지 빌더만 가능한 경우에는 write task를 만들지 않고 수동 입력 대기 상태로 멈춥니다.
