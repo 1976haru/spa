@@ -94,3 +94,14 @@ def test_assignment_ready_summary():
     v = fixtures(); preview = HomepageAssignmentService().build(homepage=v[0], collection_plan=v[1], mappings=v[2], approved_images=v[3], theme=v[4], hero_asset=v[5])
     result = HomepageAssignmentService().checklist(preview, applied=True, verified=True, desktop_checked=True, mobile_checked=True)
     assert result["status"] == "ASSIGNMENT_READY" and all(result["checks"].values())
+
+
+def test_homepage_workflow_requires_persisted_preview_for_theme_gate():
+    v = fixtures(); preview = HomepageAssignmentService().build(homepage=v[0], collection_plan=v[1], mappings=v[2], approved_images=v[3], theme=v[4], hero_asset=v[5])
+    assert not any(x["task_key"] == "THEME_WRITE" for x in homepage_assignment_workflow(preview))
+
+
+def test_homepage_theme_confirmation_carries_preview_checkpoint():
+    v = fixtures(); preview = HomepageAssignmentService().build(homepage=v[0], collection_plan=v[1], mappings=v[2], approved_images=v[3], theme=v[4], hero_asset=v[5])
+    gate = next(x for x in homepage_assignment_workflow(preview, preview_id="preview-123", assets_approved=True) if x["task_key"] == "THEME_WRITE")
+    assert gate["requires_confirmation"] and gate["checkpoint"] == {"preview_id": "preview-123", "assets_approved": True}

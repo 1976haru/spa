@@ -27,7 +27,7 @@ from ..homepage_automation import (HomepageAutomationService, assignment_banner_
     approve_hero_asset, generate_hero_image, latest_hero_asset, register_manual_hero_asset,
     suggested_theme_image_ref, upload_approved_hero_asset, validate_homepage_image)
 from ..homepage_assignment import HomepageAssignmentService, homepage_assignment_workflow
-from ..automation import WorkflowAutomationService
+from ..automation import AutomationTaskError, WorkflowAutomationService
 from ..navigation import MegaMenuThemeService, NavigationService
 from ..store_build import StoreBuildOrchestrator
 from ..store_completion import DOMAINS, StoreCompletionService
@@ -63,6 +63,33 @@ NAV_ITEMS = [
     ("/history", "history", "기록"),
     ("/settings", "settings", "설정"),
 ]
+
+
+def _workflow_service():
+    """Use durable task handlers so a confirmed theme task cannot be a no-op."""
+    def apply_homepage(task):
+        checkpoint = task.get("checkpoint") or {}
+        preview_id = checkpoint.get("preview_id")
+        if not preview_id:
+            raise AutomationTaskError("PREVIEW_STALE", "Homepage preview id missing")
+        result = HomepageAutomationService().apply(preview_id, confirmed=True,
+                                                   approved_assets=bool(checkpoint.get("assets_approved")))
+        if result.get("status") != "VERIFIED":
+            raise AutomationTaskError("CONFLICT", result.get("reason") or result.get("status") or "Theme write did not verify")
+        return {"status": "SUCCEEDED", "message": "홈페이지 적용 후 Shopify에서 검증했습니다.",
+                "backup_id": result.get("backup_id"), "theme_id": result.get("theme_id")}
+
+    def verify_homepage(task):
+        checkpoint = task.get("checkpoint") or {}
+        preview_id = checkpoint.get("preview_id")
+        if not preview_id:
+            raise AutomationTaskError("PREVIEW_STALE", "Homepage preview id missing")
+        result = HomepageAutomationService().verify(preview_id)
+        if result.get("status") != "VERIFIED":
+            raise AutomationTaskError("CONFLICT", result.get("reason") or result.get("status") or "Remote verification failed")
+        return {"message": "홈페이지 원격 검증을 완료했습니다.", "theme_id": result.get("theme_id")}
+
+    return WorkflowAutomationService(handlers={"THEME_WRITE": apply_homepage, "VERIFY": verify_homepage})
 STATUS_OPTIONS = ["ALL", "PRIMARY", "RESERVE_A", "RESERVE_B", "RESERVE_C", "LOW_RESERVE",
                   "HIGH_RESERVE", "REVIEW", "RESTRICTED", "ARCHIVED"]
 PRODUCT_SOURCE_OPTIONS = ["ALL", "BROWSER_CAPTURE", "SPARK_STORAGE", "AMAZON_SOURCE_FOLDER", "KEEPA"]
@@ -202,7 +229,7 @@ class OperatorUI:
         from ..automation import WorkflowAutomationService, source_safety_workflow
         from ..source_safety import SourceMonitorService, SourceSafetyService
         self._heading("소스 재고·가격 안전", "Amazon/source 재고와 가격을 확인하고 Shopify 판매 위험을 자동으로 막습니다.")
-        safety=SourceSafetyService(); monitor=SourceMonitorService(); automation=WorkflowAutomationService()
+        safety=SourceSafetyService(); monitor=SourceMonitorService(); automation=_workflow_service()
         state={"run_id":None,"preview":None,"filter":"ALL","page":0}
         mode=ui.toggle({"AUTO":"자동","REVIEW":"검토","MANUAL":"수동"},value="AUTO").props("unelevated")
 
@@ -373,7 +400,7 @@ class OperatorUI:
         ui = self.ui
         from ..automation import WorkflowAutomationService, store_build_workflow
         self._heading("자동으로 스토어 완성", "안전한 계획과 검사는 자동으로 진행하고, 비용이나 실제 외부 변경에서만 멈춥니다.")
-        beginner_auto=WorkflowAutomationService(); beginner_state={"run_id":None}
+        beginner_auto=_workflow_service(); beginner_state={"run_id":None}
         with ui.card().classes("w-full rounded-xl border-2 border-blue-200 p-5"):
             ui.label("원클릭 AUTO").classes("ss-card-title")
             ui.label("Store Profile → Source Safety → 상품 → 컬렉션 → 브랜드 → 메뉴 → 홈페이지 → 완성도 검사를 이어서 진행합니다.").classes("ss-help")
@@ -1167,9 +1194,12 @@ class OperatorUI:
                 design()
                 if not state.get("plan"):
                     return
-                tasks = homepage_assignment_workflow(state["assignment_preview"])
-                run = WorkflowAutomationService().create_run(self.current_store, "HOMEPAGE_AUTO_COMPLETE", tasks)
-                status = WorkflowAutomationService().run(run["run_id"])
+                tasks = homepage_assignment_workflow(state["assignment_preview"],
+                    preview_id=(state.get("preview") or {}).get("preview_id"),
+                    assets_approved=bool(hero_approved.value))
+                automation = _workflow_service()
+                run = automation.create_run(self.current_store, "HOMEPAGE_AUTO_COMPLETE", tasks)
+                status = automation.run(run["run_id"])
                 ui.notify(f"안전한 단계 완료 · {status['progress_percent']}% · 실제 적용 승인 대기", type="positive")
 
             def assignment_ready_check():
@@ -1662,7 +1692,7 @@ class OperatorUI:
         data = dashboard_data(self.current_store)
         store = next((item for item in self.stores if item["store_id"] == self.current_store), None)
         self._heading("대시보드", f"{self.current_store} | {store['store_name'] if store else ''} 운영 현황")
-        auto=WorkflowAutomationService(); interrupted=auto.interrupted(self.current_store)
+        auto=_workflow_service(); interrupted=auto.interrupted(self.current_store)
         with ui.row().classes("w-full grid grid-cols-1 lg:grid-cols-3 gap-5"):
             with ui.card().classes("rounded-xl border-2 border-blue-200 p-5"):
                 ui.label("오늘 할 일").classes("ss-card-title")
@@ -2832,7 +2862,7 @@ class OperatorUI:
         ui = self.ui
         from ..automation import WorkflowAutomationService
         self._heading("설정", "Keepa 인증과 UI 기본값을 관리합니다.")
-        automation=WorkflowAutomationService(); auto_values=automation.settings(self.current_store)
+        automation=_workflow_service(); auto_values=automation.settings(self.current_store)
         with ui.card().classes("w-full rounded-xl border border-blue-200 p-5"):
             ui.label("Automation Settings").classes("ss-card-title")
             auto_mode=ui.switch("자동 모드",value=bool(auto_values["auto_mode"]))

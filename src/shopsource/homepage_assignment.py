@@ -151,7 +151,8 @@ class HomepageAssignmentService:
                 "ready": ready, "manual_reason": preview["capability"].get("reason")}
 
 
-def homepage_assignment_workflow(preview: dict) -> list[dict[str, Any]]:
+def homepage_assignment_workflow(preview: dict, *, preview_id: str | None = None,
+                                 assets_approved: bool = False) -> list[dict[str, Any]]:
     """Queue specification: all local stages run; write is the single confirmation gate."""
     tasks = [
         {"task_key": "HERO", "title": "메인 배너 자동 만들기", "stage": "Hero"},
@@ -161,13 +162,14 @@ def homepage_assignment_workflow(preview: dict) -> list[dict[str, Any]]:
         {"task_key": "THEME_PREVIEW", "title": "테마 미리보기", "stage": "테마 미리보기"},
     ]
     capability = preview["capability"]["status"]
-    if capability in {"EXTERNAL_PAGE_BUILDER_MANUAL", "UNSUPPORTED_MANUAL"}:
+    if capability in {"EXTERNAL_PAGE_BUILDER_MANUAL", "UNSUPPORTED_MANUAL"} or not preview_id:
         tasks.append({"task_key": "EXTERNAL_MANUAL", "title": "외부 빌더 수동 적용", "stage": "수동 작업",
                       "requires_user_input": True})
     else:
         tasks.append({"task_key": "THEME_WRITE", "title": "홈페이지 실제 적용", "stage": "Theme write",
                       "requires_confirmation": True,
-                      "confirmation_prompt": "미리보기대로 홈페이지 Theme 변경을 실제 적용합니다."})
+                      "confirmation_prompt": "미리보기대로 홈페이지 Theme 변경을 실제 적용합니다.",
+                      "checkpoint": {"preview_id": preview_id, "assets_approved": bool(assets_approved)}})
         tasks.append({"task_key": "VERIFY", "title": "적용 결과 자동 검증", "stage": "검증"})
     tasks.append({"task_key": "ASSIGNMENT_READY", "title": "과제 제출용 확인", "stage": "완료"})
     return tasks
