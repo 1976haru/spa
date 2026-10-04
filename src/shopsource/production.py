@@ -32,7 +32,8 @@ GATE_LABELS_KO = dict(zip(GATES, (
     "10개 상품 안전 파일럿", "상품 업로드 단계 확대", "최종 출시 확인",
 )))
 GATE_STATES = {"NOT_STARTED", "RUNNING", "READY", "READY_WITH_WARNINGS", "REVIEW_REQUIRED",
-               "WAITING_FOR_INPUT", "WAITING_FOR_CONFIRMATION", "BLOCKED", "VERIFIED"}
+               "WAITING_FOR_INPUT", "WAITING_FOR_CONFIRMATION", "WAITING_FOR_CREDENTIALS",
+               "FAILED_TRANSIENT", "BLOCKED", "VERIFIED"}
 PRODUCTION_CLASSES = {"PRODUCTION_CANDIDATE", "RESERVE", "REVIEW_REQUIRED", "REJECT_FOR_STORE", "RESTRICTED"}
 MEDIA_POLICIES = {"SUPPLIER_AUTHORIZED", "MERCHANT_OWNED", "LICENSED", "GENERATED_LIFESTYLE_ONLY",
                   "MANUAL_REVIEW_REQUIRED", "NO_RIGHTS_CONFIRMED"}
@@ -187,7 +188,8 @@ def _gate_result(key: str, evidence: dict | None) -> dict:
     blockers = list(evidence.get("blockers") or [])
     missing = list(evidence.get("missing_inputs") or [])
     review = list(evidence.get("review_required") or [])
-    if evidence.get("status") in {"BLOCKED", "WAITING_FOR_INPUT", "WAITING_FOR_CONFIRMATION", "REVIEW_REQUIRED"}:
+    if evidence.get("status") in {"BLOCKED", "WAITING_FOR_INPUT", "WAITING_FOR_CONFIRMATION",
+                                   "WAITING_FOR_CREDENTIALS", "FAILED_TRANSIENT", "REVIEW_REQUIRED"}:
         status = evidence["status"]
     elif blockers: status = "BLOCKED"
     elif missing: status = "WAITING_FOR_INPUT"
@@ -253,20 +255,28 @@ class ProductionGoldenPathService:
         """Human-facing progress is gate evidence only, never implementation/test progress."""
         run = self.get(run_id)
         passed = {"READY", "READY_WITH_WARNINGS", "VERIFIED"}
-        completed = [gate["gate_key"] for gate in run["gates"] if gate["status"] in passed]
-        remaining = [gate["gate_key"] for gate in run["gates"] if gate["status"] not in passed]
-        current = next((gate for gate in run["gates"] if gate["status"] not in passed), None)
+        gates = run["gates"][:14]
+        completed = [gate["gate_key"] for gate in gates if gate["status"] in passed]
+        remaining = [gate["gate_key"] for gate in gates if gate["status"] not in passed]
+        current = next((gate for gate in gates if gate["status"] not in passed), None)
         blockers = [{"gate": gate["gate_key"], "status": gate["status"], "reasons": gate["blockers"]}
-                    for gate in run["gates"] if gate["status"] in {"BLOCKED", "REVIEW_REQUIRED", "WAITING_FOR_INPUT", "WAITING_FOR_CONFIRMATION"}]
-        return {"production_readiness_percent": run["summary"].get("completion_percent", 0),
-                "current_stage": current["gate_key"] if current else "COMPLETE",
+                    for gate in gates if gate["status"] in {"BLOCKED", "REVIEW_REQUIRED", "WAITING_FOR_INPUT", "WAITING_FOR_CONFIRMATION", "WAITING_FOR_CREDENTIALS", "FAILED_TRANSIENT"}]
+        actions = {"ENVIRONMENT_STORE_IDENTITY": "Shopify 연결 확인", "SOURCE_SAFETY": "Source 안전검사 승인",
+                   "PRODUCT_MEDIA": "이미지 권리 검토", "PRICING_MARGIN": "가격 정책 입력",
+                   "COLLECTION_CATEGORY_MEDIA": "부족한 이미지 준비", "PAGES_POLICIES": "정책 정보 입력",
+                   "SEO_ACCESSIBILITY_MOBILE": "모바일/데스크톱 최종 확인", "COMMERCE_READINESS": "판매 설정 확인"}
+        pilot_ready = len(completed) == 14
+        return {"production_readiness_percent": round(len(completed) * 100 / 14),
+                "evidence_gate_count": 14,
+                "current_stage": current["gate_key"] if current else ("READY_FOR_PILOT" if pilot_ready else "COMPLETE"),
                 "current_stage_label": GATE_LABELS_KO.get(current["gate_key"], "완료") if current else "완료",
                 "completed": completed, "remaining": remaining, "blockers": blockers,
                 "completed_labels": [GATE_LABELS_KO[x] for x in completed],
                 "remaining_labels": [GATE_LABELS_KO[x] for x in remaining],
-                "next_action": (current["blockers"][0] if current and current["blockers"] else
+                "next_action": (actions.get(current["gate_key"], "현재 단계의 증거 확인") if current else
                                 ("이 gate의 실제 근거를 확인하고 연결하세요." if current else "최종 launch readiness를 검토하세요.")),
-                "code_complete_does_not_imply_launch_ready": True}
+                "code_complete_does_not_imply_launch_ready": True,
+                "pilot_write_automatic": False}
 
     def update(self, run_id: str, evidence_by_gate: dict[str, dict]) -> dict:
         run = self.get(run_id)
@@ -288,7 +298,7 @@ class ProductionGoldenPathService:
                 if prior_unresolved and key == "FINAL_LAUNCH_READINESS":
                     item["status"] = "BLOCKED"
                     item["blockers"].append("최종 출시 선행 gate 미완료: " + ", ".join(prior_unresolved))
-                if prior_unresolved and item["status"] in {"READY", "READY_WITH_WARNINGS", "VERIFIED"}:
+                if prior_unresolved and key in {"CONTROLLED_LIVE_PILOT", "BATCH_EXPANSION", "FINAL_LAUNCH_READINESS"} and item["status"] in {"READY", "READY_WITH_WARNINGS", "VERIFIED"}:
                     item["status"] = "BLOCKED"
                     item["blockers"].append("선행 gate 미완료: " + ", ".join(prior_unresolved))
                 con.execute("UPDATE production_gates SET status=?,evidence_json=?,blockers_json=?,updated_at=? WHERE run_id=? AND gate_key=?",
@@ -297,7 +307,7 @@ class ProductionGoldenPathService:
             rows = list(con.execute("SELECT gate_key,status,blockers_json FROM production_gates WHERE run_id=? ORDER BY position", (run_id,)))
             counts = {state: sum(r["status"] == state for r in rows) for state in GATE_STATES}
             blockers = [{"gate": r["gate_key"], "reason": reason} for r in rows
-                        if r["status"] in {"BLOCKED", "WAITING_FOR_INPUT", "WAITING_FOR_CONFIRMATION", "REVIEW_REQUIRED"}
+                        if r["status"] in {"BLOCKED", "WAITING_FOR_INPUT", "WAITING_FOR_CONFIRMATION", "WAITING_FOR_CREDENTIALS", "FAILED_TRANSIENT", "REVIEW_REQUIRED"}
                         for reason in json.loads(r["blockers_json"])]
             blockers.extend({"gate": r["gate_key"], "reason": "아직 검증되지 않았습니다."}
                             for r in rows if r["status"] == "NOT_STARTED")

@@ -36,6 +36,7 @@ from ..navigation import MegaMenuThemeService, NavigationService
 from ..store_build import StoreBuildOrchestrator
 from ..store_completion import DOMAINS, StoreCompletionService
 from ..production import GATE_LABELS_KO, ProductionGoldenPathService
+from ..production_runner import ProductionEvidenceRunner
 from ..security import redact_text
 from ..intelligence.keyword_engine import KeywordEngine
 from ..paths import AMAZON_INBOX_DIR, EXPORT_DIR, STORE_DIR
@@ -310,11 +311,13 @@ class OperatorUI:
         ui = self.ui
         self._heading("실전 스토어 완성", "Cabin Tidy의 소싱부터 출시 전 점검까지 증거가 확인된 항목만 통과시킵니다. 확인되지 않은 내용은 준비 완료로 추정하지 않습니다.")
         service = ProductionGoldenPathService()
+        runner = ProductionEvidenceRunner(service=service)
         state = {"run": None}
+        new_run_button = ui.button("새 점검 시작", icon="add_circle").props("outline")
         summary = ui.label("아직 production 점검 run이 없습니다.").classes("ss-card-title")
         progress_report_label = ui.label("현재 단계: 아직 시작 전").classes("ss-help")
         with ui.row().classes("w-full flex-wrap gap-3"):
-            start = ui.button("실전 스토어 자동 구축 시작", icon="rocket_launch").props("color=primary size=lg")
+            start = ui.button("실전 점검 자동 진행", icon="rocket_launch").props("color=primary size=lg")
             ui.button("기존 점검 다시 열기", icon="history", on_click=lambda: load_latest()).props("outline size=lg")
         notice = ui.label("이 버튼은 로컬 gate/checkpoint만 준비합니다. Amazon·Keepa·Shopify·Theme 호출이나 실제 변경은 하지 않습니다.").classes("ss-help")
         cards = ui.column().classes("w-full gap-2")
@@ -344,10 +347,19 @@ class OperatorUI:
             if row: render(service.get(row["run_id"]))
             else: ui.notify("이 스토어의 저장된 production 점검이 없습니다.", type="info")
         def begin():
-            run = service.start(self.current_store)
+            run = runner.run(self.current_store)
             render(run)
-            ui.notify("로컬 production gate를 만들었습니다. 연결/권한 등 확인 전에는 다음 gate가 통과되지 않습니다.", type="warning")
+            ui.notify("읽기 전용 production evidence 확인을 진행했습니다. Shopify 쓰기는 실행되지 않았습니다.", type="positive")
         start.on_click(begin)
+        def create_confirmed_run():
+            run = runner.start_or_resume(self.current_store, new_run=True, confirmed=True)
+            render(run)
+        with ui.dialog() as confirm_new_run, ui.card():
+            ui.label("기존 기록은 보존됩니다. 새 점검 기록을 추가로 만들까요?")
+            with ui.row():
+                ui.button("취소", on_click=confirm_new_run.close).props("outline")
+                ui.button("새 점검 확인", on_click=lambda: (confirm_new_run.close(), create_confirmed_run())).props("color=primary")
+        new_run_button.on_click(confirm_new_run.open)
         if self.current_store == "001": load_latest()
 
     def _source_safety(self):
