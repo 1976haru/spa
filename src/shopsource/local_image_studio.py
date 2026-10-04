@@ -179,11 +179,12 @@ class LocalImageStudioProvider:
     def create_job(self, *, store_id: str, store_name: str, asset: dict, context: dict,
                    output_count: int | None = None, reference_images: list[str] | None = None) -> dict:
         kind = asset["asset_type"]
+        bridge_kind = {"COLLECTION_IMAGE": "COLLECTION_SQUARE", "CATEGORY_SHORTCUT": "COLLECTION_CARD"}.get(kind, kind)
         target = {"HERO_BANNER": {"width": 1920, "height": 1080, "aspect_ratio": "16:9"},
-                  "COLLECTION_IMAGE": {"width": 1200, "height": 1200, "aspect_ratio": "1:1"},
-                  "CATEGORY_SHORTCUT": {"width": 1200, "height": 1200, "aspect_ratio": "1:1"}}.get(kind, {"width": 1200, "height": 900, "aspect_ratio": "4:3"})
+                  "COLLECTION_SQUARE": {"width": 1200, "height": 1200, "aspect_ratio": "1:1"},
+                  "COLLECTION_CARD": {"width": 1200, "height": 900, "aspect_ratio": "4:3"}}.get(bridge_kind, {"width": 1200, "height": 900, "aspect_ratio": "4:3"})
         return {"job_id": "IMG_" + hashlib.sha256(f"{store_id}:{asset.get('title')}:{time.time_ns()}".encode()).hexdigest()[:16],
-                "store_id": store_id, "store_name": store_name, "asset_type": kind,
+                "store_id": store_id, "store_name": store_name, "asset_type": bridge_kind,
                 "prompt": asset["prompt_main"], "negative_prompt": asset["negative_prompt"],
                 "text_policy": "NO_EMBEDDED_TEXT", "target": target,
                 "safe_zone": {"preferred_text_side": "right", "text_safe_percent": 35, "mobile_center_safe": True},

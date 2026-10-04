@@ -67,6 +67,16 @@ def test_runtime_repair_is_explicit_same_interpreter_and_does_not_install_in_tes
     assert calls[0][0][0] == "selected-python" and calls[0][0][-1] == ".[ui]"
 
 
+def test_shop_source_assets_map_to_documented_bridge_asset_types(tmp_path):
+    provider = LocalImageStudioProvider(LocalImageStudioConfig(repo_path=tmp_path))
+    for source_type, bridge_type in (("COLLECTION_IMAGE", "COLLECTION_SQUARE"),
+                                    ("CATEGORY_SHORTCUT", "COLLECTION_CARD")):
+        job = provider.create_job(store_id="001", store_name="Cabin Tidy",
+            asset={"asset_type": source_type, "title": source_type, "prompt_main": "safe", "negative_prompt": "text"},
+            context={})
+        assert job["asset_type"] == bridge_type
+
+
 def test_local_image_workflow_persists_candidates_until_explicit_approval(tmp_path):
     calls = []
     def generate(task):
