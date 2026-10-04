@@ -1,0 +1,277 @@
+ShopSource Studio — Phase 4.1.3A
+AUTO-RESOLVE COLLECTION PREREQUISITE FOR PROMPT/HOMEPAGE FLOW
+
+Repository:
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+- Baseline: 3fc27806c359c40d6b874dc73900b3286987c20a
+
+Observed user issue:
+On Homepage Automation, clicking prompt auto-generation causes:
+`먼저 컬렉션 자동 설계를 완료하세요.`
+
+Root cause confirmed in current src/shopsource/ui/v2.py:
+`design()` directly queries latest store_collection_plans and raises when none exists.
+This is too strict for beginner one-click UX.
+
+Goal:
+Prompt generation and Homepage Auto Complete must AUTO-RESOLVE the collection-plan prerequisite whenever safe.
+The user should not have to leave the homepage screen and manually visit Collection Automation first.
+
+==================================================
+1. REQUIRED BEHAVIOR
+==================================================
+
+Add a reusable helper/service such as:
+`ensure_collection_plan(store_id, *, allow_create=True)`
+
+Behavior:
+A. Existing latest valid collection plan exists
+→ reuse it
+
+B. No collection plan exists, but local prerequisites are sufficient
+→ automatically create a collection plan using existing Phase 3.2 CollectionPlanner
+→ NO Shopify write
+→ NO image generation
+→ NO external network
+→ persist the newly-created local plan
+→ continue prompt/homepage flow automatically
+
+C. No collection plan exists and local prerequisites are insufficient
+→ DO NOT hard-fail all prompt generation
+→ generate all collection-independent prompts:
+   - HERO_BANNER
+   - HERO_MOBILE_CROP_GUIDE
+   - HERO_ALT_TEXT
+   - HEADER_SUPPORT
+   - FEATURED_SUPPORT if generic-safe
+   - ABOUT_BRAND
+   - CONTACT_SUPPORT
+   - BRAND_REUSE_GUIDANCE
+→ mark collection/category prompt groups:
+   `WAITING_FOR_COLLECTION_PLAN`
+→ show one clear beginner action:
+   [컬렉션 자동 설계 후 이어서]
+
+Do not require Shopify remote collection mappings merely to GENERATE prompts.
+Remote mappings are required only for live category shortcut apply/link verification.
+
+==================================================
+2. PROMPT AUTO GENERATION
+==================================================
+
+Change [프롬프트 자동 생성] flow:
+
+click
+→ inspect existing collection plan
+→ if missing and locally possible, auto-create it
+→ build prompt set
+→ display prompts
+
+Beginner message:
+`컬렉션 계획이 없어 자동으로 먼저 설계했습니다. Shopify에는 아무것도 적용하지 않았습니다.`
+
+Do NOT display the old blocking message during normal safe conditions.
+
+==================================================
+3. HOMEPAGE AUTO DESIGN / AUTO COMPLETE
+==================================================
+
+Change:
+[홈페이지 자동 설계]
+[홈페이지 자동 완성]
+[메인 배너 자동 만들기]
+[카테고리 바로가기 자동 만들기]
+
+so they all share the same prerequisite resolver.
+
+Desired sequence:
+Store Profile
+→ ensure Brand Profile
+→ ensure Collection Plan
+→ Homepage Plan
+→ Prompt Plan
+→ asset workflow
+
+No need for the user to manually navigate to Collection Automation.
+
+==================================================
+4. SAFE PARTIAL MODE
+==================================================
+
+If collections cannot yet be designed because the store has insufficient local catalog/sourcing data:
+
+Prompt UI should still work for Hero/Header.
+
+Show:
+`배너/헤더 프롬프트는 준비했습니다.`
+`컬렉션/카테고리 프롬프트는 컬렉션 설계 후 자동 추가됩니다.`
+
+Buttons:
+[현재 프롬프트 보기]
+[컬렉션 자동 설계 후 이어서]
+
+No raw exception toast for this expected state.
+
+==================================================
+5. COLLECTION PLAN CREATION SAFETY
+==================================================
+
+Reuse existing CollectionPlanner/Phase 3.2 logic.
+Do not create a second planner.
+
+Automatic prerequisite creation must be:
+- local DB only
+- deterministic
+- idempotent
+- no Shopify write
+- no Theme write
+- no Keepa/Amazon
+- no Spark
+- no paid image API
+
+If a plan is auto-created, record:
+- source = AUTO_PREREQUISITE
+- store_id
+- created_at
+- planner/version metadata if supported
+
+Do not overwrite an existing latest valid plan.
+
+==================================================
+6. INVALID / STALE PLAN
+==================================================
+
+If latest collection plan exists but is structurally invalid or references deleted local definitions:
+- do not silently use corrupt data
+- rebuild locally only if safe
+- otherwise show beginner warning and preserve old plan
+
+Do not delete historical plans.
+
+==================================================
+7. UI STATUS
+==================================================
+
+Homepage screen should show compact prerequisite status:
+
+✓ Brand Profile
+✓ Collection Plan
+✓ Homepage Plan
+✓ Prompt Set
+
+or:
+
+✓ Brand Profile
+⟳ Collection Plan 자동 준비 중
+○ Homepage Plan
+○ Prompt Set
+
+Do not show internal plan IDs by default.
+
+==================================================
+8. AUTO WORKFLOW QUEUE
+==================================================
+
+Integrate prerequisite into Phase 4.1.2 persistent queue.
+
+Suggested task:
+`ENSURE_COLLECTION_PLAN`
+
+Successful task must not repeat on resume.
+
+If collection planning waits for local sourcing/catalog data:
+status should be WAITING_FOR_INPUT, not FAILED.
+
+==================================================
+9. TESTS
+==================================================
+
+Add at minimum:
+- test_prompt_generation_reuses_existing_collection_plan
+- test_prompt_generation_auto_creates_missing_collection_plan
+- test_prompt_generation_no_shopify_write_when_auto_creating_plan
+- test_prompt_generation_partial_without_collection_prerequisites
+- test_hero_prompts_available_without_collection_plan
+- test_collection_prompts_added_after_plan_created
+- test_homepage_design_auto_resolves_collection_plan
+- test_homepage_auto_complete_auto_resolves_collection_plan
+- test_auto_created_plan_idempotent
+- test_invalid_plan_not_silently_used
+- test_queue_ensure_collection_plan_resume
+- test_protected_store_file_untouched
+- test_no_real_network_in_tests
+
+Keep all existing tests green.
+
+==================================================
+10. USER-FACING ACCEPTANCE
+==================================================
+
+After fix, on a store with no collection plan:
+
+User clicks:
+[프롬프트 자동 생성]
+
+Expected:
+- no blocking error
+- ShopSource automatically prepares collection plan when possible
+- then shows Hero + Collection + Category + Header prompts
+
+If collection planning is impossible:
+- Hero/Header prompts still appear
+- Collection/Category clearly pending
+- one button continues later
+
+==================================================
+11. QUALITY GATE
+==================================================
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+==================================================
+12. PROTECTED FILE
+==================================================
+
+stores/001_cabin_tidy.json
+
+NEVER reset/restore/checkout/clean/stage/commit/overwrite.
+
+==================================================
+13. COMMIT/PUSH
+==================================================
+
+Commit:
+`git commit -m "Auto-resolve homepage collection prerequisite"`
+
+Push origin/main.
+
+Confirm:
+`git rev-list --left-right --count main...origin/main`
+= 0 0
+
+==================================================
+14. COMPLETION REPORT
+==================================================
+
+Report:
+[1] root cause
+[2] prerequisite resolver
+[3] auto-created collection plan behavior
+[4] partial prompt mode
+[5] homepage integration
+[6] queue integration
+[7] tests
+[8] protected file
+[9] commit SHA
+[10] push state
+[11] exact user click after fix
+
+Do not perform real Shopify/Theme/provider writes.
