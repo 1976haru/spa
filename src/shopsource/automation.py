@@ -243,6 +243,11 @@ class WorkflowAutomationService:
             rows=[dict(x) for x in con.execute(f"SELECT task_key,title,stage,position,status,attempt_count,max_attempts,error_code,error_message,updated_at FROM automation_tasks WHERE {where} ORDER BY position LIMIT ? OFFSET ?",[*params,page_size,page*page_size])]
         return {"rows":rows,"total":total,"page":page,"page_size":page_size}
 
+    def task_result(self, run_id, task_key):
+        """Return the bounded, redacted summary from one completed task."""
+        task = self._task(run_id, task_key)
+        return {"task_key": task_key, "status": task["status"], "result": redact_value(task.get("result_summary") or {})}
+
     def interrupted(self, store_id=None):
         params=[]; where="status IN ('QUEUED','RUNNING','PAUSED','WAITING_FOR_CONFIRMATION','WAITING_FOR_INPUT')"
         if store_id: where+=" AND store_id=?"; params.append(store_id)
@@ -267,4 +272,3 @@ def source_safety_workflow(preview: dict):
 def store_build_workflow():
     names=("STORE_PROFILE","SOURCE_SAFETY","SOURCING_MASTER","PRODUCTS","COLLECTIONS","BRAND","NAVIGATION","HOMEPAGE","PAGES_SEO","COMPLETION","LAUNCH_READINESS")
     return [{"task_key":x,"title":x.replace("_"," ").title(),"stage":"자동 구축"} for x in names]
-

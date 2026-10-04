@@ -619,6 +619,8 @@ def validate_homepage_image(path: str | Path, *, minimum=(1600, 600), max_bytes=
             image.verify()
         with Image.open(target) as image:
             width, height, fmt = image.width, image.height, image.format
+    except ModuleNotFoundError:
+        return {"valid": False, "reason": "pillow_missing", "message_ko": "이미지 기능에 필요한 Pillow가 현재 실행 환경에 없습니다."}
     except Exception:
         return {"valid": False, "reason": "invalid_image"}
     valid = fmt in {"PNG", "JPEG", "WEBP"} and width >= minimum[0] and height >= minimum[1] and width / height >= 1.5
@@ -645,7 +647,7 @@ def generate_hero_image(store_id: str, plan: dict, *, provider, enabled=False, o
             "provider": getattr(provider, "provider_name", "MANUAL"), "approval_status": "NEEDS_REVIEW", "approved": False}
 
 
-def register_manual_hero_asset(store_id: str, plan_id: str, filename: str, content: bytes, *, db=None) -> dict:
+def register_manual_hero_asset(store_id: str, plan_id: str, filename: str, content: bytes, *, provider="MANUAL", db=None) -> dict:
     """Persist a user-selected hero image locally; DB contains metadata, not image bytes."""
     if Path(filename).suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
         raise ValueError("Hero image must be PNG, JPEG, or WebP")
@@ -662,7 +664,7 @@ def register_manual_hero_asset(store_id: str, plan_id: str, filename: str, conte
     _install(db)
     with connect(db) as con:
         con.execute("INSERT OR REPLACE INTO store_homepage_assets VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (asset_id, store_id, plan_id, "HERO", str(target), "MANUAL", digest, validation["width"], validation["height"],
+            (asset_id, store_id, plan_id, "HERO", str(target), str(provider), digest, validation["width"], validation["height"],
              validation["format"], "NEEDS_REVIEW", None, None, _now()))
     return {"asset_id": asset_id, "path": str(target), "sha256": digest, "approval_status": "NEEDS_REVIEW", "validation": validation}
 
@@ -670,6 +672,13 @@ def register_manual_hero_asset(store_id: str, plan_id: str, filename: str, conte
 def approve_hero_asset(asset_id: str, *, db=None) -> bool:
     _install(db)
     with connect(db) as con:
+        row=con.execute("SELECT local_path FROM store_homepage_assets WHERE asset_id=?",(asset_id,)).fetchone()
+        if not row:return False
+        from .image_validation import inspect_image
+        inspection=inspect_image(row["local_path"],asset_type="HERO_BANNER")
+        if not inspection.get("valid"):
+            if inspection.get("status")=="DEPENDENCY_MISSING":raise RuntimeError(inspection.get("message_ko"))
+            return False
         return con.execute("UPDATE store_homepage_assets SET approval_status='APPROVED' WHERE asset_id=?", (asset_id,)).rowcount > 0
 
 

@@ -17,7 +17,10 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageDraw, ImageFont
+try:
+    from PIL import Image, ImageChops, ImageDraw, ImageFont
+except ModuleNotFoundError:  # Profile/prompt reads must work before dependency repair.
+    Image = ImageChops = ImageDraw = ImageFont = None
 
 from .db import connect, get_store, init_db
 from .paths import EXPORT_DIR
@@ -25,6 +28,11 @@ from .shopify_collections import SHOPIFY_API_VERSION, ShopifyGraphQLClient, Shop
 
 APPROVAL_STATES = {"DRAFT", "GENERATED", "NEEDS_REVIEW", "APPROVED", "REJECTED", "SUPERSEDED"}
 ASSET_KINDS = {"LOGO_MARK", "LOGO_HORIZONTAL", "FAVICON_MASTER", "FAVICON_32", "FAVICON_64"}
+
+
+def _require_pillow():
+    if Image is None:
+        raise RuntimeError("이미지 기능에 필요한 Pillow가 현재 실행 환경에 없습니다. ShopSource 환경 자동 복구를 실행하세요.")
 THEME_FILES_QUERY = """query BrandThemeFiles($id: ID!) {
  theme(id:$id) { id name role files(first:10, filenames:[\"config/settings_schema.json\",\"config/settings_data.json\"]) {
  nodes { filename body { __typename ... on OnlineStoreThemeFileBodyText { content } ... on OnlineStoreThemeFileBodyBase64 { contentBase64 } } }
@@ -198,6 +206,7 @@ def _register_asset(store_id, asset_type, path, *, provider="MANUAL", model="", 
         match_w=re.search(r"\bwidth=['\"](\d+)",text[:3000]);match_h=re.search(r"\bheight=['\"](\d+)",text[:3000])
         width,height=int(match_w.group(1)) if match_w else 0,int(match_h.group(1)) if match_h else 0;fmt="SVG"
     else:
+        _require_pillow()
         with Image.open(target) as im: im.verify()
         with Image.open(target) as im: width,height,fmt=im.width,im.height,(im.format or target.suffix.lstrip(".")).upper()
     content = target.read_bytes(); digest = hashlib.sha256(content).hexdigest(); version = _next_version(store_id, asset_type, db)
@@ -245,6 +254,7 @@ def generate_logo_mark(store_id, *, provider, enabled=False, model=None, db=None
 
 
 def _font(size):
+    _require_pillow()
     candidates=[os.environ.get("SHOPSource_BRAND_FONT"),r"C:\Windows\Fonts\arial.ttf",r"C:\Windows\Fonts\segoeuib.ttf",
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
     for candidate in candidates:
@@ -255,6 +265,7 @@ def _font(size):
 
 
 def compose_horizontal_logo(store_id, mark_asset_id, *, db=None):
+    _require_pillow()
     mark=get_brand_asset(mark_asset_id,db=db)
     if not mark or mark["asset_type"]!="LOGO_MARK" or mark["approval_status"] not in {"GENERATED","NEEDS_REVIEW","APPROVED"}:
         raise ValueError("A reviewed LOGO_MARK asset is required")
@@ -278,6 +289,7 @@ def compose_horizontal_logo(store_id, mark_asset_id, *, db=None):
 
 
 def validate_logo_horizontal(asset):
+    _require_pillow()
     path=Path(asset["local_path"])
     with Image.open(path) as image:
         if image.width<600 or image.height<120 or image.width/image.height<2: raise ValueError("Horizontal logo dimensions/ratio are too small")
@@ -287,6 +299,7 @@ def validate_logo_horizontal(asset):
 
 
 def derive_favicon(store_id, mark_asset_id, *, transparent_white=False, db=None):
+    _require_pillow()
     mark=get_brand_asset(mark_asset_id,db=db)
     if not mark or mark["asset_type"]!="LOGO_MARK" or mark["approval_status"]!="APPROVED":
         raise ValueError("Favicon source must be an APPROVED LOGO_MARK")
@@ -323,6 +336,7 @@ def derive_favicon(store_id, mark_asset_id, *, transparent_white=False, db=None)
 
 
 def validate_favicon(asset):
+    _require_pillow()
     with Image.open(asset["local_path"]) as image:
         if image.size!=(32,32) or image.format!="PNG":raise ValueError("Favicon must be exactly 32x32 PNG")
         if image.getchannel("A").getbbox() is None:raise ValueError("Favicon is fully transparent")
@@ -333,6 +347,9 @@ def validate_favicon(asset):
 def approve_asset(asset_id, *, db=None):
     asset=get_brand_asset(asset_id,db=db)
     if not asset:raise KeyError(asset_id)
+    if Path(asset["local_path"]).suffix.lower()!=".svg":
+        _require_pillow()
+        with Image.open(asset["local_path"]) as image:image.verify()
     with connect(db) as con:
         con.execute("UPDATE brand_assets SET approval_status='SUPERSEDED' WHERE store_id=? AND asset_type=? AND approval_status='APPROVED'",(asset["store_id"],asset["asset_type"]))
         con.execute("UPDATE brand_assets SET approval_status='APPROVED' WHERE asset_id=?",(asset_id,))
@@ -354,6 +371,7 @@ def register_manual_asset(store_id, asset_type, source_path, *, db=None):
     if path.suffix.lower()==".svg":
         return _register_asset(store_id,asset_type,path,provider="MANUAL",model="assignment-svg",status="NEEDS_REVIEW",
                                metadata={"assignment_manual_mode":True,"svg_requires_shopify_conversion":True},db=db)
+    _require_pillow()
     with Image.open(path) as image: image.verify()
     transparent=False
     if path.suffix.lower()==".png":
@@ -386,6 +404,7 @@ def validate_manual_assets(store_id, *, db=None):
             if Path(asset["local_path"]).suffix.lower()==".svg":
                 if "<svg" not in Path(asset["local_path"]).read_text(encoding="utf-8")[:1000].lower():raise ValueError("invalid SVG")
             else:
+                _require_pillow()
                 with Image.open(asset["local_path"]) as image:image.verify()
             result={"asset_id":asset["asset_id"],"valid":True,"width":asset["width"],"height":asset["height"],"format":asset["format"]}
             if asset["asset_type"]=="FAVICON_32" and (asset["width"],asset["height"])!=(32,32):result["warning"]="32x32 PNG 권장"

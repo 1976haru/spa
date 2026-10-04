@@ -18,4 +18,6 @@ ShopSource의 기본 화면은 BEGINNER 모드입니다. 큰 글자와 넓은 �
 
 PageFly 같은 외부 페이지 빌더는 GUI를 자동 클릭하지 않습니다. native theme schema로 안전하게 적용할 수 없으면 `EXTERNAL_PAGE_BUILDER_MANUAL` 또는 `UNSUPPORTED_MANUAL`로 표시하고 정확한 수동 경로를 안내합니다.
 
+홈페이지의 `이미지 준비`에서 `프롬프트 자동 생성`을 누르면 hero, collection, category card, header/about 이미지별 prompt가 준비됩니다. 항목별 복사 버튼으로 외부 생성 도구에 붙여넣고 만든 파일을 업로드할 수 있습니다. YouTubeSum 로컬 브리지가 생성 모델 준비 상태를 보고하지 않으면 prompt-only와 직접 업로드가 유지됩니다. 상세 절차는 [로컬 이미지 스튜디오 안내](LOCAL_IMAGE_STUDIO_INTEGRATION.md)를 참고하세요.
+
 `과제 제출용 확인`은 Hero, 문구, CTA/실제 링크, 승인 이미지, 4개 이상의 shortcut, 이미지와 정확한 collection target, 빈 링크/잘못된 중복 target, desktop/mobile 확인을 쉬운 체크리스트로 보여 줍니다. 실제 적용 및 원격 검증 전에는 제출 준비 완료로 표시하지 않습니다.

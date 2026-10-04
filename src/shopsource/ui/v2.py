@@ -28,6 +28,9 @@ from ..homepage_automation import (HomepageAutomationService, assignment_banner_
     suggested_theme_image_ref, upload_approved_hero_asset, validate_homepage_image)
 from ..homepage_assignment import HomepageAssignmentService, homepage_assignment_workflow
 from ..automation import AutomationTaskError, WorkflowAutomationService
+from ..prompt_assets import PromptAssetService
+from ..local_image_studio import LocalImageStudioProvider
+from ..runtime_doctor import PIL_MISSING_KO, dependency_doctor, repair_runtime_dependencies
 from ..navigation import MegaMenuThemeService, NavigationService
 from ..store_build import StoreBuildOrchestrator
 from ..store_completion import DOMAINS, StoreCompletionService
@@ -89,7 +92,73 @@ def _workflow_service():
             raise AutomationTaskError("CONFLICT", result.get("reason") or result.get("status") or "Remote verification failed")
         return {"message": "홈페이지 원격 검증을 완료했습니다.", "theme_id": result.get("theme_id")}
 
-    return WorkflowAutomationService(handlers={"THEME_WRITE": apply_homepage, "VERIFY": verify_homepage})
+    def generate_local_image(task):
+        from ..local_image_studio import LocalImageStudioProvider
+        checkpoint = task.get("checkpoint") or {}
+        result = LocalImageStudioProvider().generate(checkpoint.get("job") or {})
+        if result.get("status") not in {"SUCCEEDED", "PARTIAL"}:
+            error = result.get("error") or {}
+            code = str(error.get("code") or "IMAGE_PROVIDER_FAILED").upper()
+            transient = code in {"TIMEOUT", "NETWORK_INTERRUPTION", "HTTP_429", "TEMPORARY_PROVIDER", "TEMPORARY_SERVER"}
+            raise AutomationTaskError("BUSINESS_INPUT" if result.get("status") == "WAITING_FOR_CONFIGURATION" else code,
+                                      error.get("message_ko") or result.get("message") or code, transient=transient)
+        return {"status": result["status"], "candidates": result.get("candidates", []),
+                "message": f"이미지 후보 {len(result.get('candidates', []))}개를 준비했습니다."}
+
+    def validate_local_image(task):
+        service = _workflow_service()
+        generated = service.task_result(task["run_id"], "LOCAL_IMAGE_GENERATE").get("result") or {}
+        candidates = generated.get("candidates") or []
+        if not candidates:
+            raise AutomationTaskError("CONFLICT", "검사를 통과한 이미지 후보가 없습니다.")
+        from ..image_validation import inspect_image
+        for candidate in candidates:
+            result = inspect_image(candidate["path"], asset_type=(task.get("checkpoint") or {}).get("asset_type", "HERO_BANNER"))
+            if not result.get("valid"):
+                raise AutomationTaskError("CONFLICT", result.get("message_ko") or "이미지 검증에 실패했습니다.")
+        return {"candidate_count": len(candidates), "message": "파일 형식, 크기, 비율 검사를 완료했습니다."}
+
+    def approve_local_image(task):
+        from ..local_image_studio import LocalImageStudioProvider
+        from ..paths import EXPORT_DIR
+        checkpoint = task.get("checkpoint") or {}
+        choice = checkpoint.get("user_input") or {}
+        candidate_id = choice.get("candidate_id")
+        generated = _workflow_service().task_result(task["run_id"], "LOCAL_IMAGE_GENERATE").get("result") or {}
+        candidates = generated.get("candidates") or []
+        candidate = next((x for x in candidates if x.get("candidate_id") == candidate_id), None)
+        if not candidate:
+            raise AutomationTaskError("BUSINESS_INPUT", "승인할 후보를 찾지 못했습니다. 후보를 다시 확인하세요.")
+        asset = checkpoint.get("asset") or {}
+        job = checkpoint.get("job") or {}
+        store_id = str(job.get("store_id") or "")
+        if asset.get("asset_type") == "HERO_BANNER":
+            plan_id = str(asset.get("plan_id") or "")
+            if not plan_id:
+                raise AutomationTaskError("BUSINESS_INPUT", "홈페이지 계획이 없어 Hero 이미지를 연결할 수 없습니다.")
+            destination = EXPORT_DIR / "homepage_assets" / store_id / plan_id / "hero" / "local_studio"
+        else:
+            key = str(asset.get("collection_key") or "")
+            if not key:
+                raise AutomationTaskError("BUSINESS_INPUT", "컬렉션 식별 정보가 없어 이미지를 연결할 수 없습니다.")
+            destination = EXPORT_DIR / "collection_images" / store_id / key / "local_studio"
+        imported = LocalImageStudioProvider.import_candidate(candidate, destination)
+        if asset.get("asset_type") == "HERO_BANNER":
+            asset_row = register_manual_hero_asset(store_id, str(asset["plan_id"]), Path(imported["path"]).name,
+                Path(imported["path"]).read_bytes(), provider="LOCAL_IMAGE_STUDIO")
+            approve_hero_asset(asset_row["asset_id"])
+        else:
+            from ..collection_images import approve_collection_image, register_image_asset
+            register_image_asset(store_id, str(asset["collection_key"]), imported["path"], provider="LOCAL_IMAGE_STUDIO",
+                model="headless-bridge", alt_text=asset.get("alt_text_suggestion", ""), metadata={"sha256": imported["sha256"]})
+            if not approve_collection_image(store_id, str(asset["collection_key"])):
+                raise AutomationTaskError("CONFLICT", "컬렉션 이미지 검증을 마치지 못했습니다.")
+        return {"asset_id": asset_row["asset_id"] if asset.get("asset_type") == "HERO_BANNER" else str(asset["collection_key"]),
+                "candidate_id": candidate_id, "message": "추천 이미지 승인 및 로컬 자산 등록을 완료했습니다."}
+
+    return WorkflowAutomationService(handlers={"THEME_WRITE": apply_homepage, "VERIFY": verify_homepage,
+        "LOCAL_IMAGE_GENERATE": generate_local_image, "LOCAL_IMAGE_VALIDATE": validate_local_image,
+        "LOCAL_IMAGE_APPROVAL": approve_local_image})
 STATUS_OPTIONS = ["ALL", "PRIMARY", "RESERVE_A", "RESERVE_B", "RESERVE_C", "LOW_RESERVE",
                   "HIGH_RESERVE", "REVIEW", "RESTRICTED", "ARCHIVED"]
 PRODUCT_SOURCE_OPTIONS = ["ALL", "BROWSER_CAPTURE", "SPARK_STORAGE", "AMAZON_SOURCE_FOLDER", "KEEPA"]
@@ -1084,7 +1153,8 @@ class OperatorUI:
         self._heading("홈페이지 자동 완성", "배너, 카테고리, 추천 컬렉션과 링크를 한 번에 준비하고 실제 적용 직전에만 멈춥니다.")
         ui.label("Preview is read-only. Shopify theme changes require a separate explicit confirmation; paid image generation stays off until opted in.").classes("text-sm text-amber-800")
         state = {"plan": None, "snapshot": None, "preview": None, "assignment_preview": None,
-                 "collection_plan": None, "backup_id": None}
+                 "collection_plan": None, "brand": None, "prompt_set": None, "backup_id": None,
+                 "local_candidates": []}
         with ui.card().classes("w-full border-2 border-sky-200 bg-sky-50"):
             brand_name = next((row["store_name"] for row in self.stores if row["store_id"] == self.current_store), self.current_store)
             ui.label(f"Store: {self.current_store} | Brand: {brand_name}").classes("text-xl font-bold")
@@ -1170,6 +1240,10 @@ class OperatorUI:
                     plan["hero"]["theme_image_ref_confirmed"] = bool(theme_ref_confirmed.value)
                     if plan["hero"]["image_url"]: plan["hero"]["image_asset_id"] = "SHOPIFY_FILES_URL"
                     state["plan"], state["snapshot"], state["collection_plan"] = plan, snapshot, collection_plan
+                    state["brand"] = brand
+                    state["prompt_set"] = PromptAssetService().build(
+                        store=next((item for item in self.stores if item["store_id"] == self.current_store), {"store_name": self.current_store}),
+                        brand=brand, collection_plan=collection_plan, homepage_plan=plan)
                     state["preview"] = compose_homepage_preview(plan, snapshot, collection_plan, collection_handles=mappings) if snapshot.get("status") == "CONNECTED" else None
                     discovered = discover_homepage_sections(snapshot.get("theme_files") or {})
                     category_schema = discovered.get("category") or {}
@@ -1279,8 +1353,12 @@ class OperatorUI:
             theme_ref_confirmed.on_value_change(lambda _: state.update(preview=None))
 
             def inspect_image():
-                result = validate_homepage_image((local_image.value or "").strip())
-                ui.notify(f"{result}", type="positive" if result["valid"] else "warning")
+                from ..image_validation import inspect_image as inspect_asset
+                result = inspect_asset((local_image.value or "").strip(), asset_type="HERO_BANNER")
+                if result.get("status") == "DEPENDENCY_MISSING":
+                    check_image_engine()
+                else:
+                    ui.notify(str(result.get("message_ko") or result.get("status")), type="positive" if result["valid"] and result["status"] == "FIT" else "warning")
 
             def generate_hero():
                 try:
@@ -1288,6 +1366,152 @@ class OperatorUI:
                     result = generate_hero_image(self.current_store, state["plan"], provider=OpenAIImagesProvider(), enabled=bool(paid_opt_in.value))
                     ui.notify("Generated asset ready for review: " + result["path"], type="positive")
                 except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+            def build_prompts():
+                try:
+                    if not state.get("collection_plan"):
+                        design()
+                    if not state.get("collection_plan"):
+                        return
+                    if not state.get("prompt_set"):
+                        state["prompt_set"] = PromptAssetService().build(
+                            store=next((item for item in self.stores if item["store_id"] == self.current_store), {"store_name": self.current_store}),
+                            brand=state.get("brand"), collection_plan=state["collection_plan"], homepage_plan=state.get("plan"))
+                    prompt_set = state["prompt_set"]
+                    prompt_area.clear()
+                    with prompt_area:
+                        ui.label(f"복사해 외부 이미지 도구에서 사용할 수 있는 prompt {len(prompt_set['assets'])}개").classes("ss-help")
+                        for item in prompt_set["assets"]:
+                            with ui.expansion(f"{item['title']} · {item['suggested_size']}", icon="image"):
+                                ui.textarea("복사할 prompt", value=item["prompt_main"]).props("readonly autogrow").classes("w-full")
+                                ui.label("Negative prompt: " + item["negative_prompt"]).classes("ss-help")
+                                ui.label("Alt 제안: " + item["alt_text_suggestion"]).classes("ss-help")
+                                async def copy_prompt(text=item["prompt_main"]):
+                                    await ui.run_javascript("navigator.clipboard.writeText(" + json.dumps(text, ensure_ascii=False) + ")")
+                                    ui.notify("Prompt를 클립보드에 복사했습니다.", type="positive")
+                                ui.button("복사", on_click=copy_prompt, icon="content_copy").props("outline")
+                                if item["asset_type"] in {"HERO_BANNER", "COLLECTION_IMAGE", "CATEGORY_SHORTCUT"}:
+                                    ui.button("로컬 생성기로 후보 만들기", on_click=lambda asset=item: generate_with_local_studio(asset), icon="image_search").props("outline")
+                        ui.button("전체 프롬프트 파일 내보내기", on_click=export_prompts, icon="download").props("outline")
+                        ui.button("이미지 엔진 연결 확인", on_click=check_image_engine, icon="hub").props("outline")
+                    ui.notify("프롬프트를 준비했습니다. 유료 API는 호출하지 않았습니다.", type="positive")
+                except Exception as exc:
+                    ui.notify(_safe_error(exc), type="negative")
+
+            def export_prompts():
+                if not state.get("prompt_set"):
+                    ui.notify("먼저 프롬프트 자동 생성을 누르세요.", type="warning"); return
+                result = PromptAssetService().export(state["prompt_set"], store_id=self.current_store)
+                ui.notify("복붙 묶음 저장: " + result["files"]["copy_paste_bundle.txt"], type="positive")
+
+            def check_image_engine():
+                provider = LocalImageStudioProvider()
+                health = provider.health()
+                capabilities = provider.capabilities() if health.get("available") else {}
+                doctor = dependency_doctor()
+                with ui.dialog() as dialog, ui.card().classes("w-[680px] max-w-full"):
+                    ui.label("이미지 엔진 연결 확인").classes("ss-card-title")
+                    ui.label(("✓" if doctor["checks"]["PIL"] else "✕") + " ShopSource Pillow · " + ("준비됨" if doctor["checks"]["PIL"] else PIL_MISSING_KO))
+                    ui.label(("✓" if health.get("available") else "✕") + " YouTubeSum 브리지 · " + str(health.get("message") or health.get("status")))
+                    ui.label("생성기 상태 · " + str(capabilities.get("generator", {}).get("status", "PROMPT_ONLY_FALLBACK")))
+                    ui.label("로컬 생성기가 없으면 prompt 복사와 파일 업로드 흐름을 계속 사용할 수 있습니다.").classes("ss-help")
+                    with ui.row():
+                        ui.button("닫기", on_click=dialog.close).props("outline")
+                        if not doctor["checks"]["PIL"]:
+                            async def repair_environment():
+                                dialog.close()
+                                result = await asyncio.to_thread(repair_runtime_dependencies)
+                                ui.notify(result["message"], type="positive" if result["status"] == "RESTART_REQUIRED" else "negative")
+                                if result.get("detail"):
+                                    with ui.dialog() as detail_dialog, ui.card():
+                                        ui.label("고급 설치 정보")
+                                        ui.label(result["detail"])
+                                        ui.button("닫기", on_click=detail_dialog.close)
+                                    detail_dialog.open()
+                            ui.button("환경 자동 복구", on_click=repair_environment, icon="build").props("color=primary")
+                dialog.open()
+
+            async def generate_with_local_studio(asset):
+                provider = LocalImageStudioProvider()
+                health = await asyncio.to_thread(provider.health)
+                caps = await asyncio.to_thread(provider.capabilities) if health.get("available") else {}
+                if not health.get("available") or (caps.get("generator") or {}).get("status") != "READY":
+                    ui.notify("로컬 이미지 생성기가 준비되지 않았습니다. prompt를 복사해 외부 도구에서 만든 뒤 파일을 업로드하세요.", type="warning", multi_line=True)
+                    return
+                store_row = next((x for x in self.stores if x["store_id"] == self.current_store), {"store_name": self.current_store})
+                job = provider.create_job(store_id=self.current_store, store_name=store_row.get("store_name", self.current_store),
+                    asset=asset, context=state.get("brand", {}), output_count=3)
+                from ..local_image_studio import image_generation_workflow
+                if asset["asset_type"] == "HERO_BANNER" and state.get("plan"):
+                    asset = {**asset, "plan_id": state["plan"]["plan_id"]}
+                queue = _workflow_service()
+                run = queue.create_run(self.current_store, "LOCAL_IMAGE_ASSET", image_generation_workflow(job, asset))
+                run = await asyncio.to_thread(queue.run, run["run_id"])
+                if run.get("status") != "WAITING_FOR_CONFIRMATION":
+                    ui.notify("후보 생성에 실패했습니다. prompt 복사와 수동 업로드를 이용하세요.", type="warning", multi_line=True)
+                    return
+                state["local_image_run_id"] = run["run_id"]
+                result = queue.task_result(run["run_id"], "LOCAL_IMAGE_GENERATE").get("result") or {}
+                result["status"] = "SUCCEEDED"
+                if result.get("status") not in {"SUCCEEDED", "PARTIAL"}:
+                    error = result.get("error") or {}
+                    ui.notify(error.get("message_ko") or result.get("message") or "생성을 마치지 못했습니다. prompt-only 방식으로 계속하세요.", type="warning", multi_line=True)
+                    return
+                state["local_candidates"] = result.get("candidates", [])
+                candidate_area.clear()
+                with candidate_area:
+                    ui.label("이미지 후보 · 미리보기 후 직접 가져와 승인할 수 있습니다.").classes("ss-card-title")
+                    for candidate in state["local_candidates"]:
+                        ui.label(f"{candidate.get('candidate_id')} · {candidate.get('width')}×{candidate.get('height')} · 기술 점수 {candidate.get('technical_score')}").classes("ss-help")
+                        ui.button("후보 파일 가져오기", on_click=lambda c=candidate, a=asset: import_local_candidate(c, a), icon="download").props("outline")
+                ui.notify("후보 생성 완료 · 승인 전에는 Shopify 적용에 사용할 수 없습니다.", type="positive")
+
+            async def confirm_local_candidate(run_id, candidate_id):
+                try:
+                    result = await asyncio.to_thread(_workflow_service().confirm, run_id, "LOCAL_IMAGE_APPROVAL",
+                        user_input={"candidate_id": candidate_id})
+                    if result.get("status") not in {"SUCCEEDED", "SUCCEEDED_WITH_WARNINGS"}:
+                        raise ValueError("승인 queue가 완료되지 않았습니다.")
+                    ui.notify("선택 이미지가 검사·승인되어 ShopSource에 저장됐습니다. Shopify 적용은 하지 않았습니다.", type="positive")
+                    candidate_area.clear()
+                except Exception as exc:
+                    ui.notify(_safe_error(exc), type="negative")
+
+            def import_local_candidate(candidate, asset):
+                if state.get("local_image_run_id"):
+                    try:
+                        result = _workflow_service().confirm(state["local_image_run_id"], "LOCAL_IMAGE_APPROVAL",
+                            user_input={"candidate_id": candidate.get("candidate_id")})
+                        if result.get("status") not in {"SUCCEEDED", "SUCCEEDED_WITH_WARNINGS"}:
+                            raise ValueError("승인 queue가 완료되지 않았습니다.")
+                        ui.notify("선택 이미지가 검사·승인되어 ShopSource에 저장됐습니다. Shopify 적용은 하지 않았습니다.", type="positive")
+                        candidate_area.clear()
+                    except Exception as exc:
+                        ui.notify(_safe_error(exc), type="negative")
+                    return
+                try:
+                    from ..paths import EXPORT_DIR
+                    provider = LocalImageStudioProvider()
+                    if asset["asset_type"] == "HERO_BANNER":
+                        if not state.get("plan"): raise ValueError("홈페이지 설계를 먼저 완료하세요.")
+                        destination = EXPORT_DIR / "homepage_assets" / self.current_store / state["plan"]["plan_id"] / "hero" / "local_studio"
+                    else:
+                        destination = EXPORT_DIR / "collection_images" / self.current_store / str(asset.get("collection_key") or "misc") / "local_studio"
+                    imported = provider.import_candidate(candidate, destination)
+                    from ..image_validation import inspect_image
+                    inspection = inspect_image(imported["path"], asset_type=asset["asset_type"])
+                    if not inspection["valid"]: raise ValueError(inspection.get("message_ko") or "이미지 검사를 통과하지 못했습니다.")
+                    if asset["asset_type"] == "HERO_BANNER":
+                        register_manual_hero_asset(self.current_store, state["plan"]["plan_id"],
+                            Path(imported["path"]).name, Path(imported["path"]).read_bytes(), provider="LOCAL_IMAGE_STUDIO")
+                    else:
+                        from ..collection_images import register_image_asset
+                        register_image_asset(self.current_store, asset["collection_key"], imported["path"],
+                            provider="LOCAL_IMAGE_STUDIO", model="headless-bridge", alt_text=asset.get("alt_text_suggestion", ""),
+                            metadata={"sha256": imported["sha256"], "validation": inspection, "approval_status": "NEEDS_REVIEW"})
+                    ui.notify("이미지 검사 완료 · 검수 대기 상태로 저장했습니다.", type="positive")
+                except Exception as exc:
+                    ui.notify(_safe_error(exc), type="negative")
 
             def show_manual():
                 ui.notify("Online Store → Themes → Customize → Hero/Image Banner: image, heading, text, button, link. Add Collection list (or equivalent), select only mapped collections, review cards and order, then Save.", type="info", multi_line=True)
@@ -1332,10 +1556,15 @@ class OperatorUI:
                 ui.label("초보자 자동화").classes("ss-card-title")
                 ui.label("안전한 설계와 검사는 연속 실행하고, 실제 Theme write는 한 번만 승인받습니다.").classes("ss-help")
                 ui.button("홈페이지 자동 완성", on_click=auto_complete, icon="auto_awesome").props("color=primary size=lg")
+            with ui.card().classes("w-full border border-violet-200"):
+                ui.label("이미지 준비 · prompt 복사 → 외부 생성 → 파일 업로드 → 검사 → 승인").classes("ss-card-title")
+                ui.button("프롬프트 자동 생성", on_click=build_prompts, icon="prompt_suggestion").props("color=primary")
+                prompt_area = ui.column().classes("w-full gap-2")
+                candidate_area = ui.column().classes("w-full gap-2")
             with ui.row():
                 ui.button("홈페이지 자동 설계", on_click=design, icon="auto_awesome").props("color=positive")
-                ui.button("메인 배너 자동 만들기", on_click=design, icon="image")
-                ui.button("카테고리 바로가기 자동 만들기", on_click=design, icon="category")
+                ui.button("메인 배너 자동 만들기", on_click=build_prompts, icon="image")
+                ui.button("카테고리 바로가기 자동 만들기", on_click=build_prompts, icon="category")
                 ui.button("홈페이지 미리보기", on_click=refresh_preview, icon="visibility").props("outline")
                 ui.button("과제 제출용 확인", on_click=assignment_ready_check, icon="checklist").props("outline")
                 ui.button("Shopify 적용", on_click=apply_confirm, icon="publish").props("color=primary")

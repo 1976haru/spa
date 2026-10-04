@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .db import connect, init_db, utc_now
 from .paths import EXPORT_DIR
+from .image_validation import inspect_image
 
 
 class CollectionImageProvider(ABC):
@@ -37,7 +38,8 @@ class ManualImageProvider(CollectionImageProvider):
         target.parent.mkdir(parents=True,exist_ok=True)
         if source != target: shutil.copyfile(source,target)
         return register_image_asset(store_id, collection_key, target, provider=self.provider_name,
-                                    model=self.model_version, alt_text=alt_text, metadata={"mode":"manual"}, db=db)
+                                    model=self.model_version, alt_text=alt_text,
+                                    metadata={"mode":"manual", "inspection": inspect_image(target, asset_type="COLLECTION_IMAGE")}, db=db)
 
 
 class OpenAIImagesProvider(CollectionImageProvider):
@@ -97,6 +99,8 @@ def register_image_asset(store_id: str, collection_key: str, path: str | Path, *
     target=Path(path).expanduser().resolve()
     if not target.is_file(): raise FileNotFoundError(target)
     if target.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}: raise ValueError("Use PNG, JPEG, or WebP collection artwork")
+    metadata = dict(metadata or {})
+    metadata.setdefault("inspection", inspect_image(target, asset_type="COLLECTION_IMAGE"))
     init_db(db)
     with connect(db) as con:
         con.execute("""CREATE TABLE IF NOT EXISTS collection_image_assets (
@@ -110,7 +114,7 @@ def register_image_asset(store_id: str, collection_key: str, path: str | Path, *
         con.execute("""INSERT INTO collection_image_assets(store_id,collection_key,path,provider,model,alt_text,metadata_json,created_at)
           VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(store_id,collection_key) DO UPDATE SET path=excluded.path,
           provider=excluded.provider,model=excluded.model,alt_text=excluded.alt_text,metadata_json=excluded.metadata_json,created_at=excluded.created_at""",
-          (store_id,collection_key,str(target),provider,model,alt_text,json.dumps(metadata or {},ensure_ascii=False),utc_now()))
+          (store_id,collection_key,str(target),provider,model,alt_text,json.dumps(metadata,ensure_ascii=False),utc_now()))
     return {"store_id":store_id,"collection_key":collection_key,"path":str(target),"provider":provider,"model":model,"alt_text":alt_text}
 
 
@@ -123,6 +127,12 @@ def approve_collection_image(store_id: str, collection_key: str, *, db=None) -> 
         columns={row["name"] for row in con.execute("PRAGMA table_info(collection_image_assets)")}
         if "approval_status" not in columns:
             con.execute("ALTER TABLE collection_image_assets ADD COLUMN approval_status TEXT NOT NULL DEFAULT 'NEEDS_REVIEW'")
+        row=con.execute("SELECT path FROM collection_image_assets WHERE store_id=? AND collection_key=?",(store_id,collection_key)).fetchone()
+        if not row:return False
+        inspection=inspect_image(row["path"],asset_type="COLLECTION_IMAGE")
+        if not inspection.get("valid"):
+            if inspection.get("status")=="DEPENDENCY_MISSING":raise RuntimeError(inspection.get("message_ko"))
+            return False
         return con.execute("UPDATE collection_image_assets SET approval_status='APPROVED' WHERE store_id=? AND collection_key=?",
                            (store_id,collection_key)).rowcount > 0
 
