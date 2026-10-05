@@ -1,0 +1,276 @@
+ShopSource Studio — Phase 5.2.1
+AUTOMATION QUEUE PERFORMANCE + TEST TEMP RECOVERY HOTFIX
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+- Baseline: f8aac45c4c6e1e62708140acba4179c3aa809c03
+
+Context
+- Phase 5.2 functional implementation passed 678 tests, 1 skipped.
+- Full suite runtime regressed to 1057.92 seconds vs recent ~327 seconds.
+- Slowest reported test: tests/stress/test_automation_stress.py::test_restart_mid_run_2000_items
+- Re-measurement was blocked by pytest temp-path permission errors.
+- User requires production-grade reliability and explicitly does not want multi-hour regressions ignored.
+
+Goal
+Fix the performance regression and temp-path hygiene BEFORE starting real Cabin Tidy evidence collection.
+Do not weaken safety/checkpoint/restart semantics to gain speed.
+
+======================================================================
+0. SAFETY
+======================================================================
+
+During implementation:
+- NO Shopify/Amazon/Keepa/Theme/Spark/network calls
+- no production DB destructive operations
+- protected stores/001_cabin_tidy.json untouched
+- no blanket taskkill of Python
+- no deleting arbitrary user temp directories
+
+======================================================================
+1. REPRODUCE THE SLOW TEST
+======================================================================
+
+Run only:
+python -m pytest -vv tests/stress/test_automation_stress.py::test_restart_mid_run_2000_items --durations=10 --basetemp=.phase521_perf
+
+Measure wall time.
+
+Then run:
+python -m pytest -q tests/stress/test_automation_stress.py --durations=20 --basetemp=.phase521_stress
+
+Record baseline timings before modifying code.
+
+If basetemp permission fails:
+- inspect exact path/ACL/owner
+- use a fresh repo-owned temp directory with a unique name
+- do NOT recursively delete protected/unrelated paths
+- document stale temp paths separately
+
+======================================================================
+2. PROFILE AUTOMATION RUN LOOP
+======================================================================
+
+Inspect WorkflowAutomationService.run/_execute_task/_task/_event/_refresh_run.
+
+The 2000-task restart test currently performs many per-task SQLite connections/queries/events.
+Profile/count at least:
+- DB connections opened
+- SELECTs per completed task
+- UPDATEs per completed task
+- event INSERTs
+- status refreshes
+- commits
+
+Do not guess the bottleneck.
+
+Use lightweight instrumentation in a temporary diagnostic or test helper.
+Do not leave noisy production logging enabled.
+
+======================================================================
+3. OPTIMIZE WITHOUT BREAKING SEMANTICS
+======================================================================
+
+Preserve:
+- persisted task state
+- per-task checkpoint/result
+- pause/resume/stop
+- human gates
+- bounded retry
+- restart recovery
+- event history
+- successful tasks never rerun
+
+Allowed optimizations:
+- reuse a DB connection/transaction for bounded task chunks where safe
+- fetch next task by indexed position/status
+- avoid re-reading the same task immediately after success just to learn status when the executed result already knows it
+- avoid opening a new connection for every event when a current transaction/connection can safely be reused
+- batch run-summary updates instead of recalculating after every successful task
+- bulk-update completed counters at chunk boundaries
+- ensure indexes exist for:
+  automation_tasks(run_id,status,position)
+  automation_tasks(run_id,task_key)
+  automation_events(run_id,id)
+- keep transactions bounded so pause/stop remains responsive
+
+Do NOT:
+- hold one giant 2000-task transaction that loses crash durability
+- skip checkpoint persistence
+- skip events entirely
+- mark tasks complete before handler success
+- make human gates run ahead
+
+Suggested chunk size may be 25–100 tasks if measurements justify it.
+Choose based on benchmark, not arbitrary assumptions.
+
+======================================================================
+4. RESTART TEST SEMANTICS
+======================================================================
+
+The stress test:
+- creates 2000 tasks
+- runs first 777
+- constructs a new WorkflowAutomationService
+- resumes remaining tasks
+- expects completed_tasks == 2000
+
+Ensure this remains a true restart/resume test.
+Do not make it fast by reducing 2000 or bypassing persistence.
+
+Add assertions:
+- first 777 remain completed after restart
+- no completed task reruns
+- event/task counts remain consistent
+- final run status is SUCCEEDED
+- persisted DB survives service reconstruction
+
+======================================================================
+5. TEMP DIRECTORY PERMISSION HYGIENE
+======================================================================
+
+Investigate stale pytest temp directories causing PermissionDenied.
+
+Add repo-local test helper/config only if appropriate:
+- deterministic repo-owned .pytest_runtime or unique basetemp
+- cleanup only directories created by ShopSource tests
+- handle Windows read-only attributes safely
+- do not touch user/system temp globally
+
+Do NOT silently ignore PermissionError if it can invalidate a test.
+If cleanup cannot safely occur, print exact path and continue with a new unique owned directory.
+
+Update .gitignore for runtime temp dirs if needed.
+Do not commit temp contents.
+
+======================================================================
+6. PERFORMANCE ACCEPTANCE
+======================================================================
+
+Primary acceptance:
+test_restart_mid_run_2000_items must improve materially from the Phase 5.2 baseline.
+
+Target on the same machine:
+- ideally <= 30 seconds
+- acceptable <= 60 seconds
+- if still >60 seconds, continue profiling before declaring ready
+
+Do not hardcode this timing as a brittle pytest assertion.
+Report measured timings.
+
+Stress file:
+tests/stress/test_automation_stress.py
+should complete in a practical duration.
+
+Full suite:
+run after focused/stress pass.
+
+Recent normal reference ~327 sec.
+Phase 5.2 regressed to 1057.92 sec.
+
+Goal:
+return reasonably close to prior normal.
+If full suite remains >2x recent normal, identify top durations and fix or explicitly report unresolved performance blocker.
+Do not simply wait hours.
+
+======================================================================
+7. REGRESSION TESTS
+======================================================================
+
+Must keep green:
+- 5000 task queue indexed/paged
+- restart mid-run 2000
+- 100 transient failures bounded
+- mixed human gates do not run ahead
+- pause/resume/stop/retry
+- production evidence runner
+- source safety queue
+
+Add tests if needed for:
+- chunked run does not skip tasks
+- pause is honored at safe boundary
+- stop prevents later tasks
+- human confirmation gate stops immediately
+- retry semantics unchanged
+- run summary counters accurate after chunking
+
+======================================================================
+8. QUALITY GATE
+======================================================================
+
+Focused:
+python -m pytest -q tests/stress/test_automation_stress.py --durations=20 --basetemp=.phase521_stress_final
+
+Relevant:
+python -m pytest -q tests/test_automation.py tests/test_production_evidence_runner.py tests/test_source_safety.py --durations=20 --basetemp=.phase521_related
+
+Compile:
+python -m compileall -q src tests
+git diff --check
+
+Full:
+python -m pytest -q --durations=30 --basetemp=.phase521_full
+
+CLI/UI:
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+======================================================================
+9. PROTECTED FILE
+======================================================================
+
+stores/001_cabin_tidy.json
+
+NEVER:
+reset
+restore
+checkout
+clean
+stage
+commit
+overwrite
+
+======================================================================
+10. COMMIT / PUSH
+======================================================================
+
+Only if performance/regression checks pass.
+
+Commit:
+git commit -m "Fix automation queue performance regression"
+
+Push:
+git push origin main
+
+Verify:
+git rev-list --left-right --count main...origin/main
+= 0 0
+
+Do not commit runtime DB, pytest temp dirs, reports, logs, generated assets, credentials, protected JSON.
+
+======================================================================
+11. COMPLETION REPORT
+======================================================================
+
+Report:
+[1] baseline/final SHA
+[2] exact slow-test root cause
+[3] DB/query/connection optimization
+[4] temp permission root cause/workaround
+[5] 2000-task baseline time
+[6] 2000-task final time
+[7] automation stress total time
+[8] relevant tests
+[9] full suite result
+[10] full suite runtime
+[11] top 10 slowest tests
+[12] protected file
+[13] commit/push
+[14] PERFORMANCE_READY = YES/NO
+
+If PERFORMANCE_READY=YES:
+do not start real Source Audit or Shopify write automatically.
+Wait for user to start the real production evidence run.
