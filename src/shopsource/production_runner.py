@@ -467,56 +467,23 @@ class ProductionEvidenceRunner:
             return {"status":"BLOCKED","blockers":["Expected Store 001 | Cabin Tidy"]}
         local=self._local_environment()
         try:
-            from .shopify_collections import ShopifyGraphQLClient,get_connection,get_shopify_token
-            connection=get_connection(store_id,db=self.db)
-            if not connection:
-                return {**local,"status":"WAITING_FOR_CREDENTIALS","credential_present":False,
-                        "missing_inputs":["Cabin Tidy Shopify 연결 정보를 입력하세요."],"secret_values_exposed":False}
-            token,_source=get_shopify_token(store_id,db=self.db)
-            if not token:
-                return {**local,"status":"WAITING_FOR_CREDENTIALS","credential_present":False,
-                        "shop_domain":connection.get("shop_domain"),"missing_inputs":["Shopify 자격 증명을 안전하게 저장하세요."],"secret_values_exposed":False}
-            client=ShopifyGraphQLClient(connection["shop_domain"],token,connection["api_version"])
-            identity=client.execute("query ShopSourceAuthIdentity { shop { name myshopifyDomain } currentAppInstallation { accessScopes { handle } } }")
-            shop=identity.get("shop") or {}
-            granted=sorted({row.get("handle") for row in ((identity.get("currentAppInstallation") or {}).get("accessScopes") or []) if row.get("handle")})
-            expected=str(connection.get("shop_domain") or "").casefold()
-            actual=str(shop.get("myshopifyDomain") or "").casefold()
-            if not actual:
-                return {**local,"status":"REVIEW_REQUIRED","shop_domain":connection.get("shop_domain"),
-                        "missing_inputs":["Shopify가 확인한 myshopify 도메인을 읽을 수 없습니다."],"granted_scopes":granted,
-                        "secret_values_exposed":False}
-            if actual != expected:
-                return {**local,"status":"BLOCKED","shop_domain":connection.get("shop_domain"),
-                        "missing_inputs":["Shopify 인증 결과의 스토어 도메인이 저장된 도메인과 다릅니다."],
-                        "granted_scopes":granted,"secret_values_exposed":False}
-            from .homepage_collections import ShopifyThemeReader
-            theme=ShopifyThemeReader(db=self.db).discover(store_id)
-            with connect(self.db) as con:
-                verified_at=datetime.now(timezone.utc).isoformat(timespec="seconds")
-                con.execute("UPDATE shopify_connections SET status=?,scopes_json=?,last_verified_at=?,updated_at=? WHERE store_id=?",
-                    ("MISSING_SCOPES" if theme.get("status")=="MISSING_READ_SCOPE" else "CONNECTED",
-                     _json(granted),verified_at,verified_at,store_id))
-            if theme.get("status")=="MISSING_READ_SCOPE":
-                optional={"read_products","write_products","read_publications","write_publications","write_files","read_legal_policies",
-                          "write_themes","read_online_store_navigation","write_online_store_navigation"}
-                return {**local,"status":"WAITING_FOR_INPUT","shop_domain":connection["shop_domain"],
-                        "auth_mode":connection.get("auth_mode"),"theme_status":theme.get("status"),
-                        "granted_scopes":granted,"missing_required_scopes":["read_themes"],
-                        "missing_optional_scopes":sorted(optional-set(granted)),
-                        "missing_inputs":["Dev Dashboard 앱 버전에 read_themes 권한을 추가하고 필요한 승인/설치를 완료하세요."],
-                        "secret_values_exposed":False}
-            optional={"read_products","write_products","read_publications","write_publications","write_files","read_legal_policies",
-                      "write_themes","read_online_store_navigation","write_online_store_navigation"}
-            return {**local,"status":"VERIFIED" if theme.get("theme") else "REVIEW_REQUIRED",
-                    "verified":bool(theme.get("theme")),"shop_domain":connection["shop_domain"],
-                    "shop_name":shop.get("name"),"auth_mode":connection.get("auth_mode"),
-                    "api_version":connection.get("api_version"),"theme_status":theme.get("status"),
-                    "theme_name":(theme.get("theme") or {}).get("name"),"credential_present":True,
-                    "granted_scopes":granted,"missing_required_scopes":[],
-                    "missing_optional_scopes":sorted(optional-set(granted)),"secret_values_exposed":False,
-                    "missing_inputs":[],"review_required":[] if theme.get("theme") else ["Published theme could not be verified"],
-                    "fingerprint_input":{"domain":connection["shop_domain"],"shop":shop,"theme":theme.get("theme"),"scopes":granted}}
+            from .shopify_collections import ShopifyReadOnlyVerificationService
+            evidence=ShopifyReadOnlyVerificationService(db=self.db).verify(store_id)
+            result={**local,**evidence,"verified":evidence.get("status")=="VERIFIED",
+                    "missing_required_scopes":evidence.get("missing_read_scopes",[]),
+                    "missing_inputs":[],"review_required":[],"secret_values_exposed":False,
+                    "fingerprint_input":{"domain":evidence.get("actual_shop_domain"),
+                        "theme":evidence.get("theme_name"),"scopes":evidence.get("granted_scopes",[]),
+                        "publications":evidence.get("publications",[])}}
+            if evidence.get("status")=="WAITING_FOR_CREDENTIALS":
+                result["missing_inputs"]=["Cabin Tidy Shopify 연결 정보와 자격 증명을 확인하세요."]
+            elif evidence.get("status")=="WAITING_FOR_INPUT":
+                result["missing_inputs"]=["Shopify 앱에 필수 읽기 권한(read_themes)을 부여하고 다시 확인하세요."]
+            elif evidence.get("status")=="BLOCKED":
+                result["blockers"]=["Shopify에서 확인한 스토어 도메인이 저장된 도메인과 일치하지 않습니다."]
+            elif evidence.get("status")=="REVIEW_REQUIRED":
+                result["review_required"]=["Shopify MAIN theme 읽기 결과를 확인할 수 없습니다."]
+            return result
         except (TimeoutError,ConnectionError) as exc:
             return {**local,"status":"FAILED_TRANSIENT","review_required":[type(exc).__name__],"secret_values_exposed":False}
         except Exception as exc:

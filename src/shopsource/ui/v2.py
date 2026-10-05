@@ -2049,15 +2049,24 @@ class OperatorUI:
             refresh_auth_health()
             def verify_shopify():
                 try:
-                    result = ShopifyCollectionPublisher().verify(self.current_store)
-                    connection_label.set_text("Shopify: CONNECTED" if not result["missing_scopes"] else "Shopify: MISSING SCOPES")
-                    pubs = ", ".join(f"{p.get('name')} [{p.get('id')}]" for p in result["online_store_publications"])
-                    granted=set(result["scopes"])
-                    future={"read_themes","write_themes","read_online_store_navigation","write_online_store_navigation","read_legal_policies"}
-                    missing_future=sorted(future-granted)
-                    connection_detail.set_text(f"Granted: {', '.join(sorted(granted)) or 'none'} · Missing required: {', '.join(result['missing_scopes']) or 'none'} · Missing optional/future-write: {', '.join(sorted(set(result['missing_optional_scopes'])|set(missing_future))) or 'none'} · Online Store: {pubs or 'not found'}")
+                    from ..shopify_collections import ShopifyReadOnlyVerificationService
+                    result = ShopifyReadOnlyVerificationService().verify(self.current_store)
+                    connection_label.set_text(f"Shopify G0: {result['status']}")
+                    granted = result.get("granted_scopes", [])
+                    pubs = ", ".join(f"{p.get('name')} [{p.get('id')}]" for p in result.get("online_store_publications", []))
+                    connection_detail.set_text(
+                        f"Auth: {result.get('auth_mode') or '미설정'} · 자격 증명: {'YES' if result.get('credential_present') else 'NO'} · "
+                        f"도메인 확인: {'PASS' if result.get('shop_domain_verified') else 'FAIL'} "
+                        f"({result.get('shop_domain') or '—'} / {result.get('actual_shop_domain') or '—'}) · "
+                        f"Granted scopes: {', '.join(granted) or 'none'} · "
+                        f"Missing read scopes: {', '.join(result.get('missing_read_scopes', [])) or 'none'} · "
+                        f"Future/write scopes missing: {', '.join(result.get('missing_future_write_scopes', [])) or 'none'} · "
+                        f"MAIN theme read: {result.get('theme_status', 'NOT_CHECKED')} · "
+                        f"Publications read: {result.get('publications_status', 'NOT_CHECKED')} "
+                        f"({pubs or 'not read / none'}) · Last verified: {result.get('last_verified_at') or '없음'}")
                     refresh_auth_health()
-                    ui.notify("Shopify 연결/권한을 확인했습니다.", type="positive" if not result["missing_scopes"] else "warning")
+                    ui.notify("Shopify read-only 확인을 완료했습니다.",
+                              type="positive" if result.get("status") == "VERIFIED" else "warning")
                 except Exception as exc:
                     connection_detail.set_text(f"확인 실패: {_safe_error(exc)}")
                     ui.notify(_safe_error(exc), type="negative")

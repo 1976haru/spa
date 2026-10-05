@@ -183,10 +183,13 @@ def test_production_g0_uses_read_only_identity_and_theme(tmp_path,monkeypatch):
     class Client:
         def __init__(self,*args): pass
         def execute(self,query):
-            assert "query ShopSourceAuthIdentity" in query
+            assert "query ShopSourceG0Identity" in query
             return {"shop":{"name":"Cabin Tidy","myshopifyDomain":"cabin-tidy.myshopify.com"},
                     "currentAppInstallation":{"accessScopes":[{"handle":"read_themes"}]}}
     monkeypatch.setattr("shopsource.shopify_collections.ShopifyGraphQLClient",Client)
+    read_only_service = __import__("shopsource.shopify_collections", fromlist=["ShopifyReadOnlyVerificationService"]).ShopifyReadOnlyVerificationService
+    monkeypatch.setattr("shopsource.shopify_collections.ShopifyReadOnlyVerificationService",
+                        lambda **kwargs: read_only_service(client_factory=Client, **kwargs))
     monkeypatch.setattr("shopsource.homepage_collections.ShopifyThemeReader.discover",
                         lambda self,store:{"status":"CONNECTED","theme":{"name":"Published theme"},"scopes":["read_themes"]})
     from shopsource.production_runner import ProductionEvidenceRunner

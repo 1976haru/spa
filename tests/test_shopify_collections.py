@@ -295,5 +295,5 @@ def test_secret_token_only_credential_store(tmp_path,monkeypatch):
     monkeypatch.setattr(os,"name","nt",raising=False)
     db=tmp_path/"secret.sqlite3"; save_connection("001","cabin-tidy.myshopify.com",db=db)
     save_shopify_token("001","secret-value")
-    assert get_shopify_token("001",allow_environment=False)[0] == "secret-value"
+    assert get_shopify_token("001",allow_environment=False,db=db)[0] == "secret-value"
     assert b"secret-value" not in db.read_bytes()

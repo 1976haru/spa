@@ -263,7 +263,8 @@ class ShopifyGraphQLClient:
 
 
 SCOPES_QUERY = "query { currentAppInstallation { accessScopes { handle } } }"
-PUBLICATIONS_QUERY = "query { publications(first: 100) { nodes { id name catalog { title ... on PublicationCatalog { publication { id } } } } } }"
+PUBLICATIONS_QUERY = "query ShopSourcePublications { publications(first: 100, catalogType: APP) { nodes { id name } } }"
+SHOP_IDENTITY_QUERY = "query ShopSourceG0Identity { shop { name myshopifyDomain } currentAppInstallation { accessScopes { handle } } }"
 COLLECTIONS_QUERY = "query { collections(first: 250) { nodes { id title handle descriptionHtml image { url altText } productsCount { count precision } sources { __typename id ... on CollectionConditionsSource { inclusion { matchType conditions { id __typename ... on CollectionSourceInclusionConditionProductTitle { titleRelation: relation values matchType } ... on CollectionSourceInclusionConditionProductTag { tagRelation: relation values matchType } ... on CollectionSourceInclusionConditionProductType { typeRelation: relation values matchType } ... on CollectionSourceInclusionConditionProductVendor { vendorRelation: relation values matchType } } } } } } } }"
 CREATE_MUTATION = """mutation CollectionCreate($collection: CollectionCreateInput!) {
  collectionCreate(collection: $collection) { collection { id title handle descriptionHtml image { url altText } productsCount { count precision } } userErrors { field message } }
@@ -305,6 +306,7 @@ class ShopifyCollectionPublisher:
                 "required_scopes": sorted(REQUIRED_SCOPES), "missing_scopes": missing,
                 "missing_optional_scopes": missing_optional,
                 "publications": pubs, "online_store_publications": online}
+
 
     def dry_run(self, plan: dict, *, store_id: str | None = None, publish_online_store: bool = False) -> dict:
         store_id = store_id or plan["store_id"]
@@ -496,6 +498,93 @@ class ShopifyCollectionPublisher:
             lines.extend(f"- {c.get('field')} {c.get('relation')} {c.get('value')}" for c in item.get("conditions", []))
             if item.get("error"): lines.append(f"- Error: {item['error']}")
         (root / "sync_report.md").write_text("\n".join(lines),encoding="utf-8")
+
+
+class ShopifyReadOnlyVerificationService:
+    """Read-only Shopify identity, MAIN theme, and publication verification."""
+    REQUIRED_G0_READ_SCOPES = {"read_themes"}
+    OPTIONAL_READ_SCOPES = {"read_publications"}
+    FUTURE_WRITE_SCOPES = {"write_products", "write_publications", "write_themes",
+                           "write_online_store_navigation", "write_files"}
+
+    def __init__(self, *, db=None, client_factory=ShopifyGraphQLClient, theme_reader_factory=None):
+        self.db, self.client_factory, self.theme_reader_factory = db, client_factory, theme_reader_factory
+
+    def verify(self, store_id: str) -> dict:
+        config = get_connection(store_id, db=self.db)
+        if not config:
+            return {"status": "WAITING_FOR_CREDENTIALS", "credential_present": False,
+                    "shop_domain_verified": False, "missing_read_scopes": [],
+                    "publications_status": "NOT_CHECKED", "theme_status": "NOT_CHECKED"}
+        token, _ = get_shopify_token(store_id, db=self.db)
+        if not token:
+            return {"status": "WAITING_FOR_CREDENTIALS", "credential_present": False,
+                    "auth_mode": config.get("auth_mode"), "shop_domain": config.get("shop_domain"),
+                    "shop_domain_verified": False, "missing_read_scopes": [],
+                    "publications_status": "NOT_CHECKED", "theme_status": "NOT_CHECKED"}
+
+        client = self.client_factory(config["shop_domain"], token, config["api_version"])
+        identity = client.execute(SHOP_IDENTITY_QUERY)
+        shop = identity.get("shop") or {}
+        scopes_data = identity.get("currentAppInstallation") or {}
+        scopes = sorted({row.get("handle") for row in scopes_data.get("accessScopes", []) if row.get("handle")})
+        expected, actual = str(config.get("shop_domain") or "").casefold(), str(shop.get("myshopifyDomain") or "").casefold()
+        missing_read = sorted((self.REQUIRED_G0_READ_SCOPES | self.OPTIONAL_READ_SCOPES) - set(scopes))
+        if not actual or actual != expected:
+            return {"status": "BLOCKED", "credential_present": True, "auth_mode": config.get("auth_mode"),
+                    "shop_name": shop.get("name"), "shop_domain": config.get("shop_domain"),
+                    "actual_shop_domain": shop.get("myshopifyDomain"), "shop_domain_verified": False,
+                    "granted_scopes": scopes, "missing_read_scopes": missing_read,
+                    "missing_future_write_scopes": sorted(self.FUTURE_WRITE_SCOPES - set(scopes)),
+                    "theme_status": "NOT_CHECKED", "publications_status": "NOT_CHECKED",
+                    "last_verified_at": None, "secret_values_exposed": False}
+
+        verified_at = _now()
+        with connect(self.db) as con:
+            con.execute("UPDATE shopify_connections SET status=?,scopes_json=?,last_verified_at=?,updated_at=? WHERE store_id=?",
+                        ("CONNECTED", json.dumps(scopes), verified_at, verified_at, store_id))
+
+        missing_g0 = self.REQUIRED_G0_READ_SCOPES - set(scopes)
+        theme = None
+        if missing_g0:
+            theme_status = "MISSING_SCOPE"
+        else:
+            if self.theme_reader_factory:
+                reader = self.theme_reader_factory(db=self.db)
+            else:
+                from .homepage_collections import ShopifyThemeReader
+                reader = ShopifyThemeReader(db=self.db)
+            theme = reader.discover(store_id)
+            theme_status = "PASS" if theme.get("status") == "CONNECTED" and theme.get("theme") else (
+                "MISSING_SCOPE" if theme.get("status") == "MISSING_READ_SCOPE" else "FAIL")
+
+        publications, publication_error = [], None
+        if "read_publications" in scopes:
+            try:
+                publications = client.execute(PUBLICATIONS_QUERY).get("publications", {}).get("nodes", [])
+                publication_status = "PASS"
+            except Exception as exc:
+                publication_status, publication_error = "FAIL", type(exc).__name__
+        else:
+            publication_status = "MISSING_SCOPE"
+        online = [row for row in publications if "online store" in str(row.get("name", "")).casefold()]
+        verified_at = _now()
+        with connect(self.db) as con:
+            con.execute("UPDATE shopify_connections SET publications_json=?,last_verified_at=?,updated_at=? WHERE store_id=?",
+                        (json.dumps(publications), verified_at, verified_at, store_id))
+        status = "WAITING_FOR_INPUT" if missing_g0 or theme_status == "MISSING_SCOPE" else (
+            "VERIFIED" if theme_status == "PASS" else "REVIEW_REQUIRED")
+        return {"status": status, "credential_present": True, "token_state": "VALID",
+                "auth_mode": config.get("auth_mode"), "shop_name": shop.get("name"),
+                "shop_domain": config.get("shop_domain"), "actual_shop_domain": shop.get("myshopifyDomain"),
+                "shop_domain_verified": True, "api_version": config.get("api_version"),
+                "granted_scopes": scopes, "missing_read_scopes": missing_read,
+                "missing_future_write_scopes": sorted(self.FUTURE_WRITE_SCOPES - set(scopes)),
+                "theme_status": theme_status, "theme_name": (theme or {}).get("theme", {}).get("name"),
+                "publications_status": publication_status, "publications": publications,
+                "online_store_publications": online, "publication_error_type": publication_error,
+                "last_verified_at": verified_at, "secret_values_exposed": False,
+                "mutation_executed": False}
 
 
 class ShopifyFileUploader:
