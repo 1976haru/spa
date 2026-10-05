@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+from datetime import datetime, timezone
 
 import pytest
 
@@ -41,6 +42,11 @@ class FakeAdmin:
 def configured(tmp_path, monkeypatch):
     db = tmp_path / "g0.sqlite3"
     shopify.save_connection("001", "cabin-tidy.myshopify.com", auth_mode=shopify.DEV_DASHBOARD_CLIENT_CREDENTIALS, db=db)
+    stamp=datetime.now(timezone.utc).isoformat()
+    with connect(db) as con:
+        con.execute("INSERT INTO shopify_app_profiles(profile_id,display_name,expected_app_gid,expected_app_title,client_id_fingerprint,api_version,required_scopes_json,optional_scopes_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            ("fixture-app","Fixture Production App","gid://shopify/App/fixture","Fixture Production App","fingerprint","2026-07",'["read_themes"]','[]',"VERIFIED",stamp,stamp))
+        con.execute("UPDATE shopify_connections SET app_profile_id=? WHERE store_id=?",("fixture-app","001"))
     monkeypatch.setattr(shopify, "get_shopify_token", lambda *args, **kwargs: ("private-fixture-token", "mock"))
     return db
 
@@ -138,6 +144,19 @@ def test_missing_read_themes_waits_for_input_even_when_identity_is_valid(configu
     assert result["missing_read_scopes"] == ["read_themes"]
     assert result["theme_status"] == "MISSING_SCOPE"
     assert shopify.get_connection("001", db=configured)["shopify_shop_gid"] == "gid://shopify/Shop/42"
+
+
+def test_app_identity_mismatch_is_not_connected_or_verified(configured, monkeypatch):
+    from shopsource.shopify_auth import ShopifyAuthError
+    monkeypatch.setattr(shopify, "get_shopify_token", lambda *a, **k: (_ for _ in ()).throw(
+        ShopifyAuthError("APP_IDENTITY_MISMATCH", "authenticated hps app", {
+            "authenticated_app_id":"gid://shopify/App/hps", "authenticated_app_title":"hps-automation"})))
+    result=shopify.ShopifyReadOnlyVerificationService(db=configured).verify("001")
+    assert result["status"]=="APP_IDENTITY_MISMATCH"
+    assert result["app_binding_status"]=="VERIFIED"
+    assert result["expected_app_gid"]=="gid://shopify/App/fixture"
+    assert result["authenticated_app_title"]=="hps-automation"
+    assert shopify.get_connection("001",db=configured)["status"]=="APP_IDENTITY_MISMATCH"
 
 
 def test_wrong_myshopify_domain_is_blocked_before_downstream_reads(configured):

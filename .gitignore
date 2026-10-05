@@ -38,3 +38,6 @@ SDK_SESSION_POOL_STATE.json
 SDK_CRAWLER_STATISTICS_*.json
 **/SDK_SESSION_POOL_STATE.json
 **/SDK_CRAWLER_STATISTICS_*.json
+
+# Shopify CLI-linked app configuration is machine/account specific.
+tools/shopify_app/shopify.app*.toml

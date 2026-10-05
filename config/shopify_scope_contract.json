@@ -1,0 +1,75 @@
+{
+  "contract_version": "2026-07.1",
+  "source_basis": "Static audit of Shopify GraphQL queries/mutations in src/shopsource plus Shopify Admin GraphQL 2026-07 operation scope requirements; scope availability must still be confirmed by Shopify installation readback.",
+  "features": {
+    "G0_READ_ONLY": {
+      "required_now": ["read_themes"],
+      "optional_read": ["read_publications"],
+      "future_write": [],
+      "restricted_or_approval_required": [],
+      "feature_owner": "ShopifyReadOnlyVerificationService / ShopifyThemeReader"
+    },
+    "PRODUCT_READ": {
+      "required_now": ["read_products"],
+      "future_write": [],
+      "restricted_or_approval_required": [],
+      "feature_owner": "DirectShopifyProductPublisher"
+    },
+    "PRODUCT_WRITE": {
+      "required_now": [],
+      "future_write": ["write_products"],
+      "restricted_or_approval_required": [],
+      "feature_owner": "DirectShopifyProductPublisher"
+    },
+    "COLLECTION_WRITE": {
+      "required_now": [],
+      "future_write": ["write_products", "write_publications"],
+      "restricted_or_approval_required": [],
+      "feature_owner": "ShopifyCollectionPublisher"
+    },
+    "COLLECTION_READ": {
+      "required_now": ["read_products", "read_publications"],
+      "future_write": [],
+      "restricted_or_approval_required": [],
+      "feature_owner": "ShopifyCollectionPublisher"
+    },
+    "FILES": {
+      "required_now": [],
+      "future_write": ["write_files"],
+      "restricted_or_approval_required": [],
+      "feature_owner": "ShopifyFileUploader"
+    },
+    "THEME_READ": {
+      "required_now": ["read_themes"],
+      "future_write": [],
+      "restricted_or_approval_required": [],
+      "feature_owner": "ShopifyThemeReader"
+    },
+    "THEME_WRITE": {
+      "required_now": [],
+      "future_write": ["write_themes"],
+      "restricted_or_approval_required": ["write_themes", "Shopify exemption where applicable"],
+      "feature_owner": "ThemeApplyService (disabled for production baseline)"
+    },
+    "NAVIGATION": {
+      "required_now": [],
+      "optional_read": ["read_online_store_navigation"],
+      "future_write": ["write_online_store_navigation"],
+      "restricted_or_approval_required": [],
+      "feature_owner": "NavigationService"
+    },
+    "POLICIES": {
+      "required_now": [],
+      "optional_read": ["read_content", "read_online_store_pages", "read_legal_policies"],
+      "future_write": [],
+      "restricted_or_approval_required": [],
+      "feature_owner": "ProductionEvidenceRunner._pages_policies"
+    },
+    "COMMERCE": {
+      "required_now": [],
+      "future_write": [],
+      "restricted_or_approval_required": [],
+      "feature_owner": "ProductionEvidenceRunner._commerce (read/manual evidence only)"
+    }
+  }
+}

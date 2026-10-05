@@ -481,9 +481,23 @@ class ProductionEvidenceRunner:
             if evidence.get("status")=="WAITING_FOR_CREDENTIALS":
                 result["missing_inputs"]=["Cabin Tidy Shopify 연결 정보와 자격 증명을 확인하세요."]
             elif evidence.get("status")=="WAITING_FOR_INPUT":
-                result["missing_inputs"]=["Shopify 앱에 필수 읽기 권한(read_themes)을 부여하고 다시 확인하세요."]
+                if evidence.get("app_binding_status")=="NOT_BOUND":
+                    result["missing_inputs"]=["Target Production App이 아직 Store에 연결되지 않았습니다. app.apiKey와 Shop ID를 검증해 Production App 프로필을 연결하세요."]
+                else:
+                    result["missing_inputs"]=["Shopify 앱에 필수 읽기 권한(read_themes)을 부여하고 다시 확인하세요."]
+            elif evidence.get("status")=="EXTERNAL_ORG_OAUTH_REQUIRED":
+                result["status"]="WAITING_FOR_INPUT"
+                result["missing_inputs"]=["이 Shopify 스토어는 Client Credentials 설치에 허용되지 않았습니다. 별도의 OAuth 연결 방식이 필요합니다."]
             elif evidence.get("status")=="BLOCKED":
                 result["blockers"]=["Shopify에서 확인한 스토어 도메인이 저장된 도메인과 일치하지 않습니다."]
+            elif evidence.get("status")=="APP_IDENTITY_MISMATCH":
+                result["status"]="BLOCKED"
+                result["blockers"]=[f"Shopify 앱 신원이 다릅니다. 인증된 앱: {evidence.get('authenticated_app_title') or '확인된 이름 없음'} ({evidence.get('authenticated_app_id') or 'GID 미확인'}); Production App을 연결하세요."]
+                result["authenticated_app_title"]=evidence.get("authenticated_app_title")
+                result["authenticated_app_gid"]=evidence.get("authenticated_app_id")
+            elif evidence.get("status")=="STORE_IDENTITY_MISMATCH":
+                result["status"]="BLOCKED"
+                result["blockers"]=["인증된 Shopify 스토어 ID가 이 연결에 저장된 Shop ID와 다릅니다."]
             elif evidence.get("status")=="REVIEW_REQUIRED":
                 result["review_required"]=["Shopify MAIN theme 읽기 결과를 확인할 수 없습니다."]
             return result
@@ -493,8 +507,11 @@ class ProductionEvidenceRunner:
             from .security import redact_text
             from .shopify_auth import ShopifyAuthError
             if isinstance(exc,ShopifyAuthError):
+                if exc.code in {"APP_IDENTITY_MISMATCH","STORE_IDENTITY_MISMATCH"}:
+                    return {**local,"status":"BLOCKED","blockers":[str(exc)],
+                            "identity_details":getattr(exc,"details",{}),"secret_values_exposed":False}
                 if exc.code=="SHOP_NOT_PERMITTED":
-                    return {**local,"status":"WAITING_FOR_INPUT","missing_inputs":[str(exc)],"secret_values_exposed":False}
+                    return {**local,"status":"EXTERNAL_ORG_OAUTH_REQUIRED","missing_inputs":[str(exc)],"secret_values_exposed":False}
                 if exc.code in {"MISSING_CREDENTIALS","BAD_CREDENTIAL"}:
                     return {**local,"status":"WAITING_FOR_CREDENTIALS","missing_inputs":[str(exc)],"secret_values_exposed":False}
                 if exc.code=="NETWORK_ERROR":

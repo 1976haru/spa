@@ -98,7 +98,18 @@ def _install_schema(db=None):
             scopes_json TEXT NOT NULL DEFAULT '[]', publications_json TEXT NOT NULL DEFAULT '[]',
             last_verified_at TEXT, updated_at TEXT NOT NULL,
             auth_mode TEXT NOT NULL DEFAULT 'LEGACY_ADMIN_TOKEN', token_expires_at TEXT,
-            shopify_shop_gid TEXT
+            shopify_shop_gid TEXT, app_profile_id TEXT,
+            shopify_installation_gid TEXT, canonical_myshopify_domain TEXT, primary_domain TEXT,
+            authenticated_app_gid TEXT, authenticated_app_title TEXT, client_id_fingerprint TEXT,
+            authenticated_requested_scopes_json TEXT NOT NULL DEFAULT '[]',
+            authenticated_optional_scopes_json TEXT NOT NULL DEFAULT '[]'
+        );
+        CREATE TABLE IF NOT EXISTS shopify_app_profiles (
+            profile_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, expected_app_gid TEXT NOT NULL,
+            expected_app_title TEXT NOT NULL DEFAULT '', client_id_fingerprint TEXT NOT NULL,
+            api_version TEXT NOT NULL DEFAULT '2026-07', required_scopes_json TEXT NOT NULL DEFAULT '[]',
+            optional_scopes_json TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'NOT_VERIFIED',
+            last_verified_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS shopify_collection_mappings (
             store_id TEXT NOT NULL, collection_key TEXT NOT NULL, handle TEXT NOT NULL,
@@ -124,6 +135,16 @@ def _install_schema(db=None):
             con.execute("ALTER TABLE shopify_connections ADD COLUMN token_expires_at TEXT")
         if "shopify_shop_gid" not in columns:
             con.execute("ALTER TABLE shopify_connections ADD COLUMN shopify_shop_gid TEXT")
+        for name, declaration in {
+            "app_profile_id": "TEXT", "shopify_installation_gid": "TEXT",
+            "canonical_myshopify_domain": "TEXT", "primary_domain": "TEXT",
+            "authenticated_app_gid": "TEXT", "authenticated_app_title": "TEXT",
+            "client_id_fingerprint": "TEXT",
+            "authenticated_requested_scopes_json": "TEXT NOT NULL DEFAULT '[]'",
+            "authenticated_optional_scopes_json": "TEXT NOT NULL DEFAULT '[]'",
+        }.items():
+            if name not in columns:
+                con.execute(f"ALTER TABLE shopify_connections ADD COLUMN {name} {declaration}")
 
 
 def save_connection(store_id: str, shop_domain: str, *, api_version: str = SHOPIFY_API_VERSION,
@@ -519,7 +540,26 @@ class ShopifyReadOnlyVerificationService:
             return {"status": "WAITING_FOR_CREDENTIALS", "credential_present": False,
                     "shop_domain_verified": False, "missing_read_scopes": [],
                     "publications_status": "NOT_CHECKED", "theme_status": "NOT_CHECKED"}
-        token, _ = get_shopify_token(store_id, db=self.db)
+        try:
+            token, _ = get_shopify_token(store_id, db=self.db)
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            if code in {"APP_IDENTITY_MISMATCH", "STORE_IDENTITY_MISMATCH"}:
+                with connect(self.db) as con:
+                    con.execute("UPDATE shopify_connections SET status=? WHERE store_id=?", (code, store_id))
+                from .shopify_auth import _app_profile
+                app_profile = _app_profile(self.db, config.get("app_profile_id")) if config.get("app_profile_id") else None
+                return {"status": code, "credential_present": True, "auth_mode": config.get("auth_mode"),
+                        "shop_domain": config.get("shop_domain"), "shop_domain_verified": False,
+                        "app_binding_status": "VERIFIED" if app_profile else "NOT_BOUND",
+                        "expected_app_gid": (app_profile or {}).get("expected_app_gid"),
+                        "expected_app_title": (app_profile or {}).get("display_name"),
+                        "authenticated_app_gid": getattr(exc, "details", {}).get("authenticated_app_id"),
+                        "authenticated_app_title": getattr(exc, "details", {}).get("authenticated_app_title"),
+                        **getattr(exc, "details", {}),
+                        "publications_status": "NOT_CHECKED", "theme_status": "NOT_CHECKED",
+                        "secret_values_exposed": False, "mutation_executed": False}
+            raise
         if not token:
             return {"status": "WAITING_FOR_CREDENTIALS", "credential_present": False,
                     "auth_mode": config.get("auth_mode"), "shop_domain": config.get("shop_domain"),
@@ -540,6 +580,10 @@ class ShopifyReadOnlyVerificationService:
         domain_matches = bool(expected and expected in {actual, primary_host})
         shop_id_matches = None if not saved_shop_id else saved_shop_id == shop_id
         missing_read = sorted((self.REQUIRED_G0_READ_SCOPES | self.OPTIONAL_READ_SCOPES) - set(scopes))
+        profile_id = config.get("app_profile_id")
+        from .shopify_auth import _app_profile
+        profile = _app_profile(self.db, profile_id) if profile_id else None
+        app_binding_status = "VERIFIED" if profile else "NOT_BOUND"
         if not shop_id or not domain_matches or shop_id_matches is False:
             return {"status": "BLOCKED", "credential_present": True, "auth_mode": config.get("auth_mode"),
                     "shop_id": shop_id, "shop_id_matches": shop_id_matches,
@@ -583,14 +627,36 @@ class ShopifyReadOnlyVerificationService:
             theme_status = "PASS" if theme.get("status") == "CONNECTED" and theme.get("theme") else (
                 "MISSING_SCOPE" if theme.get("status") == "MISSING_READ_SCOPE" else "FAIL")
         verified_at = _now()
-        status = "WAITING_FOR_INPUT" if missing_g0 or theme_status == "MISSING_SCOPE" else (
+        status = "WAITING_FOR_INPUT" if not profile or missing_g0 or theme_status == "MISSING_SCOPE" else (
             "VERIFIED" if theme_status == "PASS" and publication_status != "FAIL" else "REVIEW_REQUIRED")
         with connect(self.db) as con:
             con.execute("UPDATE shopify_connections SET status=?,scopes_json=?,publications_json=?,last_verified_at=?,updated_at=? WHERE store_id=?",
                         ("CONNECTED" if status == "VERIFIED" else status, json.dumps(scopes), json.dumps(publications),
                          verified_at, verified_at, store_id))
+        status = status if profile else "WAITING_FOR_INPUT"
+        with connect(self.db) as con:
+            con.execute("UPDATE shopify_connections SET status=? WHERE store_id=?", (status, store_id))
+        from .shopify_auth import ShopifyAuthService
+        auth_status = ShopifyAuthService(db=self.db).status(store_id)
+        from .shopify_scope_contract import scope_preflight
+        scope_info = scope_preflight(scopes, gate="G0_READ_ONLY")
         return {"status": status, "credential_present": True, "token_state": "VALID",
                 "auth_mode": config.get("auth_mode"), "shop_name": shop.get("name"),
+                "authenticated_app_title": auth_status.get("authenticated_app_title"),
+                "authenticated_app_gid": auth_status.get("authenticated_app_gid"),
+                "expected_app_title": auth_status.get("expected_app_title"),
+                "expected_app_gid": auth_status.get("expected_app_gid"),
+                "app_binding_status": app_binding_status,
+                "app_profile_id": profile_id,
+                "declared_required_scopes": auth_status.get("declared_required_scopes", []),
+                "declared_optional_scopes": auth_status.get("declared_optional_scopes", []),
+                "authenticated_requested_scopes": auth_status.get("authenticated_requested_scopes", []),
+                "authenticated_optional_scopes": auth_status.get("authenticated_optional_scopes", []),
+                "missing_for_current_gate": scope_info["missing_for_current_gate"],
+                "future_write_scopes": scope_info["future_write"],
+                "restricted_or_approval_required_scopes": scope_info["restricted_or_approval_required"],
+                "installation_id": config.get("shopify_installation_gid"),
+                "client_id_fingerprint": auth_status.get("client_id_fingerprint"),
                 "shop_id": shop_id, "shop_id_matches": shop_id_matches,
                 "shop_domain": config.get("shop_domain"), "actual_shop_domain": shop.get("myshopifyDomain"),
                 "primary_domain_host": primary_host, "shop_domain_verified": domain_matches,

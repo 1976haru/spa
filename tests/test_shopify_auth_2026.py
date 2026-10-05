@@ -35,6 +35,18 @@ class Response:
     def read(self): return self.payload
 
 
+def identity_factory(client_id, shop_id="gid://shopify/Shop/1", domain="cabin-tidy.myshopify.com"):
+    class IdentityClient:
+        def __init__(self,*args): pass
+        def execute(self,query):
+            assert "query ShopSourceAppIdentity" in query
+            return {"app":{"id":"gid://shopify/App/9","title":"Test Production App","apiKey":client_id,
+                    "requestedAccessScopes":[{"handle":"read_themes"}],"optionalAccessScopes":[]},
+                "currentAppInstallation":{"id":"gid://shopify/AppInstallation/8","accessScopes":[{"handle":"read_themes"}]},
+                "shop":{"id":shop_id,"name":"Cabin Tidy","myshopifyDomain":domain,"primaryDomain":{"host":domain}}}
+    return IdentityClient
+
+
 @pytest.fixture(autouse=True)
 def fake_credentials(monkeypatch):
     FakeKeyring.values = {}
@@ -64,7 +76,7 @@ def test_client_credentials_token_request_form(tmp_path):
     def opener(request,timeout):
         seen.append((request.full_url,request.get_header("Content-type"),urllib.parse.parse_qs(request.data.decode()),timeout))
         return Response({"access_token":"ephemeral-token","scope":"read_themes read_products","expires_in":86399})
-    token=auth.ShopifyAuthService(db=db,opener=opener,clock=lambda:1000).token_for("001")
+    token=auth.ShopifyAuthService(db=db,opener=opener,clock=lambda:1000,client_factory=identity_factory("client-id")).token_for("001")
     assert str(token)=="ephemeral-token"
     url,content_type,form,timeout=seen[0]
     assert url=="https://cabin-tidy.myshopify.com/admin/oauth/access_token"
@@ -79,7 +91,7 @@ def test_token_cached_until_safety_window_then_refreshed(tmp_path):
     now={"value":1000}; calls=[]
     def opener(request,timeout):
         calls.append(1); return Response({"access_token":f"token-{len(calls)}","scope":"read_themes","expires_in":1000})
-    service=auth.ShopifyAuthService(db=db,opener=opener,clock=lambda:now["value"])
+    service=auth.ShopifyAuthService(db=db,opener=opener,clock=lambda:now["value"],client_factory=identity_factory("id"))
     assert str(service.token_for("001"))==str(service.token_for("001"))=="token-1" and len(calls)==1
     now["value"]+=701
     assert str(service.token_for("001"))=="token-2" and len(calls)==2
@@ -89,9 +101,9 @@ def test_restart_requests_new_ephemeral_token(tmp_path):
     db=tmp_path/"auth.sqlite3"; configured(db); auth.save_dev_credentials("001","id","secret")
     calls=[]
     def opener(request,timeout): calls.append(1); return Response({"access_token":f"r{len(calls)}","scope":"read_themes","expires_in":86399})
-    assert str(auth.ShopifyAuthService(db=db,opener=opener).token_for("001"))=="r1"
+    assert str(auth.ShopifyAuthService(db=db,opener=opener,client_factory=identity_factory("id")).token_for("001"))=="r1"
     with auth._CACHE_LOCK: auth._CACHE.clear()  # process restart: only OS credentials remain
-    assert str(auth.ShopifyAuthService(db=db,opener=opener).token_for("001"))=="r2" and len(calls)==2
+    assert str(auth.ShopifyAuthService(db=db,opener=opener,client_factory=identity_factory("id")).token_for("001"))=="r2" and len(calls)==2
 
 
 def http_error(code=401, body=b""):
@@ -147,7 +159,7 @@ def test_scope_readback_and_missing_scope_summary(tmp_path):
     status=auth.ShopifyAuthService(db=db).status("001")
     assert status["granted_scopes"]==["read_themes","read_products"]
     assert status["missing_required_scopes"]==[]
-    assert "write_products" in status["missing_optional_scopes"]
+    assert "write_products" in status["scope_preflight"]["future_write"]
 
 
 def test_legacy_token_still_works(tmp_path):
@@ -179,6 +191,12 @@ def test_auth_health_never_contains_secrets(tmp_path):
 
 def test_production_g0_uses_read_only_identity_and_theme(tmp_path,monkeypatch):
     db=tmp_path/"g0.sqlite3"; configured(db); auth.save_dev_credentials("001","id","secret")
+    from datetime import datetime,timezone
+    stamp=datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(db) as con:
+        con.execute("INSERT INTO shopify_app_profiles(profile_id,display_name,expected_app_gid,expected_app_title,client_id_fingerprint,api_version,required_scopes_json,optional_scopes_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            ("profile-test","Test App","gid://shopify/App/9","Test App","fingerprint","2026-07",'["read_themes"]','[]',"VERIFIED",stamp,stamp))
+        con.execute("UPDATE shopify_connections SET app_profile_id=? WHERE store_id=?",("profile-test","001"))
     monkeypatch.setattr("shopsource.shopify_collections.get_shopify_token",lambda *a,**k:("mock-token","dev-dashboard-client-credentials"))
     class Client:
         def __init__(self,*args): pass
@@ -231,6 +249,6 @@ def test_no_real_network_and_protected_file_untouched(tmp_path,monkeypatch):
         calls.append(request.full_url)
         return Response({"access_token":"fixture-token","scope":"read_themes","expires_in":86399})
     monkeypatch.setattr(auth.urllib.request,"urlopen",mock_urlopen)
-    assert str(auth.ShopifyAuthService(db=db).token_for("001"))=="fixture-token"
+    assert str(auth.ShopifyAuthService(db=db,client_factory=identity_factory("id")).token_for("001"))=="fixture-token"
     assert calls==["https://cabin-tidy.myshopify.com/admin/oauth/access_token"]
     assert protected.read_bytes()==before

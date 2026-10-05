@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import os
 import threading
 import time
@@ -19,10 +21,17 @@ KEYRING_SERVICE = "ShopSourceStudio.Shopify"
 _CACHE: dict[str, dict] = {}
 _CACHE_LOCK = threading.RLock()
 
+SHOPIFY_APP_IDENTITY_QUERY = """query ShopSourceAppIdentity {
+  app { id title apiKey requestedAccessScopes { handle } optionalAccessScopes { handle } }
+  currentAppInstallation { id accessScopes { handle } }
+  shop { id name myshopifyDomain primaryDomain { host } }
+}"""
+
 
 class ShopifyAuthError(RuntimeError):
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, details: dict | None = None):
         self.code = code
+        self.details = details or {}
         super().__init__(message)
 
 
@@ -38,6 +47,10 @@ def _keyring():
 
 def _credential_key(store_id: str, kind: str) -> str:
     return f"{store_id}:{kind}"
+
+
+def _profile_credential_key(profile_id: str) -> str:
+    return f"app-profile:{profile_id}:dev-dashboard-client"
 
 
 def save_dev_credentials(store_id: str, client_id: str, client_secret: str) -> None:
@@ -59,6 +72,149 @@ def get_dev_credentials(store_id: str) -> dict | None:
     except Exception:
         return None
     return None
+
+
+def get_profile_credentials(profile_id: str) -> dict | None:
+    try:
+        raw = _keyring().get_password(KEYRING_SERVICE, _profile_credential_key(profile_id))
+        value = json.loads(raw) if raw else None
+        if value and value.get("client_id") and value.get("client_secret"):
+            return {"client_id": value["client_id"], "client_secret": value["client_secret"]}
+    except Exception:
+        return None
+    return None
+
+
+def _app_profile(db, profile_id: str) -> dict | None:
+    from .shopify_collections import _install_schema
+    _install_schema(db)
+    with connect(db) as con:
+        row = con.execute("SELECT * FROM shopify_app_profiles WHERE profile_id=?", (profile_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_app_profiles(db=None) -> list[dict]:
+    from .shopify_collections import _install_schema
+    _install_schema(db)
+    with connect(db) as con:
+        rows = con.execute("SELECT profile_id,display_name,expected_app_gid,expected_app_title,client_id_fingerprint,api_version,status,last_verified_at FROM shopify_app_profiles ORDER BY display_name,profile_id").fetchall()
+    return [dict(row) for row in rows]
+
+
+def _identity_result(domain: str, api_version: str, token: str, client_id: str, *, db=None,
+                     expected_app_gid: str | None = None, expected_shop_gid: str | None = None,
+                     client_factory=None) -> dict:
+    """Read authoritative app/store identity; never infer it from dashboard labels."""
+    if client_factory is None:
+        from .shopify_collections import ShopifyGraphQLClient
+        client_factory = ShopifyGraphQLClient
+    identity = client_factory(domain, token, api_version).execute(SHOPIFY_APP_IDENTITY_QUERY)
+    app = identity.get("app") or {}
+    installation = identity.get("currentAppInstallation") or {}
+    shop = identity.get("shop") or {}
+    key_matches = bool(app.get("apiKey")) and hmac.compare_digest(str(app.get("apiKey")), str(client_id))
+    app_id_matches = not expected_app_gid or app.get("id") == expected_app_gid
+    shop_id_matches = not expected_shop_gid or shop.get("id") == expected_shop_gid
+    configured = str(domain or "").casefold().rstrip(".")
+    canonical = str(shop.get("myshopifyDomain") or "").casefold().rstrip(".")
+    primary = str(((shop.get("primaryDomain") or {}).get("host")) or "").casefold().rstrip(".")
+    domain_matches = bool(configured and configured in {canonical, primary})
+    safe_identity = {"authenticated_app_id": app.get("id"), "authenticated_app_title": app.get("title"),
+                     "shop_id": shop.get("id"), "shop_name": shop.get("name"),
+                     "myshopify_domain": shop.get("myshopifyDomain"), "primary_domain": primary,
+                     "installation_id": installation.get("id")}
+    if not key_matches or not app_id_matches:
+        actual_label = f"{app.get('title') or '이름 미확인'} [{app.get('id') or 'GID 미확인'}]"
+        raise ShopifyAuthError("APP_IDENTITY_MISMATCH", f"인증된 Shopify 앱 {actual_label}이 입력한 Client ID 또는 선택한 Production App과 일치하지 않습니다.",
+                               {**safe_identity, "expected_app_gid": expected_app_gid})
+    if not shop_id_matches or not shop.get("id") or not domain_matches:
+        raise ShopifyAuthError("STORE_IDENTITY_MISMATCH", "인증된 Shopify 스토어가 이 연결의 스토어와 일치하지 않습니다.",
+                               {**safe_identity, "expected_shop_gid": expected_shop_gid, "configured_domain": domain})
+    handles = lambda rows: sorted({str(row.get("handle")) for row in rows or [] if isinstance(row, dict) and row.get("handle")})
+    return {"app_id": app.get("id"), "app_title": app.get("title"), "client_id_fingerprint": hashlib.sha256(str(client_id).encode()).hexdigest(),
+            "shop_id": shop.get("id"), "shop_name": shop.get("name"), "myshopify_domain": shop.get("myshopifyDomain"),
+            "primary_domain": (shop.get("primaryDomain") or {}).get("host"), "installation_id": installation.get("id"),
+            "requested_scopes": handles(app.get("requestedAccessScopes")),
+            "optional_scopes": handles(app.get("optionalAccessScopes")), "granted_scopes": handles(installation.get("accessScopes"))}
+
+
+def verify_and_bind_app_profile(store_id: str, shop_domain: str, client_id: str, client_secret: str, *,
+                                profile_id: str | None = None, display_name: str | None = None,
+                                api_version: str = "2026-07", db=None, opener=None,
+                                client_factory=None, clock=time.time) -> dict:
+    """Validate a candidate app and store before persisting credentials or binding."""
+    from .shopify_collections import _safe_domain, _install_schema, _now
+    client_id, client_secret = str(client_id or "").strip(), str(client_secret or "").strip()
+    if not client_id or not client_secret:
+        raise ShopifyAuthError("MISSING_CREDENTIALS", "Client ID와 Client Secret을 입력해야 합니다.")
+    domain = _safe_domain(shop_domain)
+    connection = _connection(db, store_id)
+    expected_shop_gid = (connection or {}).get("shopify_shop_gid")
+    candidate_profile_id = profile_id or ("app-" + hashlib.sha256(client_id.encode()).hexdigest()[:20])
+    prior = _app_profile(db, candidate_profile_id)
+    credentials = {"client_id": client_id, "client_secret": client_secret}
+    service = ShopifyAuthService(db=db, opener=opener, clock=clock)
+    token, _, expires_in = service._request_token(domain, credentials)
+    if not token:
+        raise ShopifyAuthError("TOKEN_ERROR", "Shopify 인증 응답에 access token이 없습니다.")
+    identity = _identity_result(domain, api_version, token, client_id, db=db,
+                                expected_app_gid=(prior or {}).get("expected_app_gid"),
+                                expected_shop_gid=expected_shop_gid, client_factory=client_factory)
+    # Only after authoritative identity checks pass do credentials and bindings persist.
+    bundle = json.dumps(credentials, separators=(",", ":"))
+    _keyring().set_password(KEYRING_SERVICE, _profile_credential_key(candidate_profile_id), bundle)
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    expires_at = float(clock()) + max(1, int(expires_in))
+    _install_schema(db)
+    with connect(db) as con:
+        con.execute("""INSERT INTO shopify_app_profiles(profile_id,display_name,expected_app_gid,expected_app_title,
+          client_id_fingerprint,api_version,required_scopes_json,optional_scopes_json,status,last_verified_at,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(profile_id) DO UPDATE SET display_name=excluded.display_name,
+          expected_app_gid=excluded.expected_app_gid,expected_app_title=excluded.expected_app_title,
+          client_id_fingerprint=excluded.client_id_fingerprint,api_version=excluded.api_version,
+          required_scopes_json=excluded.required_scopes_json,optional_scopes_json=excluded.optional_scopes_json,
+          status=excluded.status,last_verified_at=excluded.last_verified_at,updated_at=excluded.updated_at""",
+          (candidate_profile_id, display_name or identity["app_title"], identity["app_id"], identity["app_title"],
+           identity["client_id_fingerprint"], api_version, json.dumps(identity["requested_scopes"]),
+           json.dumps(identity["optional_scopes"]), "VERIFIED", now_iso, now_iso, now_iso))
+        con.execute("""INSERT INTO shopify_connections(store_id,shop_domain,api_version,status,scopes_json,
+          publications_json,last_verified_at,updated_at,auth_mode,shopify_shop_gid,app_profile_id,
+          shopify_installation_gid,canonical_myshopify_domain,primary_domain)
+          VALUES(?,?,?,'IDENTITY_VERIFIED',?,'[]',?,?,?,?,?,?,?,?)
+          ON CONFLICT(store_id) DO UPDATE SET shop_domain=excluded.shop_domain,api_version=excluded.api_version,
+          auth_mode=excluded.auth_mode,app_profile_id=excluded.app_profile_id,shopify_shop_gid=excluded.shopify_shop_gid,
+          shopify_installation_gid=excluded.shopify_installation_gid,canonical_myshopify_domain=excluded.canonical_myshopify_domain,
+          primary_domain=excluded.primary_domain,status=excluded.status,scopes_json=excluded.scopes_json,
+          last_verified_at=excluded.last_verified_at,updated_at=excluded.updated_at""",
+          (store_id, domain, api_version, json.dumps(identity["granted_scopes"]), now_iso, now_iso,
+           DEV_DASHBOARD_CLIENT_CREDENTIALS, identity["shop_id"], candidate_profile_id, identity["installation_id"],
+          identity["myshopify_domain"], identity["primary_domain"]))
+        con.execute("""UPDATE shopify_connections SET authenticated_app_gid=?,authenticated_app_title=?,
+          authenticated_requested_scopes_json=?,authenticated_optional_scopes_json=?,client_id_fingerprint=?
+          WHERE store_id=?""", (identity["app_id"], identity["app_title"],
+          json.dumps(identity["requested_scopes"]), json.dumps(identity["optional_scopes"]),
+          identity["client_id_fingerprint"], store_id))
+    with _CACHE_LOCK:
+        _CACHE[str(store_id)] = {"token": token, "scope": " ".join(identity["granted_scopes"]),
+                                 "expires_at": expires_at,
+                                 "fingerprint": (domain, client_id, client_secret, candidate_profile_id,
+                                                 identity["app_id"], identity["shop_id"]),
+                                 "identity": identity}
+    _set_expiry(db, store_id, datetime.fromtimestamp(expires_at, timezone.utc).isoformat(timespec="seconds"),
+                " ".join(identity["granted_scopes"]))
+    return {**identity, "profile_id": candidate_profile_id, "status": "VERIFIED", "expires_in": expires_in,
+            "secret_values_exposed": False}
+
+
+def bind_existing_app_profile(store_id: str, shop_domain: str, profile_id: str, *, db=None,
+                              opener=None, client_factory=None, clock=time.time) -> dict:
+    profile = _app_profile(db, profile_id)
+    credentials = get_profile_credentials(profile_id)
+    if not profile or not credentials:
+        raise ShopifyAuthError("MISSING_CREDENTIALS", "선택한 Production App 프로필의 자격 증명을 찾을 수 없습니다.")
+    return verify_and_bind_app_profile(store_id, shop_domain, credentials["client_id"], credentials["client_secret"],
+        profile_id=profile_id, display_name=profile.get("display_name"), api_version=profile.get("api_version") or "2026-07",
+        db=db, opener=opener, client_factory=client_factory, clock=clock)
 
 
 def delete_dev_credentials(store_id: str) -> None:
@@ -88,9 +244,11 @@ def _set_expiry(db, store_id, expires_at, scope):
 
 
 def credential_present(store_id: str, *, db=None, auth_mode: str | None = None) -> bool:
-    mode = auth_mode or ((_connection(db, store_id) or {}).get("auth_mode") or LEGACY_ADMIN_TOKEN)
+    connection = _connection(db, store_id) or {}
+    mode = auth_mode or connection.get("auth_mode") or LEGACY_ADMIN_TOKEN
     if mode == DEV_DASHBOARD_CLIENT_CREDENTIALS:
-        return get_dev_credentials(store_id) is not None
+        profile_id = connection.get("app_profile_id")
+        return (get_profile_credentials(profile_id) is not None if profile_id else get_dev_credentials(store_id) is not None)
     try:
         import keyring
         return bool(keyring.get_password(KEYRING_SERVICE, _credential_key(store_id, "admin-access-token")) or
@@ -113,8 +271,8 @@ class ShopifyAccessToken(str):
 class ShopifyAuthService:
     SAFETY_WINDOW_SECONDS = 300
 
-    def __init__(self, *, db=None, opener=None, clock=time.time):
-        self.db = db
+    def __init__(self, *, db=None, opener=None, clock=time.time, client_factory=None):
+        self.db, self.client_factory = db, client_factory
         self.opener = opener or urllib.request.urlopen
         self.clock = clock
 
@@ -124,10 +282,13 @@ class ShopifyAuthService:
         if not connection:
             raise ShopifyAuthError("MISSING_CREDENTIALS", "Shopify 연결 정보가 없습니다.")
         domain = _safe_domain(connection["shop_domain"])
-        credentials = get_dev_credentials(store_id)
+        profile_id = connection.get("app_profile_id")
+        profile = _app_profile(self.db, profile_id) if profile_id else None
+        credentials = get_profile_credentials(profile_id) if profile_id else get_dev_credentials(store_id)
         if not credentials:
             raise ShopifyAuthError("MISSING_CREDENTIALS", "Shopify Dev Dashboard의 Client ID와 Client Secret을 입력해야 합니다.")
-        fingerprint = (domain, credentials["client_id"], credentials["client_secret"])
+        fingerprint = (domain, credentials["client_id"], credentials["client_secret"], profile_id,
+                       (profile or {}).get("expected_app_gid"), connection.get("shopify_shop_gid"))
         now = float(self.clock())
         with _CACHE_LOCK:
             cached = _CACHE.get(str(store_id))
@@ -137,11 +298,40 @@ class ShopifyAuthService:
         token, scope, expires_in = self._request_token(domain, credentials)
         if not token or not isinstance(token, str):
             raise ShopifyAuthError("TOKEN_ERROR", "Shopify가 유효한 access token을 반환하지 않았습니다.")
+        # A token is not considered valid until Shopify identifies the app and store.
+        try:
+            identity = _identity_result(domain, connection.get("api_version") or "2026-07", token,
+                credentials["client_id"], db=self.db,
+                expected_app_gid=(profile or {}).get("expected_app_gid"),
+                expected_shop_gid=connection.get("shopify_shop_gid"), client_factory=self.client_factory)
+        except ShopifyAuthError as exc:
+            if exc.code in {"APP_IDENTITY_MISMATCH", "STORE_IDENTITY_MISMATCH"}:
+                with _CACHE_LOCK:
+                    _CACHE.pop(str(store_id), None)
+                from .shopify_collections import _install_schema
+                _install_schema(self.db)
+                with connect(self.db) as con:
+                    con.execute("UPDATE shopify_connections SET status=? WHERE store_id=?", (exc.code, store_id))
+            raise
+        fingerprint = (domain, credentials["client_id"], credentials["client_secret"], profile_id,
+                       (profile or {}).get("expected_app_gid"), identity["shop_id"])
         expires_at = now + max(1, expires_in)
         with _CACHE_LOCK:
-            _CACHE[str(store_id)] = {"token": token, "scope": scope, "expires_at": expires_at,
-                                     "fingerprint": fingerprint}
-        _set_expiry(self.db, store_id, datetime.fromtimestamp(expires_at, timezone.utc).isoformat(timespec="seconds"),scope)
+            _CACHE[str(store_id)] = {"token": token, "scope": " ".join(identity["granted_scopes"]), "expires_at": expires_at,
+                                     "fingerprint": fingerprint, "identity": identity}
+        _set_expiry(self.db, store_id, datetime.fromtimestamp(expires_at, timezone.utc).isoformat(timespec="seconds"),
+                    " ".join(identity["granted_scopes"]))
+        from .shopify_collections import _install_schema
+        _install_schema(self.db)
+        with connect(self.db) as con:
+            con.execute("""UPDATE shopify_connections SET authenticated_app_gid=?,authenticated_app_title=?,
+              authenticated_requested_scopes_json=?,authenticated_optional_scopes_json=?,
+              client_id_fingerprint=?,shopify_installation_gid=COALESCE(shopify_installation_gid,?),
+              canonical_myshopify_domain=COALESCE(canonical_myshopify_domain,?),
+              primary_domain=COALESCE(primary_domain,?),shopify_shop_gid=COALESCE(shopify_shop_gid,?)
+              WHERE store_id=?""", (identity["app_id"],identity["app_title"],json.dumps(identity["requested_scopes"]),
+              json.dumps(identity["optional_scopes"]),identity["client_id_fingerprint"],
+              identity["installation_id"],identity["myshopify_domain"],identity["primary_domain"],identity["shop_id"],store_id))
         return self._leased(store_id, token)
 
     def _leased(self, store_id, token):
@@ -212,10 +402,27 @@ class ShopifyAuthService:
                 remaining = max(0, int((datetime.fromisoformat(expiry).timestamp() - self.clock()) / 60))
             except ValueError:
                 pass
-        required = {"read_themes"}
-        optional = {"read_products", "write_products", "read_publications", "write_publications", "write_files","read_legal_policies",
-                    "write_themes", "read_online_store_navigation", "write_online_store_navigation"}
+        with _CACHE_LOCK:
+            cached = _CACHE.get(str(store_id))
+        identity = (cached or {}).get("identity") or {}
+        profile_id = (connection or {}).get("app_profile_id")
+        profile = _app_profile(self.db, profile_id) if profile_id else None
+        from .shopify_scope_contract import scope_preflight
+        scope_info = scope_preflight(granted, gate="G0_READ_ONLY")
         return {"auth_mode": mode, "credential_present": present, "token_state": token_state,
                 "expires_in_minutes": remaining, "last_verified_at": (connection or {}).get("last_verified_at"),
-                "granted_scopes": granted, "missing_required_scopes": sorted(required - set(granted)),
-                "missing_optional_scopes": sorted(optional - set(granted))}
+                "granted_scopes": granted, "missing_required_scopes": scope_info["missing_for_current_gate"],
+                "missing_optional_scopes": sorted(set(scope_info["declared_optional"]) - set(granted)),
+                "scope_preflight": scope_info,
+                "app_profile_id": profile_id, "production_app_bound": bool(profile),
+                "expected_app_gid": (profile or {}).get("expected_app_gid"),
+                "expected_app_title": (profile or {}).get("display_name"),
+                "authenticated_app_gid": (connection or {}).get("authenticated_app_gid") or identity.get("app_id"),
+                "authenticated_app_title": (connection or {}).get("authenticated_app_title") or identity.get("app_title"),
+                "authenticated_requested_scopes": json.loads((connection or {}).get("authenticated_requested_scopes_json") or "[]") or identity.get("requested_scopes", []),
+                "authenticated_optional_scopes": json.loads((connection or {}).get("authenticated_optional_scopes_json") or "[]") or identity.get("optional_scopes", []),
+                "client_id_fingerprint": (connection or {}).get("client_id_fingerprint") or identity.get("client_id_fingerprint"),
+                "shopify_shop_gid": (connection or {}).get("shopify_shop_gid"),
+                "shopify_installation_gid": (connection or {}).get("shopify_installation_gid"),
+                "declared_required_scopes": json.loads((profile or {}).get("required_scopes_json") or json.dumps(scope_info["declared_required"])),
+                "declared_optional_scopes": json.loads((profile or {}).get("optional_scopes_json") or "[]")}
