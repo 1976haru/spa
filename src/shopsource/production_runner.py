@@ -106,6 +106,10 @@ class ProductionEvidenceRunner:
                   PRIMARY KEY(run_id,gate_key,evidence_kind));
                 CREATE TABLE IF NOT EXISTS production_business_inputs(
                   store_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL, updated_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS production_content_drafts(
+                  store_id TEXT NOT NULL, product_id INTEGER NOT NULL, payload_json TEXT NOT NULL,
+                  source_facts_confirmed INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
+                  PRIMARY KEY(store_id,product_id));
             """)
 
     def active_run(self, store_id):
@@ -944,12 +948,80 @@ class ProductionEvidenceRunner:
         return ProductionGoldenPathService(db=self.db).audit_master(store_id)
 
     def _content(self, store_id):
-        rows = self._catalog_rows(store_id)
-        issues = sum(any(reason.startswith("CONTENT_") for reason in row.get("reasons", [])) for row in rows)
-        return {"status": "VERIFIED" if rows and not issues else ("REVIEW_REQUIRED" if rows else "BLOCKED"),
-                "ready": bool(rows) and not issues, "counts": {"total": len(rows), "content_review": issues},
-                "review_required": [] if rows and not issues else ["Local title/description/features/variant/SEO/handle evidence needs review"],
-                "shopify_write_performed": False, "fingerprint_input": {"total": len(rows), "content_review": issues}}
+        # User preparation is kept separately from MASTER/raw source data.
+        with connect(self.db) as con:
+            products = [dict(row) for row in con.execute("""SELECT p.id,p.asin,p.title,p.overview_json,p.about_json,p.options_json,
+                d.final_status FROM products p JOIN store_product_decisions d ON d.product_id=p.id AND d.store_id=?
+                WHERE upper(d.final_status) IN ('PRIMARY','PRODUCTION_CANDIDATE') ORDER BY p.id""", (str(store_id),))]
+            drafts = {int(row["product_id"]): dict(row) for row in con.execute(
+                "SELECT product_id,payload_json,source_facts_confirmed,updated_at FROM production_content_drafts WHERE store_id=?", (str(store_id),))}
+        required = ("storefront_title", "description", "features", "variant_summary", "variant_reviewed", "seo_title", "seo_description", "handle")
+        queue = []
+        totals = {field: 0 for field in required}
+        draft_fingerprints = []
+        for product in products:
+            draft_row = drafts.get(int(product["id"]))
+            draft = {}
+            if draft_row:
+                try: draft = json.loads(draft_row["payload_json"] or "{}")
+                except (json.JSONDecodeError, TypeError): draft = {}
+            missing = [field for field in required if not (draft.get(field) is True if field == "variant_reviewed" else str(draft.get(field) or "").strip())]
+            facts_confirmed = bool(draft_row and draft_row.get("source_facts_confirmed"))
+            if not facts_confirmed: missing.append("source_facts_confirmation")
+            for field in set(missing): totals[field] = totals.get(field, 0) + 1
+            if missing:
+                queue.append({"product_id": product["id"], "asin": product["asin"], "title": product["title"],
+                              "missing_fields": missing, "draft": draft})
+            if draft_row:
+                draft_fingerprints.append((product["id"], draft_row.get("updated_at"), draft))
+        incomplete = len(queue)
+        return {"status": "VERIFIED" if products and not incomplete else ("WAITING_FOR_INPUT" if products else "BLOCKED"),
+                "verified": bool(products) and not incomplete,
+                "counts": {"total": len(products), "content_review": incomplete, "missing_by_field": totals,
+                           "drafted": len(draft_fingerprints)},
+                "review_queue": queue[:100],
+                "review_required": [] if products and not incomplete else (["상품별 내용 초안 및 원본 근거 확인이 필요합니다."] if products else ["PRIMARY/PRODUCTION_CANDIDATE 상품이 없습니다."]),
+                "source_facts_explicitly_confirmed": True, "master_data_overwritten": False,
+                "shopify_write_performed": False,
+                "fingerprint_input": {"store_id": str(store_id), "counts": {"total": len(products), "content_review": incomplete,
+                    "missing_by_field": totals, "drafted": len(draft_fingerprints)}, "drafts": draft_fingerprints}}
+
+    def get_content_draft(self, store_id, product_id):
+        with connect(self.db) as con:
+            row = con.execute("SELECT payload_json,source_facts_confirmed FROM production_content_drafts WHERE store_id=? AND product_id=?",
+                              (str(store_id), int(product_id))).fetchone()
+        if not row: return {}
+        try: payload = json.loads(row["payload_json"] or "{}")
+        except (json.JSONDecodeError, TypeError): payload = {}
+        payload["source_facts_confirmed"] = bool(row["source_facts_confirmed"])
+        return payload
+
+    def save_content_draft(self, run_id, product_id, values, *, source_facts_confirmed=False, confirmed=False):
+        """Save operator-authored local content without mutating MASTER or Shopify."""
+        if not confirmed: raise PermissionError("상품 내용 초안 저장에는 명시적 확인이 필요합니다.")
+        allowed = {"storefront_title", "description", "features", "variant_summary", "variant_reviewed", "seo_title", "seo_description", "handle"}
+        if set(values) - allowed: raise ValueError("지원하지 않는 상품 내용 필드입니다.")
+        normalized = {key: (bool(value) if key == "variant_reviewed" else str(value or "").strip()[:5000])
+                      for key, value in values.items()}
+        if any(not value for key, value in normalized.items() if key != "variant_reviewed"):
+            raise ValueError("입력한 필드에는 빈 값을 저장할 수 없습니다.")
+        if not normalized.get("variant_reviewed") or not normalized.get("variant_summary"):
+            raise ValueError("옵션/variant 요약과 원본 대조 확인이 필요합니다.")
+        run = self.service.get(run_id); store_id = str(run["store_id"])
+        with connect(self.db) as con:
+            candidate = con.execute("""SELECT 1 FROM products p JOIN store_product_decisions d ON d.product_id=p.id
+                WHERE p.id=? AND d.store_id=? AND upper(d.final_status) IN ('PRIMARY','PRODUCTION_CANDIDATE')""",
+                (int(product_id), store_id)).fetchone()
+            if not candidate: raise ValueError("이 상품은 해당 Store의 production content 준비 대상이 아닙니다.")
+            now = datetime.now(timezone.utc).isoformat()
+            con.execute("""INSERT INTO production_content_drafts(store_id,product_id,payload_json,source_facts_confirmed,updated_at)
+                VALUES(?,?,?,?,?) ON CONFLICT(store_id,product_id) DO UPDATE SET payload_json=excluded.payload_json,
+                source_facts_confirmed=excluded.source_facts_confirmed,updated_at=excluded.updated_at""",
+                (store_id, int(product_id), _json(normalized), int(bool(source_facts_confirmed)), now))
+        updated = self.run(store_id, run_id=run_id)
+        return {"store_id": store_id, "product_id": int(product_id), "updated_at": now,
+                "local_only": True, "master_data_overwritten": False, "shopify_write_performed": False,
+                "production_run": updated}
 
     def _media(self, store_id):
         rows = self._catalog_rows(store_id)

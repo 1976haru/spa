@@ -55,6 +55,8 @@ from .v2_service import (
     open_package, product_detail, product_page,
 )
 from .beginner import BEGINNER_NAV_GROUPS, GLOBAL_UI_CSS
+from .production_control_center import (GATE_ACTION_REGISTRY, gate_board_rows,
+    production_summary, resolve_gate_click)
 
 NAV_ITEMS = [
     ("/production", "rocket_launch", "실전 스토어 완성"),
@@ -316,49 +318,50 @@ class OperatorUI:
         self._heading("실전 스토어 완성", "Cabin Tidy의 소싱부터 출시 전 점검까지 증거가 확인된 항목만 통과시킵니다. 확인되지 않은 내용은 준비 완료로 추정하지 않습니다.")
         service = ProductionGoldenPathService()
         runner = ProductionEvidenceRunner(service=service)
-        state = {"run": None}
+        state = {"run": None, "selected_gate": None}
         new_run_button = ui.button("새 점검 시작", icon="add_circle").props("outline")
-        summary = ui.label("아직 production 점검 run이 없습니다.").classes("ss-card-title")
-        progress_report_label = ui.label("현재 단계: 아직 시작 전").classes("ss-help")
         with ui.row().classes("w-full flex-wrap gap-3"):
             start = ui.button("실전 점검 자동 진행", icon="rocket_launch").props("color=primary size=lg")
             ui.button("기존 점검 다시 열기", icon="history", on_click=lambda: load_latest()).props("outline size=lg")
-        notice = ui.label("이 버튼은 로컬 gate/checkpoint만 준비합니다. Amazon·Keepa·Shopify·Theme 호출이나 실제 변경은 하지 않습니다.").classes("ss-help")
-        cards = ui.column().classes("w-full gap-2")
-        action_label = ui.label("현재 필요한 확인 작업이 여기에 표시됩니다.").classes("ss-card-title")
-        action_button = ui.button("현재 단계 확인", icon="task_alt").props("color=primary size=lg")
-        with ui.dialog() as action_dialog, ui.card().classes("w-[min(95vw,900px)] max-h-[85vh] overflow-auto"):
-            ui.label("실전 점검에서 필요한 확인").classes("ss-card-title")
+        notice = ui.label("게이트를 열어 내용을 확인하는 것만으로 외부 검사는 시작되지 않습니다. 외부 작업은 별도의 승인 버튼이 필요합니다.").classes("ss-help")
+        board = ui.element("div").classes("ss-gate-board w-full")
+        action_dialog = ui.dialog()
+        with action_dialog, ui.card().classes("w-[min(95vw,1000px)] max-h-[88vh] overflow-auto"):
+            action_dialog_title = ui.label("실전 점검에서 필요한 확인").classes("ss-card-title")
             action_content = ui.column().classes("w-full gap-3")
+            ui.button("닫기", on_click=action_dialog.close, icon="close").props("outline")
+        with ui.card().classes("ss-production-summary w-full border border-blue-100 p-3"):
+            with ui.row().classes("w-full items-center justify-between flex-wrap gap-3"):
+                summary = ui.label("아직 production 점검 run이 없습니다.").classes("ss-card-title")
+                progress_report_label = ui.label("현재 단계: 아직 시작 전").classes("ss-help")
+            with ui.row().classes("w-full items-center gap-2 flex-wrap"):
+                current_action_button = ui.button("현재 단계 해결하기", icon="task_alt", on_click=lambda: open_current_action()).props("color=primary")
+                ui.button("전체 재검증", icon="refresh", on_click=lambda: begin()).props("outline")
+                ui.button("기존 점검 새로고침", icon="history", on_click=lambda: load_latest()).props("outline")
         def render(run):
             state["run"] = run
             progress_state = service.progress_report(run["run_id"])
-            summary.set_text(f"실전 진행률: {progress_state['production_readiness_percent']}% · 판정: {run['status']} · 미해결 {run['summary'].get('blocker_count', 0)}")
-            progress_report_label.set_text(
-                f"현재 단계: {progress_state['current_stage_label']}\n완료: {', '.join(progress_state['completed_labels']) or '없음'}\n"
-                f"남은 것: {', '.join(progress_state['remaining_labels']) or '없음'}\n"
-                f"현재 blocker/risk: {progress_state['blockers'][0]['reasons'] if progress_state['blockers'] else '확인된 blocker 없음'}\n"
-                f"다음 실행: {progress_state['next_action']}"
-            )
+            overview = production_summary(run, progress_state)
+            summary.set_text(f"{overview['store_name']} · 실전 진행률 {overview['percent']}% · 검증 {overview['verified']} / {overview['denominator']} · {overview['status']}")
+            progress_report_label.set_text(f"현재 단계: {overview['current_label']} · 남은 증거 단계 {overview['remaining']}개\n{overview['progress_note']}")
             current_key = progress_state["current_stage"]
-            action_names = {"ENVIRONMENT_STORE_IDENTITY": "Shopify 연결 확인", "SOURCE_SAFETY": "실제 Source 안전검사 승인",
-                "PRODUCT_MEDIA": "상품 이미지 권리 검토", "PRICING_MARGIN": "가격마진 정책 설정",
-                "COLLECTION_CATEGORY_MEDIA": "부족한 이미지 준비", "HOMEPAGE": "홈페이지 미리보기 확인",
-                "PAGES_POLICIES": "페이지정책 확인", "SEO_ACCESSIBILITY_MOBILE": "데스크톱/모바일 최종 확인",
-                "COMMERCE_READINESS": "판매 설정 확인", "READY_FOR_PILOT": "10개 DRAFT 파일럿 준비"}
-            action_label.set_text(f"다음으로 할 일: {action_names.get(current_key, '현재 gate 확인')}")
-            action_button.set_text(action_names.get(current_key, "현재 단계 확인"))
-            action_button.set_visibility(True)
-            cards.clear()
-            with cards:
-                for gate in run["gates"]:
-                    with ui.card().classes("w-full p-4 border border-slate-200"):
-                        ui.label(f"{gate['position'] + 1:02d}. {GATE_LABELS_KO.get(gate['gate_key'], gate['gate_key'])}").classes("ss-card-title")
-                        status_ko = {"NOT_STARTED": "아직 확인 전", "READY": "준비됨", "READY_WITH_WARNINGS": "주의와 함께 준비됨",
-                                     "VERIFIED": "검증 완료", "REVIEW_REQUIRED": "확인 필요", "WAITING_FOR_INPUT": "정보 입력 필요",
-                                     "WAITING_FOR_CONFIRMATION": "사용자 확인 대기", "BLOCKED": "차단", "RUNNING": "진행 중"}
-                        ui.label(status_ko.get(gate["status"], gate["status"])).classes("font-semibold")
-                        for reason in gate["blockers"][:5]: ui.label(f"• {reason}").classes("ss-help")
+            current_action_button.set_text(GATE_ACTION_REGISTRY.get(current_key, {}).get("label", "현재 단계 해결하기"))
+            rows = gate_board_rows(run, progress_state)
+            board.clear()
+            with board:
+                for gate_row in rows:
+                    classes = f"ss-gate-row {gate_row['status_class']}" + (" ss-gate-current" if gate_row["current"] else "")
+                    with ui.card().classes(classes):
+                        with ui.row().classes("w-full items-center gap-2 flex-nowrap"):
+                            ui.label(f"{gate_row['number']:02d}").classes("ss-gate-number")
+                            with ui.column().classes("grow gap-0"):
+                                with ui.row().classes("items-center gap-2 flex-wrap"):
+                                    ui.label(gate_row["label"]).classes("font-semibold")
+                                    ui.badge(gate_row["status_ko"]).classes(gate_row["status_class"])
+                                    if gate_row["current"]: ui.badge("현재 단계").classes("bg-blue-100 text-blue-900")
+                                ui.label(gate_row["summary"]).classes("ss-help")
+                            ui.button(gate_row["action_label"], icon="chevron_right",
+                                      on_click=lambda key=gate_row["gate_key"]: open_gate_action(key)).props("flat dense")
         def load_latest():
             with connect() as con:
                 row = con.execute("SELECT run_id FROM production_runs WHERE store_id=? ORDER BY updated_at DESC LIMIT 1", (self.current_store,)).fetchone()
@@ -368,13 +371,28 @@ class OperatorUI:
             run = runner.run(self.current_store)
             render(run)
             ui.notify("읽기 전용 production evidence 확인을 진행했습니다. Shopify 쓰기는 실행되지 않았습니다.", type="positive")
-        def open_gate_action():
+        def open_gate_action(gate_key=None):
             run = state.get("run")
             if not run:
                 ui.notify("먼저 실전 점검 자동 진행을 눌러 주세요.", type="warning"); return
-            key = service.progress_report(run["run_id"])["current_stage"]
+            progress_state = service.progress_report(run["run_id"])
+            key = resolve_gate_click(run, gate_key or state.get("selected_gate") or progress_state["current_stage"])
+            state["selected_gate"] = key
+            gate = next(item for item in run["gates"] if item["gate_key"] == key)
+            from .production_control_center import STATUS_KO
+            action_dialog_title.set_text(f"{gate['position'] + 1:02d}. {GATE_LABELS_KO.get(key, key)} · {STATUS_KO.get(gate.get('status'), '상태 확인 필요')}")
             action_content.clear()
             with action_content:
+                ui.label("이 패널은 현재 gate와 무관하게 미리 볼 수 있습니다. 여기서 화면을 여는 것만으로 외부 검사나 쓰기는 실행되지 않습니다.").classes("ss-help")
+                if gate.get("status") in {"READY", "READY_WITH_WARNINGS", "VERIFIED"}:
+                    ui.label("저장된 증거").classes("font-semibold")
+                    ui.label(f"상태: {gate.get('status')} · 확인 시각: {gate.get('updated_at') or '기록 없음'}")
+                    with ui.expansion("확인된 세부 증거", value=False):
+                        ui.code(json.dumps(gate.get("evidence") or {}, ensure_ascii=False, indent=2)).classes("w-full max-h-72 overflow-auto")
+                else:
+                    ui.label("왜 아직 완료되지 않았나요?").classes("font-semibold")
+                    for blocker in (gate.get("blockers") or [])[:8]:
+                        ui.label(f"• {blocker}").classes("ss-help")
                 if key == "SOURCE_SAFETY":
                     from ..source_safety import FreeSourceSafetyService
                     free = FreeSourceSafetyService()
@@ -576,6 +594,56 @@ class OperatorUI:
                                 render(result["production_run"])
                             except Exception as exc: ui.notify(f"재시도하지 못했습니다: {exc}", type="warning")
                         ui.button("실패 항목 재시도", on_click=retry_source).props("outline")
+                elif key == "PRODUCT_CONTENT":
+                    evidence = runner._content(str(run["store_id"]))
+                    counts = evidence.get("counts", {})
+                    ui.label("상품 설명·검색 정보 준비 (로컬 초안)").classes("ss-card-title")
+                    ui.label(f"대상 {counts.get('total', 0)}개 · 보완 필요 {counts.get('content_review', 0)}개 · 초안 저장 {counts.get('drafted', 0)}개").classes("font-semibold")
+                    ui.label("아래 내용은 사용자가 제공한 로컬 초안으로만 저장됩니다. MASTER 원본 데이터나 Shopify는 변경하지 않습니다. 확인되지 않은 제품 사실은 입력하지 마세요.").classes("ss-help")
+                    with ui.expansion("항목별 누락 수", value=True):
+                        for field, missing_count in (counts.get("missing_by_field") or {}).items():
+                            ui.label(f"{field}: {missing_count}개 확인 필요").classes("ss-help")
+                    queue = evidence.get("review_queue") or []
+                    options = {str(row["product_id"]): f"{row.get('asin') or 'ASIN 없음'} · {row.get('title') or '제목 없음'} · 누락 {len(row['missing_fields'])}개" for row in queue}
+                    if options:
+                        selected_product = ui.select(options, label="보완할 상품 선택").classes("w-full")
+                        draft_fields = {
+                            "storefront_title": ui.input("표시용 상품명").classes("w-full"),
+                            "description": ui.textarea("상품 설명 (원본에서 확인된 사실만)").classes("w-full"),
+                            "features": ui.textarea("주요 특징 (한 줄에 하나, 근거가 있는 내용만)").classes("w-full"),
+                            "variant_summary": ui.input("옵션/variant 요약 (옵션이 없는 경우 '단일 옵션 확인' 등 실제 확인 내용)").classes("w-full"),
+                            "seo_title": ui.input("검색 제목").classes("w-full"),
+                            "seo_description": ui.textarea("검색 설명").classes("w-full"),
+                            "handle": ui.input("상품 URL handle").classes("w-full"),
+                        }
+                        variant_reviewed = ui.checkbox("옵션/variant를 원본과 대조했고 실제 구성만 확인했습니다.")
+                        facts_confirmed = ui.checkbox("입력한 제목·설명·특징은 원본 자료로 확인했습니다.")
+                        def load_selected_content(_=None):
+                            try:
+                                saved = runner.get_content_draft(str(run["store_id"]), int(selected_product.value)) if selected_product.value else {}
+                            except (TypeError, ValueError): saved = {}
+                            for name, field in draft_fields.items(): field.value = saved.get(name, "")
+                            variant_reviewed.value = bool(saved.get("variant_reviewed"))
+                            facts_confirmed.value = bool(saved.get("source_facts_confirmed"))
+                        selected_product.on_value_change(load_selected_content)
+                        def save_and_recheck_content():
+                            if not selected_product.value:
+                                ui.notify("먼저 보완할 상품을 선택하세요.", type="warning"); return
+                            try:
+                                result = runner.save_content_draft(run["run_id"], int(selected_product.value),
+                                    {name: field.value for name, field in draft_fields.items()} | {"variant_reviewed": variant_reviewed.value},
+                                    source_facts_confirmed=facts_confirmed.value, confirmed=True)
+                                render(result["production_run"])
+                                open_gate_action("PRODUCT_CONTENT")
+                                ui.notify("로컬 초안을 저장하고 상품 설명 gate를 다시 확인했습니다. MASTER와 Shopify는 변경하지 않았습니다.", type="positive")
+                            except Exception as exc: ui.notify(f"로컬 초안을 저장하지 못했습니다: {exc}", type="warning")
+                        ui.button("저장 후 재검증", on_click=save_and_recheck_content).props("color=primary")
+                    else:
+                        ui.label("현재 production 후보의 로컬 초안은 모두 준비되어 있습니다. 증거가 바뀌면 재검증하세요.").classes("ss-help")
+                    with ui.expansion("미완료 상품 목록", value=False):
+                        for row in queue[:50]:
+                            ui.label(f"{row.get('asin') or 'ASIN 없음'} · {row.get('title') or '제목 없음'} · {', '.join(row['missing_fields'])}").classes("ss-help")
+                    ui.button("저장된 내용 gate 재검증", on_click=lambda: (render(runner.run(str(run["store_id"]), run_id=run["run_id"])), open_gate_action("PRODUCT_CONTENT"))).props("outline")
                 elif key == "PRODUCT_MEDIA":
                     checks = {}
                     for row in runner._catalog_rows(str(run["store_id"]))[:50]:
@@ -705,12 +773,51 @@ class OperatorUI:
                         except Exception as exc: ui.notify(_safe_error(exc),type="negative")
                     ui.button("연결 정보 저장 후 Shopify 읽기 확인 / 같은 점검 계속",on_click=save_and_continue_g0).props("color=primary size=lg")
                     ui.button("Shopify 연결 다시 확인", on_click=begin).props("color=primary")
+                elif key == "SOURCING_QUALITY":
+                    evidence = gate.get("evidence") or {}
+                    ui.label("MASTER 소싱 품질 증거").classes("ss-card-title")
+                    ui.label(f"현재 상태: {STATUS_KO.get(gate.get('status'), '확인 필요')} · 증거 집계: {json.dumps(evidence.get('counts', {}), ensure_ascii=False)}")
+                    ui.label("PRIMARY 분류만으로 통과하지 않습니다. ASIN·원본 참조·제한/중복·variant 등 소싱 근거를 확인합니다.").classes("ss-help")
+                    ui.button("소싱 품질 화면 열기", on_click=lambda: ui.navigate.to("/sourcing")).props("outline")
+                elif key == "COLLECTION_ARCHITECTURE":
+                    ui.label("상품 분포를 기준으로 컬렉션 계획을 확인합니다. 빈 컬렉션이나 지나치게 넓은 규칙은 준비 완료로 보지 않습니다.").classes("ss-help")
+                    ui.button("컬렉션 설계 열기", on_click=lambda: ui.navigate.to("/collections")).props("outline")
+                elif key == "COLLECTION_CATEGORY_MEDIA":
+                    ui.label("컬렉션별 승인 이미지와 비율 검토가 필요합니다. 이미지 생성·업로드는 이 패널을 여는 것만으로 실행되지 않습니다.").classes("ss-help")
+                    ui.button("이미지·홈페이지 준비 열기", on_click=lambda: ui.navigate.to("/homepage")).props("outline")
+                elif key == "BRAND_HEADER_NAVIGATION":
+                    ui.label("브랜드 자산과 메뉴의 실제 대상 링크를 각각 점검합니다. 기존 사용자 메뉴는 별도 승인 없이 수정하지 않습니다.").classes("ss-help")
+                    with ui.row().classes("gap-2 flex-wrap"):
+                        ui.button("브랜드 확인", on_click=lambda: ui.navigate.to("/brand")).props("outline")
+                        ui.button("메뉴 확인", on_click=lambda: ui.navigate.to("/navigation")).props("outline")
+                elif key == "HOMEPAGE":
+                    ui.label("Hero·CTA·카테고리 대상 링크와 현재 테마를 미리보기로 확인합니다. 테마 쓰기는 별도 승인 없이는 실행되지 않습니다.").classes("ss-help")
+                    ui.button("홈페이지 자동화 열기", on_click=lambda: ui.navigate.to("/homepage")).props("outline")
+                elif key == "PRODUCT_COLLECTION_TEMPLATES":
+                    ui.label("상품/컬렉션 템플릿은 읽을 수 있는 실제 theme evidence만 검토합니다. 모르는 schema는 수동 확인으로 남깁니다.").classes("ss-help")
+                    ui.button("스토어 완성도 화면 열기", on_click=lambda: ui.navigate.to("/completion")).props("outline")
+                elif key == "CONTROLLED_LIVE_PILOT":
+                    unresolved = [f"{i + 1:02d} {GATE_LABELS_KO.get(item['gate_key'], item['gate_key'])}" for i, item in enumerate(run["gates"][:14]) if item.get("status") not in {"READY", "READY_WITH_WARNINGS", "VERIFIED"}]
+                    ui.label("10개 상품 DRAFT 파일럿은 별도 명시 승인 전에는 실행되지 않습니다.").classes("ss-help")
+                    if unresolved:
+                        ui.label("아직 충족되지 않은 선행 확인:").classes("font-semibold")
+                        for item in unresolved: ui.label(f"• {item}").classes("ss-help")
+                    ui.button("파일럿 화면 열기", on_click=lambda: ui.navigate.to("/pilot")).props("outline" + (" disable" if unresolved else ""))
+                elif key == "BATCH_EXPANSION":
+                    ui.label("10개 파일럿의 remote 재조회 검증이 완료되기 전에는 확대 batch를 시작할 수 없습니다.").classes("ss-help")
+                    ui.label(f"저장 증거: {json.dumps(gate.get('evidence') or {}, ensure_ascii=False)}").classes("ss-help")
+                elif key == "FINAL_LAUNCH_READINESS":
+                    ui.label("최종 체크리스트는 source·권리·마진·배송·결제 등 실제 evidence를 요구합니다. ACTIVE 공개는 별도의 명시 승인이 필요합니다.").classes("ss-help")
+                    ui.label(f"현재 선행 gate 미완료: {sum(item.get('status') not in {'READY', 'READY_WITH_WARNINGS', 'VERIFIED'} for item in run['gates'][:16])}개").classes("font-semibold")
                 else:
                     ui.label("기존 해당 기능에서 항목을 준비한 뒤 실전 점검을 다시 실행하세요.").classes("ss-help")
-                    if key in {"COLLECTION_CATEGORY_MEDIA", "HOMEPAGE"}:
-                        ui.button("홈페이지/이미지 화면 열기", on_click=lambda: ui.navigate.to("/homepage")).props("outline")
+                ui.button("이 gate와 전체 증거 재검증", on_click=lambda: begin()).props("outline")
             action_dialog.open()
-        action_button.on_click(open_gate_action)
+        def open_current_action():
+            run = state.get("run")
+            if not run:
+                ui.notify("먼저 실전 점검 자동 진행을 눌러 주세요.", type="warning"); return
+            open_gate_action(service.progress_report(run["run_id"])["current_stage"])
         start.on_click(begin)
         def create_confirmed_run():
             run = runner.start_or_resume(self.current_store, new_run=True, confirmed=True)
