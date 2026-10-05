@@ -44,7 +44,8 @@ def test_free_default_does_not_require_keepa_and_selects_primary_only(tmp_path, 
     preview = free.preview_batch("001", "DRAFT_PILOT")
     assert preview["provider"] == "FREE_LOCAL_SOURCE_CHECK"
     assert preview["master_total"] == 12
-    assert preview["eligible_upload_candidates"] == 9
+    assert preview["source_check_eligible"] == 9
+    assert preview["eligible_upload_candidates"] == 0
     assert preview["target_count"] == 9
     assert preview["estimated_tokens"] == 0
     runner = ProductionEvidenceRunner(db=db)
@@ -73,12 +74,16 @@ def test_validation_batch_is_explicit_primary_only_and_limited_to_200(tmp_path):
     free = FreeSourceSafetyService(db)
     primary_ids = [int(row["master_product_id"]) for row in free.primary_candidates("001")]
     assert len(primary_ids) == 202
-    preview = free.preview_batch("001", "VALIDATION_BATCH", selected_product_ids=primary_ids[:150])
+    now = datetime.now(timezone.utc).isoformat()
+    with connect(db) as con:
+        con.execute("INSERT INTO source_safety_release_batches(batch_id,store_id,batch_kind,status,target_count,checked_count,created_at,updated_at) VALUES('pilot-pass','001','SOURCE_CHECK_PILOT','VERIFIED',10,10,?,?)", (now, now))
+        con.executemany("INSERT INTO source_safety_release_items(batch_id,product_id,status) VALUES('pilot-pass',?,'VERIFIED')", [(pid,) for pid in primary_ids[:10]])
+    preview = free.preview_batch("001", "VALIDATION_BATCH", selected_product_ids=primary_ids[10:160])
     assert preview["target_count"] == 150
     with pytest.raises(ValueError, match="100-200"):
-        free.preview_batch("001", "VALIDATION_BATCH", selected_product_ids=primary_ids[:99])
+        free.preview_batch("001", "VALIDATION_BATCH", selected_product_ids=primary_ids[10:109])
     with pytest.raises(ValueError, match="100-200"):
-        free.preview_batch("001", "VALIDATION_BATCH", selected_product_ids=primary_ids[:201])
+        free.preview_batch("001", "VALIDATION_BATCH", selected_product_ids=list(range(10000, 10201)))
 
 
 def test_draft_free_check_stays_waiting_without_fresh_browser_capture(tmp_path):
@@ -129,11 +134,11 @@ def test_validation_limits_and_captcha_human_gate(tmp_path):
     db = _db_with_products(tmp_path / "captcha.sqlite3", 105)
     runner = ProductionEvidenceRunner(db=db)
     run = runner.start_or_resume("001")
-    ids = [int(row["master_product_id"]) for row in FreeSourceSafetyService(db).primary_candidates("001")[:100]]
+    ids = FreeSourceSafetyService(db).preview_batch("001", "SOURCE_CHECK_PILOT")["target_product_ids"]
     obs = {product_id: {"availability":"UNKNOWN", "source_price": 10, "evidence":{"page_text":"Robot Check"}}
            for product_id in ids}
-    result = runner.run_free_source_safety_check(run["run_id"], "VALIDATION_BATCH",
-        selected_product_ids=ids, observations=obs, confirmed=True)
+    result = runner.run_free_source_safety_check(run["run_id"], "SOURCE_CHECK_PILOT",
+        observations=obs, confirmed=True)
     assert result["status"] == "REVIEW_REQUIRED"
     assert result["production_run"]["gates"][2]["status"] != "VERIFIED"
     with connect(db) as con:

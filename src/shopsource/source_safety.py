@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 import math
 import secrets
+import re
+from urllib.parse import urlsplit
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -639,7 +641,10 @@ class FreeSourceSafetyService:
     presence/quantity as availability. Browser observations are supplied only
     after an operator/browser capture has explicitly produced them.
     """
-    BATCH_LIMITS = {"DRAFT_PILOT": (1, 10), "VALIDATION_BATCH": (100, 200), "REMAINING_CATALOG": (1, 200)}
+    BATCH_ALIASES = {"DRAFT_PILOT": "SOURCE_CHECK_PILOT", "VALIDATION_BATCH": "SOURCE_VALIDATION_BATCH",
+                     "REMAINING_CATALOG": "REMAINING_SOURCE_CHECK"}
+    BATCH_LIMITS = {"SOURCE_CHECK_PILOT": (1, 10), "SOURCE_VALIDATION_BATCH": (100, 200),
+                    "REMAINING_SOURCE_CHECK": (1, 200)}
     EXPLICIT_AVAILABILITY_KEYS = {"availability", "availability_status", "stock_status", "in_stock"}
 
     def __init__(self, db=None):
@@ -690,41 +695,186 @@ class FreeSourceSafetyService:
                 "availability_from_presence_inferred": False,
                 "quantity_is_stock_evidence": False}
 
+    @staticmethod
+    def _valid_asin(value):
+        return bool(re.fullmatch(r"[A-Z0-9]{10}", str(value or "").strip().upper()))
+
+    @staticmethod
+    def _valid_source_url(value):
+        try:
+            parsed = urlsplit(str(value or "").strip())
+            return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+        except ValueError:
+            return False
+
+    def source_check_candidates(self, store_id):
+        """G2 set: store decision + identity/source reference only; no downstream Shopify fields."""
+        with connect(self.db) as con:
+            rows = con.execute("""SELECT p.id AS master_product_id,p.asin,p.title,p.source_url,p.price AS previous_observed_price,
+                p.source_kind,p.last_seen_at,d.final_status,
+                (SELECT o.source_url FROM product_occurrences o WHERE o.product_id=p.id
+                 ORDER BY COALESCE(o.collected_at,'') DESC,o.id DESC LIMIT 1) AS occurrence_url,
+                (SELECT o.collected_at FROM product_occurrences o WHERE o.product_id=p.id
+                 ORDER BY COALESCE(o.collected_at,'') DESC,o.id DESC LIMIT 1) AS latest_observed_at
+                FROM products p JOIN store_product_decisions d ON d.product_id=p.id AND d.store_id=?
+                ORDER BY p.id""", (str(store_id),)).fetchall()
+        eligible, exclusions = [], {"REVIEW_REQUIRED": 0, "RESTRICTED": 0, "REJECT_FOR_STORE": 0,
+                                    "MISSING_ASIN": 0, "MISSING_SOURCE_URL": 0, "OTHER_STATUS": 0}
+        for item in rows:
+            row = dict(item)
+            status = str(row.get("final_status") or "").upper()
+            source_url = row.get("occurrence_url") or row.get("source_url")
+            if status not in {"PRIMARY", "PRODUCTION_CANDIDATE"}:
+                key = "REVIEW_REQUIRED" if status in {"REVIEW", "REVIEW_REQUIRED"} else status if status in exclusions else "OTHER_STATUS"
+                exclusions[key] += 1
+                continue
+            if not self._valid_asin(row.get("asin")):
+                exclusions["MISSING_ASIN"] += 1
+                continue
+            if not self._valid_source_url(source_url):
+                exclusions["MISSING_SOURCE_URL"] += 1
+                continue
+            row.update({"source_url": source_url, "asin": str(row["asin"]).strip().upper(),
+                        "candidate_set": "SOURCE_CHECK_ELIGIBLE"})
+            eligible.append(row)
+        return eligible, exclusions
+
+    def source_check_eligible(self, store_id):
+        return self.source_check_candidates(store_id)[0]
+
+    def unprocessed_source_candidates(self, store_id):
+        rows = self.source_check_eligible(store_id)
+        with connect(self.db) as con:
+            done = {int(row[0]) for row in con.execute("""SELECT DISTINCT i.product_id FROM source_safety_release_items i
+                JOIN source_safety_release_batches b ON b.batch_id=i.batch_id
+                WHERE b.store_id=? AND b.status IN ('WAITING_FOR_INPUT','RUNNING','PAUSED','VERIFIED','REVIEW_REQUIRED')""", (str(store_id),))}
+        return [row for row in rows if int(row["master_product_id"]) not in done]
+
+    def source_check_pilot_passed(self, store_id):
+        with connect(self.db) as con:
+            row = con.execute("""SELECT 1 FROM source_safety_release_batches
+                WHERE store_id=? AND batch_kind='SOURCE_CHECK_PILOT' AND status='VERIFIED' LIMIT 1""", (str(store_id),)).fetchone()
+        return bool(row)
+
     def primary_candidates(self, store_id):
-        """Same deterministic selector used by the DRAFT pilot, PRIMARY only."""
+        """Backward-compatible alias for G2 source-check candidates (never the DRAFT selector)."""
+        return self.source_check_eligible(store_id)
+
+    def draft_upload_candidates(self, store_id):
+        """G14 candidates: strict Shopify/product/source readiness, independent of G2 selection."""
         from .shopify_pilot import ShopifyLivePilot
-        return ShopifyLivePilot(db=self.db)._select(str(store_id), 100000)
+        selected = ShopifyLivePilot(db=self.db)._select(str(store_id), 100000)
+        if not selected:
+            return []
+        ids = [int(row["master_product_id"]) for row in selected]
+        marks = ",".join("?" for _ in ids)
+        with connect(self.db) as con:
+            rights_table = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='product_media_rights'").fetchone()
+            if not rights_table:
+                return []
+            monitored = {int(row["product_id"]): row for row in con.execute(
+                f"SELECT product_id,last_checked_at,latest_availability,freshness_status FROM source_monitoring_state WHERE product_id IN ({marks})", ids)}
+            sellability = {int(row["product_id"]): row["sellability_status"] for row in con.execute(
+                f"SELECT product_id,sellability_status FROM store_product_sellability WHERE store_id=? AND product_id IN ({marks})",
+                (str(store_id), *ids))}
+            rights = {int(row["product_id"]): row for row in con.execute(
+                f"SELECT product_id,policy,reviewed_at FROM product_media_rights WHERE store_id=? AND product_id IN ({marks})",
+                (str(store_id), *ids))}
+        return [row for row in selected if
+                (state := monitored.get(int(row["master_product_id"]))) is not None
+                and state["last_checked_at"] and state["latest_availability"] == "IN_STOCK"
+                and state["freshness_status"] == "FRESH"
+                and sellability.get(int(row["master_product_id"])) == "SELLABLE"
+                and int(row["master_product_id"]) in rights
+                and rights[int(row["master_product_id"])]["policy"] in {"SUPPLIER_AUTHORIZED", "MERCHANT_OWNED", "LICENSED"}
+                and bool(rights[int(row["master_product_id"])]["reviewed_at"])
+                and bool(row.get("title")) and bool(row.get("description_html"))
+                and row.get("selling_price") is not None and int(row.get("source_variant_count") or 0) <= 1]
+
+    def release_batch_candidates(self, store_id, *, rollout_approved=False):
+        if not rollout_approved:
+            return []
+        return self.draft_upload_candidates(store_id)
+
+    def full_source_status(self, store_id):
+        candidates, exclusions = self.source_check_candidates(store_id)
+        ids = [int(row["master_product_id"]) for row in candidates]
+        if not ids:
+            return {"status": "WAITING_FOR_INPUT", "verified": False, "target_count": 0,
+                    "checked": 0, "pending": 0, "unknown": 0, "out_of_stock": 0, "errors": 0,
+                    "exclusions": exclusions}
+        marks = ",".join("?" for _ in ids)
+        with connect(self.db) as con:
+            states = {int(row["product_id"]): dict(row) for row in con.execute(
+                f"""SELECT m.product_id,m.last_checked_at,m.latest_availability,m.latest_source_price,m.freshness_status,
+                    s.observed_at snapshot_observed_at,s.evidence_kind FROM source_monitoring_state m
+                    LEFT JOIN source_product_snapshots s ON s.id=m.last_snapshot_id
+                    WHERE m.product_id IN ({marks})""", ids)}
+        now = datetime.now(timezone.utc)
+        fresh_limit = SourceSafetyService(self.db).settings(str(store_id))["freshness"]["pre_list_max_age_minutes"]
+        counts = {"IN_STOCK": 0, "OUT_OF_STOCK": 0, "UNKNOWN": 0, "SOURCE_ERROR": 0,
+                  "pending": 0, "checked": 0}
+        for product_id in ids:
+            state = states.get(product_id)
+            if not state or not state.get("last_checked_at"):
+                counts["pending"] += 1
+                continue
+            availability = str(state.get("latest_availability") or "UNKNOWN").upper()
+            if availability in counts:
+                counts[availability] += 1
+            else:
+                counts["UNKNOWN"] += 1
+            try:
+                age = (now - _dt(state["last_checked_at"])).total_seconds()
+                fresh = 0 <= age <= float(fresh_limit) * 60
+            except (TypeError, ValueError, OverflowError):
+                fresh = False
+            if not fresh:
+                counts["pending"] += 1
+                continue
+            explicit = (state.get("snapshot_observed_at") == state.get("last_checked_at") and
+                        state.get("evidence_kind") in {"JSON_LD_OFFER_AVAILABILITY", "VISIBLE_AVAILABILITY_TEXT"})
+            if not explicit:
+                counts["pending"] += 1
+                continue
+            counts["checked"] += 1
+            if state.get("latest_source_price") is None or float(state["latest_source_price"] or 0) <= 0:
+                counts["pending"] += 1
+        ready = counts["pending"] == 0 and counts["checked"] == len(ids) and counts["IN_STOCK"] == len(ids)
+        return {"status": "VERIFIED" if ready else "WAITING_FOR_INPUT", "verified": ready,
+                "target_count": len(ids), "checked": counts["checked"], "exclusions": exclusions,
+                "unknown": counts["UNKNOWN"], "out_of_stock": counts["OUT_OF_STOCK"],
+                "errors": counts["SOURCE_ERROR"], "pending": counts["pending"]}
 
     def preview_batch(self, store_id, batch_kind, *, selected_product_ids=None):
-        kind = str(batch_kind).upper()
+        kind = self.BATCH_ALIASES.get(str(batch_kind).upper(), str(batch_kind).upper())
         if kind not in self.BATCH_LIMITS:
             raise ValueError("unsupported source safety batch kind")
         master = self.evidence_audit(store_id)["master_total"]
-        candidates = self.primary_candidates(store_id)
-        if kind == "DRAFT_PILOT":
-            chosen = candidates[:10]
-        elif kind == "VALIDATION_BATCH":
+        candidates = self.source_check_eligible(store_id)
+        prior_ids = set()
+        with connect(self.db) as con:
+            prior_ids = {int(row[0]) for row in con.execute("""SELECT DISTINCT i.product_id FROM source_safety_release_items i
+                JOIN source_safety_release_batches b ON b.batch_id=i.batch_id WHERE b.store_id=?
+                AND b.status IN ('WAITING_FOR_INPUT','RUNNING','PAUSED','VERIFIED','REVIEW_REQUIRED')""", (str(store_id),))}
+        unprocessed = [row for row in candidates if int(row["master_product_id"]) not in prior_ids]
+        if kind == "SOURCE_CHECK_PILOT":
+            chosen = unprocessed[:10]
+        elif kind == "SOURCE_VALIDATION_BATCH":
+            if not self.source_check_pilot_passed(store_id):
+                raise ValueError("Source Validation Batch requires a passed 10-item Source Check Pilot")
             chosen_ids = list(dict.fromkeys(int(value) for value in (selected_product_ids or [])))
             if not 100 <= len(chosen_ids) <= 200:
                 raise ValueError("validation batch must explicitly select 100-200 products")
-            from .shopify_pilot import ShopifyLivePilot
-            catalog = {int(row["master_product_id"]): row for row in ShopifyLivePilot(db=self.db).publisher._catalog_rows(str(store_id))}
-            allowed = {product_id for product_id in chosen_ids if
-                       str((catalog.get(product_id) or {}).get("final_status") or "").upper() == "PRIMARY" or
-                       str((catalog.get(product_id) or {}).get("final_status") or "").upper() in
-                       {"RESERVE_A", "RESERVE_B", "RESERVE_C", "LOW_RESERVE", "HIGH_RESERVE"}}
-            if len(allowed) != len(chosen_ids):
-                raise ValueError("validation batch permits PRIMARY or explicitly selected RESERVE only; REVIEW/RESTRICTED are excluded")
-            by_id = catalog
+            by_id = {int(row["master_product_id"]): row for row in unprocessed}
+            if any(product_id not in by_id or product_id in prior_ids for product_id in chosen_ids):
+                raise ValueError("validation batch only permits unprocessed SOURCE_CHECK_ELIGIBLE products")
             chosen = [by_id[product_id] for product_id in chosen_ids]
         else:
-            with connect(self.db) as con:
-                prior = con.execute("""SELECT DISTINCT i.product_id FROM source_safety_release_items i
-                    JOIN source_safety_release_batches b ON b.batch_id=i.batch_id
-                    WHERE b.store_id=? AND b.batch_kind IN ('DRAFT_PILOT','VALIDATION_BATCH','REMAINING_CATALOG')
-                    AND b.status IN ('WAITING_FOR_INPUT','RUNNING','PAUSED','VERIFIED')""", (str(store_id),)).fetchall()
-            excluded = {int(value) for value in (selected_product_ids or [])} | {int(row[0]) for row in prior}
-            chosen = [row for row in candidates if int(row["master_product_id"]) not in excluded][:200]
+            if unprocessed and not self._has_verified_batch(store_id, "SOURCE_VALIDATION_BATCH", self.db):
+                raise ValueError("Remaining Source Check requires a passed Source Validation Batch")
+            excluded = {int(value) for value in (selected_product_ids or [])} | prior_ids
+            chosen = [row for row in unprocessed if int(row["master_product_id"]) not in excluded][:200]
         ids = [int(row["master_product_id"]) for row in chosen]
         source_preview = SourceMonitorService(self.db).preview_due_checks(str(store_id), limit=max(1, len(ids)), product_ids=ids)
         row_by_id = {int(row["product_id"]): row for row in source_preview["items"]}
@@ -732,13 +882,28 @@ class FreeSourceSafetyService:
         for product_id in ids:
             status = row_by_id.get(product_id, {}).get("freshness_status") or "NEVER_VERIFIED"
             freshness[status] = freshness.get(status, 0) + 1
+        draft_count = len(self.draft_upload_candidates(store_id))
         return {"provider": "FREE_LOCAL_SOURCE_CHECK", "batch_kind": kind, "master_total": master,
-                "eligible_upload_candidates": len(candidates), "target_count": len(ids),
-                "target_product_ids": ids, "batch_size": 100 if kind == "REMAINING_CATALOG" else max(1, len(ids)),
+                "primary_count": sum(str(row.get("final_status") or "").upper() in {"PRIMARY", "PRODUCTION_CANDIDATE"}
+                                     for row in self._decision_rows(store_id)),
+                "source_check_eligible": len(candidates), "eligible_upload_candidates": draft_count, "target_count": len(ids),
+                "target_product_ids": ids, "batch_size": 100 if kind == "REMAINING_SOURCE_CHECK" else max(1, len(ids)),
                 "estimated_batches": (len(ids) + 99) // 100, "estimated_tokens": 0,
                 "estimated_cost": "FREE_LOCAL", "freshness": freshness,
                 "requires_live_capture_for_unknown": True,
-                "excluded_statuses": ["REVIEW", "RESTRICTED", "RESERVE*"], "preview_only": True}
+                "excluded_statuses": ["REVIEW_REQUIRED", "RESTRICTED", "REJECT_FOR_STORE", "RESERVE*"],
+                "exclusion_reasons": self.source_check_candidates(store_id)[1], "preview_only": True}
+
+    def _decision_rows(self, store_id):
+        with connect(self.db) as con:
+            return [dict(row) for row in con.execute("""SELECT d.final_status FROM store_product_decisions d
+                WHERE d.store_id=?""", (str(store_id),))]
+
+    @staticmethod
+    def _has_verified_batch(store_id, batch_kind, db=None):
+        with connect(db) as con:
+            return bool(con.execute("SELECT 1 FROM source_safety_release_batches WHERE store_id=? AND batch_kind=? AND status='VERIFIED' LIMIT 1",
+                                    (str(store_id), str(batch_kind))).fetchone())
 
     def inspect_local_batch(self, store_id, batch_kind, *, selected_product_ids=None):
         """Return captured evidence for a selected release batch without writes."""

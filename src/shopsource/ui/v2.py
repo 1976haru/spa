@@ -379,10 +379,13 @@ class OperatorUI:
                     from ..source_safety import FreeSourceSafetyService
                     free = FreeSourceSafetyService()
                     audit = free.evidence_audit(str(run["store_id"]))
-                    draft = runner.free_source_safety_preflight(run["run_id"], "DRAFT_PILOT")
+                    draft = runner.free_source_safety_preflight(run["run_id"], "SOURCE_CHECK_PILOT")
+                    source_status = free.full_source_status(str(run["store_id"]))
+                    validation_ready = free.source_check_pilot_passed(str(run["store_id"]))
                     ui.label("무료 Spark + 로컬 브라우저 안전검사").classes("ss-card-title")
                     ui.label("Keepa는 기본 경로가 아닙니다. Spark 캡처를 먼저 확인하며 재고 증거가 없거나 오래된 상품은 브라우저에서 새로 확인해야 합니다.").classes("ss-help")
-                    ui.label(f"MASTER 전체 {audit['master_total']} · 업로드 후보(PRIMARY) {draft['eligible_upload_candidates']} · 현재 10개 DRAFT 후보 검사 대상 {draft['target_count']}")
+                    ui.label(f"MASTER {audit['master_total']} · PRIMARY {draft['primary_count']} · Source-check eligible {draft['source_check_eligible']} · 현재 pilot 대상 {draft['target_count']}")
+                    ui.label(f"Source checked {source_status['checked']} · pending {source_status['pending']} · UNKNOWN {source_status['unknown']} · OOS {source_status['out_of_stock']} · error {source_status['errors']}")
                     ui.label(f"Spark evidence: URL {audit['source_url']} · ASIN {audit['asin']} · 가격 {audit['price']} · 수집시각 {audit['_collectedAt']} · quantity 필드 {audit['quantity']} · 명시적 재고 {audit['explicit_availability']} · 최근 occurrence {audit['latest_occurrence_timestamp'] or '없음'}")
                     ui.label("quantity는 재고로 간주하지 않습니다. 기존 Spark 수집 사실만으로 IN_STOCK 처리하지 않습니다.").classes("ss-help")
                     ui.label(f"무료 모드 · 예상 token 0 · 예상 비용 FREE_LOCAL · 최신 확인 {draft['freshness'].get('FRESH', 0)} · 오래됨 {draft['freshness'].get('STALE_WARNING', 0) + draft['freshness'].get('STALE_BLOCKED', 0)} · 미확인 {draft['freshness'].get('NEVER_VERIFIED', 0)}")
@@ -397,10 +400,10 @@ class OperatorUI:
                         except Exception as exc:
                             ui.notify(f"무료 Source 검사 준비 실패 ({type(exc).__name__}).", type="negative")
 
-                    ui.button("10개 DRAFT 후보 무료 검사", on_click=lambda: prepare_free("DRAFT_PILOT")).props("color=primary" + (" disable" if draft["target_count"] == 0 else ""))
+                    ui.button("10개 무료 Source Check Pilot", on_click=lambda: prepare_free("SOURCE_CHECK_PILOT")).props("color=primary" + (" disable" if draft["target_count"] == 0 else ""))
                     if draft["target_count"] == 0:
-                        ui.label("현재 명시된 Shopify 판매가와 상품 필수정보를 갖춘 PRIMARY 후보가 없습니다. 가격/상품 입력 후 검사 버튼이 활성화됩니다.").classes("ss-help")
-                    candidate_rows = free.primary_candidates(str(run["store_id"]))
+                        ui.label("검사할 미처리 PRIMARY source 후보가 없습니다. 분류·ASIN·원본 URL 또는 기존 batch 상태를 확인하세요.").classes("ss-help")
+                    candidate_rows = free.unprocessed_source_candidates(str(run["store_id"]))
                     candidate_options = {int(row["master_product_id"]): f"{row.get('asin') or 'ASIN 없음'} · {row.get('title') or '제목 없음'}" for row in candidate_rows}
                     validation_selection = ui.select(candidate_options, label="검증 batch에 넣을 업로드 상품 선택 (100~200개)", multiple=True).classes("w-full")
                     async def run_validation_batch():
@@ -409,12 +412,13 @@ class OperatorUI:
                             ui.notify("실제 다음 업로드에 넣을 PRIMARY 상품을 100~200개 선택하세요.", type="warning"); return
                         try:
                             result = await asyncio.to_thread(runner.prepare_free_browser_capture_batch,
-                                run["run_id"], "VALIDATION_BATCH", selected_product_ids=ids, confirmed=True)
+                                run["run_id"], "SOURCE_VALIDATION_BATCH", selected_product_ids=ids, confirmed=True)
                             render(runner.service.get(run["run_id"])); open_gate_action()
                         except Exception as exc:
                             ui.notify(f"검증 batch 준비 실패 ({type(exc).__name__}).", type="negative")
-                    ui.button("선택한 100~200개 무료 검사", on_click=run_validation_batch).props("outline" + (" disable" if len(candidate_options) < 100 else ""))
-                    ui.button("나머지 승인 catalog 검사", on_click=lambda: prepare_free("REMAINING_CATALOG")).props("outline" + (" disable" if draft["eligible_upload_candidates"] == 0 else ""))
+                    ui.button("100~200개 Source Validation Batch", on_click=run_validation_batch).props("outline" + (" disable" if not validation_ready or len(candidate_options) < 100 else ""))
+                    ui.button("다음 Source Batch", on_click=lambda: prepare_free("REMAINING_SOURCE_CHECK")).props("outline" + (" disable" if not validation_ready or not candidate_options else ""))
+                    ui.label("Shopify 10개 DRAFT 업로드 파일럿은 G14에서 진행합니다.").classes("ss-help")
                     async def apply_latest_capture():
                         with connect() as con:
                             latest = con.execute("SELECT batch_id FROM source_safety_release_batches WHERE store_id=? AND status='WAITING_FOR_INPUT' ORDER BY created_at DESC LIMIT 1", (str(run["store_id"]),)).fetchone()
@@ -454,7 +458,7 @@ class OperatorUI:
                         ui.button("선택 유료 Keepa profile 저장", on_click=save_optional_keepa).props("outline")
                     if draft.get("target_product_ids"):
                         with ui.expansion("DRAFT 후보 원본 링크와 현재 로컬 evidence"):
-                            inspected = free.inspect_local_batch(str(run["store_id"]), "DRAFT_PILOT")
+                            inspected = free.inspect_local_batch(str(run["store_id"]), "SOURCE_CHECK_PILOT")
                             for item in inspected["items"]:
                                 ui.label(f"{item['asin']} · source 재고 {item['availability']} · 가격 {item['source_price'] or '확인 필요'} · freshness {item['freshness']}")
                                 if item.get("source_url"):
