@@ -184,7 +184,7 @@ class FakeShopify:
 
 def theme_service(monkeypatch, db, fake):
     monkeypatch.setattr(brand, "get_connection", lambda store_id, db=None: {"shop_domain": "fixture.myshopify.com", "api_version": "2026-07"})
-    monkeypatch.setattr(brand, "get_shopify_token", lambda store_id: ("fake-secret", "fixture"))
+    monkeypatch.setattr(brand, "get_shopify_token", lambda store_id, db=None: ("fake-secret", "fixture"))
     return brand.BrandThemeService(db=db, client_factory=lambda *args: fake)
 
 
@@ -208,7 +208,7 @@ def test_shopify_brand_file_upload_mock(env, monkeypatch):
     class Uploader:
         def upload(self, path, alt): return {"id": "gid://shopify/GenericFile/1", "url": "https://cdn.shopify.com/mark.png"}
     monkeypatch.setattr(brand, "get_connection", lambda store_id, db=None: {"shop_domain": "fixture.myshopify.com", "api_version": "2026-07"})
-    monkeypatch.setattr(brand, "get_shopify_token", lambda store_id: ("fake", "fixture"))
+    monkeypatch.setattr(brand, "get_shopify_token", lambda store_id, db=None: ("fake", "fixture"))
     result = brand.BrandThemeService(db=db).upload_approved_asset("s1", approved["asset_id"], uploader=Uploader())
     assert result["shopify_file_id"].endswith("/1") and result["shopify_url"].startswith("https://")
 

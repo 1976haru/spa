@@ -124,7 +124,7 @@ class ShopifyThemeReader:
         config = get_connection(store_id, db=self.db)
         if not config:
             raise RuntimeError("Shopify shop domain is not configured")
-        token, _ = get_shopify_token(store_id)
+        token, _ = get_shopify_token(store_id,db=self.db)
         if not token:
             raise RuntimeError("Shopify credential missing; token is never stored in ShopSource DB")
         return config, self.client_factory(config["shop_domain"], token, config["api_version"])

@@ -113,7 +113,7 @@ class NavigationService:
         _ensure(db)
 
     def _client(self,store_id):
-        config=get_connection(store_id,db=self.db);token,_=get_shopify_token(store_id)
+        config=get_connection(store_id,db=self.db);token,_=get_shopify_token(store_id,db=self.db)
         if not config or not token:raise RuntimeError("Shopify connection/credential is missing")
         return config,self.client_factory(config["shop_domain"],token,config["api_version"])
 
@@ -415,7 +415,7 @@ class MegaMenuThemeService:
         try:current=json.loads(files.get("config/settings_data.json") or "{}")
         except Exception:current={}
         if (snapshot.get("theme") or {}).get("id")!=row["theme_id"] or _hash(current)!=row["settings_hash"]:return {"status":"CONFLICT","reason":"Theme settings changed since preview."}
-        config=get_connection(row["store_id"],db=self.db);token,_=get_shopify_token(row["store_id"]);client=client or self.client_factory(config["shop_domain"],token,config["api_version"])
+        config=get_connection(row["store_id"],db=self.db);token,_=get_shopify_token(row["store_id"],db=self.db);client=client or self.client_factory(config["shop_domain"],token,config["api_version"])
         folder=self.export_dir/"theme_backups"/_slug(row["store_id"])/(datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")+"-"+secrets.token_hex(3));folder.mkdir(parents=True,exist_ok=False)
         before={"config/settings_data.json":files.get("config/settings_data.json") or "{}","theme_id":row["theme_id"]}
         (folder/"before.json").write_text(json.dumps(before,ensure_ascii=False,indent=2),encoding="utf-8")

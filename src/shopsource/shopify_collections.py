@@ -11,7 +11,6 @@ import json
 import os
 import re
 import time
-import time
 import urllib.error
 import urllib.request
 import uuid
@@ -28,6 +27,8 @@ REQUIRED_SCOPES = {"write_products", "read_products", "read_publications"}
 PUBLISH_SCOPE = "write_publications"
 FILE_SCOPES = {"write_files"}
 KEYRING_SERVICE = "ShopSourceStudio.Shopify"
+DEV_DASHBOARD_CLIENT_CREDENTIALS = "DEV_DASHBOARD_CLIENT_CREDENTIALS"
+LEGACY_ADMIN_TOKEN = "LEGACY_ADMIN_TOKEN"
 
 
 def _now() -> str:
@@ -65,7 +66,16 @@ def delete_shopify_token(store_id: str) -> None:
         return
 
 
-def get_shopify_token(store_id: str, *, allow_environment: bool = True) -> tuple[str | None, str]:
+def get_shopify_token(store_id: str, *, allow_environment: bool = True, db=None) -> tuple[str | None, str]:
+    connection=get_connection(store_id,db=db)
+    mode=(connection or {}).get("auth_mode") or LEGACY_ADMIN_TOKEN
+    if mode == DEV_DASHBOARD_CLIENT_CREDENTIALS:
+        from .shopify_auth import ShopifyAuthError,ShopifyAuthService
+        try: token=ShopifyAuthService(db=db).token_for(store_id)
+        except ShopifyAuthError as exc:
+            if exc.code=="MISSING_CREDENTIALS": return None,"missing"
+            raise
+        return token,"dev-dashboard-client-credentials"
     if allow_environment and os.environ.get("SHOPIFY_ACCESS_TOKEN"):
         return os.environ["SHOPIFY_ACCESS_TOKEN"], "environment"
     try:
@@ -86,7 +96,8 @@ def _install_schema(db=None):
             store_id TEXT PRIMARY KEY, shop_domain TEXT NOT NULL,
             api_version TEXT NOT NULL DEFAULT '2026-07', status TEXT NOT NULL DEFAULT 'NOT_VERIFIED',
             scopes_json TEXT NOT NULL DEFAULT '[]', publications_json TEXT NOT NULL DEFAULT '[]',
-            last_verified_at TEXT, updated_at TEXT NOT NULL
+            last_verified_at TEXT, updated_at TEXT NOT NULL,
+            auth_mode TEXT NOT NULL DEFAULT 'LEGACY_ADMIN_TOKEN', token_expires_at TEXT
         );
         CREATE TABLE IF NOT EXISTS shopify_collection_mappings (
             store_id TEXT NOT NULL, collection_key TEXT NOT NULL, handle TEXT NOT NULL,
@@ -105,17 +116,28 @@ def _install_schema(db=None):
             result_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
         """)
+        columns={row[1] for row in con.execute("PRAGMA table_info(shopify_connections)")}
+        if "auth_mode" not in columns:
+            con.execute("ALTER TABLE shopify_connections ADD COLUMN auth_mode TEXT NOT NULL DEFAULT 'LEGACY_ADMIN_TOKEN'")
+        if "token_expires_at" not in columns:
+            con.execute("ALTER TABLE shopify_connections ADD COLUMN token_expires_at TEXT")
 
 
-def save_connection(store_id: str, shop_domain: str, *, api_version: str = SHOPIFY_API_VERSION, db=None) -> dict:
+def save_connection(store_id: str, shop_domain: str, *, api_version: str = SHOPIFY_API_VERSION,
+                    auth_mode: str | None = None, db=None) -> dict:
     if api_version != SHOPIFY_API_VERSION:
         raise ValueError(f"Only supported pinned Shopify API version {SHOPIFY_API_VERSION} is enabled")
     domain = _safe_domain(shop_domain)
+    if auth_mode is not None and auth_mode not in {DEV_DASHBOARD_CLIENT_CREDENTIALS,LEGACY_ADMIN_TOKEN}:
+        raise ValueError("Unsupported Shopify auth mode")
     _install_schema(db)
     with connect(db) as con:
-        con.execute("""INSERT INTO shopify_connections(store_id,shop_domain,api_version,updated_at)
-          VALUES(?,?,?,?) ON CONFLICT(store_id) DO UPDATE SET shop_domain=excluded.shop_domain,
-          api_version=excluded.api_version,updated_at=excluded.updated_at""", (store_id, domain, api_version, _now()))
+        existing=con.execute("SELECT auth_mode FROM shopify_connections WHERE store_id=?",(store_id,)).fetchone()
+        selected=auth_mode or (existing["auth_mode"] if existing else LEGACY_ADMIN_TOKEN)
+        con.execute("""INSERT INTO shopify_connections(store_id,shop_domain,api_version,auth_mode,updated_at)
+          VALUES(?,?,?,?,?) ON CONFLICT(store_id) DO UPDATE SET shop_domain=excluded.shop_domain,
+          api_version=excluded.api_version,auth_mode=excluded.auth_mode,updated_at=excluded.updated_at""",
+          (store_id, domain, api_version, selected, _now()))
     return get_connection(store_id, db=db)
 
 
@@ -128,7 +150,12 @@ def get_connection(store_id: str, *, db=None) -> dict | None:
     result = dict(row)
     result["scopes"] = json.loads(result.pop("scopes_json"))
     result["publications"] = json.loads(result.pop("publications_json"))
-    result["credential_source"] = get_shopify_token(store_id)[1]
+    from .shopify_auth import credential_present
+    result["credential_present"] = credential_present(store_id,db=db,auth_mode=result.get("auth_mode"))
+    if result.get("auth_mode")==LEGACY_ADMIN_TOKEN and os.environ.get("SHOPIFY_ACCESS_TOKEN"):
+        result["credential_source"]="environment"
+    else:
+        result["credential_source"]=("windows-credential-manager" if result["credential_present"] else "missing")
     return result
 
 
@@ -209,19 +236,25 @@ class ShopifyGraphQLClient:
     def execute(self, query: str, variables: dict | None = None) -> dict:
         url = f"https://{self.domain}/admin/api/{self.version}/graphql.json"
         body = json.dumps({"query": query, "variables": variables or {}}).encode()
-        request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "X-Shopify-Access-Token": self.token})
-        for attempt in range(3):
+        token=self.token; auth_refreshed=False; transient_attempts=0
+        while True:
+            request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "X-Shopify-Access-Token": str(token)})
             try:
                 with self.opener(request, timeout=30) as response:
                     payload = json.loads(response.read().decode("utf-8"))
                 break
             except urllib.error.HTTPError as exc:
-                if exc.code in {429, 500, 502, 503, 504} and attempt < 2:
-                    time.sleep(.25 * (2 ** attempt)); continue
+                if exc.code == 401:
+                    refresh=getattr(token,"refresh",None)
+                    if refresh and not auth_refreshed:
+                        token=refresh(); self.token=token; auth_refreshed=True; continue
+                    raise RuntimeError("Shopify 인증이 거부되었습니다. 앱 설치 상태와 자격 증명을 확인하세요.") from None
+                if exc.code in {429, 500, 502, 503, 504} and transient_attempts < 2:
+                    time.sleep(.25 * (2 ** transient_attempts)); transient_attempts+=1; continue
                 raise RuntimeError(f"Shopify HTTP {exc.code}; response body suppressed") from None
             except Exception as exc:
-                if isinstance(exc, (urllib.error.URLError, TimeoutError)) and attempt < 2:
-                    time.sleep(.25 * (2 ** attempt)); continue
+                if isinstance(exc, (urllib.error.URLError, TimeoutError)) and transient_attempts < 2:
+                    time.sleep(.25 * (2 ** transient_attempts)); transient_attempts+=1; continue
                 raise RuntimeError(f"Shopify request failed: {type(exc).__name__}") from None
         if payload.get("errors"):
             messages = [str(err.get("message", "GraphQL error"))[:240] for err in payload["errors"]]
@@ -252,7 +285,7 @@ class ShopifyCollectionPublisher:
         config = get_connection(store_id, db=self.db)
         if not config:
             raise RuntimeError("Shopify shop domain is not configured")
-        token, source = get_shopify_token(store_id)
+        token, source = get_shopify_token(store_id,db=self.db)
         if not token:
             raise RuntimeError("Shopify credential missing; token is never stored in ShopSource DB")
         return config, self.client_factory(config["shop_domain"], token, config["api_version"]), source

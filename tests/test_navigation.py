@@ -76,7 +76,7 @@ class FakeAdmin:
 
 def _patch_shopify(monkeypatch,fake):
     config=lambda store_id,db=None:{"shop_domain":"fixture.myshopify.com","api_version":SHOPIFY_API_VERSION}
-    token=lambda store_id:("fixture-secret","fixture")
+    token=lambda store_id,db=None:("fixture-secret","fixture")
     monkeypatch.setattr(navigation,"get_connection",config);monkeypatch.setattr(navigation,"get_shopify_token",token)
     monkeypatch.setattr(homepage,"get_connection",config);monkeypatch.setattr(homepage,"get_shopify_token",token)
     factory=lambda *args:fake

@@ -417,14 +417,14 @@ class ProductionEvidenceRunner:
         if key == "COMMERCE_READINESS": return self._commerce(store_id, run)
         return {"status": "REVIEW_REQUIRED", "review_required": ["No evidence collector configured"]}
 
-    def _environment(self, store_id):
+    def _environment_legacy(self, store_id):
         if store_id != "001":
             return {"status": "BLOCKED", "blockers": ["Expected Store 001 | Cabin Tidy"]}
         local = self._local_environment()
         try:
             from .shopify_collections import get_connection, get_shopify_token
             connection = get_connection(store_id, db=self.db)
-            token, _source = get_shopify_token(store_id)
+            token, _source = get_shopify_token(store_id,db=self.db)
             if not connection or not token:
                 return {**local, "status": "WAITING_FOR_CREDENTIALS", "missing_inputs": ["Configure Cabin Tidy Shopify connection and credential"],
                         "credential_present": bool(token), "shop_domain": (connection or {}).get("shop_domain"),
@@ -461,6 +461,78 @@ class ProductionEvidenceRunner:
             state = "WAITING_FOR_CREDENTIALS" if "credential" in lowered or "token" in lowered else "REVIEW_REQUIRED"
             field = "missing_inputs" if state == "WAITING_FOR_CREDENTIALS" else "review_required"
             return {"status": state, field: [text[:240]], "secret_values_exposed": False}
+
+    def _environment(self, store_id):
+        if store_id != "001":
+            return {"status":"BLOCKED","blockers":["Expected Store 001 | Cabin Tidy"]}
+        local=self._local_environment()
+        try:
+            from .shopify_collections import ShopifyGraphQLClient,get_connection,get_shopify_token
+            connection=get_connection(store_id,db=self.db)
+            if not connection:
+                return {**local,"status":"WAITING_FOR_CREDENTIALS","credential_present":False,
+                        "missing_inputs":["Cabin Tidy Shopify 연결 정보를 입력하세요."],"secret_values_exposed":False}
+            token,_source=get_shopify_token(store_id,db=self.db)
+            if not token:
+                return {**local,"status":"WAITING_FOR_CREDENTIALS","credential_present":False,
+                        "shop_domain":connection.get("shop_domain"),"missing_inputs":["Shopify 자격 증명을 안전하게 저장하세요."],"secret_values_exposed":False}
+            client=ShopifyGraphQLClient(connection["shop_domain"],token,connection["api_version"])
+            identity=client.execute("query ShopSourceAuthIdentity { shop { name myshopifyDomain } currentAppInstallation { accessScopes { handle } } }")
+            shop=identity.get("shop") or {}
+            granted=sorted({row.get("handle") for row in ((identity.get("currentAppInstallation") or {}).get("accessScopes") or []) if row.get("handle")})
+            expected=str(connection.get("shop_domain") or "").casefold()
+            actual=str(shop.get("myshopifyDomain") or "").casefold()
+            if not actual:
+                return {**local,"status":"REVIEW_REQUIRED","shop_domain":connection.get("shop_domain"),
+                        "missing_inputs":["Shopify가 확인한 myshopify 도메인을 읽을 수 없습니다."],"granted_scopes":granted,
+                        "secret_values_exposed":False}
+            if actual != expected:
+                return {**local,"status":"BLOCKED","shop_domain":connection.get("shop_domain"),
+                        "missing_inputs":["Shopify 인증 결과의 스토어 도메인이 저장된 도메인과 다릅니다."],
+                        "granted_scopes":granted,"secret_values_exposed":False}
+            from .homepage_collections import ShopifyThemeReader
+            theme=ShopifyThemeReader(db=self.db).discover(store_id)
+            with connect(self.db) as con:
+                verified_at=datetime.now(timezone.utc).isoformat(timespec="seconds")
+                con.execute("UPDATE shopify_connections SET status=?,scopes_json=?,last_verified_at=?,updated_at=? WHERE store_id=?",
+                    ("MISSING_SCOPES" if theme.get("status")=="MISSING_READ_SCOPE" else "CONNECTED",
+                     _json(granted),verified_at,verified_at,store_id))
+            if theme.get("status")=="MISSING_READ_SCOPE":
+                optional={"read_products","write_products","read_publications","write_publications","write_files","read_legal_policies",
+                          "write_themes","read_online_store_navigation","write_online_store_navigation"}
+                return {**local,"status":"WAITING_FOR_INPUT","shop_domain":connection["shop_domain"],
+                        "auth_mode":connection.get("auth_mode"),"theme_status":theme.get("status"),
+                        "granted_scopes":granted,"missing_required_scopes":["read_themes"],
+                        "missing_optional_scopes":sorted(optional-set(granted)),
+                        "missing_inputs":["Dev Dashboard 앱 버전에 read_themes 권한을 추가하고 필요한 승인/설치를 완료하세요."],
+                        "secret_values_exposed":False}
+            optional={"read_products","write_products","read_publications","write_publications","write_files","read_legal_policies",
+                      "write_themes","read_online_store_navigation","write_online_store_navigation"}
+            return {**local,"status":"VERIFIED" if theme.get("theme") else "REVIEW_REQUIRED",
+                    "verified":bool(theme.get("theme")),"shop_domain":connection["shop_domain"],
+                    "shop_name":shop.get("name"),"auth_mode":connection.get("auth_mode"),
+                    "api_version":connection.get("api_version"),"theme_status":theme.get("status"),
+                    "theme_name":(theme.get("theme") or {}).get("name"),"credential_present":True,
+                    "granted_scopes":granted,"missing_required_scopes":[],
+                    "missing_optional_scopes":sorted(optional-set(granted)),"secret_values_exposed":False,
+                    "missing_inputs":[],"review_required":[] if theme.get("theme") else ["Published theme could not be verified"],
+                    "fingerprint_input":{"domain":connection["shop_domain"],"shop":shop,"theme":theme.get("theme"),"scopes":granted}}
+        except (TimeoutError,ConnectionError) as exc:
+            return {**local,"status":"FAILED_TRANSIENT","review_required":[type(exc).__name__],"secret_values_exposed":False}
+        except Exception as exc:
+            from .security import redact_text
+            from .shopify_auth import ShopifyAuthError
+            if isinstance(exc,ShopifyAuthError):
+                if exc.code=="SHOP_NOT_PERMITTED":
+                    return {**local,"status":"WAITING_FOR_INPUT","missing_inputs":[str(exc)],"secret_values_exposed":False}
+                if exc.code in {"MISSING_CREDENTIALS","BAD_CREDENTIAL"}:
+                    return {**local,"status":"WAITING_FOR_CREDENTIALS","missing_inputs":[str(exc)],"secret_values_exposed":False}
+                if exc.code=="NETWORK_ERROR":
+                    return {**local,"status":"FAILED_TRANSIENT","review_required":[str(exc)],"secret_values_exposed":False}
+            text=redact_text(str(exc)); lowered=text.casefold()
+            state="WAITING_FOR_CREDENTIALS" if "credential" in lowered or "token" in lowered else "REVIEW_REQUIRED"
+            field="missing_inputs" if state=="WAITING_FOR_CREDENTIALS" else "review_required"
+            return {**local,"status":state,field:[text[:240]],"secret_values_exposed":False}
 
     def _local_environment(self):
         import importlib.util
@@ -601,7 +673,7 @@ class ProductionEvidenceRunner:
     def _shopify_read_client(self, store_id):
         from .shopify_collections import ShopifyGraphQLClient, get_connection, get_shopify_token
         connection = get_connection(store_id, db=self.db)
-        token, _ = get_shopify_token(store_id)
+        token, _ = get_shopify_token(store_id,db=self.db)
         if not connection or not token:
             return None, connection, set(), "WAITING_FOR_CREDENTIALS"
         client = ShopifyGraphQLClient(connection["shop_domain"], token, connection["api_version"])

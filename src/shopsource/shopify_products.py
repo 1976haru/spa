@@ -172,7 +172,7 @@ class DirectShopifyProductPublisher(ProductPublisher):
         config = get_connection(store_id, db=self.db)
         if not config:
             raise RuntimeError("Shopify connection is not configured")
-        token, _ = get_shopify_token(store_id)
+        token, _ = get_shopify_token(store_id,db=self.db)
         if not token:
             raise RuntimeError("Shopify credential missing")
         return config, self.client_factory(config["shop_domain"], token, config["api_version"])

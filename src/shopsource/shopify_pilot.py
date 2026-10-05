@@ -24,7 +24,7 @@ class ShopifyLivePilot:
 
     def connection_preflight(self, store_id):
         config = get_connection(store_id, db=self.db)
-        token, source = get_shopify_token(store_id)
+        token, source = get_shopify_token(store_id,db=self.db)
         result = {"shop_domain": (config or {}).get("shop_domain"), "credential_present": bool(token),
                   "credential_source": source if token else "missing", "api_version": (config or {}).get("api_version"),
                   "api_version_ready": bool(config and config.get("api_version") == SHOPIFY_API_VERSION),

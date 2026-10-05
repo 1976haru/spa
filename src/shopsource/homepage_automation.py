@@ -497,7 +497,7 @@ class HomepageAutomationService:
             return {"status": "MANUAL_ACTION_REQUIRED", "reason": "write_themes capability missing"}
         if preview.get("diff", {}).get("before_hash") == preview.get("diff", {}).get("proposed_hash"):
             return {"status": "VERIFIED", "no_change": True, "theme_id": row["theme_id"]}
-        config = get_connection(row["store_id"], db=self.db); token, _ = get_shopify_token(row["store_id"])
+        config = get_connection(row["store_id"], db=self.db); token, _ = get_shopify_token(row["store_id"],db=self.db)
         if not config or not token:
             return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Shopify connection or credential missing"}
         if preview.get("shop_domain") and config.get("shop_domain") != preview["shop_domain"]:
@@ -557,7 +557,7 @@ class HomepageAutomationService:
             raise RuntimeError("홈페이지 rollback은 별도 명시적 확인이 필요합니다")
         with connect(self.db) as con: row = con.execute("SELECT * FROM store_homepage_backups WHERE backup_id=?", (backup_id,)).fetchone()
         if not row: raise KeyError(backup_id)
-        config = get_connection(row["store_id"], db=self.db); token, _ = get_shopify_token(row["store_id"])
+        config = get_connection(row["store_id"], db=self.db); token, _ = get_shopify_token(row["store_id"],db=self.db)
         if not config or not token: return {"status": "MANUAL_ACTION_REQUIRED"}
         client = client or self.client_factory(config["shop_domain"], token, config["api_version"])
         scopes_result = client.execute("query HomepageRollbackScopes { currentAppInstallation { accessScopes { handle } } }")
@@ -582,7 +582,7 @@ class HomepageAutomationService:
         with connect(self.db) as con: row = con.execute("SELECT * FROM store_homepage_previews WHERE preview_id=?", (preview_id,)).fetchone()
         if not row: return {"status": "NOT_FOUND"}
         preview = json.loads(row["preview_json"])
-        config = get_connection(row["store_id"], db=self.db); token, _ = get_shopify_token(row["store_id"])
+        config = get_connection(row["store_id"], db=self.db); token, _ = get_shopify_token(row["store_id"],db=self.db)
         if not config or not token: return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Shopify connection or credential missing"}
         client = client or self.client_factory(config["shop_domain"], token, config["api_version"])
         query = "query HomepageVerify($id: ID!, $filenames: [String!]!) { theme(id: $id) { files(first: 1, filenames: $filenames) { nodes { body { __typename ... on OnlineStoreThemeFileBodyText { content } } } } } }"
@@ -702,7 +702,7 @@ def upload_approved_hero_asset(store_id: str, asset_id: str, *, alt_text: str = 
     with connect(db) as con: row = con.execute("SELECT * FROM store_homepage_assets WHERE asset_id=? AND store_id=?", (asset_id, store_id)).fetchone()
     if not row or row["approval_status"] != "APPROVED": raise RuntimeError("Approve the hero asset before Shopify Files upload")
     if not Path(row["local_path"]).is_file(): raise FileNotFoundError(row["local_path"])
-    config = get_connection(store_id, db=db); token, _ = get_shopify_token(store_id)
+    config = get_connection(store_id, db=db); token, _ = get_shopify_token(store_id,db=db)
     if not config or not token: return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Shopify credential missing"}
     client = client_factory(config["shop_domain"], token, config["api_version"])
     scopes = {scope.get("handle") for scope in (client.execute("query HomepageFileScopes { currentAppInstallation { accessScopes { handle } } }").get("currentAppInstallation") or {}).get("accessScopes", [])}

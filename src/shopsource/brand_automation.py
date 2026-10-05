@@ -451,7 +451,7 @@ class BrandThemeService:
         self.db,self.client_factory,self.uploader_factory=db,client_factory,uploader_factory
 
     def discover(self, store_id):
-        config=get_connection(store_id,db=self.db);token,_=get_shopify_token(store_id)
+        config=get_connection(store_id,db=self.db);token,_=get_shopify_token(store_id,db=self.db)
         if not config or not token:return {"status":"MANUAL_ACTION_REQUIRED","reason":"Shopify 연결/credential 없음","write_themes":False}
         client=self.client_factory(config["shop_domain"],token,config["api_version"])
         scopes={row["handle"] for row in (client.execute("query BrandScopes { currentAppInstallation { accessScopes { handle } } }").get("currentAppInstallation") or {}).get("accessScopes",[])}
@@ -468,7 +468,7 @@ class BrandThemeService:
         asset=get_brand_asset(asset_id,db=self.db)
         if not asset or asset["store_id"]!=store_id or asset["approval_status"]!="APPROVED":raise RuntimeError("승인된 현재 스토어 asset만 업로드할 수 있습니다.")
         if not Path(asset["local_path"]).is_file() or Path(asset["local_path"]).suffix.lower()==".svg":raise RuntimeError("업로드할 PNG/JPEG asset이 없습니다.")
-        config=get_connection(store_id,db=self.db);token,_=get_shopify_token(store_id)
+        config=get_connection(store_id,db=self.db);token,_=get_shopify_token(store_id,db=self.db)
         if not config or not token:raise RuntimeError("Shopify credential/연결을 확인하세요.")
         if uploader is None:
             client=self.client_factory(config["shop_domain"],token,config["api_version"]);uploader=self.uploader_factory(client)
@@ -536,7 +536,7 @@ class BrandThemeService:
         snapshot=self.discover(row["store_id"]);theme=snapshot.get("theme") or {}
         if theme.get("id")!=row["theme_id"] or _hash(json.loads(snapshot.get("settings_data") or "{}"))!=row["template_hash"]:
             return {"status":"CONFLICT","reason":"Theme settings changed since preview."}
-        config=get_connection(row["store_id"],db=self.db);token,_=get_shopify_token(row["store_id"])
+        config=get_connection(row["store_id"],db=self.db);token,_=get_shopify_token(row["store_id"],db=self.db)
         client=client or self.client_factory(config["shop_domain"],token,config["api_version"])
         scopes=set(snapshot.get("scopes",[]))
         if "write_themes" not in scopes:return {"status":"MANUAL_ACTION_REQUIRED","instructions":preview.get("instructions")}
@@ -561,7 +561,7 @@ class BrandThemeService:
         if not backup:raise KeyError(backup_id)
         snapshot=self.discover(backup["store_id"])
         if not snapshot.get("write_themes"):return {"status":"MANUAL_ACTION_REQUIRED","instructions":"Shopify Theme Editor에서 백업의 settings_data.json 값을 복구하세요."}
-        config=get_connection(backup["store_id"],db=self.db);token,_=get_shopify_token(backup["store_id"])
+        config=get_connection(backup["store_id"],db=self.db);token,_=get_shopify_token(backup["store_id"],db=self.db)
         client=client or self.client_factory(config["shop_domain"],token,config["api_version"])
         response=client.execute(UPSERT_THEME_FILES,{"themeId":backup["theme_id"],"files":[{"filename":"config/settings_data.json","body":{"type":"TEXT","value":backup["settings_data"]}}]}).get("themeFilesUpsert") or {}
         if response.get("userErrors"):

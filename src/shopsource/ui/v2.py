@@ -14,7 +14,10 @@ from ..capture.service import CaptureService
 from ..capture.batch import BatchSourcingService
 from ..capture.campaign import CampaignService
 from ..collection_planner import CollectionPlanner
-from ..shopify_collections import ShopifyCollectionPublisher, get_connection as get_shopify_connection, save_connection as save_shopify_connection, save_shopify_token
+from ..shopify_collections import (DEV_DASHBOARD_CLIENT_CREDENTIALS, LEGACY_ADMIN_TOKEN,
+    ShopifyGraphQLClient, ShopifyCollectionPublisher, get_connection as get_shopify_connection,
+    get_shopify_token, save_connection as save_shopify_connection, save_shopify_token)
+from ..shopify_auth import ShopifyAuthService, save_dev_credentials, delete_dev_credentials
 from ..collection_images import (ManualImageProvider, OpenAIImagesProvider, approve_collection_image,
     generate_collection_image, approved_collection_images)
 from ..classifier import classify_store
@@ -477,6 +480,40 @@ class OperatorUI:
                     ui.label("G0~G13 사전 증거가 준비되었습니다. 이는 출시 완료가 아닙니다. 이 점검은 상품을 Shopify에 올리지 않습니다.").classes("ss-help")
                     ui.button("별도 10개 DRAFT 파일럿 화면 열기", on_click=lambda: ui.navigate.to("/pilot")).props("color=primary")
                 elif key == "ENVIRONMENT_STORE_IDENTITY":
+                    current_connection=get_shopify_connection(str(run["store_id"]))
+                    auth_mode=ui.select({DEV_DASHBOARD_CLIENT_CREDENTIALS:"Dev Dashboard 앱 (권장)",
+                                         LEGACY_ADMIN_TOKEN:"기존 Legacy 토큰"},
+                        value=(current_connection or {}).get("auth_mode") or DEV_DASHBOARD_CLIENT_CREDENTIALS,
+                        label="Shopify 연결 방식").classes("w-full")
+                    domain=ui.input("Shopify shop domain (*.myshopify.com)",value=(current_connection or {}).get("shop_domain") or "").classes("w-full")
+                    client_id=ui.input("Dev Dashboard Client ID").classes("w-full")
+                    client_secret=ui.input("Dev Dashboard Client Secret").props("type=password autocomplete=new-password").classes("w-full")
+                    legacy_token=ui.input("기존 Legacy Admin API access token").props("type=password autocomplete=new-password").classes("w-full")
+                    ui.label("Client Secret은 Windows Credential Manager에 저장하며, 인증 토큰은 만료 전에 자동 갱신합니다.").classes("ss-help")
+                    def update_g0_auth_fields():
+                        dev=auth_mode.value==DEV_DASHBOARD_CLIENT_CREDENTIALS
+                        client_id.set_visibility(dev);client_secret.set_visibility(dev);legacy_token.set_visibility(not dev)
+                    auth_mode.on_value_change(lambda _:update_g0_auth_fields());update_g0_auth_fields()
+                    health=ui.label("").classes("ss-help")
+                    def show_g0_auth_health():
+                        info=ShopifyAuthService(db=runner.db).status(str(run["store_id"]))
+                        health.set_text(f"{info['auth_mode']} · 자격 증명 {'YES' if info['credential_present'] else 'NO'} · {info['token_state']} · 만료 {info.get('expires_in_minutes') if info.get('expires_in_minutes') is not None else '확인 전'}분")
+                    show_g0_auth_health()
+                    async def save_and_continue_g0():
+                        try:
+                            mode=auth_mode.value
+                            if mode==DEV_DASHBOARD_CLIENT_CREDENTIALS and bool(client_id.value)!=bool(client_secret.value):
+                                raise ValueError("Client ID와 Client Secret을 모두 입력하세요.")
+                            save_shopify_connection(str(run["store_id"]),domain.value or "",auth_mode=mode,db=runner.db)
+                            if mode==DEV_DASHBOARD_CLIENT_CREDENTIALS and client_id.value and client_secret.value:
+                                save_dev_credentials(str(run["store_id"]),client_id.value,client_secret.value)
+                                client_id.value="";client_secret.value=""
+                            if mode==LEGACY_ADMIN_TOKEN and legacy_token.value:
+                                save_shopify_token(str(run["store_id"]),legacy_token.value);legacy_token.value=""
+                            updated=await asyncio.to_thread(runner.run,str(run["store_id"]),run_id=run["run_id"])
+                            render(updated);ui.notify("같은 production run에서 Shopify 읽기 연결 확인을 이어갔습니다. 원격 쓰기는 하지 않았습니다.",type="positive")
+                        except Exception as exc: ui.notify(_safe_error(exc),type="negative")
+                    ui.button("연결 정보 저장 후 Shopify 읽기 확인 / 같은 점검 계속",on_click=save_and_continue_g0).props("color=primary size=lg")
                     ui.button("Shopify 연결 다시 확인", on_click=begin).props("color=primary")
                 else:
                     ui.label("기존 해당 기능에서 항목을 준비한 뒤 실전 점검을 다시 실행하세요.").classes("ss-help")
@@ -1968,25 +2005,58 @@ class OperatorUI:
             ).classes("font-medium")
             with ui.expansion("Shopify 연결 설정 (토큰은 Windows 자격 증명에만 저장)", icon="lock"):
                 shop_domain = ui.input("Shopify shop domain (*.myshopify.com)", value=config.get("shop_domain", "") if config else "").classes("w-96")
+                shop_auth_mode=ui.select({DEV_DASHBOARD_CLIENT_CREDENTIALS:"Dev Dashboard 앱 (권장)",
+                                          LEGACY_ADMIN_TOKEN:"기존 Legacy 토큰"},
+                    value=(config or {}).get("auth_mode") or DEV_DASHBOARD_CLIENT_CREDENTIALS,
+                    label="Shopify 연결 방식").classes("w-96")
+                shop_client_id=ui.input("Dev Dashboard Client ID",value="").classes("w-96")
+                shop_client_secret=ui.input("Dev Dashboard Client Secret",value="").props("type=password autocomplete=new-password").classes("w-96")
+                ui.label("새 앱은 고정 Admin API token 대신 Client ID/Secret으로 만료되는 access token을 자동 발급·갱신합니다.").classes("ss-help")
                 shop_token = ui.input("Admin API access token (저장 후 화면에서 지워짐)").props("type=password autocomplete=new-password").classes("w-96")
+                def update_shopify_auth_fields():
+                    dev=shop_auth_mode.value==DEV_DASHBOARD_CLIENT_CREDENTIALS
+                    shop_client_id.set_visibility(dev); shop_client_secret.set_visibility(dev); shop_token.set_visibility(not dev)
+                shop_auth_mode.on_value_change(lambda _:update_shopify_auth_fields()); update_shopify_auth_fields()
                 ui.label("Scopes: read_products, write_products, read_publications; homepage theme read: read_themes. Shopify theme write needs write_themes plus Shopify exemption; this phase never performs theme writes.").classes("text-xs text-slate-600")
                 def save_shopify_config():
                     try:
-                        save_shopify_connection(self.current_store, shop_domain.value or "")
-                        if shop_token.value:
+                        mode=shop_auth_mode.value
+                        if mode==DEV_DASHBOARD_CLIENT_CREDENTIALS and bool(shop_client_id.value)!=bool(shop_client_secret.value):
+                            raise ValueError("Client ID와 Client Secret을 모두 입력하세요.")
+                        save_shopify_connection(self.current_store, shop_domain.value or "",auth_mode=mode)
+                        if mode==DEV_DASHBOARD_CLIENT_CREDENTIALS and shop_client_id.value and shop_client_secret.value:
+                            save_dev_credentials(self.current_store,shop_client_id.value,shop_client_secret.value)
+                            shop_client_id.value=""; shop_client_secret.value=""
+                        if mode==LEGACY_ADMIN_TOKEN and shop_token.value:
                             save_shopify_token(self.current_store, shop_token.value)
                             shop_token.value = ""
                         connection_label.set_text(f"Shopify: {shop_domain.value} · CONFIGURED · API 2026-07")
+                        refresh_auth_health()
                         ui.notify("연결 설정을 저장했습니다. token은 OS credential store 외부에 저장되지 않습니다.", type="positive")
                     except Exception as exc: ui.notify(_safe_error(exc), type="negative")
                 ui.button("연결 설정/토큰 저장", on_click=save_shopify_config, icon="save")
             connection_detail = ui.label("권한 및 publication 미확인").classes("text-xs text-slate-600")
+            auth_health=ui.label("").classes("ss-help")
+            def remove_auth_credentials():
+                from ..shopify_collections import delete_shopify_token
+                if shop_auth_mode.value==DEV_DASHBOARD_CLIENT_CREDENTIALS: delete_dev_credentials(self.current_store)
+                else: delete_shopify_token(self.current_store)
+                refresh_auth_health(); ui.notify("선택한 인증정보를 Windows Credential Manager에서 삭제했습니다.",type="warning")
+            ui.button("저장된 인증정보 삭제",on_click=remove_auth_credentials).props("outline color=negative")
+            def refresh_auth_health():
+                status=ShopifyAuthService().status(self.current_store)
+                auth_health.set_text(f"인증 상태: {status['auth_mode']} · 자격 증명 {'YES' if status['credential_present'] else 'NO'} · token {status['token_state']} · 만료까지 약 {status.get('expires_in_minutes') if status.get('expires_in_minutes') is not None else '확인 전'}분 · 최근 확인 {status.get('last_verified_at') or '없음'}")
+            refresh_auth_health()
             def verify_shopify():
                 try:
                     result = ShopifyCollectionPublisher().verify(self.current_store)
                     connection_label.set_text("Shopify: CONNECTED" if not result["missing_scopes"] else "Shopify: MISSING SCOPES")
                     pubs = ", ".join(f"{p.get('name')} [{p.get('id')}]" for p in result["online_store_publications"])
-                    connection_detail.set_text(f"Missing required: {', '.join(result['missing_scopes']) or 'none'} · Optional: {', '.join(result['missing_optional_scopes']) or 'none'} · Online Store: {pubs or 'not found'}")
+                    granted=set(result["scopes"])
+                    future={"read_themes","write_themes","read_online_store_navigation","write_online_store_navigation","read_legal_policies"}
+                    missing_future=sorted(future-granted)
+                    connection_detail.set_text(f"Granted: {', '.join(sorted(granted)) or 'none'} · Missing required: {', '.join(result['missing_scopes']) or 'none'} · Missing optional/future-write: {', '.join(sorted(set(result['missing_optional_scopes'])|set(missing_future))) or 'none'} · Online Store: {pubs or 'not found'}")
+                    refresh_auth_health()
                     ui.notify("Shopify 연결/권한을 확인했습니다.", type="positive" if not result["missing_scopes"] else "warning")
                 except Exception as exc:
                     connection_detail.set_text(f"확인 실패: {_safe_error(exc)}")
