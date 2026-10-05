@@ -49,12 +49,13 @@ def test_g0_missing_credentials_is_distinct_and_secret_is_not_exposed(tmp_path, 
     assert "token" not in str(result).lower()
 
 
-def test_source_safety_preview_is_free_and_waits_for_provider_confirmation(tmp_path):
+def test_source_safety_preview_is_free_and_does_not_require_keepa(tmp_path):
     db = tmp_path / "source-preview.sqlite3"
     runner = ProductionEvidenceRunner(db=db, collectors=_ready_collectors())
     result = runner._source("001")
-    assert result["status"] == "VERIFIED"
-    assert result["preview_only"] is True
+    assert result["status"] == "WAITING_FOR_INPUT"
+    assert result["provider"] == "FREE_LOCAL_SOURCE_CHECK"
+    assert result["keepa_optional"] is True
     assert result["target_count"] == 0
 
 

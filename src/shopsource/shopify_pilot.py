@@ -6,12 +6,12 @@ import secrets
 
 from .db import connect
 from .shopify_collections import SHOPIFY_API_VERSION, get_connection, get_shopify_token
-from .shopify_products import DirectShopifyProductPublisher, ELIGIBLE_STATUSES, _now
+from .shopify_products import DirectShopifyProductPublisher, _now
 
 
 class ShopifyLivePilot:
     DEFAULT_LIMIT = 10
-    MAX_LIMIT = 20
+    MAX_LIMIT = 10
 
     def __init__(self, *, db=None, publisher=None, client_factory=None):
         self.db = db
@@ -66,7 +66,16 @@ class ShopifyLivePilot:
     def _select(self, store_id, limit):
         rows = []
         for row in self.publisher._catalog_rows(store_id):
-            if str(row.get("final_status") or "").upper() not in ELIGIBLE_STATUSES or row.get("archived"):
+            # Production source checks and the first DRAFT pilot must use the
+            # same set. Reserve/review rows require explicit promotion/review.
+            if str(row.get("final_status") or "").upper() != "PRIMARY" or row.get("archived"):
+                continue
+            try:
+                valid_selling_price = row.get("selling_price") is not None and float(row["selling_price"]) > 0
+            except (TypeError, ValueError):
+                valid_selling_price = False
+            if (not str(row.get("asin") or "").strip() or not str(row.get("title") or "").strip()
+                    or not valid_selling_price or int(row.get("source_variant_count") or 0) > 1):
                 continue
             rows.append(row)
         # Stable tie-break by MASTER ID; completeness and a valid store price win.
@@ -75,7 +84,7 @@ class ShopifyLivePilot:
     def preview(self, store_id, *, limit=DEFAULT_LIMIT, media_mode="MANUAL_MEDIA", source_media_rights_confirmed=False):
         limit = int(limit)
         if not 1 <= limit <= self.MAX_LIMIT:
-            raise ValueError("Pilot 상품 수는 1~20개로 제한됩니다.")
+            raise ValueError("Pilot 상품 수는 1~10개로 제한됩니다.")
         preflight = self.connection_preflight(store_id)
         if not preflight["product_ready"]:
             raise RuntimeError("Shopify 상품 연결/권한이 준비되지 않았습니다: " + ", ".join(preflight["missing_product_scopes"]))

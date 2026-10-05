@@ -376,6 +376,90 @@ class OperatorUI:
             action_content.clear()
             with action_content:
                 if key == "SOURCE_SAFETY":
+                    from ..source_safety import FreeSourceSafetyService
+                    free = FreeSourceSafetyService()
+                    audit = free.evidence_audit(str(run["store_id"]))
+                    draft = runner.free_source_safety_preflight(run["run_id"], "DRAFT_PILOT")
+                    ui.label("무료 Spark + 로컬 브라우저 안전검사").classes("ss-card-title")
+                    ui.label("Keepa는 기본 경로가 아닙니다. Spark 캡처를 먼저 확인하며 재고 증거가 없거나 오래된 상품은 브라우저에서 새로 확인해야 합니다.").classes("ss-help")
+                    ui.label(f"MASTER 전체 {audit['master_total']} · 업로드 후보(PRIMARY) {draft['eligible_upload_candidates']} · 현재 10개 DRAFT 후보 검사 대상 {draft['target_count']}")
+                    ui.label(f"Spark evidence: URL {audit['source_url']} · ASIN {audit['asin']} · 가격 {audit['price']} · 수집시각 {audit['_collectedAt']} · quantity 필드 {audit['quantity']} · 명시적 재고 {audit['explicit_availability']} · 최근 occurrence {audit['latest_occurrence_timestamp'] or '없음'}")
+                    ui.label("quantity는 재고로 간주하지 않습니다. 기존 Spark 수집 사실만으로 IN_STOCK 처리하지 않습니다.").classes("ss-help")
+                    ui.label(f"무료 모드 · 예상 token 0 · 예상 비용 FREE_LOCAL · 최신 확인 {draft['freshness'].get('FRESH', 0)} · 오래됨 {draft['freshness'].get('STALE_WARNING', 0) + draft['freshness'].get('STALE_BLOCKED', 0)} · 미확인 {draft['freshness'].get('NEVER_VERIFIED', 0)}")
+
+                    async def prepare_free(kind):
+                        try:
+                            result = await asyncio.to_thread(runner.prepare_free_browser_capture_batch,
+                                run["run_id"], kind, confirmed=True)
+                            render(runner.service.get(run["run_id"]))
+                            open_gate_action()
+                            ui.notify(f"브라우저 캡처 대기열을 준비했습니다 ({result['queued']}개). Amazon 페이지는 사용자가 기존 Browser Capture로 직접 열어 확인해야 합니다.", type="warning")
+                        except Exception as exc:
+                            ui.notify(f"무료 Source 검사 준비 실패 ({type(exc).__name__}).", type="negative")
+
+                    ui.button("10개 DRAFT 후보 무료 검사", on_click=lambda: prepare_free("DRAFT_PILOT")).props("color=primary" + (" disable" if draft["target_count"] == 0 else ""))
+                    if draft["target_count"] == 0:
+                        ui.label("현재 명시된 Shopify 판매가와 상품 필수정보를 갖춘 PRIMARY 후보가 없습니다. 가격/상품 입력 후 검사 버튼이 활성화됩니다.").classes("ss-help")
+                    candidate_rows = free.primary_candidates(str(run["store_id"]))
+                    candidate_options = {int(row["master_product_id"]): f"{row.get('asin') or 'ASIN 없음'} · {row.get('title') or '제목 없음'}" for row in candidate_rows}
+                    validation_selection = ui.select(candidate_options, label="검증 batch에 넣을 업로드 상품 선택 (100~200개)", multiple=True).classes("w-full")
+                    async def run_validation_batch():
+                        ids = validation_selection.value or []
+                        if not 100 <= len(ids) <= 200:
+                            ui.notify("실제 다음 업로드에 넣을 PRIMARY 상품을 100~200개 선택하세요.", type="warning"); return
+                        try:
+                            result = await asyncio.to_thread(runner.prepare_free_browser_capture_batch,
+                                run["run_id"], "VALIDATION_BATCH", selected_product_ids=ids, confirmed=True)
+                            render(runner.service.get(run["run_id"])); open_gate_action()
+                        except Exception as exc:
+                            ui.notify(f"검증 batch 준비 실패 ({type(exc).__name__}).", type="negative")
+                    ui.button("선택한 100~200개 무료 검사", on_click=run_validation_batch).props("outline" + (" disable" if len(candidate_options) < 100 else ""))
+                    ui.button("나머지 승인 catalog 검사", on_click=lambda: prepare_free("REMAINING_CATALOG")).props("outline" + (" disable" if draft["eligible_upload_candidates"] == 0 else ""))
+                    async def apply_latest_capture():
+                        with connect() as con:
+                            latest = con.execute("SELECT batch_id FROM source_safety_release_batches WHERE store_id=? AND status='WAITING_FOR_INPUT' ORDER BY created_at DESC LIMIT 1", (str(run["store_id"]),)).fetchone()
+                        if not latest:
+                            ui.notify("반영할 대기 중 Source Safety batch가 없습니다.", type="info"); return
+                        try:
+                            result = await asyncio.to_thread(runner.apply_free_browser_capture_results,
+                                run["run_id"], latest["batch_id"], confirmed=True)
+                            if result.get("status") == "WAITING_FOR_INPUT":
+                                ui.notify(f"브라우저 확인이 아직 남았습니다: {result.get('captured', 0)} / {result.get('target_count', 0)}개. CAPTCHA/차단 페이지는 우회하지 말고 직접 확인하세요.", type="warning")
+                                return
+                            render(result["production_run"]); open_gate_action()
+                            ui.notify(f"캡처 결과 반영: {result.get('verified_items', 0)}개 fresh IN_STOCK · 나머지는 검토 필요", type="positive" if result.get("status") == "COMPLETE" else "warning")
+                        except Exception as exc:
+                            ui.notify(f"Browser Capture 결과 반영 실패 ({type(exc).__name__}).", type="negative")
+                    ui.button("Browser Capture 결과 반영", on_click=apply_latest_capture).props("outline")
+                    with ui.row().classes("gap-2"):
+                        ui.button("Pause", on_click=lambda: runner.free_source_batch_control(run["run_id"], "PAUSE")).props("outline")
+                        ui.button("Resume", on_click=lambda: runner.free_source_batch_control(run["run_id"], "RESUME")).props("outline")
+                        ui.button("Stop", on_click=lambda: runner.free_source_batch_control(run["run_id"], "STOP")).props("outline color=negative")
+                        ui.button("Retry failed", on_click=lambda: runner.free_source_batch_control(run["run_id"], "RETRY_FAILED")).props("outline")
+                    with ui.expansion("선택 유료 Provider · Keepa (무료 기본 검사에는 불필요)").classes("w-full"):
+                        ui.label("Keepa profile은 기존 호환을 위해 유지됩니다. Keepa 미설정은 정상이며 무료 G2 경로를 막지 않습니다. 사용자가 선택하지 않는 한 Keepa API 호출은 하지 않습니다.").classes("ss-help")
+                        keepa_key = ui.input("Keepa API key · 선택 유료 사용 시에만", password=True).props("autocomplete=new-password").classes("w-full")
+                        keepa_profile_id = ui.input("공유 Keepa profile ID", value="keepa-production-shared").classes("w-full")
+                        async def save_optional_keepa():
+                            if not keepa_key.value:
+                                ui.notify("선택한 유료 Keepa 경로에 사용할 때만 API key를 입력하세요.", type="warning"); return
+                            try:
+                                await asyncio.to_thread(runner.source_profiles.save_keepa_profile,
+                                    keepa_profile_id.value, "Optional paid Keepa Source Safety", keepa_key.value,
+                                    store_id=str(run["store_id"]))
+                                keepa_key.value = ""
+                                ui.notify("Keepa credential을 Windows Credential Manager에 저장했습니다. G2 기본 provider는 계속 무료입니다.", type="positive")
+                            except Exception as exc:
+                                ui.notify(f"선택 유료 profile 저장 실패 ({type(exc).__name__}).", type="negative")
+                        ui.button("선택 유료 Keepa profile 저장", on_click=save_optional_keepa).props("outline")
+                    if draft.get("target_product_ids"):
+                        with ui.expansion("DRAFT 후보 원본 링크와 현재 로컬 evidence"):
+                            inspected = free.inspect_local_batch(str(run["store_id"]), "DRAFT_PILOT")
+                            for item in inspected["items"]:
+                                ui.label(f"{item['asin']} · source 재고 {item['availability']} · 가격 {item['source_price'] or '확인 필요'} · freshness {item['freshness']}")
+                                if item.get("source_url"):
+                                    ui.link("원본 상품을 브라우저에서 직접 확인", item["source_url"], new_tab=True)
+                if key == "SOURCE_SAFETY_LEGACY":
                     profiles = runner.source_profiles
                     preflight = runner.source_provider_preflight(run["run_id"])
                     ui.label("G2 Source Safety | Provider 사전점검").classes("ss-card-title")

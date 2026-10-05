@@ -82,6 +82,16 @@ CREATE TABLE IF NOT EXISTS source_check_runs (
 CREATE TABLE IF NOT EXISTS source_check_items (
  run_id TEXT NOT NULL, product_id INTEGER NOT NULL, priority INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING',
  attempts INTEGER NOT NULL DEFAULT 0, error TEXT, PRIMARY KEY(run_id,product_id));
+CREATE TABLE IF NOT EXISTS source_safety_release_batches (
+ batch_id TEXT PRIMARY KEY, store_id TEXT NOT NULL, batch_kind TEXT NOT NULL,
+ status TEXT NOT NULL, target_count INTEGER NOT NULL, checked_count INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}');
+CREATE INDEX IF NOT EXISTS idx_source_safety_release_store ON source_safety_release_batches(store_id,batch_kind,created_at DESC);
+CREATE TABLE IF NOT EXISTS source_safety_release_items (
+ batch_id TEXT NOT NULL, product_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING',
+ availability TEXT NOT NULL DEFAULT 'UNKNOWN', price_status TEXT NOT NULL DEFAULT 'MISSING_PRICE',
+ observed_at TEXT, source_price REAL, reason TEXT, PRIMARY KEY(batch_id,product_id));
+CREATE INDEX IF NOT EXISTS idx_source_safety_release_items_batch_status ON source_safety_release_items(batch_id,status);
 CREATE TABLE IF NOT EXISTS shopify_inventory_snapshots (
  id INTEGER PRIMARY KEY AUTOINCREMENT, store_id TEXT NOT NULL, product_id INTEGER NOT NULL,
  shopify_product_id TEXT, shopify_variant_id TEXT, inventory_item_id TEXT, product_status TEXT,
@@ -94,6 +104,9 @@ CREATE TABLE IF NOT EXISTS shopify_inventory_snapshots (
 def ensure_source_safety_schema(db=None):
     with connect(db) as con:
         con.executescript(SCHEMA)
+        columns = {row["name"] for row in con.execute("PRAGMA table_info(source_safety_release_items)")}
+        if "source_price" not in columns:
+            con.execute("ALTER TABLE source_safety_release_items ADD COLUMN source_price REAL")
 
 
 def browser_source_observation(*, jsonld_availability=None, visible_text=None, search_hint=False):
@@ -119,6 +132,60 @@ def browser_source_observation(*, jsonld_availability=None, visible_text=None, s
                     "evidence": {"normalized": text}, "qualifies_for_sellability": False if search_hint else True}
     return {"availability": "UNKNOWN", "availability_confidence": "UNKNOWN",
             "evidence_kind": "NO_AVAILABILITY_EVIDENCE", "evidence": {}, "qualifies_for_sellability": False}
+
+
+def free_capture_observation(raw, *, observed_at=None, visible_text=None):
+    """Normalize only explicit local/Spark or browser-capture evidence.
+
+    In particular, a generic ``quantity`` field is deliberately not treated as
+    source stock: imports often use it for order/list metadata rather than live
+    availability. Missing fields stay UNKNOWN and missing price is surfaced.
+    """
+    raw = raw if isinstance(raw, dict) else {}
+    captured_state = str(raw.get("sourceAvailability") or "").upper()
+    browser_evidence = raw.get("availabilityEvidence") if isinstance(raw.get("availabilityEvidence"), dict) else {}
+    browser_kind = str(browser_evidence.get("kind") or "").upper()
+    explicit_browser_state = captured_state in AVAILABILITY - {"SOURCE_ERROR", "UNKNOWN"} and browser_kind in {
+        "JSON_LD_OFFER_AVAILABILITY", "VISIBLE_AVAILABILITY_TEXT"}
+    jsonld = raw.get("availability") or raw.get("availability_status") or raw.get("stock_status")
+    if not jsonld and isinstance(raw.get("offers"), dict):
+        jsonld = raw["offers"].get("availability")
+    if jsonld is None and isinstance(raw.get("in_stock"), bool):
+        jsonld = "InStock" if raw["in_stock"] else "OutOfStock"
+    visible_text = visible_text or raw.get("visible_availability_text") or raw.get("visible_text")
+    compact_text = " ".join(str(visible_text or "").casefold().split())[:500]
+    if any(term in compact_text for term in ("captcha", "robot check", "sign in to continue", "automated access")):
+        base = {"availability":"SOURCE_ERROR", "availability_confidence":"UNKNOWN",
+                "evidence_kind":"HUMAN_ACTION_REQUIRED", "evidence":{"challenge_detected":True},
+                "qualifies_for_sellability":False}
+    elif explicit_browser_state:
+        base = {"availability":captured_state,
+                "availability_confidence":str(raw.get("availabilityConfidence") or "UNKNOWN").upper(),
+                "evidence_kind":browser_kind,
+                "evidence":{"value":browser_evidence.get("value"),
+                            "normalized":browser_evidence.get("normalized")},
+                "qualifies_for_sellability":True}
+    else:
+        base = browser_source_observation(jsonld_availability=jsonld, visible_text=visible_text)
+    price = None
+    for key in ("source_price", "current_price", "price", "offer_price"):
+        value = raw.get(key)
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed) and parsed > 0:
+            price = parsed
+            break
+    safe_evidence = {"availability_field": "explicit" if base["availability"] != "UNKNOWN" else "missing",
+                     "price_field": "explicit" if price is not None else "missing"}
+    base.update({"source_price": price, "source_currency": raw.get("currency") or "USD",
+                 "source_platform":"AMAZON", "source_kind":"BROWSER_CAPTURE",
+                 "source_url":raw.get("_sourceUrl") or raw.get("url"),
+                 "observed_at": observed_at or raw.get("_collectedAt"), "evidence": {**safe_evidence, **base.get("evidence", {})},
+                 "price_status": "OBSERVED" if price is not None else "MISSING_PRICE",
+                 "evidence_kind": base["evidence_kind"] if base["availability"] != "UNKNOWN" else "SPARK_CAPTURE_NO_AVAILABILITY"})
+    return base
 
 
 def keepa_source_observation(raw: dict | None, *, provider_error=None):
@@ -450,27 +517,40 @@ class SourceMonitorService:
     def __init__(self, db=None, provider=None, reports_root="exports/source_safety_reports"):
         self.db=db; self.provider=provider; self.safety=SourceSafetyService(db); self.reports_root=Path(reports_root)
 
-    def preview_due_checks(self, store_id, *, limit=100, offset=0):
+    def preview_due_checks(self, store_id, *, limit=100, offset=0, product_ids=None):
         with connect(self.db) as con:
+            id_filter = ""
+            id_params = []
+            if product_ids is not None:
+                product_ids = list(dict.fromkeys(int(value) for value in product_ids))
+                if not product_ids:
+                    return {"store_id":store_id,"items":[],"preview_only":True,"batch_size":100,
+                            "estimated_batches":0,"estimated_tokens":0,"offset":offset,
+                            "estimated_cost_usd":None,"cost_estimate_available":False}
+                id_filter = " AND p.id IN (" + ",".join("?" for _ in product_ids) + ")"
+                id_params = product_ids
+            due_clause = "1=1" if product_ids is not None else "(sm.next_check_at IS NULL OR sm.next_check_at<=?)"
             mapped = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='shopify_product_mappings'").fetchone()
             if mapped:
                 rows=con.execute("""SELECT p.id product_id,p.asin,
                     CASE WHEN m.shopify_product_id IS NOT NULL THEN 1 WHEN sm.latest_availability='OUT_OF_STOCK' THEN 3 ELSE 4 END priority,
                     sm.freshness_status FROM products p LEFT JOIN source_monitoring_state sm ON sm.product_id=p.id
                     LEFT JOIN shopify_product_mappings m ON m.store_id=? AND m.master_product_id=p.id
-                    WHERE sm.next_check_at IS NULL OR sm.next_check_at<=? ORDER BY priority,p.id LIMIT ? OFFSET ?""",(store_id,_now(),limit,offset)).fetchall()
+                    WHERE """ + due_clause + id_filter + " ORDER BY priority,p.id LIMIT ? OFFSET ?",
+                    ([store_id,*id_params,limit,offset] if product_ids is not None else [store_id,_now(),*id_params,limit,offset])).fetchall()
             else:
                 rows=con.execute("""SELECT p.id product_id,p.asin,
                     CASE WHEN sm.latest_availability='OUT_OF_STOCK' THEN 3 ELSE 4 END priority,sm.freshness_status
                     FROM products p LEFT JOIN source_monitoring_state sm ON sm.product_id=p.id
-                    WHERE sm.next_check_at IS NULL OR sm.next_check_at<=? ORDER BY priority,p.id LIMIT ? OFFSET ?""",(_now(),limit,offset)).fetchall()
+                    WHERE """ + due_clause + id_filter + " ORDER BY priority,p.id LIMIT ? OFFSET ?",
+                    ([*id_params,limit,offset] if product_ids is not None else [_now(),*id_params,limit,offset])).fetchall()
         return {"store_id":store_id,"items":[dict(r) for r in rows],"preview_only":True,"batch_size":100,
                 "estimated_batches":math.ceil(len(rows)/100),"estimated_tokens":len(rows),"offset":offset,
                 "estimated_cost_usd":None,"cost_estimate_available":False,
                 "cost_estimate_note":"Provider-specific cost is unavailable until a provider adapter supplies a quote."}
 
-    def run_due_checks(self, store_id, *, observations=None, max_retries=3, limit=100, offset=0):
-        preview=self.preview_due_checks(store_id,limit=limit,offset=offset); run_id="SOURCE_"+secrets.token_hex(8); now=_now()
+    def run_due_checks(self, store_id, *, observations=None, max_retries=3, limit=100, offset=0, product_ids=None):
+        preview=self.preview_due_checks(store_id,limit=limit,offset=offset,product_ids=product_ids); run_id="SOURCE_"+secrets.token_hex(8); now=_now()
         with connect(self.db) as con:
             con.execute("INSERT INTO source_check_runs(run_id,store_id,mode,provider,requested_count,token_estimate,status,checkpoint_json,started_at) VALUES(?,?,?,?,?,?,?,'{}',?)",
                         (run_id,store_id,"MANUAL_AUDIT","INJECTED" if observations is not None else "CONFIGURED",len(preview["items"]),preview["estimated_tokens"],"RUNNING",now))
@@ -492,7 +572,10 @@ class SourceMonitorService:
                 obs=observations.get(item["product_id"])
                 if isinstance(obs, Exception): raise obs
                 if not obs: raise RuntimeError("missing observation")
-                self.safety.record_snapshot(item["product_id"],item["asin"],obs,check_run_id=run_id)
+                self.safety.record_snapshot(item["product_id"],item["asin"],obs,
+                    source_platform=obs.get("source_platform", "AMAZON"),
+                    source_kind=obs.get("source_kind", "MANUAL"),
+                    check_run_id=run_id,source_url=obs.get("source_url"))
                 availability=str(obs.get("availability") or "UNKNOWN").upper()
                 interval_hours=(freshness_settings["out_of_stock_recheck_hours"] if availability=="OUT_OF_STOCK" else
                                 freshness_settings["reserve_recheck_hours"] if availability in {"LIMITED","PREORDER","BACKORDER"} else
@@ -547,3 +630,147 @@ class SourceMonitorService:
         for name,value in payloads.items(): (root/name).write_text(json.dumps(redact_value(value),ensure_ascii=False,indent=2),encoding="utf-8")
         (root/"summary.md").write_text(f"# Source Safety\n\n- checked: {run['checked_count']}\n- failed: {run['failed_count']}\n- live mutations: 0\n",encoding="utf-8")
         return {"report_dir":str(root),"files":[*payloads,"summary.md"]}
+
+
+class FreeSourceSafetyService:
+    """Local-first release-batch selection and captured-evidence audit.
+
+    This service never opens Amazon, calls a provider, or treats imported
+    presence/quantity as availability. Browser observations are supplied only
+    after an operator/browser capture has explicitly produced them.
+    """
+    BATCH_LIMITS = {"DRAFT_PILOT": (1, 10), "VALIDATION_BATCH": (100, 200), "REMAINING_CATALOG": (1, 200)}
+    EXPLICIT_AVAILABILITY_KEYS = {"availability", "availability_status", "stock_status", "in_stock"}
+
+    def __init__(self, db=None):
+        self.db = db
+        ensure_source_safety_schema(db)
+
+    @staticmethod
+    def _decode(raw):
+        try:
+            value = json.loads(raw or "{}")
+            return value if isinstance(value, dict) else {}
+        except (TypeError, ValueError):
+            return {}
+
+    def evidence_audit(self, store_id):
+        """Count only observed local fields; this is a read-only diagnostic."""
+        with connect(self.db) as con:
+            rows = con.execute("""SELECT p.id,p.asin,p.price,p.source_url,p.source_kind,p.raw_json,
+                o.raw_json occurrence_json,o.source_url occurrence_url,o.collected_at
+                FROM products p JOIN store_product_decisions d ON d.product_id=p.id AND d.store_id=?
+                LEFT JOIN product_occurrences o ON o.id=(SELECT o2.id FROM product_occurrences o2
+                    WHERE o2.product_id=p.id ORDER BY COALESCE(o2.collected_at,'') DESC,o2.id DESC LIMIT 1)
+                ORDER BY p.id""", (str(store_id),)).fetchall()
+            occurrence = con.execute("""SELECT COUNT(*) n,MAX(collected_at) latest
+                FROM product_occurrences o JOIN store_product_decisions d
+                ON d.product_id=o.product_id AND d.store_id=?""", (str(store_id),)).fetchone()
+            master_total = int(con.execute("SELECT COUNT(*) FROM products").fetchone()[0])
+        counts = {"master_total": master_total, "store_decision_total": len(rows), "source_url": 0, "asin": 0, "price": 0,
+                  "_collectedAt": 0, "quantity": 0, "explicit_availability": 0,
+                  "source_kind": 0, "latest_occurrence_rows": int(occurrence["n"] or 0),
+                  "products_with_occurrence_timestamp": 0, "missing_price": 0}
+        kinds = {}
+        for row in rows:
+            raw = {**self._decode(row["raw_json"]), **self._decode(row["occurrence_json"])}
+            counts["source_url"] += bool(row["occurrence_url"] or row["source_url"])
+            counts["asin"] += bool(str(row["asin"] or "").strip())
+            has_price = row["price"] is not None and float(row["price"] or 0) > 0
+            counts["price"] += bool(has_price); counts["missing_price"] += not has_price
+            counts["_collectedAt"] += bool(raw.get("_collectedAt"))
+            counts["products_with_occurrence_timestamp"] += bool(row["collected_at"])
+            counts["quantity"] += "quantity" in raw
+            counts["explicit_availability"] += any(key in raw for key in self.EXPLICIT_AVAILABILITY_KEYS)
+            kind = str(raw.get("source_kind") or row["source_kind"] or "UNKNOWN")
+            kinds[kind] = kinds.get(kind, 0) + 1
+            counts["source_kind"] += bool(kind)
+        return {**counts, "source_kind_breakdown": kinds,
+                "latest_occurrence_timestamp": occurrence["latest"],
+                "availability_from_presence_inferred": False,
+                "quantity_is_stock_evidence": False}
+
+    def primary_candidates(self, store_id):
+        """Same deterministic selector used by the DRAFT pilot, PRIMARY only."""
+        from .shopify_pilot import ShopifyLivePilot
+        return ShopifyLivePilot(db=self.db)._select(str(store_id), 100000)
+
+    def preview_batch(self, store_id, batch_kind, *, selected_product_ids=None):
+        kind = str(batch_kind).upper()
+        if kind not in self.BATCH_LIMITS:
+            raise ValueError("unsupported source safety batch kind")
+        master = self.evidence_audit(store_id)["master_total"]
+        candidates = self.primary_candidates(store_id)
+        if kind == "DRAFT_PILOT":
+            chosen = candidates[:10]
+        elif kind == "VALIDATION_BATCH":
+            chosen_ids = list(dict.fromkeys(int(value) for value in (selected_product_ids or [])))
+            if not 100 <= len(chosen_ids) <= 200:
+                raise ValueError("validation batch must explicitly select 100-200 products")
+            from .shopify_pilot import ShopifyLivePilot
+            catalog = {int(row["master_product_id"]): row for row in ShopifyLivePilot(db=self.db).publisher._catalog_rows(str(store_id))}
+            allowed = {product_id for product_id in chosen_ids if
+                       str((catalog.get(product_id) or {}).get("final_status") or "").upper() == "PRIMARY" or
+                       str((catalog.get(product_id) or {}).get("final_status") or "").upper() in
+                       {"RESERVE_A", "RESERVE_B", "RESERVE_C", "LOW_RESERVE", "HIGH_RESERVE"}}
+            if len(allowed) != len(chosen_ids):
+                raise ValueError("validation batch permits PRIMARY or explicitly selected RESERVE only; REVIEW/RESTRICTED are excluded")
+            by_id = catalog
+            chosen = [by_id[product_id] for product_id in chosen_ids]
+        else:
+            with connect(self.db) as con:
+                prior = con.execute("""SELECT DISTINCT i.product_id FROM source_safety_release_items i
+                    JOIN source_safety_release_batches b ON b.batch_id=i.batch_id
+                    WHERE b.store_id=? AND b.batch_kind IN ('DRAFT_PILOT','VALIDATION_BATCH','REMAINING_CATALOG')
+                    AND b.status IN ('WAITING_FOR_INPUT','RUNNING','PAUSED','VERIFIED')""", (str(store_id),)).fetchall()
+            excluded = {int(value) for value in (selected_product_ids or [])} | {int(row[0]) for row in prior}
+            chosen = [row for row in candidates if int(row["master_product_id"]) not in excluded][:200]
+        ids = [int(row["master_product_id"]) for row in chosen]
+        source_preview = SourceMonitorService(self.db).preview_due_checks(str(store_id), limit=max(1, len(ids)), product_ids=ids)
+        row_by_id = {int(row["product_id"]): row for row in source_preview["items"]}
+        freshness = {"FRESH": 0, "STALE_WARNING": 0, "STALE_BLOCKED": 0, "NEVER_VERIFIED": 0}
+        for product_id in ids:
+            status = row_by_id.get(product_id, {}).get("freshness_status") or "NEVER_VERIFIED"
+            freshness[status] = freshness.get(status, 0) + 1
+        return {"provider": "FREE_LOCAL_SOURCE_CHECK", "batch_kind": kind, "master_total": master,
+                "eligible_upload_candidates": len(candidates), "target_count": len(ids),
+                "target_product_ids": ids, "batch_size": 100 if kind == "REMAINING_CATALOG" else max(1, len(ids)),
+                "estimated_batches": (len(ids) + 99) // 100, "estimated_tokens": 0,
+                "estimated_cost": "FREE_LOCAL", "freshness": freshness,
+                "requires_live_capture_for_unknown": True,
+                "excluded_statuses": ["REVIEW", "RESTRICTED", "RESERVE*"], "preview_only": True}
+
+    def inspect_local_batch(self, store_id, batch_kind, *, selected_product_ids=None):
+        """Return captured evidence for a selected release batch without writes."""
+        preview = self.preview_batch(store_id, batch_kind, selected_product_ids=selected_product_ids)
+        ids = preview["target_product_ids"]
+        if not ids:
+            return {**preview, "items": [], "status": "WAITING_FOR_INPUT", "verified": False}
+        placeholders = ",".join("?" for _ in ids)
+        with connect(self.db) as con:
+            rows = con.execute(f"""SELECT p.id product_id,p.asin,p.price,p.currency,p.source_url,p.raw_json,
+                p.last_seen_at,o.raw_json occurrence_json,o.source_url occurrence_url,o.collected_at
+                FROM products p LEFT JOIN product_occurrences o ON o.id=(SELECT o2.id FROM product_occurrences o2
+                    WHERE o2.product_id=p.id ORDER BY COALESCE(o2.collected_at,'') DESC,o2.id DESC LIMIT 1)
+                WHERE p.id IN ({placeholders}) ORDER BY p.id""", ids).fetchall()
+        now = datetime.now(timezone.utc)
+        output = []
+        safe = True
+        for row in rows:
+            raw = {**self._decode(row["raw_json"]), **self._decode(row["occurrence_json"])}
+            collected = raw.get("_collectedAt") or row["collected_at"] or row["last_seen_at"]
+            obs = free_capture_observation(raw, observed_at=collected)
+            if obs["source_price"] is None and row["price"] is not None and float(row["price"]) > 0:
+                obs["source_price"] = float(row["price"])
+                obs["price_status"] = "SPARK_CAPTURE_PRICE"
+            age_status = SourceSafetyService(self.db).freshness(collected, store_id, pre_list=True, now=now)
+            if obs["availability"] != "IN_STOCK" or obs["source_price"] is None or age_status != "FRESH":
+                safe = False
+            output.append({"product_id": int(row["product_id"]), "asin": row["asin"],
+                "source_url": row["occurrence_url"] or row["source_url"],
+                "availability": obs["availability"], "source_price": obs["source_price"],
+                "price_status": obs["price_status"], "freshness": age_status,
+                "evidence_kind": obs["evidence_kind"], "manual_capture_required": obs["availability"] == "UNKNOWN" or age_status != "FRESH"})
+        return {**preview, "items": output, "status": "READY_FOR_OPERATOR_CAPTURE" if safe else "WAITING_FOR_INPUT",
+                "verified": False, "all_items_sellable": False,
+                "reason": "Local Spark import evidence is not a live stock check; unknown, missing price, or stale rows require a fresh browser observation."}

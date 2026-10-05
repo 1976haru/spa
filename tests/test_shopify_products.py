@@ -291,10 +291,10 @@ def test_pilot_default_10(product_setup):
     assert ShopifyLivePilot(db=db, publisher=publisher).preview("store-a")["requested"] == 10
 
 
-def test_pilot_max_20(product_setup):
+def test_pilot_max_10(product_setup):
     from shopsource.shopify_pilot import ShopifyLivePilot
     db, publisher, _ = product_setup
-    with pytest.raises(ValueError): ShopifyLivePilot(db=db, publisher=publisher).preview("store-a", limit=21)
+    with pytest.raises(ValueError): ShopifyLivePilot(db=db, publisher=publisher).preview("store-a", limit=11)
 
 
 def test_pilot_draft_forced(product_setup):
@@ -313,15 +313,15 @@ def test_pilot_deterministic_selection(product_setup):
 def test_pilot_restricted_excluded(product_setup):
     from shopsource.shopify_pilot import ShopifyLivePilot
     db, publisher, _ = product_setup
-    rows = ShopifyLivePilot(db=db, publisher=publisher).preview("store-a", limit=20)["items"]
+    rows = ShopifyLivePilot(db=db, publisher=publisher).preview("store-a", limit=10)["items"]
     assert all(row["title"] != "Risk Product" for row in rows)
 
 
 def test_pilot_missing_price_skipped(product_setup):
     from shopsource.shopify_pilot import ShopifyLivePilot
     db, publisher, _ = product_setup; add_pilot_products(db, 9, missing_price=True)
-    rows = ShopifyLivePilot(db=db, publisher=publisher).preview("store-a", limit=20)["items"]
-    assert any(row["selling_price"] is None and row["action"] == "SKIP" for row in rows)
+    rows = ShopifyLivePilot(db=db, publisher=publisher).preview("store-a", limit=10)["items"]
+    assert all(row["source_id"] != "PILOT000008" for row in rows)
 
 
 def test_pilot_price_preview(product_setup):

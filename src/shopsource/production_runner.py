@@ -79,6 +79,8 @@ class _KeepaObservationProvider:
                 normalized["evidence"] = {"provider": "Keepa", "domain_id": raw.get("domainId"),
                                           "product_type": product_type, "new_offer_count": new_count,
                                           "stat_price_type": "NEW", "offer_request_used": False}
+                normalized["source_platform"] = "AMAZON"
+                normalized["source_kind"] = "KEEPA"
                 result[item["product_id"]] = normalized
         return result
 
@@ -658,7 +660,67 @@ class ProductionEvidenceRunner:
                 "blockers": [] if rows else ["MASTER catalog is empty"], "fingerprint_input": counts}
 
     def _source(self, store_id):
-        from .source_safety import SourceMonitorService
+        from .source_safety import FreeSourceSafetyService, SourceMonitorService, SourceSafetyService
+        if self.source_provider is None:
+            free = FreeSourceSafetyService(self.db)
+            audit = free.evidence_audit(store_id)
+            preview = free.preview_batch(store_id, "DRAFT_PILOT")
+            latest_batch = None
+            with connect(self.db) as con:
+                latest_batch = con.execute("""SELECT * FROM source_safety_release_batches
+                    WHERE store_id=? ORDER BY created_at DESC LIMIT 1""", (str(store_id),)).fetchone()
+                freshness = {r["freshness_status"]: r["n"] for r in con.execute(
+                    "SELECT freshness_status,COUNT(*) n FROM source_monitoring_state GROUP BY freshness_status")}
+            if latest_batch and latest_batch["status"] == "VERIFIED":
+                batch = dict(latest_batch)
+                with connect(self.db) as con:
+                    batch_items = [dict(row) for row in con.execute("""SELECT i.*,s.last_checked_at,
+                        s.latest_availability,s.latest_source_price FROM source_safety_release_items i
+                        LEFT JOIN source_monitoring_state s ON s.product_id=i.product_id
+                        WHERE i.batch_id=? ORDER BY i.product_id""", (batch["batch_id"],))]
+                freshness_policy = SourceSafetyService(self.db).settings(store_id)["freshness"]
+                checked_at = datetime.now(timezone.utc)
+                fresh_items = 0
+                for item in batch_items:
+                    try:
+                        observed = datetime.fromisoformat(str(item.get("observed_at")).replace("Z", "+00:00"))
+                        age = checked_at - observed
+                        if age.total_seconds() < 0 or age.total_seconds() > float(freshness_policy["pre_list_max_age_minutes"]) * 60:
+                            age_state = "STALE_BLOCKED"
+                        elif age.total_seconds() > float(freshness_policy["stale_warning_hours"]) * 3600:
+                            age_state = "STALE_WARNING"
+                        else:
+                            age_state = "FRESH"
+                    except (TypeError, ValueError, OverflowError):
+                        age_state = "NEVER_VERIFIED"
+                    current = (item.get("last_checked_at") == item.get("observed_at") and
+                               item.get("latest_availability") == item.get("availability") and
+                               item.get("latest_source_price") == item.get("source_price"))
+                    item["freshness"] = age_state
+                    item["evidence_current"] = bool(current)
+                    fresh_items += int(age_state == "FRESH" and current and
+                        item.get("availability") == "IN_STOCK" and item.get("price_status") == "OBSERVED")
+                batch_ready = bool(batch_items) and fresh_items == int(batch["target_count"])
+                if batch_ready:
+                    return {"status": "VERIFIED", "verified": True, "provider": "FREE_LOCAL_SOURCE_CHECK",
+                        "batch_scoped": True, "batch_kind": batch["batch_kind"], "target_count": batch["target_count"],
+                        "counts": {"checked": batch["checked_count"]}, "spark_evidence_audit": audit,
+                        "master_total": preview["master_total"], "eligible_upload_candidates": preview["eligible_upload_candidates"],
+                        "fingerprint_input": {"batch_id": batch["batch_id"], "updated_at": batch["updated_at"],
+                                               "evidence": batch["evidence_json"], "items": batch_items}}
+                return {"status":"WAITING_FOR_INPUT","verified":False,"provider":"FREE_LOCAL_SOURCE_CHECK",
+                    "batch_scoped":True,"batch_kind":batch["batch_kind"],"target_count":batch["target_count"],
+                    "fresh_verified_count":fresh_items,"missing_inputs":["Source evidence expired or changed after verification. Recheck this release batch."],
+                    "fingerprint_input":{"batch_id":batch["batch_id"],"items":batch_items}}
+            local = free.inspect_local_batch(store_id, "DRAFT_PILOT")
+            return {"status": "WAITING_FOR_INPUT", "verified": False, "provider": "FREE_LOCAL_SOURCE_CHECK",
+                    "provider_mode": "FREE_SPARK_PLUS_LOCAL_BROWSER", "keepa_optional": True,
+                    "master_total": preview["master_total"], "eligible_upload_candidates": preview["eligible_upload_candidates"],
+                    "current_source_safety_target": preview["target_count"], "target_count": preview["target_count"],
+                    "draft_pilot_preview": local, "spark_evidence_audit": audit, "freshness": freshness,
+                    "missing_inputs": ["Fresh browser source observations are required; imported Spark presence is not stock evidence."],
+                    "provider_errors_are_not_oos": True,
+                    "fingerprint_input": {"audit": audit, "target_ids": preview["target_product_ids"], "freshness": freshness}}
         preview = self.source_preview(store_id) if self.source_preview else SourceMonitorService(self.db).preview_due_checks(store_id, limit=50000)
         with connect(self.db) as con:
             freshness = {r["freshness_status"]: r["n"] for r in con.execute("SELECT freshness_status,COUNT(*) n FROM source_monitoring_state GROUP BY freshness_status")}
@@ -690,6 +752,205 @@ class ProductionEvidenceRunner:
                 "provider_errors_are_not_oos": True, "preview_only": True,
                 "fingerprint_input": {"freshness": freshness, "source_errors": source_errors,
                                       "latest_source_check_run": dict(latest_run) if latest_run else None}}
+
+    def free_source_safety_preflight(self, run_id, batch_kind="DRAFT_PILOT", *, selected_product_ids=None):
+        from .source_safety import FreeSourceSafetyService
+        run = self.service.get(run_id)
+        return FreeSourceSafetyService(self.db).preview_batch(
+            str(run["store_id"]), batch_kind, selected_product_ids=selected_product_ids)
+
+    def run_free_source_safety_check(self, run_id, batch_kind="DRAFT_PILOT", *,
+                                     selected_product_ids=None, observations=None, confirmed=False, batch_id=None):
+        """Persist an explicitly approved free capture batch; never calls a provider.
+
+        Without browser observations this is only a local evidence review/queue
+        preparation and cannot pass G2. An external observation must be supplied
+        by the existing user-operated Browser Capture path.
+        """
+        if not confirmed:
+            raise PermissionError("Explicit confirmation is required to run a release-batch source check")
+        from .source_safety import FreeSourceSafetyService, SourceMonitorService, SourceSafetyService, free_capture_observation
+        run = self.service.get(run_id); store_id = str(run["store_id"])
+        safety = FreeSourceSafetyService(self.db)
+        preview = safety.preview_batch(store_id, batch_kind, selected_product_ids=selected_product_ids)
+        if not preview["target_product_ids"]:
+            raise ValueError("No PRIMARY upload candidates are available for this source check")
+        batch_id = batch_id or "FREE_SOURCE_" + hashlib.sha256(
+            f"{run_id}:{batch_kind}:{datetime.now(timezone.utc).isoformat()}".encode()).hexdigest()[:16]
+        now = datetime.now(timezone.utc).isoformat()
+        if observations is None:
+            inspected = safety.inspect_local_batch(store_id, batch_kind, selected_product_ids=selected_product_ids)
+            with connect(self.db) as con:
+                con.execute("INSERT INTO source_safety_release_batches(batch_id,store_id,batch_kind,status,target_count,checked_count,created_at,updated_at,evidence_json) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(batch_id) DO UPDATE SET status=excluded.status,updated_at=excluded.updated_at,evidence_json=excluded.evidence_json",
+                    (batch_id,store_id,batch_kind,"WAITING_FOR_INPUT",len(preview["target_product_ids"]),0,now,now,_json({"provider":"FREE_LOCAL_SOURCE_CHECK","manual_capture_required":True})))
+                con.executemany("INSERT INTO source_safety_release_items(batch_id,product_id,status,availability,price_status,observed_at,reason) VALUES(?,?,?, ?,?,?,?) ON CONFLICT(batch_id,product_id) DO UPDATE SET status=excluded.status,availability=excluded.availability,price_status=excluded.price_status,observed_at=excluded.observed_at,reason=excluded.reason",
+                    [(batch_id,item["product_id"],"WAITING_FOR_INPUT",item["availability"],item["price_status"],None,
+                      "Fresh user-operated browser capture required" if item["manual_capture_required"] else "Local evidence is preview only") for item in inspected["items"]])
+            self.service.update(run_id, {"SOURCE_SAFETY": {"status":"WAITING_FOR_INPUT","verified":False,
+                "provider":"FREE_LOCAL_SOURCE_CHECK","batch_id":batch_id,"batch_kind":batch_kind,
+                "counts":{"target":len(inspected["items"]),"checked":0},"manual_capture_required":True,
+                "fingerprint_input":{"batch_id":batch_id,"target_ids":preview["target_product_ids"]}}})
+            return {"status":"WAITING_FOR_INPUT","batch_id":batch_id,"preview":inspected,
+                    "production_run":self.run(store_id,run_id=run_id)}
+        normalized = {}
+        for product_id in preview["target_product_ids"]:
+            value = (observations or {}).get(product_id)
+            if not isinstance(value, dict):
+                normalized[product_id] = {"availability":"SOURCE_ERROR","availability_confidence":"UNKNOWN",
+                    "evidence_kind":"MISSING_BROWSER_CAPTURE","evidence":{"reason":"capture missing"}}
+                continue
+            if "sourceAvailability" in value or "availabilityEvidence" in value:
+                value = free_capture_observation(value, observed_at=value.get("_collectedAt"))
+            evidence_text = json.dumps(value.get("evidence") or {}, ensure_ascii=False).casefold()
+            if any(term in evidence_text for term in ("captcha", "robot check", "sign in to continue", "automated access")):
+                normalized[product_id] = {"availability":"SOURCE_ERROR","availability_confidence":"UNKNOWN",
+                    "evidence_kind":"HUMAN_ACTION_REQUIRED","evidence":{"challenge_detected":True}}
+            else:
+                explicit = (value.get("qualifies_for_sellability") is True and
+                    value.get("evidence_kind") in {"JSON_LD_OFFER_AVAILABILITY", "VISIBLE_AVAILABILITY_TEXT"})
+                normalized[product_id] = {**value,
+                    "availability": str(value.get("availability") or "UNKNOWN").upper() if explicit else "UNKNOWN",
+                    "availability_confidence": value.get("availability_confidence") or "UNKNOWN",
+                    "evidence_kind": value.get("evidence_kind") if explicit else "NO_EXPLICIT_AVAILABILITY_EVIDENCE",
+                    "observed_at":value.get("observed_at") or now}
+        status = SourceMonitorService(self.db).run_due_checks(store_id, observations=normalized,
+            limit=len(preview["target_product_ids"]), product_ids=preview["target_product_ids"])
+        monitor = SourceMonitorService(self.db)
+        monitor.safety.evaluate_many(store_id, preview["target_product_ids"])
+        rows = []
+        verified_count = 0
+        freshness_policy = monitor.safety.settings(store_id)["freshness"]
+        observed_now = datetime.now(timezone.utc)
+        for product_id, observation in normalized.items():
+            observed = datetime.fromisoformat(str(observation.get("observed_at") or now).replace("Z", "+00:00"))
+            age_seconds = (observed_now - observed).total_seconds()
+            freshness = "FRESH" if 0 <= age_seconds <= float(freshness_policy["pre_list_max_age_minutes"]) * 60 else "STALE_BLOCKED"
+            avail = str(observation.get("availability") or "UNKNOWN").upper()
+            price_ok = isinstance(observation.get("source_price"), (int,float)) and observation["source_price"] > 0
+            good = avail == "IN_STOCK" and price_ok and freshness == "FRESH"
+            verified_count += int(good)
+            reason = ("HUMAN_ACTION_REQUIRED: challenge or source capture error; do not bypass."
+                      if avail == "SOURCE_ERROR" else
+                      None if good else "Availability, current price, or freshness needs review")
+            rows.append((batch_id,product_id,"VERIFIED" if good else "REVIEW_REQUIRED",avail,
+                         "OBSERVED" if price_ok else "MISSING_PRICE",observation.get("observed_at") or now,
+                         observation.get("source_price") if price_ok else None,
+                         reason))
+        complete = verified_count == len(preview["target_product_ids"]) and status.get("failed_count",0) == 0
+        with connect(self.db) as con:
+            con.execute("INSERT INTO source_safety_release_batches(batch_id,store_id,batch_kind,status,target_count,checked_count,created_at,updated_at,evidence_json) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(batch_id) DO UPDATE SET status=excluded.status,checked_count=excluded.checked_count,updated_at=excluded.updated_at,evidence_json=excluded.evidence_json",
+                (batch_id,store_id,batch_kind,"VERIFIED" if complete else "REVIEW_REQUIRED",len(rows),len(rows),now,now,
+                 _json({"provider":"FREE_LOCAL_SOURCE_CHECK","verified_items":verified_count,"source_check_run_id":status["run_id"]})))
+            con.executemany("INSERT INTO source_safety_release_items(batch_id,product_id,status,availability,price_status,observed_at,source_price,reason) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(batch_id,product_id) DO UPDATE SET status=excluded.status,availability=excluded.availability,price_status=excluded.price_status,observed_at=excluded.observed_at,source_price=excluded.source_price,reason=excluded.reason",rows)
+        result = self.run(store_id,run_id=run_id)
+        return {"status":"COMPLETE" if complete else "REVIEW_REQUIRED","batch_id":batch_id,
+                "checked":len(rows),"verified_items":verified_count,"production_run":result}
+
+    def prepare_free_browser_capture_batch(self, run_id, batch_kind="DRAFT_PILOT", *,
+                                           selected_product_ids=None, confirmed=False):
+        """Queue explicit ASINs in the existing user-operated Browser Capture flow."""
+        if not confirmed:
+            raise PermissionError("Explicit confirmation is required to prepare the local browser queue")
+        from .capture.batch import BatchSourcingService
+        from .source_safety import FreeSourceSafetyService
+        run = self.service.get(run_id); store_id = str(run["store_id"])
+        free = FreeSourceSafetyService(self.db)
+        preview = free.preview_batch(store_id, batch_kind, selected_product_ids=selected_product_ids)
+        if not preview["target_product_ids"]:
+            raise ValueError("No eligible products are available for this browser source queue")
+        prepared = self.run_free_source_safety_check(run_id, batch_kind,
+            selected_product_ids=selected_product_ids, confirmed=True)
+        release_batch_id = prepared["batch_id"]
+        rows_by_id = {}
+        ids = preview["target_product_ids"]
+        marks = ",".join("?" for _ in ids)
+        with connect(self.db) as con:
+            rows_by_id = {int(row["id"]): dict(row) for row in con.execute(
+                f"SELECT id,asin,title,source_url FROM products WHERE id IN ({marks})", ids)}
+        from .db import utc_now
+        batch_service = BatchSourcingService(self.db)
+        browser_batch = batch_service.create(store_id, "FREE SOURCE SAFETY", len(ids),
+            auto_import_master=False, target_mode="PRIMARY")
+        capture_run_id = "BC_" + hashlib.sha256(f"{browser_batch['run_id']}:{release_batch_id}".encode()).hexdigest()[:20]
+        now = utc_now()
+        asins = []
+        with connect(self.db) as con:
+            con.execute("INSERT INTO browser_capture_runs(run_id,store_id,keyword,search_url,status,captured_at,candidates) VALUES(?,?,?,?,?,?,?)",
+                (capture_run_id,store_id,"FREE SOURCE SAFETY","","DETAIL_QUEUED",now,len(ids)))
+            for product_id in ids:
+                row = rows_by_id[product_id]
+                asin = str(row["asin"]).upper(); asins.append(asin)
+                search_payload = json.dumps({"asin":asin,"title":row["title"],"url":row["source_url"],"source_safety_only":True},ensure_ascii=False)
+                con.execute("INSERT INTO browser_capture_candidates(run_id,asin,search_payload_json,completeness_score,capture_status,created_at,updated_at) VALUES(?,?,?,0,'NEEDS_DETAIL',?,?)",
+                    (capture_run_id,asin,search_payload,now,now))
+            con.execute("UPDATE source_safety_release_batches SET evidence_json=? WHERE batch_id=?",
+                (_json({"provider":"FREE_LOCAL_SOURCE_CHECK","browser_batch_run_id":browser_batch["run_id"],
+                        "capture_run_id":capture_run_id,"master_ids":ids,"manual_browser_action_required":True}),release_batch_id))
+        queued = batch_service.queue_existing_candidates(browser_batch["run_id"], asins)
+        return {"status":"WAITING_FOR_INPUT","provider":"FREE_LOCAL_SOURCE_CHECK",
+            "release_batch_id":release_batch_id,"browser_batch_run_id":browser_batch["run_id"],
+            "capture_run_id":capture_run_id,"queued":queued.get("queued",0),
+            "target_count":len(ids),"auto_import_master":False,
+            "note":"Open the queued Amazon pages with the existing Browser Capture extension. No bypass or automatic Amazon execution was performed."}
+
+    def apply_free_browser_capture_results(self, run_id, release_batch_id, *, confirmed=False):
+        if not confirmed:
+            raise PermissionError("Explicit confirmation is required to apply captured observations")
+        from .source_safety import FreeSourceSafetyService
+        run = self.service.get(run_id); store_id = str(run["store_id"])
+        with connect(self.db) as con:
+            batch = con.execute("SELECT * FROM source_safety_release_batches WHERE batch_id=? AND store_id=?",
+                                (release_batch_id,store_id)).fetchone()
+            if not batch:
+                raise KeyError(release_batch_id)
+            checkpoint = json.loads(batch["evidence_json"] or "{}")
+            targets = con.execute("SELECT i.product_id,p.asin FROM source_safety_release_items i JOIN products p ON p.id=i.product_id WHERE i.batch_id=? ORDER BY i.product_id",
+                                  (release_batch_id,)).fetchall()
+            capture_run_id = checkpoint.get("capture_run_id")
+            captured = con.execute("""SELECT c.asin,c.detail_payload_json FROM browser_capture_candidates c
+                JOIN browser_capture_runs r ON r.run_id=c.run_id WHERE r.store_id=? AND c.run_id=? AND c.capture_status='DETAIL_COMPLETE'""",
+                (store_id,capture_run_id)).fetchall() if capture_run_id else []
+        by_asin = {str(row["asin"]).upper(): FreeSourceSafetyService._decode(row["detail_payload_json"]) for row in captured}
+        expected = int(batch["target_count"])
+        if len(by_asin) < expected:
+            return {"status":"WAITING_FOR_INPUT","batch_id":release_batch_id,
+                "captured":len(by_asin),"target_count":expected,
+                "missing_capture_count":expected-len(by_asin),
+                "human_action_required":True,
+                "note":"Wait for each queued Browser Capture detail result. CAPTCHA/challenge items require manual handling; no result is inferred."}
+        observations = {}
+        for target in targets:
+            payload = by_asin.get(str(target["asin"]).upper())
+            if payload:
+                observations[int(target["product_id"])] = payload
+        return self.run_free_source_safety_check(run_id, batch["batch_kind"],
+            selected_product_ids=[int(row["product_id"]) for row in targets],
+            observations=observations, confirmed=True, batch_id=release_batch_id)
+
+    def free_source_batch_control(self, run_id, action):
+        action = str(action).upper()
+        transitions = {"PAUSE":("PAUSED", {"WAITING_FOR_INPUT", "RUNNING"}),
+                       "RESUME":("WAITING_FOR_INPUT", {"PAUSED"}),
+                       "STOP":("STOPPED", {"WAITING_FOR_INPUT", "PAUSED", "RUNNING"}),
+                       "RETRY_FAILED":("WAITING_FOR_INPUT", {"REVIEW_REQUIRED", "FAILED"})}
+        if action not in transitions:
+            raise ValueError("unsupported free source batch control")
+        run = self.service.get(run_id)
+        with connect(self.db) as con:
+            batch = con.execute("SELECT * FROM source_safety_release_batches WHERE store_id=? ORDER BY created_at DESC LIMIT 1",
+                                (str(run["store_id"]),)).fetchone()
+            if not batch:
+                raise ValueError("no persisted free source batch exists")
+            new_status, accepted = transitions[action]
+            if batch["status"] not in accepted:
+                raise ValueError(f"cannot {action.lower()} batch in {batch['status']} state")
+            con.execute("UPDATE source_safety_release_batches SET status=?,updated_at=? WHERE batch_id=?",
+                        (new_status, datetime.now(timezone.utc).isoformat(), batch["batch_id"]))
+            if action == "RETRY_FAILED":
+                con.execute("UPDATE source_safety_release_items SET status='WAITING_FOR_INPUT' WHERE batch_id=? AND status='REVIEW_REQUIRED'",
+                            (batch["batch_id"],))
+        return {"run_id":run_id,"batch_id":batch["batch_id"],"status":new_status,
+                "note":"This controls the persisted local capture queue; it does not launch browser automation or a paid provider."}
 
     def _catalog_rows(self, store_id):
         from .production import ProductionGoldenPathService
@@ -874,8 +1135,8 @@ class ProductionEvidenceRunner:
         with connect(self.db) as con:
             exists = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='shopify_product_mappings'").fetchone()
             if exists:
-                duplicate_handles = con.execute("""SELECT COUNT(*) FROM (SELECT lower(handle) h FROM shopify_product_mappings
-                    WHERE store_id=? AND handle IS NOT NULL GROUP BY lower(handle) HAVING COUNT(*)>1)""", (store_id,)).fetchone()
+                duplicate_handles = con.execute("""SELECT COUNT(*) FROM (SELECT lower(shopify_handle) h FROM shopify_product_mappings
+                    WHERE store_id=? AND shopify_handle IS NOT NULL GROUP BY lower(shopify_handle) HAVING COUNT(*)>1)""", (store_id,)).fetchone()
                 issues["duplicate_handle"] = int(duplicate_handles[0])
         theme_fingerprint = _hash({"theme": theme.get("theme"), "template": theme.get("template"), "files": theme.get("theme_files")})
         with connect(self.db) as con:
