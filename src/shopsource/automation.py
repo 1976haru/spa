@@ -157,10 +157,70 @@ class WorkflowAutomationService:
                 self._set_waiting(task,"WAITING_FOR_INPUT","입력이 필요한 단계입니다."); break
             if task["requires_confirmation"] and not checkpoint.get("confirmed"):
                 self._set_waiting(task,"WAITING_FOR_CONFIRMATION",task["confirmation_prompt"] or "사용자 확인이 필요합니다."); break
-            self._execute_task(dict(task)); processed+=1
-            state=self._task(run_id,task["task_key"])["status"]
+            if self.handlers.get(task["handler_key"]) is None:
+                # Handler-free local work can use a bounded, connection-reusing
+                # path. Each task is still committed atomically with its events.
+                completed=self._execute_noop_chunk(run_id,dict(task),
+                    limit=min(50,int(max_tasks)-processed) if max_tasks is not None else 50)
+                processed+=completed
+                if completed == 0: break
+                continue
+            task_state=dict(task)
+            self._execute_task(task_state); processed+=1
+            state=task_state.get("_final_status","FAILED")
             if state in {"FAILED","WAITING_FOR_INPUT","WAITING_FOR_CONFIRMATION"}: break
         return self.status(run_id)
+
+    def _execute_noop_chunk(self, run_id, first_task, *, limit=50):
+        """Run a bounded sequence of default local tasks with per-task durability."""
+        limit=max(1,min(100,int(limit)))
+        candidates=[first_task]
+        with connect(self.db) as con:
+            if limit>1:
+                rows=con.execute(
+                    "SELECT * FROM automation_tasks WHERE run_id=? AND status='QUEUED' AND position>? ORDER BY position LIMIT ?",
+                    (run_id,int(first_task["position"]),limit-1),
+                ).fetchall()
+                for row in rows:
+                    item=dict(row)
+                    if (self.handlers.get(item["handler_key"]) is not None or
+                            item["requires_confirmation"] or item["requires_user_input"]):
+                        break
+                    candidates.append(item)
+
+            # Reconcile a potentially stale legacy summary at each safe chunk
+            # boundary, then increment it atomically with every completed task.
+            counts={r[0]:r[1] for r in con.execute(
+                "SELECT status,COUNT(*) FROM automation_tasks WHERE run_id=? GROUP BY status",(run_id,))}
+            done=sum(counts.get(s,0) for s in ("SUCCEEDED","SUCCEEDED_WITH_WARNINGS","SKIPPED"))
+            con.execute("UPDATE automation_runs SET completed_tasks=?,failed_tasks=?,warning_tasks=? WHERE run_id=?",
+                        (done,counts.get("FAILED",0),counts.get("SUCCEEDED_WITH_WARNINGS",0),run_id))
+            completed_count=0
+            for item in candidates:
+                control=con.execute("SELECT pause_requested,stop_requested FROM automation_runs WHERE run_id=?",
+                                    (run_id,)).fetchone()
+                if not control or control["pause_requested"] or control["stop_requested"]:
+                    break
+                now=_now()
+                result={"status":"SUCCEEDED","message":"안전한 로컬 단계를 완료했습니다."}
+                updated=con.execute("""UPDATE automation_tasks SET status='SUCCEEDED',attempt_count=attempt_count+1,
+                    result_summary_json=?,error_code=NULL,error_message=NULL,technical_detail=NULL,
+                    started_at=COALESCE(started_at,?),finished_at=?,updated_at=? WHERE id=? AND status='QUEUED'""",
+                    (json.dumps(redact_value(result),ensure_ascii=False),now,now,now,item["id"]))
+                if updated.rowcount != 1:
+                    con.rollback()
+                    continue
+                con.execute("""UPDATE automation_runs SET status='RUNNING',current_task_key=?,
+                    completed_tasks=completed_tasks+1,started_at=COALESCE(started_at,?),updated_at=? WHERE run_id=?""",
+                    (item["task_key"],now,now,run_id))
+                con.execute("INSERT INTO automation_events(run_id,task_key,event_type,message,detail_json,created_at) VALUES(?,?,?,?,?,?)",
+                    (run_id,item["task_key"],"RUNNING",redact_text(f"{item['title']} 시작",limit=500),"{}",now))
+                con.execute("INSERT INTO automation_events(run_id,task_key,event_type,message,detail_json,created_at) VALUES(?,?,?,?,?,?)",
+                    (run_id,item["task_key"],"SUCCEEDED",redact_text(result["message"],limit=500),
+                     json.dumps(redact_value(result),ensure_ascii=False),now))
+                con.commit()
+                completed_count+=1
+        return completed_count
 
     def _set_waiting(self, task, status, message):
         with connect(self.db) as con:
@@ -178,12 +238,14 @@ class WorkflowAutomationService:
             if handler is None: result={"status":"SUCCEEDED","message":"안전한 로컬 단계를 완료했습니다."}
             else: result=handler(self._task(run_id,key)) or {}
             status="SUCCEEDED_WITH_WARNINGS" if result.get("warnings") else "SUCCEEDED"
+            task["_final_status"]=status
             with connect(self.db) as con: con.execute("UPDATE automation_tasks SET status=?,result_summary_json=?,error_code=NULL,error_message=NULL,technical_detail=NULL,finished_at=?,updated_at=? WHERE id=?",
                 (status,json.dumps(redact_value(result),ensure_ascii=False),_now(),_now(),task["id"]))
             self._event(run_id,key,status,result.get("message") or f"{task['title']} 완료",result)
         except AutomationTaskError as exc:
             current=self._task(run_id,key); settings=self.settings(self.status(run_id)["store_id"])
             if exc.transient and settings["auto_retry"] and current["attempt_count"] < current["max_attempts"]:
+                task["_final_status"]="QUEUED"
                 message=f"일시적인 오류라 자동으로 다시 시도 중입니다. ({current['attempt_count'] + 1}/{current['max_attempts']})"
                 with connect(self.db) as con: con.execute("UPDATE automation_tasks SET status='QUEUED',error_code=?,error_message=?,technical_detail=?,updated_at=? WHERE id=?",
                     (exc.code,message,redact_text(exc.detail,limit=500),_now(),task["id"]))
@@ -191,11 +253,13 @@ class WorkflowAutomationService:
             else:
                 wait=exc.code in {"BAD_CREDENTIAL","MISSING_SCOPE","CAPTCHA","BUSINESS_INPUT","CONFLICT","TOKEN_BUDGET"}
                 status="WAITING_FOR_INPUT" if wait else "FAILED"
+                task["_final_status"]=status
                 message=friendly_error(exc.code,exc.detail)
                 with connect(self.db) as con: con.execute("UPDATE automation_tasks SET status=?,error_code=?,error_message=?,technical_detail=?,updated_at=? WHERE id=?",
                     (status,exc.code,message,redact_text(exc.detail,limit=500),_now(),task["id"]))
                 self._event(run_id,key,status,message,{"code":exc.code}); self._refresh_run(run_id,status=status,current_task_key=key)
         except Exception as exc:
+            task["_final_status"]="FAILED"
             with connect(self.db) as con: con.execute("UPDATE automation_tasks SET status='FAILED',error_code='UNEXPECTED',error_message=?,technical_detail=?,updated_at=? WHERE id=?",
                 ("예상하지 못한 오류가 발생했습니다. 자세한 내용을 확인하세요.",redact_text(exc,limit=500),_now(),task["id"]))
             self._refresh_run(run_id,status="FAILED",current_task_key=key)
