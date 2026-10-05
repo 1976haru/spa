@@ -9,13 +9,15 @@ from shopsource.db import connect
 
 
 class FakeAdmin:
-    def __init__(self, domain="cabin-tidy.myshopify.com", scopes=None):
+    def __init__(self, domain="cabin-tidy.myshopify.com", primary_host="cabin-tidy.myshopify.com", scopes=None):
         self.domain = domain
+        self.primary_host = primary_host
         self.scopes = scopes if scopes is not None else {"read_themes", "read_publications"}
         self.queries = []
+        self.steps = []
 
     def __call__(self, domain, token, api_version):
-        assert domain == "cabin-tidy.myshopify.com"
+        assert domain in {"cabin-tidy.myshopify.com", "kgxbpi-it.myshopify.com"}
         assert token == "private-fixture-token"
         assert api_version == "2026-07"
         return self
@@ -24,9 +26,13 @@ class FakeAdmin:
         self.queries.append(query)
         assert "mutation" not in query.casefold()
         if "ShopSourceG0Identity" in query:
-            return {"shop": {"name": "Cabin Tidy", "myshopifyDomain": self.domain},
+            self.steps.append("identity")
+            return {"shop": {"id": "gid://shopify/Shop/42", "name": "Cabin Tidy",
+                              "myshopifyDomain": self.domain,
+                              "primaryDomain": {"host": self.primary_host, "id": "gid://shopify/Domain/1"}},
                     "currentAppInstallation": {"accessScopes": [{"handle": x} for x in sorted(self.scopes)]}}
         if "ShopSourcePublications" in query:
+            self.steps.append("publications")
             return {"publications": {"nodes": [{"id": "gid://shopify/Publication/7", "name": "Online Store"}]}}
         raise AssertionError(f"Unexpected read query: {query}")
 
@@ -45,6 +51,7 @@ def run_g0(db, fake, *, theme_status="CONNECTED", theme=None):
             self.db = db
 
         def discover(self, store_id):
+            fake.steps.append("theme")
             return {"status": theme_status, "theme": theme or {"name": "Main Theme", "role": "MAIN"}}
 
     service = shopify.ShopifyReadOnlyVerificationService(db=db, client_factory=fake,
@@ -67,7 +74,54 @@ def test_read_only_verification_succeeds_with_2026_07_publication_fixture_and_no
     assert result["publications_status"] == "PASS"
     assert result["online_store_publications"][0]["name"] == "Online Store"
     assert "write_products" not in result["granted_scopes"]
+    assert result["shop_id"] == "gid://shopify/Shop/42"
+    assert result["primary_domain_host"] == "cabin-tidy.myshopify.com"
+    assert result["shop_id_matches"] is None
     assert result["last_verified_at"]
+    connection = shopify.get_connection("001", db=configured)
+    assert connection["shopify_shop_gid"] == "gid://shopify/Shop/42"
+
+
+def test_configured_primary_domain_matches_when_myshopify_domain_changed(configured):
+    fake = FakeAdmin(domain="kgxbpi-it.myshopify.com", primary_host="cabin-tidy.myshopify.com")
+    result = run_g0(configured, fake)
+    assert result["status"] == "VERIFIED"
+    assert result["shop_domain_verified"] is True
+    assert result["actual_shop_domain"] == "kgxbpi-it.myshopify.com"
+
+
+def test_configured_myshopify_domain_matches_when_primary_domain_is_different(configured):
+    shopify.save_connection("001", "kgxbpi-it.myshopify.com", db=configured)
+    fake = FakeAdmin(domain="kgxbpi-it.myshopify.com", primary_host="cabin-tidy.myshopify.com")
+    result = run_g0(configured, fake)
+    assert result["status"] == "VERIFIED"
+    assert result["shop_domain_verified"] is True
+
+
+def test_both_domain_candidates_mismatch_is_blocked(configured):
+    fake = FakeAdmin(domain="remote.myshopify.com", primary_host="other.example.com")
+    result = run_g0(configured, fake)
+    assert result["status"] == "BLOCKED"
+    assert result["shop_domain_verified"] is False
+    assert result["publications_status"] == "NOT_CHECKED"
+    assert len(fake.queries) == 1
+
+
+def test_identity_publications_theme_read_order_and_no_mutation(configured):
+    fake = FakeAdmin()
+    result = run_g0(configured, fake)
+    assert result["status"] == "VERIFIED"
+    assert fake.steps == ["identity", "publications", "theme"]
+    assert all("mutation" not in query.casefold() for query in fake.queries)
+
+
+def test_saved_stable_shop_gid_mismatch_blocks(configured):
+    with connect(configured) as con:
+        con.execute("UPDATE shopify_connections SET shopify_shop_gid=? WHERE store_id=?",
+                    ("gid://shopify/Shop/other", "001"))
+    result = run_g0(configured, FakeAdmin())
+    assert result["status"] == "BLOCKED"
+    assert result["shop_id_matches"] is False
 
 
 def test_g0_only_executes_read_queries(configured):
@@ -83,10 +137,11 @@ def test_missing_read_themes_waits_for_input_even_when_identity_is_valid(configu
     assert result["status"] == "WAITING_FOR_INPUT"
     assert result["missing_read_scopes"] == ["read_themes"]
     assert result["theme_status"] == "MISSING_SCOPE"
+    assert shopify.get_connection("001", db=configured)["shopify_shop_gid"] == "gid://shopify/Shop/42"
 
 
 def test_wrong_myshopify_domain_is_blocked_before_downstream_reads(configured):
-    fake = FakeAdmin(domain="wrong-shop.myshopify.com")
+    fake = FakeAdmin(domain="wrong-shop.myshopify.com", primary_host="other-shop.myshopify.com")
     result = run_g0(configured, fake)
     assert result["status"] == "BLOCKED"
     assert result["shop_domain_verified"] is False

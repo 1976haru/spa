@@ -97,7 +97,8 @@ def _install_schema(db=None):
             api_version TEXT NOT NULL DEFAULT '2026-07', status TEXT NOT NULL DEFAULT 'NOT_VERIFIED',
             scopes_json TEXT NOT NULL DEFAULT '[]', publications_json TEXT NOT NULL DEFAULT '[]',
             last_verified_at TEXT, updated_at TEXT NOT NULL,
-            auth_mode TEXT NOT NULL DEFAULT 'LEGACY_ADMIN_TOKEN', token_expires_at TEXT
+            auth_mode TEXT NOT NULL DEFAULT 'LEGACY_ADMIN_TOKEN', token_expires_at TEXT,
+            shopify_shop_gid TEXT
         );
         CREATE TABLE IF NOT EXISTS shopify_collection_mappings (
             store_id TEXT NOT NULL, collection_key TEXT NOT NULL, handle TEXT NOT NULL,
@@ -121,6 +122,8 @@ def _install_schema(db=None):
             con.execute("ALTER TABLE shopify_connections ADD COLUMN auth_mode TEXT NOT NULL DEFAULT 'LEGACY_ADMIN_TOKEN'")
         if "token_expires_at" not in columns:
             con.execute("ALTER TABLE shopify_connections ADD COLUMN token_expires_at TEXT")
+        if "shopify_shop_gid" not in columns:
+            con.execute("ALTER TABLE shopify_connections ADD COLUMN shopify_shop_gid TEXT")
 
 
 def save_connection(store_id: str, shop_domain: str, *, api_version: str = SHOPIFY_API_VERSION,
@@ -264,7 +267,7 @@ class ShopifyGraphQLClient:
 
 SCOPES_QUERY = "query { currentAppInstallation { accessScopes { handle } } }"
 PUBLICATIONS_QUERY = "query ShopSourcePublications { publications(first: 100, catalogType: APP) { nodes { id name } } }"
-SHOP_IDENTITY_QUERY = "query ShopSourceG0Identity { shop { name myshopifyDomain } currentAppInstallation { accessScopes { handle } } }"
+SHOP_IDENTITY_QUERY = "query ShopSourceG0Identity { shop { id name myshopifyDomain primaryDomain { host id } } currentAppInstallation { accessScopes { handle } } }"
 COLLECTIONS_QUERY = "query { collections(first: 250) { nodes { id title handle descriptionHtml image { url altText } productsCount { count precision } sources { __typename id ... on CollectionConditionsSource { inclusion { matchType conditions { id __typename ... on CollectionSourceInclusionConditionProductTitle { titleRelation: relation values matchType } ... on CollectionSourceInclusionConditionProductTag { tagRelation: relation values matchType } ... on CollectionSourceInclusionConditionProductType { typeRelation: relation values matchType } ... on CollectionSourceInclusionConditionProductVendor { vendorRelation: relation values matchType } } } } } } } }"
 CREATE_MUTATION = """mutation CollectionCreate($collection: CollectionCreateInput!) {
  collectionCreate(collection: $collection) { collection { id title handle descriptionHtml image { url altText } productsCount { count precision } } userErrors { field message } }
@@ -526,23 +529,45 @@ class ShopifyReadOnlyVerificationService:
         client = self.client_factory(config["shop_domain"], token, config["api_version"])
         identity = client.execute(SHOP_IDENTITY_QUERY)
         shop = identity.get("shop") or {}
+        primary = shop.get("primaryDomain") or {}
         scopes_data = identity.get("currentAppInstallation") or {}
         scopes = sorted({row.get("handle") for row in scopes_data.get("accessScopes", []) if row.get("handle")})
-        expected, actual = str(config.get("shop_domain") or "").casefold(), str(shop.get("myshopifyDomain") or "").casefold()
+        expected = str(config.get("shop_domain") or "").casefold().rstrip(".")
+        actual = str(shop.get("myshopifyDomain") or "").casefold().rstrip(".")
+        primary_host = str(primary.get("host") or "").casefold().rstrip(".")
+        shop_id = shop.get("id")
+        saved_shop_id = config.get("shopify_shop_gid")
+        domain_matches = bool(expected and expected in {actual, primary_host})
+        shop_id_matches = None if not saved_shop_id else saved_shop_id == shop_id
         missing_read = sorted((self.REQUIRED_G0_READ_SCOPES | self.OPTIONAL_READ_SCOPES) - set(scopes))
-        if not actual or actual != expected:
+        if not shop_id or not domain_matches or shop_id_matches is False:
             return {"status": "BLOCKED", "credential_present": True, "auth_mode": config.get("auth_mode"),
+                    "shop_id": shop_id, "shop_id_matches": shop_id_matches,
                     "shop_name": shop.get("name"), "shop_domain": config.get("shop_domain"),
-                    "actual_shop_domain": shop.get("myshopifyDomain"), "shop_domain_verified": False,
+                    "actual_shop_domain": shop.get("myshopifyDomain"), "primary_domain_host": primary_host,
+                    "shop_domain_verified": False,
                     "granted_scopes": scopes, "missing_read_scopes": missing_read,
                     "missing_future_write_scopes": sorted(self.FUTURE_WRITE_SCOPES - set(scopes)),
                     "theme_status": "NOT_CHECKED", "publications_status": "NOT_CHECKED",
                     "last_verified_at": None, "secret_values_exposed": False}
 
-        verified_at = _now()
+        # This GID is non-secret. Persist it as soon as identity and a configured
+        # Shopify domain alias agree, even if a later read scope still needs input.
         with connect(self.db) as con:
-            con.execute("UPDATE shopify_connections SET status=?,scopes_json=?,last_verified_at=?,updated_at=? WHERE store_id=?",
-                        ("CONNECTED", json.dumps(scopes), verified_at, verified_at, store_id))
+            con.execute("UPDATE shopify_connections SET shopify_shop_gid=COALESCE(shopify_shop_gid,?) WHERE store_id=?",
+                        (shop_id, store_id))
+
+        # Follow a fixed read-only sequence: identity/scopes, publications, then MAIN theme.
+        publications, publication_error = [], None
+        if "read_publications" in scopes:
+            try:
+                publications = client.execute(PUBLICATIONS_QUERY).get("publications", {}).get("nodes", [])
+                publication_status = "PASS"
+            except Exception as exc:
+                publication_status, publication_error = "FAIL", type(exc).__name__
+        else:
+            publication_status = "MISSING_SCOPE"
+        online = [row for row in publications if "online store" in str(row.get("name", "")).casefold()]
 
         missing_g0 = self.REQUIRED_G0_READ_SCOPES - set(scopes)
         theme = None
@@ -557,27 +582,20 @@ class ShopifyReadOnlyVerificationService:
             theme = reader.discover(store_id)
             theme_status = "PASS" if theme.get("status") == "CONNECTED" and theme.get("theme") else (
                 "MISSING_SCOPE" if theme.get("status") == "MISSING_READ_SCOPE" else "FAIL")
-
-        publications, publication_error = [], None
-        if "read_publications" in scopes:
-            try:
-                publications = client.execute(PUBLICATIONS_QUERY).get("publications", {}).get("nodes", [])
-                publication_status = "PASS"
-            except Exception as exc:
-                publication_status, publication_error = "FAIL", type(exc).__name__
-        else:
-            publication_status = "MISSING_SCOPE"
-        online = [row for row in publications if "online store" in str(row.get("name", "")).casefold()]
         verified_at = _now()
-        with connect(self.db) as con:
-            con.execute("UPDATE shopify_connections SET publications_json=?,last_verified_at=?,updated_at=? WHERE store_id=?",
-                        (json.dumps(publications), verified_at, verified_at, store_id))
         status = "WAITING_FOR_INPUT" if missing_g0 or theme_status == "MISSING_SCOPE" else (
-            "VERIFIED" if theme_status == "PASS" else "REVIEW_REQUIRED")
+            "VERIFIED" if theme_status == "PASS" and publication_status != "FAIL" else "REVIEW_REQUIRED")
+        with connect(self.db) as con:
+            con.execute("UPDATE shopify_connections SET status=?,scopes_json=?,publications_json=?,last_verified_at=?,updated_at=? WHERE store_id=?",
+                        ("CONNECTED" if status == "VERIFIED" else status, json.dumps(scopes), json.dumps(publications),
+                         verified_at, verified_at, store_id))
         return {"status": status, "credential_present": True, "token_state": "VALID",
                 "auth_mode": config.get("auth_mode"), "shop_name": shop.get("name"),
+                "shop_id": shop_id, "shop_id_matches": shop_id_matches,
                 "shop_domain": config.get("shop_domain"), "actual_shop_domain": shop.get("myshopifyDomain"),
-                "shop_domain_verified": True, "api_version": config.get("api_version"),
+                "primary_domain_host": primary_host, "shop_domain_verified": domain_matches,
+                "shop_id_persisted": True,
+                "api_version": config.get("api_version"),
                 "granted_scopes": scopes, "missing_read_scopes": missing_read,
                 "missing_future_write_scopes": sorted(self.FUTURE_WRITE_SCOPES - set(scopes)),
                 "theme_status": theme_status, "theme_name": (theme or {}).get("theme", {}).get("name"),

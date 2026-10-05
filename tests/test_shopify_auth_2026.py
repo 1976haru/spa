@@ -184,7 +184,9 @@ def test_production_g0_uses_read_only_identity_and_theme(tmp_path,monkeypatch):
         def __init__(self,*args): pass
         def execute(self,query):
             assert "query ShopSourceG0Identity" in query
-            return {"shop":{"name":"Cabin Tidy","myshopifyDomain":"cabin-tidy.myshopify.com"},
+            return {"shop":{"id":"gid://shopify/Shop/42","name":"Cabin Tidy",
+                            "myshopifyDomain":"cabin-tidy.myshopify.com",
+                            "primaryDomain":{"host":"cabin-tidy.myshopify.com","id":"gid://shopify/Domain/1"}},
                     "currentAppInstallation":{"accessScopes":[{"handle":"read_themes"}]}}
     monkeypatch.setattr("shopsource.shopify_collections.ShopifyGraphQLClient",Client)
     read_only_service = __import__("shopsource.shopify_collections", fromlist=["ShopifyReadOnlyVerificationService"]).ShopifyReadOnlyVerificationService

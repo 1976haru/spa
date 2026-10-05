@@ -472,7 +472,10 @@ class ProductionEvidenceRunner:
             result={**local,**evidence,"verified":evidence.get("status")=="VERIFIED",
                     "missing_required_scopes":evidence.get("missing_read_scopes",[]),
                     "missing_inputs":[],"review_required":[],"secret_values_exposed":False,
-                    "fingerprint_input":{"domain":evidence.get("actual_shop_domain"),
+                    "fingerprint_input":{"shop_id":evidence.get("shop_id"),
+                        "configured_domain":evidence.get("shop_domain"),
+                        "primary_domain":evidence.get("primary_domain_host"),
+                        "myshopify_domain":evidence.get("actual_shop_domain"),
                         "theme":evidence.get("theme_name"),"scopes":evidence.get("granted_scopes",[]),
                         "publications":evidence.get("publications",[])}}
             if evidence.get("status")=="WAITING_FOR_CREDENTIALS":

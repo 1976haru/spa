@@ -2056,8 +2056,10 @@ class OperatorUI:
                     pubs = ", ".join(f"{p.get('name')} [{p.get('id')}]" for p in result.get("online_store_publications", []))
                     connection_detail.set_text(
                         f"Auth: {result.get('auth_mode') or '미설정'} · 자격 증명: {'YES' if result.get('credential_present') else 'NO'} · "
+                        f"스토어 ID: {result.get('shop_id') or '—'} · "
                         f"도메인 확인: {'PASS' if result.get('shop_domain_verified') else 'FAIL'} "
-                        f"({result.get('shop_domain') or '—'} / {result.get('actual_shop_domain') or '—'}) · "
+                        f"(설정 {result.get('shop_domain') or '—'} / primary {result.get('primary_domain_host') or '—'} / "
+                        f"myshopify {result.get('actual_shop_domain') or '—'}) · "
                         f"Granted scopes: {', '.join(granted) or 'none'} · "
                         f"Missing read scopes: {', '.join(result.get('missing_read_scopes', [])) or 'none'} · "
                         f"Future/write scopes missing: {', '.join(result.get('missing_future_write_scopes', [])) or 'none'} · "
