@@ -38,14 +38,20 @@ def _hash(value):
 
 class _KeepaObservationProvider:
     """Opt-in Keepa adapter; only documented normalized offer evidence counts."""
-    def __init__(self):
+    def __init__(self, api_key=None, *, client=None):
         from .sourcing.providers.keepa import KeepaProvider
-        self.client = KeepaProvider()
+        self.client = client or KeepaProvider(api_key=api_key)
+        self.last_tokens_consumed = 0
+
+    def health(self):
+        return self.client.health()
 
     def observe_batch(self, items):
         from .source_safety import keepa_source_observation
         asins = [str(row.get("asin") or "").upper() for row in items if row.get("asin")]
         batch = self.client.hydrate(asins)
+        telemetry = getattr(batch, "telemetry", None)
+        self.last_tokens_consumed = int(getattr(telemetry, "tokens_consumed", 0) or 0)
         products = {str(row.get("asin") or "").upper(): row for row in batch.products}
         result = {}
         for item in items:
@@ -86,6 +92,8 @@ class ProductionEvidenceRunner:
         self.collectors = collectors or {}
         self.source_preview = source_preview
         self.source_provider = source_provider
+        from .source_provider_profiles import SourceProviderProfiles
+        self.source_profiles = SourceProviderProfiles(db)
         with connect(db) as con:
             con.execute("""CREATE TABLE IF NOT EXISTS production_runner_locks(
                 store_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, acquired_at TEXT NOT NULL)""")
@@ -210,13 +218,6 @@ class ProductionEvidenceRunner:
         current_checkpoint = run.get("checkpoint", {}).get("source_audit", {})
         if not confirmed and not current_checkpoint.get("approved_at"):
             raise PermissionError("Explicit user confirmation is required before source-provider calls")
-        if confirmed and not current_checkpoint.get("approved_at"):
-            current_checkpoint["approved_at"] = datetime.now(timezone.utc).isoformat()
-            current_checkpoint["control"] = "RUNNING"
-            with connect(self.db) as con:
-                con.execute("UPDATE production_runs SET checkpoint_json=?,updated_at=? WHERE run_id=?",
-                            (_json({**run.get("checkpoint", {}), "source_audit": current_checkpoint}),
-                             datetime.now(timezone.utc).isoformat(), run_id))
         store_id = str(run["store_id"])
         monitor = SourceMonitorService(self.db)
         prior_checkpoint = run.get("checkpoint", {}).get("source_audit", {})
@@ -224,13 +225,34 @@ class ProductionEvidenceRunner:
         # Previously successful checks are scheduled for a later interval, so
         # the due-only preview naturally contains only unfinished/retry items.
         preview = monitor.preview_due_checks(store_id, limit=50000)
+        production_profile = self.source_profiles.for_store(store_id)
+        injected_fixture = observations is not None or self.source_provider is not None
         if preview["items"] and observations is None and self.source_provider is None:
             try:
-                # Provider construction (and any request) is deliberately after
-                # the UI's explicit confirmation. Missing credentials fail closed.
-                self.source_provider = _KeepaObservationProvider()
+                if not production_profile:
+                    production_profile = self.source_profiles.register_env_compatibility(store_id)
+                if not production_profile:
+                    raise RuntimeError("not configured")
+                preflight = self.source_profiles.preflight(store_id, target_count=len(preview["items"]), batch_size=100)
+                pilot = prior_checkpoint.get("provider_pilot", {})
+                if preflight["status"] != "READY" or pilot.get("status") != "PASS":
+                    raise PermissionError("Provider health and a passing 100-item provider pilot are required before full source audit")
+                client, _ = self.source_profiles.create_keepa_provider(production_profile["profile_id"])
+                self.source_provider = _KeepaObservationProvider(client=client)
             except Exception:
-                raise RuntimeError("No usable source provider is configured; add Keepa credentials or a canonical adapter") from None
+                # Crucially, approval is not checkpointed until all local/provider gates pass.
+                raise RuntimeError("Source provider is not ready. Configure credentials, pass Health check and Provider Pilot, then approve the full audit.") from None
+        if confirmed and not current_checkpoint.get("approved_at"):
+            if preview["items"] and not injected_fixture:
+                preflight = self.source_profiles.preflight(store_id, target_count=len(preview["items"]), batch_size=100)
+                if preflight["status"] != "READY" or current_checkpoint.get("provider_pilot", {}).get("status") != "PASS":
+                    raise PermissionError("Provider preflight and pilot must pass before approval is recorded")
+            current_checkpoint["approved_at"] = datetime.now(timezone.utc).isoformat()
+            current_checkpoint["control"] = "RUNNING"
+            with connect(self.db) as con:
+                con.execute("UPDATE production_runs SET checkpoint_json=?,updated_at=? WHERE run_id=?",
+                            (_json({**run.get("checkpoint", {}), "source_audit": current_checkpoint}),
+                             datetime.now(timezone.utc).isoformat(), run_id))
         checked = failed = provider_errors = 0
         target_count = int(prior_checkpoint.get("target_count") or (len(preview["items"]) + resume_offset))
         checkpoint = {"target_count": target_count, "completed": resume_offset, "batch_size": 100,
@@ -272,7 +294,9 @@ class ProductionEvidenceRunner:
                 if value: normalized[row["product_id"]] = value
                 if isinstance(value, dict) and value.get("availability") == "SOURCE_ERROR":
                     provider_errors += 1
-            status = monitor.run_due_checks(store_id, observations=normalized, limit=len(batch), offset=offset)
+            # Each previous batch is rescheduled into the future; the next batch
+            # is therefore at offset 0 in the newly-computed due set.
+            status = monitor.run_due_checks(store_id, observations=normalized, limit=len(batch), offset=0)
             checked += int(status.get("checked_count", 0)); failed += int(status.get("failed_count", 0))
             control_after_batch = self.service.get(run_id).get("checkpoint", {}).get("source_audit", {}).get("control", "RUNNING")
             checkpoint.update({"completed": (resume_offset + offset + len(batch)
@@ -299,6 +323,95 @@ class ProductionEvidenceRunner:
         self.service.update(run_id, {"SOURCE_SAFETY": evidence})
         continued = self.run(store_id, run_id=run_id)
         return {**counts, "status": "COMPLETE" if complete else "FAILED", "production_run": continued}
+
+    def source_provider_preflight(self, run_id, *, pilot=False):
+        """Return a local-only cost/token/health preflight; never contacts Keepa."""
+        from .source_safety import SourceMonitorService
+        run = self.service.get(run_id)
+        preview = SourceMonitorService(self.db).preview_due_checks(str(run["store_id"]), limit=50000)
+        profile = self.source_profiles.for_store(str(run["store_id"]))
+        if not profile:
+            profile = self.source_profiles.register_env_compatibility(str(run["store_id"]))
+        target = min(100, len(preview["items"])) if pilot else len(preview["items"])
+        result = self.source_profiles.preflight(str(run["store_id"]), target_count=target, batch_size=100)
+        result.update({"pilot": bool(pilot), "full_due_count": len(preview["items"]),
+                       "fresh": sum(row.get("freshness_status") == "FRESH" for row in preview["items"]),
+                       "stale": sum(row.get("freshness_status") in {"STALE_WARNING", "STALE_BLOCKED"} for row in preview["items"]),
+                       "never_verified": sum(row.get("freshness_status") == "NEVER_VERIFIED" for row in preview["items"]),
+                       "estimated_cost": "UNKNOWN"})
+        checkpoint = run.get("checkpoint", {}).get("source_audit", {})
+        result["pilot_status"] = checkpoint.get("provider_pilot", {}).get("status", "NOT_RUN")
+        result["can_run_pilot"] = result["usable"] and target > 0
+        result["can_run_full"] = result["usable"] and result["pilot_status"] == "PASS" and len(preview["items"]) > 0
+        return result
+
+    def source_provider_health_check(self, run_id, *, provider=None):
+        run = self.service.get(run_id)
+        store_id = str(run["store_id"])
+        if not self.source_profiles.for_store(store_id):
+            self.source_profiles.register_env_compatibility(store_id)
+        return self.source_profiles.health_check(store_id, provider=provider)
+
+    def run_source_provider_pilot(self, run_id, *, confirmed=False, observations=None):
+        """Run one explicitly approved provider-normalization batch (max 100); never verifies G2."""
+        if not confirmed:
+            raise PermissionError("Explicit approval is required for the 100-item source-provider pilot")
+        from .source_safety import AVAILABILITY, SourceMonitorService
+        run = self.service.get(run_id); store_id = str(run["store_id"])
+        monitor = SourceMonitorService(self.db)
+        preview = monitor.preview_due_checks(store_id, limit=100)
+        if not preview["items"]:
+            raise ValueError("No due source products are available for provider pilot")
+        preflight = self.source_profiles.preflight(store_id, target_count=len(preview["items"]), batch_size=100)
+        if self.source_provider is None and preflight["status"] != "READY":
+            raise PermissionError("Provider credential and passing health check are required")
+        provider = self.source_provider
+        if observations is None:
+            if provider is None:
+                profile = self.source_profiles.for_store(store_id)
+                client, _ = self.source_profiles.create_keepa_provider(profile["profile_id"])
+                provider = _KeepaObservationProvider(client=client)
+            try:
+                observations = provider.observe_batch(preview["items"])
+            except Exception as exc:
+                raise RuntimeError(f"Provider pilot failed safely ({type(exc).__name__}); no G2 approval was recorded") from None
+        normalized = {}
+        invalid = 0; unknown = 0; provider_errors = 0
+        for row in preview["items"]:
+            value = (observations or {}).get(row["product_id"])
+            if not isinstance(value, dict) or str(value.get("availability", "")).upper() not in AVAILABILITY:
+                invalid += 1; continue
+            availability = str(value.get("availability")).upper()
+            if availability == "UNKNOWN": unknown += 1
+            if availability == "SOURCE_ERROR": provider_errors += 1
+            normalized[row["product_id"]] = value
+        if invalid:
+            raise ValueError("Provider pilot response could not be normalized; no G2 approval was recorded")
+        # The provider pilot validates quota and response normalization only.
+        # It deliberately does not create source snapshots or mark catalog rows
+        # checked; the subsequent full audit must still cover the whole due set.
+        source_run_failed = invalid > 0
+        pilot_status = "PASS" if not source_run_failed and unknown == 0 and provider_errors == 0 else "REVIEW_REQUIRED"
+        checkpoint = dict(run.get("checkpoint", {}).get("source_audit", {}))
+        checkpoint["provider_pilot"] = {"status": pilot_status, "checked": len(normalized),
+            "target_count": len(preview["items"]), "unknown": unknown, "provider_errors": provider_errors,
+            "failed": int(source_run_failed),
+            "tokens_consumed": int(getattr(provider, "last_tokens_consumed", 0) or 0),
+            "completed_at": datetime.now(timezone.utc).isoformat()}
+        profile = self.source_profiles.for_store(store_id)
+        if profile and checkpoint["provider_pilot"]["tokens_consumed"]:
+            self.source_profiles.record_usage(profile["profile_id"], checkpoint["provider_pilot"]["tokens_consumed"])
+        with connect(self.db) as con:
+            con.execute("UPDATE production_runs SET checkpoint_json=?,updated_at=? WHERE run_id=?",
+                        (_json({**run.get("checkpoint", {}), "source_audit": checkpoint}), datetime.now(timezone.utc).isoformat(), run_id))
+        evidence = {"status": "WAITING_FOR_CONFIRMATION" if pilot_status == "PASS" else "WAITING_FOR_INPUT",
+                    "verified": False, "provider_pilot": checkpoint["provider_pilot"],
+                    "target_count": checkpoint["provider_pilot"]["target_count"],
+                    "pilot_does_not_verify_full_catalog": True,
+                    "fingerprint_input": {"provider_pilot": checkpoint["provider_pilot"]}}
+        self.service.update(run_id, {"SOURCE_SAFETY": evidence})
+        return {"status": pilot_status, "provider_pilot": checkpoint["provider_pilot"],
+                "production_run": self.service.get(run_id)}
 
     def source_audit_control(self, run_id, action):
         action = str(action).upper()
@@ -558,6 +671,8 @@ class ProductionEvidenceRunner:
                     "provider_errors_are_not_oos": True,
                     "missing_inputs": ["Some source provider checks failed; retry those items before completing G2."],
                     "preview_only": True, "fingerprint_input": {"freshness": freshness, "source_errors": source_errors}}
+        profile = self.source_profiles.for_store(str(store_id)) or self.source_profiles.register_env_compatibility(str(store_id))
+        provider_preflight = self.source_profiles.preflight(str(store_id), target_count=count, batch_size=100)
         if count:
             return {"status": "WAITING_FOR_CONFIRMATION", "missing_inputs": ["Explicit approval required for live source checks"],
                     "target_count": count, "estimated_batches": preview.get("estimated_batches", 0),
@@ -565,7 +680,11 @@ class ProductionEvidenceRunner:
                     "cost_estimate_note": preview.get("cost_estimate_note"), "fresh": freshness.get("FRESH", 0),
                     "stale": freshness.get("STALE_WARNING", 0) + freshness.get("STALE_BLOCKED", 0),
                     "never_verified": freshness.get("NEVER_VERIFIED", 0), "preview_only": True,
-                    "fingerprint_input": {"target_count": count, "freshness": freshness}}
+                    "provider_preflight": provider_preflight,
+                    "status": "WAITING_FOR_INPUT" if provider_preflight["status"] != "READY" else "WAITING_FOR_CONFIRMATION",
+                    "missing_inputs": (["Select a source provider, save its credential and pass the provider health check."]
+                                        if provider_preflight["status"] != "READY" else ["Provider pilot and explicit approval are required before full source checks."]),
+                    "fingerprint_input": {"target_count": count, "freshness": freshness, "provider_status": provider_preflight["status"]}}
         return {"status": "VERIFIED", "verified": True, "target_count": 0,
                 "counts": {"checked": latest_run["checked_count"], "failed": latest_run["failed_count"]} if latest_run else {"checked": 0, "failed": 0},
                 "provider_errors_are_not_oos": True, "preview_only": True,

@@ -376,6 +376,94 @@ class OperatorUI:
             action_content.clear()
             with action_content:
                 if key == "SOURCE_SAFETY":
+                    profiles = runner.source_profiles
+                    preflight = runner.source_provider_preflight(run["run_id"])
+                    ui.label("G2 Source Safety | Provider 사전점검").classes("ss-card-title")
+                    ui.label(f"Provider: {preflight.get('provider_status', 'Keepa / NOT CONFIGURED')} · Credential: {'YES' if preflight.get('credential_present') else 'NO'} · Health: {preflight.get('health', 'NOT_CHECKED')}")
+                    ui.label(f"Tokens left: {preflight.get('tokensLeft', '확인 전')} · 예상 tokens: {preflight.get('estimated_tokens', 0)} · target: {preflight.get('full_due_count', 0)} · batches: {preflight.get('batch_count', 0)} · 비용: UNKNOWN")
+                    ui.label(f"Fresh {preflight.get('fresh', 0)} · Stale {preflight.get('stale', 0)} · Never verified {preflight.get('never_verified', 0)} · 마지막 health: {preflight.get('last_health_check') or '없음'}").classes("ss-help")
+                    ui.label("G1 소싱 품질과 G2 원본 재고·가격 검사는 별도 단계입니다. Keepa는 G2 확인용이며 상품 후보 소싱 provider를 바꾸지 않습니다.").classes("ss-help")
+                    api_key_input = ui.input("Keepa API key (Windows Credential Manager에 저장)").props("type=password autocomplete=new-password").classes("w-full")
+                    profile_id_input = ui.input("공유 Provider Profile ID", value="keepa-production-shared").classes("w-full")
+                    existing_profiles = {item["profile_id"]: item["display_name"] for item in profiles.profiles()}
+                    if existing_profiles:
+                        selected_profile = ui.select(existing_profiles, label="기존 공유 Provider Profile 재사용")
+                        def bind_existing_profile():
+                            try:
+                                profiles.bind(str(run["store_id"]), selected_profile.value)
+                                ui.notify("선택한 공유 Provider Profile을 Store에 연결했습니다. API key 재입력은 필요 없습니다.", type="positive")
+                                render(runner.run(str(run["store_id"]), run_id=run["run_id"]))
+                                open_gate_action()
+                            except Exception as exc:
+                                ui.notify(f"Profile 연결 실패 ({type(exc).__name__}).", type="warning")
+                        ui.button("기존 Profile 연결", on_click=bind_existing_profile).props("outline")
+                    async def save_provider():
+                        try:
+                            if not api_key_input.value:
+                                ui.notify("Keepa key를 입력하세요.", type="warning"); return
+                            await asyncio.to_thread(profiles.save_keepa_profile, profile_id_input.value,
+                                "Keepa Production Source Safety", api_key_input.value, store_id=str(run["store_id"]))
+                            api_key_input.value = ""
+                            ui.notify("Provider profile을 안전하게 저장했습니다. key 원문은 DB에 저장하지 않습니다.", type="positive")
+                            render(runner.run(str(run["store_id"]), run_id=run["run_id"]))
+                            open_gate_action()
+                        except Exception as exc:
+                            ui.notify(f"Provider profile 저장 실패 ({type(exc).__name__}). Credential Manager 설정을 확인하세요.", type="negative")
+                    ui.button("Provider 설정 저장", on_click=save_provider).props("outline")
+                    async def check_provider_health():
+                        try:
+                            result = await asyncio.to_thread(runner.source_provider_health_check, run["run_id"])
+                            ui.notify(f"Keepa health: {result.get('health')} · tokensLeft {result.get('tokensLeft', '확인 불가')}", type="positive" if result.get("health") == "PASS" else "warning")
+                            render(runner.run(str(run["store_id"]), run_id=run["run_id"]))
+                            open_gate_action()
+                        except Exception as exc:
+                            ui.notify(f"Health 확인 실패 ({type(exc).__name__}). key/네트워크 상태를 확인하세요.", type="negative")
+                    ui.button("Health check", on_click=check_provider_health).props("outline")
+                    refreshed = runner.source_provider_preflight(run["run_id"], pilot=True)
+                    pilot_enabled = bool(refreshed.get("can_run_pilot"))
+                    full_enabled = bool(refreshed.get("can_run_full"))
+                    async def run_provider_pilot():
+                        try:
+                            result = await asyncio.to_thread(runner.run_source_provider_pilot, run["run_id"], confirmed=True)
+                            ui.notify(f"Provider pilot: {result['status']} · {result['provider_pilot']['checked']}개 검사 · UNKNOWN {result['provider_pilot']['unknown']}", type="positive" if result["status"] == "PASS" else "warning")
+                            render(result["production_run"])
+                            open_gate_action()
+                        except Exception as exc:
+                            ui.notify(f"Provider pilot 중단 ({type(exc).__name__}). G2는 완료 처리되지 않았습니다.", type="warning")
+                    ui.button("100개 Provider Pilot", on_click=run_provider_pilot).props("color=primary" + ("" if pilot_enabled else " disable"))
+                    ui.label("Provider Pilot은 최대 100개·1회 batch만 검사하며, 성공해도 G2 전체 완료가 아닙니다.").classes("ss-help")
+                    async def approve_full_source():
+                        dialog = ui.dialog()
+                        with dialog, ui.card():
+                            ui.label(f"전체 due 상품 {refreshed.get('full_due_count', 0)}개를 Keepa로 확인합니다. 예상 token {refreshed.get('full_due_count', 0)}개, 금액 비용은 확인할 수 없습니다.")
+                            with ui.row():
+                                async def do_run():
+                                    dialog.close()
+                                    try:
+                                        result = await asyncio.to_thread(runner.confirm_source_audit, run["run_id"], confirmed=True)
+                                        render(result["production_run"])
+                                    except Exception as exc:
+                                        ui.notify(f"Full Source Audit을 시작하지 못했습니다 ({type(exc).__name__}). G2는 승인되지 않았습니다.", type="warning")
+                                ui.button("취소", on_click=dialog.close).props("outline")
+                                ui.button("Full Audit 승인", on_click=do_run).props("color=negative")
+                        dialog.open()
+                    ui.button("Full Source Audit", on_click=approve_full_source).props("color=negative" + ("" if full_enabled else " disable"))
+                    with ui.row().classes("gap-2"):
+                        ui.button("Pause", on_click=lambda: runner.source_audit_control(run["run_id"], "PAUSE")).props("outline")
+                        async def resume_provider_audit():
+                            try:
+                                result = await asyncio.to_thread(runner.source_audit_control, run["run_id"], "RESUME")
+                                render(result["production_run"])
+                            except Exception as exc: ui.notify(f"Resume 불가 ({type(exc).__name__}).", type="warning")
+                        ui.button("Resume", on_click=resume_provider_audit).props("outline")
+                        ui.button("Stop", on_click=lambda: runner.source_audit_control(run["run_id"], "STOP")).props("outline color=negative")
+                        async def retry_provider_audit():
+                            try:
+                                result = await asyncio.to_thread(runner.source_audit_control, run["run_id"], "RETRY_FAILED")
+                                render(result["production_run"])
+                            except Exception as exc: ui.notify(f"Retry 실패 ({type(exc).__name__}).", type="warning")
+                        ui.button("Retry failed", on_click=retry_provider_audit).props("outline")
+                if key == "SOURCE_SAFETY_LEGACY":
                     preview = runner._source(str(run["store_id"]))
                     ui.label(f"대상 {preview.get('target_count', 0)}개 · batch {preview.get('estimated_batches', 0)}개 · 추정 token {preview.get('estimated_tokens', 0)} · 금액 비용 견적은 provider 미연결 시 확인 불가")
                     ui.label("승인 시 설정된 source provider를 호출합니다. provider 미설정이면 외부 호출 없이 멈춥니다.").classes("ss-help")

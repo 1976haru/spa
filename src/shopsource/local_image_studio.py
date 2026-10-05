@@ -109,6 +109,10 @@ class LocalImageStudioProvider:
                 for key, item in value.items():
                     if key in {"sha256", "prompt_hash"} and isinstance(item, str) and re.fullmatch(r"[a-fA-F0-9]{64}", item):
                         result[key] = item
+                    elif key in {"output_dir", "path"} and isinstance(item, str):
+                        # Local paths are protocol fields, not credential text.
+                        # They are constrained to output_dir and hash-validated below.
+                        result[key] = item
                     else:
                         result[key] = scrub(item)
                 return result
@@ -132,6 +136,9 @@ class LocalImageStudioProvider:
                 result = {}
                 for key, item in value.items():
                     if key in {"sha256", "prompt_hash"} and isinstance(item, str) and re.fullmatch(r"[a-fA-F0-9]{64}", item):
+                        result[key] = item
+                    elif key in {"output_dir", "path"} and isinstance(item, str):
+                        # Candidate paths are accepted only after containment and digest checks.
                         result[key] = item
                     else:
                         result[key] = scrub(item)
