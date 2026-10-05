@@ -1,0 +1,377 @@
+ShopSource Studio — Phase 5.2.2
+SHOPIFY 2026 AUTH MODERNIZATION — DEV DASHBOARD CLIENT CREDENTIALS + LEGACY TOKEN COMPATIBILITY
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+- Baseline: 2a4095e39f401eaef199af50934c2d128a696cc2
+
+Why this hotfix is required
+- Current ShopSource UI only accepts a static "Admin API access token".
+- Shopify changed custom-app creation/authentication in 2026.
+- New Dev Dashboard custom apps do not expose a static token for the merchant to copy from Shopify Admin.
+- For server-side integrations acting on stores in the same Shopify organization, Shopify's current documented flow is the client credentials grant:
+  client_id + client_secret -> POST /admin/oauth/access_token -> expiring access token.
+- Client-credentials access tokens expire after ~24 hours (expires_in 86399), so ShopSource must obtain/refresh them automatically rather than asking the user to paste a new token each day.
+- Existing legacy admin-created custom apps must continue to work with their existing static Admin API token.
+
+Primary goal
+Support BOTH:
+1. DEV_DASHBOARD_CLIENT_CREDENTIALS (recommended/current)
+2. LEGACY_ADMIN_TOKEN (existing older custom apps)
+
+No real write is performed by this implementation.
+
+======================================================================
+0. SAFETY
+======================================================================
+
+During implementation/tests:
+- NO real Shopify mutation
+- NO real product/theme/navigation write
+- NO Amazon/Keepa/Spark
+- NO paid APIs
+- no secrets in repo/DB/plaintext logs
+- no browser scraping of Shopify Admin
+
+Protected:
+stores/001_cabin_tidy.json
+NEVER reset/restore/checkout/clean/stage/commit/overwrite.
+
+======================================================================
+1. AUTH MODEL
+======================================================================
+
+Add auth modes:
+
+DEV_DASHBOARD_CLIENT_CREDENTIALS
+LEGACY_ADMIN_TOKEN
+
+Optional:
+AUTO
+may detect based on configured credential types, but must never guess from a secret value.
+
+Recommended default for new setup:
+DEV_DASHBOARD_CLIENT_CREDENTIALS.
+
+Connection metadata DB may contain:
+- store_id
+- shop_domain
+- auth_mode
+- api_version
+- status
+- last_verified_at
+- granted_scope summary
+- token_expires_at metadata
+- non-secret credential references
+
+NEVER store client_secret or access_token plaintext in SQLite.
+
+======================================================================
+2. WINDOWS CREDENTIAL MANAGER
+======================================================================
+
+Use the existing credential storage abstraction/pattern.
+
+Store secrets separately:
+- client_id may be stored as metadata or credential; prefer same secure credential bundle for simplicity
+- client_secret MUST be Windows Credential Manager
+- legacy admin access token MUST remain Windows Credential Manager
+- ephemeral client-credentials access token should preferably be memory-cached; if persisted at all, only use OS secure credential storage
+
+Never echo/reveal secrets after save.
+
+Provide delete/rotate actions.
+
+======================================================================
+3. CLIENT CREDENTIALS TOKEN SERVICE
+======================================================================
+
+Implement a ShopifyAuthService / credential provider that can supply a valid Admin API access token to all existing Shopify services.
+
+For DEV_DASHBOARD_CLIENT_CREDENTIALS:
+
+POST:
+https://{shop}.myshopify.com/admin/oauth/access_token
+
+Content-Type:
+application/x-www-form-urlencoded
+
+Fields:
+grant_type=client_credentials
+client_id=...
+client_secret=...
+
+Expected response:
+- access_token
+- scope
+- expires_in
+
+Rules:
+- expires_in is expected around 86399 but do not hardcode exact success requirement
+- cache token in memory with expires_at
+- refresh/request a new token before expiry with a safety window (e.g. 5 minutes)
+- after app restart, request a new token rather than requiring user input again
+- one token request should be reused across calls while valid
+- 401/token-expiry response may trigger one safe refresh+retry
+- never infinite retry
+
+Handle documented error:
+shop_not_permitted
+-> beginner message explaining the Dev Dashboard app/store must support this grant / be in the required organization context
+-> do not downgrade to fake success
+
+LEGACY_ADMIN_TOKEN:
+- use current stored token behavior unchanged
+- do not force migration during this phase
+
+======================================================================
+4. UNIFY EXISTING SHOPIFY CLIENTS
+======================================================================
+
+Do not make each module manage tokens independently.
+
+Existing services including:
+- ShopifyCollectionPublisher
+- ControlledLivePilotService
+- ShopifyThemeReader / homepage automation
+- NavigationService
+- ProductionEvidenceRunner
+- any Shopify product sync client
+
+must obtain auth through one central token provider.
+
+Remove direct assumptions that "saved static access token must exist" when auth_mode is client credentials.
+
+Do not break existing legacy-token tests/flows.
+
+======================================================================
+5. BEGINNER UI
+======================================================================
+
+Current /collections UI says:
+"Shopify 연결 설정 (토큰은 Windows 자격 증명에만 저장)"
+and only offers shop_domain + Admin API access token.
+
+Upgrade to:
+
+Shopify 연결 방식:
+[Dev Dashboard 앱 (권장)] [기존 Legacy 토큰]
+
+For Dev Dashboard:
+- Shopify shop domain (*.myshopify.com)
+- Client ID
+- Client Secret (password field)
+- [연결 정보 저장]
+- [Shopify 연결 / 권한 확인]
+
+Helper text:
+"새 Shopify 앱은 고정 Admin API token을 직접 복사하는 방식이 아닙니다. Client ID/Secret을 저장하면 ShopSource가 필요한 access token을 자동 발급/갱신합니다."
+
+For Legacy:
+- shop domain
+- Admin API access token
+- explicit label that this is for an existing legacy admin-created custom app
+
+Never ask user to paste a Client Secret into the "Admin API access token" field.
+
+After save, clear secret input fields.
+
+======================================================================
+6. PRODUCTION G0 INTEGRATION
+======================================================================
+
+On "실전 스토어 완성" G0 action:
+[Shopify 연결 확인]
+
+If connection not configured, open/embed the same connection setup directly in the production action dialog.
+Do NOT force the beginner to navigate to /collections.
+
+After config:
+- acquire token according to auth mode
+- read-only verify shop identity
+- granted scopes
+- theme read access
+- update G0 evidence
+- auto-continue same production run
+
+This addresses the current user confusion where G0 says WAITING_FOR_CREDENTIALS but the credential form exists only under Collection.
+
+======================================================================
+7. SCOPES
+======================================================================
+
+Do not invent scope names.
+
+Derive required/optional scopes from existing ShopSource modules and verify against the current Shopify API/version already pinned by the project.
+
+UI should show:
+- Granted
+- Missing required
+- Missing optional/future-write
+
+Do not require future write scopes merely to pass a read-only G0 if they are not needed for current read verification.
+Later write gates may require additional scopes and must stop truthfully.
+
+For a Dev Dashboard app, scope changes happen in the app configuration/version and may require release/approval/reinstall depending on Shopify's current flow.
+Provide exact beginner guidance based on actual missing scopes returned by Shopify.
+
+======================================================================
+8. TOKEN HEALTH / DIAGNOSTICS
+======================================================================
+
+Add:
+[인증 상태 확인]
+
+Show only:
+- auth mode
+- credential present: YES/NO
+- access token state: VALID / REFRESH_NEEDED / ERROR
+- expires in approximate minutes/hours (never token)
+- last verified
+- granted/missing scopes
+
+Never show:
+- client_secret
+- access_token
+- credential-manager raw target secret
+
+======================================================================
+9. ERROR MAPPING
+======================================================================
+
+Friendly Korean messages:
+
+missing client ID/secret
+-> "Shopify Dev Dashboard의 Client ID와 Client Secret을 입력해야 합니다."
+
+shop_not_permitted
+-> "현재 앱/스토어 조합에서는 Client Credentials 인증이 허용되지 않습니다. Dev Dashboard의 앱과 대상 스토어 조직/설치를 확인하세요."
+
+401 after refresh
+-> "Shopify 인증이 거부되었습니다. 앱 설치 상태와 자격 증명을 확인하세요."
+
+missing scopes
+-> "ShopSource에 필요한 Shopify 권한 일부가 없습니다."
+
+network timeout
+-> transient retry, not credential deletion
+
+Do not show raw secret-bearing response bodies by default.
+
+======================================================================
+10. MIGRATION / BACKWARD COMPATIBILITY
+======================================================================
+
+Existing saved legacy connection must continue working.
+
+Migration behavior:
+- if auth_mode absent but existing legacy token exists -> treat as LEGACY_ADMIN_TOKEN
+- do not delete legacy token
+- do not automatically convert credentials
+- user may switch auth mode explicitly later
+
+Additive DB migration only.
+
+======================================================================
+11. TESTS
+======================================================================
+
+Add at least:
+
+test_dev_dashboard_credentials_saved_securely
+test_client_secret_not_in_sqlite
+test_client_credentials_token_request_form
+test_token_cached_until_near_expiry
+test_token_refresh_before_expiry
+test_restart_requests_new_ephemeral_token
+test_401_refresh_once
+test_no_infinite_auth_retry
+test_shop_not_permitted_friendly_error
+test_missing_credentials
+test_granted_scopes_readback
+test_missing_required_scopes
+test_legacy_token_still_works
+test_legacy_connection_migrates_without_secret_loss
+test_production_g0_opens_connection_setup
+test_production_g0_continues_after_auth_success
+test_secret_redaction
+test_no_real_network_in_tests
+test_protected_file_untouched
+
+Existing suite remains green.
+
+======================================================================
+12. DOCS
+======================================================================
+
+Create:
+docs/SHOPIFY_AUTH_2026.md
+
+Korean beginner guide:
+- how to find *.myshopify.com domain
+- difference between Dev Dashboard app and legacy admin-created custom app
+- Client ID / Client Secret location
+- why no static token appears for new app
+- 24-hour access-token behavior
+- how ShopSource refreshes automatically
+- how to verify scopes
+- security warning: never paste secrets into chat
+
+Do not embed real secrets/examples.
+
+======================================================================
+13. QUALITY
+======================================================================
+
+Focused tests first.
+Then:
+python -m compileall -q src tests
+python -m pytest -q --durations=30
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Do not accept multi-hour regression.
+
+======================================================================
+14. COMMIT / PUSH
+======================================================================
+
+Commit:
+git commit -m "Support Shopify Dev Dashboard authentication"
+
+Push:
+git push origin main
+
+Verify:
+git rev-list --left-right --count main...origin/main
+= 0 0
+
+Do not commit secrets/runtime DB/logs/generated assets/protected JSON.
+
+======================================================================
+15. COMPLETION REPORT
+======================================================================
+
+Report:
+[1] baseline/final SHA
+[2] auth modes
+[3] secure credential storage
+[4] token refresh/caching
+[5] legacy compatibility
+[6] production G0 integrated setup
+[7] scope verification
+[8] error mapping
+[9] tests
+[10] full-suite runtime
+[11] protected file
+[12] commit/push
+[13] SHOPIFY_AUTH_2026_READY = YES/NO
+
+If YES:
+do not perform Shopify writes.
+Wait for user to configure credentials in the UI and run read-only G0 verification.
