@@ -64,6 +64,12 @@ def resolve_gate_click(run: dict, gate_key_or_number: str | int) -> str:
 def _summary(gate: dict) -> str:
     key, evidence = gate.get("gate_key"), gate.get("evidence") or {}
     counts = evidence.get("counts") or {}
+    if key == "BRAND_HEADER_NAVIGATION":
+        brand = evidence.get("brand_assets") or {}
+        if brand:
+            return (f"브랜드명: {brand.get('brand_name') or '미설정'} {brand.get('name_status', '확인 필요')} · "
+                    f"로고: {brand.get('logo', '확인 필요')} · 파비콘: {brand.get('favicon', '확인 필요')} · "
+                    f"메뉴: {brand.get('navigation', '확인 필요')}")
     if key == "SOURCE_SAFETY":
         checked = counts.get("checked", evidence.get("checked", 0))
         target = counts.get("source_check_eligible", evidence.get("source_check_eligible", 0))

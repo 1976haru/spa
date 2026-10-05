@@ -1282,24 +1282,27 @@ class ProductionEvidenceRunner:
                 duplicates.add("duplicate collection target")
             ready = data.get("status") == "FOUND" and not duplicates
             state = "VERIFIED" if ready else ("WAITING_FOR_INPUT" if data.get("status") in {"NOT_CONNECTED", "MANUAL_ACTION_REQUIRED"} else "REVIEW_REQUIRED")
-            brand_assets = {"logo": "UNKNOWN", "favicon": "UNKNOWN"}
+            brand_assets = {"logo": "UNKNOWN", "favicon": "UNKNOWN", "name_status": "REVIEW_REQUIRED",
+                            "brand_name": None, "navigation": "VERIFIED" if data.get("status") == "FOUND" and not duplicates else "NEEDS_REVIEW"}
             try:
-                from .brand_automation import detect_brand_settings
+                from .brand_automation import brand_identity_evidence, detect_brand_settings
                 theme = self._theme_snapshot(store_id)
                 if theme.get("status") == "CONNECTED":
                     detected = detect_brand_settings((theme.get("theme_files") or {}).get("config/settings_schema.json", "[]"),
                                                      (theme.get("theme_files") or {}).get("config/settings_data.json", "{}"))
-                    brand_assets = {kind: (value.get("status") if value.get("current") else "MISSING")
-                                    for kind, value in detected.items()}
+                    remote = {kind: value.get("current") for kind, value in detected.items()}
+                    brand_assets = brand_identity_evidence(store_id, remote=remote, db=self.db)
             except Exception:
                 pass
-            if "MISSING" in brand_assets.values() or "UNKNOWN" in brand_assets.values():
+            brand_missing = brand_assets.get("name_status") != "LOCKED" or any(
+                brand_assets.get(kind) != "VERIFIED_REMOTE" for kind in ("logo", "favicon"))
+            if brand_missing:
                 ready = False
                 state = "WAITING_FOR_INPUT"
             return {"status": state, "verified": ready, "menu_status": data.get("status"),
                     "link_count": len(links), "issues": sorted(duplicates),
                     "brand_assets": brand_assets,
-                    "missing_inputs": ([data.get("reason") or "Shopify navigation requires review"] if data.get("status") != "FOUND" else []) + (sorted(duplicates)) + (["Verify existing logo and favicon in the published theme"] if "MISSING" in brand_assets.values() or "UNKNOWN" in brand_assets.values() else []),
+                    "missing_inputs": ([data.get("reason") or "Shopify navigation requires review"] if data.get("status") != "FOUND" else []) + (sorted(duplicates)) + (["Confirm locked brand name and verify the current approved logo and favicon in the published theme"] if brand_missing else []),
                     "write_performed": False,
                     "fingerprint_input": {"menu": menu, "status": data.get("status"), "scopes": data.get("scopes")}}
         except (TimeoutError, ConnectionError) as exc:

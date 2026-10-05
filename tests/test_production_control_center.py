@@ -62,6 +62,16 @@ def test_gate_board_summary_keeps_evidence_denominator_14(tmp_path):
     assert summary["store_id"] == "001" and summary["store_name"] == "Cabin Tidy"
 
 
+def test_brand_gate_summary_shows_name_logo_favicon_and_navigation():
+    from shopsource.ui.production_control_center import _summary
+    gate={"gate_key":"BRAND_HEADER_NAVIGATION","evidence":{"brand_assets":{
+        "brand_name":"Cabin Tidy","name_status":"LOCKED","logo":"APPROVED_LOCAL",
+        "favicon":"NEEDS_REVIEW","navigation":"VERIFIED"}}}
+    summary=_summary(gate)
+    assert "Cabin Tidy" in summary and "LOCKED" in summary and "APPROVED_LOCAL" in summary
+    assert "NEEDS_REVIEW" in summary and "VERIFIED" in summary
+
+
 def test_summary_uses_synthetic_store_profile_without_cabin_tidy_assumption(tmp_path):
     _, service, run = _run(tmp_path)
     run["store_id"] = "002"

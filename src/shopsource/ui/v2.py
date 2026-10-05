@@ -787,9 +787,16 @@ class OperatorUI:
                     ui.label("컬렉션별 승인 이미지와 비율 검토가 필요합니다. 이미지 생성·업로드는 이 패널을 여는 것만으로 실행되지 않습니다.").classes("ss-help")
                     ui.button("이미지·홈페이지 준비 열기", on_click=lambda: ui.navigate.to("/homepage")).props("outline")
                 elif key == "BRAND_HEADER_NAVIGATION":
-                    ui.label("브랜드 자산과 메뉴의 실제 대상 링크를 각각 점검합니다. 기존 사용자 메뉴는 별도 승인 없이 수정하지 않습니다.").classes("ss-help")
+                    brand_state=(gate.get("evidence") or {}).get("brand_assets") or {}
+                    ui.label(f"브랜드명: {brand_state.get('brand_name') or '미설정'} · {brand_state.get('name_status','확인 필요')}").classes("font-semibold")
+                    ui.label(f"로고: {brand_state.get('logo','확인 필요')} · 파비콘: {brand_state.get('favicon','확인 필요')} · 메뉴: {brand_state.get('navigation','확인 필요')}").classes("ss-help")
+                    ui.label("기술 검사는 시각 품질 승인을 대신하지 않습니다. remote 적용/검증도 별도 상태로 관리합니다.").classes("ss-help")
                     with ui.row().classes("gap-2 flex-wrap"):
-                        ui.button("브랜드 확인", on_click=lambda: ui.navigate.to("/brand")).props("outline")
+                        ui.button("브랜드 이름 확인", on_click=lambda: ui.navigate.to("/brand")).props("outline")
+                        ui.button("로고 준비", on_click=lambda: ui.navigate.to("/brand")).props("outline")
+                        ui.button("파비콘 준비", on_click=lambda: ui.navigate.to("/brand")).props("outline")
+                        ui.button("Shopify 적용 미리보기", on_click=lambda: ui.navigate.to("/brand")).props("outline")
+                        ui.button("수동 적용 안내", on_click=lambda: ui.navigate.to("/brand")).props("outline")
                         ui.button("메뉴 확인", on_click=lambda: ui.navigate.to("/navigation")).props("outline")
                 elif key == "HOMEPAGE":
                     ui.label("Hero·CTA·카테고리 대상 링크와 현재 테마를 미리보기로 확인합니다. 테마 쓰기는 별도 승인 없이는 실행되지 않습니다.").classes("ss-help")
@@ -1363,33 +1370,43 @@ class OperatorUI:
         ui=self.ui
         from ..brand_automation import (BrandThemeService,approve_asset,brand_name_prompt,brand_profile_from_store,
             compose_horizontal_logo,derive_favicon,generate_logo_mark,get_brand_profile,list_brand_assets,
-            logo_mark_prompt,manual_theme_instructions,register_manual_asset_bytes,suggest_brand_names,validate_manual_assets)
+            logo_mark_prompt,manual_theme_instructions,register_manual_asset_bytes,suggest_brand_names,validate_manual_assets,
+            brand_name_state,export_brand_prompts,import_brand_name_candidates,lock_brand_name,begin_brand_name_change,
+            derive_initial_favicon,logo_preview_report,validate_favicon,logo_prompt,brand_identity_evidence)
         from ..collection_images import OpenAIImagesProvider
         self._heading("브랜드 · 로고 · 파비콘", "Store Profile에서 브랜드 방향을 만들고, 승인된 자산만 Shopify Theme에 제안합니다.")
-        state={"profile":get_brand_profile(self.current_store),"preview":None,"uploaded":[],"backup_id":None}
+        state={"profile":get_brand_profile(self.current_store),"candidates":suggest_brand_names(self.current_store),"preview":None,"uploaded":[],"backup_id":None}
         if not state["profile"]:
             try:state["profile"]=brand_profile_from_store(self.current_store)
             except Exception:pass
         profile_card=ui.label("브랜드 profile 불러오는 중")
         status_card=ui.label("로고: MISSING · 파비콘: MISSING · Shopify Theme: MANUAL ACTION")
         asset_area=ui.column().classes("w-full gap-2")
+        candidate_area=ui.column().classes("w-full gap-2")
         prompt_area=ui.textarea("생성 프롬프트", value="").props("readonly autogrow").classes("w-full")
+        candidate_json=ui.textarea("외부 AI에서 받은 후보 JSON 붙여넣기", value="").props("autogrow").classes("w-full")
+        clearance_confirm=ui.checkbox("도메인 및 상표를 직접 별도 검토했으며 법적 사용 가능 판정이 아님을 이해합니다.",value=False)
         candidate_select=ui.select({},label="브랜드명 후보 (선택 시에만 변경)").classes("w-96")
         asset_select=ui.select({},label="승인할 자산").classes("w-96")
         mark_select=ui.select({},label="로고 mark source").classes("w-96")
         favicon_select=ui.select({},label="favicon source mark (APPROVED)").classes("w-96")
+        favicon_initial=ui.select({"C":"C 이니셜","CT":"CT 이니셜"},label="파비콘 이니셜 직접 선택 (선택사항)").classes("w-72")
         logo_upload=ui.upload(label="로고 파일 선택",auto_upload=True,on_upload=lambda e:save_manual_upload(e,"LOGO_HORIZONTAL")).props("accept=.png,.jpg,.jpeg,.svg").classes("w-full")
         favicon_upload=ui.upload(label="파비콘 파일 선택",auto_upload=True,on_upload=lambda e:save_manual_upload(e,"FAVICON_32")).props("accept=.png").classes("w-full")
         opt_in=ui.checkbox("이미지 자동 생성 사용 (유료 이미지 API opt-in)",value=False)
         transparent=ui.checkbox("거의 흰색 배경을 투명 처리",value=False)
+        ui.label("로고 설계 입력 · 스토어명은 현재 Brand Profile에서 가져옵니다.").classes("text-base font-semibold")
+        category=ui.input("주요 판매 카테고리").classes("w-96")
+        customer=ui.input("주요 고객층").classes("w-96")
+        desired_image=ui.input("원하는 브랜드 이미지 / 느낌 / 키워드").classes("w-96")
+        primary=ui.input("선호 색상 · Primary",value="#24364B").classes("w-48")
+        secondary=ui.input("선호 색상 · Secondary",value="#FFFFFF").classes("w-48")
+        accent=ui.input("선호 색상 · Accent",value="#D7C7A6").classes("w-48")
+        avoid_colors=ui.input("피하고 싶은 색상 (쉼표 구분)").classes("w-96")
+        avoid_styles=ui.input("피하고 싶은 스타일 (쉼표 구분)").classes("w-96")
         with ui.expansion("고급 설정",icon="tune"):
-            category=ui.input("주요 카테고리").classes("w-96")
-            customer=ui.input("주요 고객층").classes("w-96")
             country=ui.input("판매 국가").classes("w-48")
             keywords=ui.input("브랜드 키워드 (쉼표 구분)").classes("w-96")
-            primary=ui.input("Primary color",value="#24364B").classes("w-48")
-            secondary=ui.input("Secondary color",value="#FFFFFF").classes("w-48")
-            accent=ui.input("Accent color",value="#D7C7A6").classes("w-48")
             model=ui.input("OpenAI image model",value="gpt-image-1").classes("w-72")
         generated=ui.label("이미지 자동 생성 예상 호출: 로고 mark 1회 · 파비콘 0회 (mark에서 결정적 파생)").classes("text-sm text-slate-600")
 
@@ -1397,15 +1414,19 @@ class OperatorUI:
             profile=get_brand_profile(self.current_store);state["profile"]=profile
             assets=list_brand_assets(self.current_store)
             name=profile["profile"]["brand_name"] if profile else "미설정"
+            name_state=brand_name_state(self.current_store)
             direction=" · ".join(str(x) for x in (profile["profile"].get("personality") or [])) if profile else ""
-            profile_card.set_text(f"브랜드: {name} · 방향: {direction} · Profile v{profile['version'] if profile else '-'} · {profile['approval_status'] if profile else 'DRAFT'}")
+            profile_card.set_text(f"브랜드: {name} · 이름 {name_state.get('name_status','REVIEW_REQUIRED')} · 방향: {direction} · Profile v{profile['version'] if profile else '-'} · {profile['approval_status'] if profile else 'DRAFT'}")
             logo=next((x for x in reversed(assets) if x["asset_type"]=="LOGO_HORIZONTAL" and x["approval_status"]=="APPROVED"),None)
             fav=next((x for x in reversed(assets) if x["asset_type"]=="FAVICON_32" and x["approval_status"]=="APPROVED"),None)
-            status_card.set_text(f"로고: {'READY' if logo else 'NEEDS_REVIEW' if any(x['asset_type']=='LOGO_HORIZONTAL' for x in assets) else 'MISSING'} · 파비콘: {'READY' if fav else 'NEEDS_REVIEW' if any(x['asset_type']=='FAVICON_32' for x in assets) else 'MISSING'} · Shopify Theme: {'PREVIEW 생성됨' if state['preview'] else 'MANUAL ACTION / 검사 전'}")
+            identity=brand_identity_evidence(self.current_store)
+            logo_state=identity["logo"]
+            fav_state=identity["favicon"]
+            status_card.set_text(f"이름: {name_state.get('name_status','REVIEW_REQUIRED')} · 로고: {logo_state} · 파비콘: {fav_state} · Shopify Theme: {'PREVIEW 생성됨' if state['preview'] else 'MANUAL ACTION / 검사 전'}")
             options={x["asset_id"]:f"{x['asset_type']} v{x['version']} · {x['approval_status']}" for x in assets}
             asset_select.options=options;mark_select.options={x["asset_id"]:f"{x['asset_type']} v{x['version']}" for x in assets if x["asset_type"]=="LOGO_MARK"}
             favicon_select.options={x["asset_id"]:f"{x['asset_type']} v{x['version']}" for x in assets if x["asset_type"]=="LOGO_MARK" and x["approval_status"]=="APPROVED"}
-            candidate_select.options={x["name"]:x["name"] for x in state.get("candidates",[])}
+            candidate_select.options={x["brand_name"]:f"{x['brand_name']} · {x['direction']}" for x in state.get("candidates",[]) if x.get("shortlisted")}
             asset_select.update();mark_select.update();favicon_select.update();candidate_select.update()
             asset_area.clear()
             with asset_area:
@@ -1413,11 +1434,33 @@ class OperatorUI:
                     ui.label(f"{asset['asset_type']} v{asset['version']} · {asset['width']}×{asset['height']} {asset['format']} · {asset['approval_status']} · {asset['sha256'][:12]}…")
                     if Path(asset["local_path"]).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".svg"}:
                         ui.image(asset["local_path"]).classes("max-w-md max-h-48 object-contain bg-white rounded border")
+                        if asset["asset_type"] == "LOGO_HORIZONTAL" and asset["format"] != "SVG":
+                            try:
+                                report=logo_preview_report(asset)
+                                ui.label(f"Desktop header 축소 {report['desktop_header_width']}px · Mobile {report['mobile_header_width']}px · 여백 {report['safe_padding_ratio']:.1%} · {report['technical_status']} · 최종 시각 승인 필요").classes("ss-help")
+                                ui.image(asset["local_path"]).style("width:300px;max-height:80px;object-fit:contain;background:#fff;padding:8px;border:1px solid #ddd")
+                                ui.image(asset["local_path"]).style("width:168px;max-height:56px;object-fit:contain;background:#24364b;padding:8px;border:1px solid #ddd")
+                            except Exception: pass
+                    if asset["asset_type"] == "FAVICON_32" and asset["format"] == "PNG":
+                        try:
+                            check=validate_favicon(asset)
+                            ui.label(f"32×32 enlarged preview · safe padding {check['safe_padding_ratio']:.1%} · coverage {check['coverage_ratio']:.1%} · {check['technical_status']} · 시각 검수 필요").classes("ss-help")
+                            ui.image(asset["local_path"]).style("width:128px;height:128px;image-rendering:pixelated;background:#fff;padding:16px;border:1px solid #ddd")
+                        except Exception: pass
+            candidate_area.clear()
+            with candidate_area:
+                for candidate in state.get("candidates",[]):
+                    shortlist=" · 전략 shortlist" if candidate.get("shortlisted") else ""
+                    ui.label(f"{candidate['brand_name']} ({candidate['pronunciation']}){shortlist} · {candidate['review_status']}").classes("font-semibold")
+                    ui.label(f"{candidate['meaning_and_rationale']} · 이미지: {candidate['brand_image']} · 방향: {candidate['direction']} · 기본 충돌: {len(candidate.get('conflicts',[]))}건").classes("ss-help")
 
         async def design_profile():
             try:
                 overrides={"primary_category":category.value or None,"target_customer":customer.value or None,"target_country":country.value or None,
                            "brand_keywords":[x.strip() for x in (keywords.value or "").split(",") if x.strip()],
+                           "desired_brand_image":desired_image.value or "",
+                           "avoid_colors":[x.strip() for x in (avoid_colors.value or "").split(",") if x.strip()],
+                           "avoid_styles":[x.strip() for x in (avoid_styles.value or "").split(",") if x.strip()] or ["3D","watermarks","busy patterns","thin details"],
                            "colors":{"primary":primary.value,"secondary":secondary.value,"accent":accent.value}}
                 overrides={k:v for k,v in overrides.items() if v not in (None,[])}
                 state["profile"]=brand_profile_from_store(self.current_store,overrides=overrides)
@@ -1425,18 +1468,30 @@ class OperatorUI:
             except Exception as exc:ui.notify(_safe_error(exc),type="negative")
 
         async def recommend_names():
-            try:state["candidates"]=suggest_brand_names(self.current_store);prompt_area.value=brand_name_prompt(self.current_store);refresh();ui.notify("후보 10개를 저장했습니다. 도메인/상표 확인은 별도입니다.",type="positive")
+            try:
+                prompt_area.value=brand_name_prompt(self.current_store)
+                state["prompt_exports"]=export_brand_prompts(self.current_store)
+                state["candidates"]=suggest_brand_names(self.current_store)
+                refresh();ui.notify(f"이름 후보 prompt를 내보냈습니다: {state['prompt_exports']['brand_name_prompt']} · 도메인/상표는 별도 검토",type="positive")
+            except Exception as exc:ui.notify(_safe_error(exc),type="negative")
+
+        async def import_names():
+            try:
+                state["candidates"]=import_brand_name_candidates(self.current_store,candidate_json.value)
+                refresh();ui.notify("정확히 10개 후보와 3개 전략 shortlist를 검증해 저장했습니다.",type="positive")
             except Exception as exc:ui.notify(_safe_error(exc),type="negative")
 
         async def choose_name():
             if not candidate_select.value:return
-            try:state["profile"]=brand_profile_from_store(self.current_store,overrides={"brand_name":candidate_select.value});refresh()
+            if not clearance_confirm.value:ui.notify("도메인·상표를 직접 별도 검토했음을 체크하세요.",type="warning");return
+            try:state["profile"]=lock_brand_name(self.current_store,candidate_select.value,confirmed=True,clearance_reviewed=True);refresh()
             except Exception as exc:ui.notify(_safe_error(exc),type="negative")
 
         async def show_logo_prompt():
             try:
                 state["profile"]=get_brand_profile(self.current_store) or brand_profile_from_store(self.current_store)
-                prompt_area.value="LOGO MARK (text-free)\n"+logo_mark_prompt(state["profile"])+"\n\nWORDMARK\n"+state["profile"]["profile"]["brand_name"]
+                state["prompt_exports"]=export_brand_prompts(self.current_store)
+                prompt_area.value="LOGO MARK (text-free)\n"+logo_mark_prompt(state["profile"])+"\n\nHORIZONTAL LOGO GUIDANCE\n"+logo_prompt(state["profile"])
                 ui.notify("정확한 워드마크는 이미지 모델이 아니라 프로그램이 합성합니다.",type="positive")
             except Exception as exc:ui.notify(_safe_error(exc),type="negative")
 
@@ -1460,9 +1515,30 @@ class OperatorUI:
 
         async def make_favicon():
             mark_id=favicon_select.value
-            if not mark_id:ui.notify("승인된 LOGO_MARK를 먼저 선택하세요.",type="warning");return
+            if not mark_id:ui.notify("승인된 LOGO_MARK를 선택하세요. 전체 wordmark 축소는 금지됩니다.",type="warning");return
             try:result=await asyncio.to_thread(derive_favicon,self.current_store,mark_id,transparent_white=bool(transparent.value));refresh();ui.notify(f"32×32 파비콘 생성: {result['favicon_32']['local_path']}",type="positive")
             except Exception as exc:ui.notify(_safe_error(exc),type="negative")
+
+        async def make_initial_favicon():
+            if favicon_initial.value not in {"C","CT"}:ui.notify("먼저 C 또는 CT를 직접 선택하세요.",type="warning");return
+            try:
+                await asyncio.to_thread(derive_initial_favicon,self.current_store,favicon_initial.value,confirmed=True)
+                refresh();ui.notify("선택한 이니셜로 파비콘 초안을 만들었습니다. 시각 검토 후 승인하세요.",type="positive")
+            except Exception as exc:ui.notify(_safe_error(exc),type="negative")
+
+        async def request_name_change():
+            with ui.dialog() as dialog,ui.card():
+                ui.label("브랜드명 변경은 기존 이름을 바꾸는 별도 작업입니다. 기존 로고/파비콘 파일은 삭제하지 않지만 favicon identity 검토가 필요해집니다.")
+                confirmed=ui.checkbox("이름 변경 절차를 시작하겠습니다.",value=False)
+                async def proceed():
+                    if not confirmed.value:ui.notify("확인란을 선택하세요.",type="warning");return
+                    try:
+                        begin_brand_name_change(self.current_store,confirmed=True)
+                        dialog.close();refresh();ui.notify("이름 변경 검토 상태로 전환했습니다. 기존 자산은 보존됩니다.",type="warning")
+                    except Exception as exc:ui.notify(_safe_error(exc),type="negative")
+                ui.button("취소",on_click=dialog.close).props("outline")
+                ui.button("변경 절차 시작",on_click=proceed).props("color=negative")
+            dialog.open()
 
         async def approve_selected():
             if not asset_select.value:return
@@ -1540,14 +1616,16 @@ class OperatorUI:
             ui.label("과제 모드: 승인 전에는 자동 적용되지 않습니다. 업로드 후에는 Theme Editor에서 저장·표시를 확인하세요.").classes("text-sm")
             with ui.row().classes("flex-wrap"):
                 ui.button("브랜드 자동 설계",on_click=design_profile)
-                ui.button("브랜드명 추천",on_click=recommend_names).props("outline")
-                ui.button("후보 선택 적용",on_click=choose_name).props("outline")
+                ui.button("STEP 1 · 이름 prompt 생성",on_click=recommend_names).props("outline")
+                ui.button("후보 JSON 검증/import",on_click=import_names).props("outline")
+                ui.button("선택한 후보 잠금",on_click=choose_name).props("outline")
+                ui.button("브랜드명 변경 시작",on_click=request_name_change).props("outline color=negative")
                 ui.button("로고 프롬프트 생성",on_click=show_logo_prompt).props("outline")
                 ui.button("로고 생성",on_click=generate_mark).props("color=primary")
                 ui.button("가로 wordmark 합성",on_click=compose_logo).props("outline")
-                ui.button("파비콘 프롬프트 생성",on_click=lambda:prompt_area.set_value("\n".join(["Approved LOGO_MARK 기반 파생", "32×32에서 식별 가능", "새 로고 디자인을 만들지 않음"]))).props("outline")
+                ui.button("STEP 4 · 파비콘 prompt 생성",on_click=lambda:prompt_area.set_value(__import__('shopsource.brand_automation',fromlist=['favicon_prompt']).favicon_prompt(get_brand_profile(self.current_store),source_logo_mark_id=favicon_select.value) if favicon_select.value else __import__('shopsource.brand_automation',fromlist=['favicon_prompt']).favicon_prompt(get_brand_profile(self.current_store),selected_initial=favicon_initial.value))).props("outline")
                 ui.button("파비콘 생성",on_click=make_favicon).props("outline")
-                ui.button("3232 자동 변환",on_click=make_favicon).props("outline")
+                ui.button("선택한 C/CT로 favicon 초안",on_click=make_initial_favicon).props("outline")
                 ui.button("승인",on_click=approve_selected).props("color=positive")
                 ui.button("파일 검사",on_click=validate_files).props("outline")
                 ui.button("승인 자산을 Shopify Files에 업로드",on_click=upload_assets).props("outline")
@@ -1555,7 +1633,9 @@ class OperatorUI:
                 ui.button("Shopify에 적용",on_click=apply_theme).props("color=negative")
                 ui.button("롤백",on_click=rollback_theme).props("outline color=negative")
                 ui.button("수동 적용 안내",on_click=manual_instructions).props("outline")
-            candidate_select;asset_select;mark_select;favicon_select
+            candidate_json
+            candidate_area
+            candidate_select;clearance_confirm;asset_select;mark_select;favicon_select;favicon_initial
             logo_upload;favicon_upload;opt_in;transparent;generated
             prompt_area;asset_area
         refresh()
