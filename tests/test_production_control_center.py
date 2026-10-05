@@ -55,10 +55,22 @@ def test_control_center_layout_is_compact_desktop_and_single_column_mobile():
 def test_gate_board_summary_keeps_evidence_denominator_14(tmp_path):
     _, service, run = _run(tmp_path)
     progress = service.progress_report(run["run_id"])
-    summary = production_summary(run, progress)
+    summary = production_summary(run, progress, {"store_id": "001", "store_name": "Cabin Tidy"})
     assert summary["denominator"] == 14
     assert summary["percent"] == 0
     assert "17개" in summary["progress_note"] and "14개" in summary["progress_note"]
+    assert summary["store_id"] == "001" and summary["store_name"] == "Cabin Tidy"
+
+
+def test_summary_uses_synthetic_store_profile_without_cabin_tidy_assumption(tmp_path):
+    _, service, run = _run(tmp_path)
+    run["store_id"] = "002"
+    summary = production_summary(run, service.progress_report(run["run_id"]),
+                                {"store_id": "002", "store_name": "Maple Road Gear"})
+    assert summary["store_id"] == "002"
+    assert summary["store_name"] == "Maple Road Gear"
+    source = (__import__("pathlib").Path(__file__).parents[1] / "src/shopsource/ui/production_control_center.py").read_text(encoding="utf-8")
+    assert "Cabin Tidy" not in source
 
 
 def test_product_content_draft_is_local_and_rechecks_selected_gate(tmp_path):

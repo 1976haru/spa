@@ -107,8 +107,12 @@ def gate_board_rows(run: dict, progress: dict) -> list[dict]:
     return rows
 
 
-def production_summary(run: dict, progress: dict) -> dict:
-    return {"store_name": "Cabin Tidy", "percent": progress["production_readiness_percent"],
+def production_summary(run: dict, progress: dict, store_profile: dict | None = None) -> dict:
+    """Build the summary from the active run/profile, never from a store constant."""
+    profile = dict(store_profile or {})
+    store_id = str(profile.get("store_id") or run.get("store_id") or "")
+    store_name = str(profile.get("store_name") or run.get("store_name") or (f"Store {store_id}" if store_id else "스토어 미선택"))
+    return {"store_id": store_id, "store_name": store_name, "percent": progress["production_readiness_percent"],
             "verified": len(progress.get("completed", [])), "denominator": progress["evidence_gate_count"],
             "current_stage": progress.get("current_stage"), "current_label": progress.get("current_stage_label"),
             "status": run.get("status", "NOT_READY"), "next_action": progress.get("next_action"),

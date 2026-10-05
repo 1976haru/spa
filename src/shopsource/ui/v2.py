@@ -341,8 +341,9 @@ class OperatorUI:
         def render(run):
             state["run"] = run
             progress_state = service.progress_report(run["run_id"])
-            overview = production_summary(run, progress_state)
-            summary.set_text(f"{overview['store_name']} · 실전 진행률 {overview['percent']}% · 검증 {overview['verified']} / {overview['denominator']} · {overview['status']}")
+            store_profile = get_store(str(run["store_id"]))
+            overview = production_summary(run, progress_state, store_profile)
+            summary.set_text(f"Store {overview['store_id']} | {overview['store_name']} · 실전 진행률 {overview['percent']}% · 검증 {overview['verified']} / {overview['denominator']} · {overview['status']}")
             progress_report_label.set_text(f"현재 단계: {overview['current_label']} · 남은 증거 단계 {overview['remaining']}개\n{overview['progress_note']}")
             current_key = progress_state["current_stage"]
             current_action_button.set_text(GATE_ACTION_REGISTRY.get(current_key, {}).get("label", "현재 단계 해결하기"))
