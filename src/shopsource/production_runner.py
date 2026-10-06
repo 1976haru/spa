@@ -847,7 +847,12 @@ class ProductionEvidenceRunner:
         from .capture.batch import BatchSourcingService
         from .source_safety import FreeSourceSafetyService
         run = self.service.get(run_id); store_id = str(run["store_id"])
+        batch_kind = str(batch_kind).upper()
         free = FreeSourceSafetyService(self.db)
+        existing = self.find_open_free_browser_capture_batch(run_id, batch_kind)
+        if existing:
+            return {**existing, "reused": True,
+                    "note": "Reusing the existing incomplete source-check batch; no duplicate batch was created."}
         preview = free.preview_batch(store_id, batch_kind, selected_product_ids=selected_product_ids)
         batch_kind = preview["batch_kind"]
         if not preview["target_product_ids"]:
@@ -884,8 +889,70 @@ class ProductionEvidenceRunner:
         return {"status":"WAITING_FOR_INPUT","provider":"FREE_LOCAL_SOURCE_CHECK",
             "release_batch_id":release_batch_id,"browser_batch_run_id":browser_batch["run_id"],
             "capture_run_id":capture_run_id,"queued":queued.get("queued",0),
-            "target_count":len(ids),"auto_import_master":False,
+            "target_count":len(ids),"auto_import_master":False,"reused":False,
             "note":"Open the queued Amazon pages with the existing Browser Capture extension. No bypass or automatic Amazon execution was performed."}
+
+    def find_open_free_browser_capture_batch(self, run_id, batch_kind="SOURCE_CHECK_PILOT", *, include_completed=False):
+        """Return the newest incomplete free source batch with its persisted worker state."""
+        from .capture.batch import BatchSourcingService
+        run = self.service.get(run_id)
+        store_id = str(run["store_id"])
+        active = {"WAITING_FOR_INPUT", "RUNNING", "PAUSED", "PAUSED_NEEDS_USER", "REVIEW_REQUIRED"}
+        if include_completed:
+            active.add("VERIFIED")
+        with connect(self.db) as con:
+            exists = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_safety_release_batches'").fetchone()
+            if not exists:
+                return None
+            rows = con.execute("""SELECT * FROM source_safety_release_batches
+                WHERE store_id=? AND batch_kind=? ORDER BY created_at DESC,batch_id DESC""",
+                (store_id, str(batch_kind).upper())).fetchall()
+            for row in rows:
+                if row["status"] not in active:
+                    continue
+                evidence = json.loads(row["evidence_json"] or "{}")
+                browser_run_id = evidence.get("browser_batch_run_id")
+                capture_run_id = evidence.get("capture_run_id")
+                if not browser_run_id:
+                    continue
+                browser = con.execute("SELECT run_id FROM browser_batch_runs WHERE run_id=? AND store_id=?",
+                                      (browser_run_id, store_id)).fetchone()
+                if not browser:
+                    continue
+                item_counts = {str(item["state"]): int(item["n"]) for item in con.execute(
+                    "SELECT state,COUNT(*) n FROM browser_batch_items WHERE batch_run_id=? GROUP BY state",
+                    (browser_run_id,)).fetchall()}
+                current_item = con.execute("""SELECT asin,state FROM browser_batch_items
+                    WHERE batch_run_id=? AND state IN ('DETAIL_OPENED','DETAIL_PENDING')
+                    ORDER BY CASE state WHEN 'DETAIL_OPENED' THEN 0 ELSE 1 END,id LIMIT 1""",
+                    (browser_run_id,)).fetchone()
+                completed = int(con.execute("""SELECT COUNT(*) FROM browser_capture_candidates
+                    WHERE run_id=? AND capture_status='DETAIL_COMPLETE'""", (capture_run_id,)).fetchone()[0])
+                observation_counts = {str(item["availability"]): int(item["n"]) for item in con.execute(
+                    "SELECT availability,COUNT(*) n FROM source_safety_release_items WHERE batch_id=? AND status<>'PENDING' GROUP BY availability",
+                    (row["batch_id"],)).fetchall()}
+                browser_status = BatchSourcingService(self.db).get(browser_run_id)
+                if browser_status["status"] == "CANCELLED":
+                    continue
+                return {"status": row["status"], "provider": "FREE_LOCAL_SOURCE_CHECK",
+                    "release_batch_id": row["batch_id"], "browser_batch_run_id": browser_run_id,
+                    "capture_run_id": capture_run_id, "queued": sum(item_counts.values()),
+                    "target_count": int(row["target_count"]), "checked_count": int(row["checked_count"]),
+                    "captured_count": completed, "queue_states": item_counts,
+                    "observation_counts": observation_counts,
+                    "current_item": dict(current_item) if current_item else None,
+                    "browser_status": browser_status["status"],
+                    "browser_batch": browser_status, "auto_import_master": False}
+        return None
+
+    def resume_free_browser_capture_batch(self, browser_batch_run_id):
+        """Resume an existing user-authorized local capture queue without adding items."""
+        from .capture.batch import BatchSourcingService
+        batches = BatchSourcingService(self.db)
+        current = batches.get(browser_batch_run_id)
+        if current["status"] in {"PAUSED", "PAUSED_NEEDS_USER", "PENDING"}:
+            current = batches.action(browser_batch_run_id, "RESUME")
+        return current
 
     def apply_free_browser_capture_results(self, run_id, release_batch_id, *, confirmed=False):
         if not confirmed:

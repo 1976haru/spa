@@ -409,17 +409,174 @@ class OperatorUI:
                     ui.label("quantity는 재고로 간주하지 않습니다. 기존 Spark 수집 사실만으로 IN_STOCK 처리하지 않습니다.").classes("ss-help")
                     ui.label(f"무료 모드 · 예상 token 0 · 예상 비용 FREE_LOCAL · 최신 확인 {draft['freshness'].get('FRESH', 0)} · 오래됨 {draft['freshness'].get('STALE_WARNING', 0) + draft['freshness'].get('STALE_BLOCKED', 0)} · 미확인 {draft['freshness'].get('NEVER_VERIFIED', 0)}")
 
-                    async def prepare_free(kind):
-                        try:
-                            result = await asyncio.to_thread(runner.prepare_free_browser_capture_batch,
-                                run["run_id"], kind, confirmed=True)
-                            render(runner.service.get(run["run_id"]))
-                            open_gate_action()
-                            ui.notify(f"브라우저 캡처 대기열을 준비했습니다 ({result['queued']}개). Amazon 페이지는 사용자가 기존 Browser Capture로 직접 열어 확인해야 합니다.", type="warning")
-                        except Exception as exc:
-                            ui.notify(f"무료 Source 검사 준비 실패 ({type(exc).__name__}).", type="negative")
+                    pilot = runner.find_open_free_browser_capture_batch(run["run_id"], "SOURCE_CHECK_PILOT", include_completed=True)
+                    pilot_box = ui.column().classes("w-full rounded-lg border border-amber-200 bg-amber-50 p-3 gap-2")
+                    with pilot_box:
+                        pilot_heading = ui.label("무료 Source Check Pilot").classes("ss-card-title")
+                        pilot_summary = ui.label()
+                        pilot_worker = ui.label()
+                        pilot_notice = ui.label().classes("ss-help")
+                        with ui.row().classes("gap-2 flex-wrap"):
+                            pilot_start = ui.button("10개 무료 검사 시작", icon="play_arrow").props("color=primary")
+                            worker_show = ui.button("Amazon 작업 탭 보기", icon="open_in_new").props("outline")
+                            pilot_apply = ui.button("캡처 결과 반영", icon="publish").props("outline")
+                        with ui.row().classes("gap-2 flex-wrap"):
+                            pilot_pause = ui.button("일시정지", on_click=lambda: control_pilot("PAUSE")).props("outline")
+                            pilot_resume = ui.button("계속", on_click=lambda: control_pilot("RESUME")).props("outline")
+                            pilot_retry = ui.button("현재 상품 다시 시도", on_click=lambda: control_pilot("RETRY")).props("outline")
+                            pilot_stop = ui.button("중단", on_click=lambda: control_pilot("STOP")).props("outline color=negative")
+                        extension_help = ui.row().classes("gap-2 flex-wrap")
+                        with extension_help:
+                            ui.button("확장프로그램 연결 방법", on_click=lambda: ui.navigate.to("/settings")).props("outline")
+                            ui.button("설정 화면 열기", on_click=lambda: ui.navigate.to("/settings")).props("outline")
+                            ui.button("다시 연결 확인", on_click=lambda: launch_free("SOURCE_CHECK_PILOT")).props("outline")
+                            pilot_manual_fallback = ui.button("원본 상품 직접 열기", on_click=lambda: open_current_source()).props("outline")
+                            pilot_manual_fallback.set_enabled(False)
 
-                    ui.button("10개 무료 Source Check Pilot", on_click=lambda: prepare_free("SOURCE_CHECK_PILOT")).props("color=primary" + (" disable" if draft["target_count"] == 0 else ""))
+                    def update_pilot_view(current):
+                        if not current:
+                            pilot_summary.set_text("상태: 준비 · 진행 0 / 10 · 작업 탭 없음")
+                            pilot_worker.set_text("Browser Capture 확장프로그램은 시작 버튼을 누를 때 확인합니다.")
+                            pilot_start.set_text("10개 무료 검사 시작")
+                            pilot_start.set_enabled(draft["target_count"] > 0)
+                            pilot_apply.set_enabled(False)
+                            pilot_notice.set_text("ShopSource가 전용 Amazon 작업 탭에서 상품을 하나씩 확인합니다. CAPTCHA 또는 Amazon 확인 화면이 나타날 때만 사용자 조치가 필요합니다.")
+                            return
+                        total = int(current.get("target_count", 0))
+                        captured = int(current.get("captured_count", 0))
+                        browser_state = current.get("browser_status", "UNKNOWN")
+                        applied = int(current.get("checked_count", 0)) > 0
+                        status_text = "결과 반영됨" if applied else "완료" if captured >= total and total else "사용자 조치 필요" if browser_state == "PAUSED_NEEDS_USER" else "실행 중" if browser_state == "RUNNING" else "준비"
+                        pilot_summary.set_text(f"상태: {status_text} · 진행 {captured} / {total} · 현재 {min(captured + 1, total) if captured < total else total}/{total} · 대기 {max(0, total-captured)}")
+                        current_item = current.get("current_item") or {}
+                        current_asin = str(current_item.get("asin") or "")
+                        current_label = ("…" + current_asin[-4:]) if current_asin else "다음 상품 대기"
+                        pilot_worker.set_text(f"현재 상품: {current_label} · Worker: {'작업 요청됨' if browser_state == 'RUNNING' else '대기/사용자 조치'} · Batch {current.get('browser_batch_run_id')}")
+                        if browser_state == "PAUSED_NEEDS_USER":
+                            pilot_notice.set_text("Amazon 확인 화면 또는 확장 연결 확인이 필요합니다. 직접 CAPTCHA를 우회하지 말고 브라우저에서 확인하세요.")
+                        elif applied:
+                            counts = current.get("observation_counts", {})
+                            pilot_notice.set_text(f"반영 결과 · IN_STOCK {counts.get('IN_STOCK', 0)} · UNKNOWN {counts.get('UNKNOWN', 0)} · OOS {counts.get('OUT_OF_STOCK', 0)} · 가격 누락/오류는 상세 결과에서 확인하세요. 전체 G2 완료를 뜻하지 않습니다.")
+                        elif captured >= total and total:
+                            pilot_notice.set_text("캡처 완료 — 결과 반영 버튼을 눌러 확인된 항목만 저장하세요. 전체 G2 통과로 자동 처리하지 않습니다.")
+                        else:
+                            pilot_notice.set_text("ShopSource가 전용 Amazon 작업 탭에서 상품을 하나씩 확인합니다. CAPTCHA 또는 Amazon 확인 화면이 나타날 때만 사용자 조치가 필요합니다.")
+                        pilot_start.set_text("10개 무료 검사 계속")
+                        pilot_start.set_enabled(not applied and browser_state not in {"DONE", "CANCELLED"} and captured < total)
+                        pilot_apply.set_enabled(bool(not applied and total and captured >= total))
+
+                    update_pilot_view(pilot)
+
+                    def poll_pilot_state():
+                        try:
+                            update_pilot_view(runner.find_open_free_browser_capture_batch(run["run_id"], "SOURCE_CHECK_PILOT", include_completed=True))
+                        except Exception as exc:
+                            # Keep the operator panel usable while surfacing that local status could not be read.
+                            pilot_notice.set_text(f"진행 상태를 새로 읽지 못했습니다 ({type(exc).__name__}). 잠시 뒤 다시 확인하세요.")
+
+                    ui.timer(2.0, poll_pilot_state)
+
+                    async def launch_free(kind):
+                        try:
+                            from .browser_capture_bridge import start_free_capture
+                            launched = await start_free_capture(runner, run["run_id"], kind, ui)
+                            result, bridge = launched["batch"], launched["bridge"]
+                            browser_run_id = launched["browser_batch_run_id"]
+                            current = runner.find_open_free_browser_capture_batch(run["run_id"], kind)
+                            update_pilot_view(current)
+                            if bridge.get("state") == "ACKNOWLEDGED":
+                                pilot_worker.set_text(f"Worker 요청됨 · Batch {browser_run_id}")
+                                pilot_manual_fallback.set_enabled(False)
+                                ui.notify("기존 단일 Amazon 작업 탭에 첫 상품 열기를 요청했습니다.", type="positive")
+                            else:
+                                pilot_notice.set_text("Browser Capture 확장프로그램 연결이 필요합니다. 확장 설치·활성화 및 로컬 연결 상태를 확인한 뒤 다시 연결 확인을 누르세요.")
+                                pilot_manual_fallback.set_enabled(True)
+                                ui.notify("Browser Capture 확장프로그램 연결이 필요합니다.", type="warning")
+                            if result.get("reused"):
+                                ui.notify("새 batch를 만들지 않고 기존 미완료 파일럿을 이어갑니다.", type="info")
+                        except Exception as exc:
+                            pilot_notice.set_text(f"검사 시작을 완료하지 못했습니다 ({type(exc).__name__}). 설정을 확인하고 다시 연결해 주세요.")
+                            pilot_manual_fallback.set_enabled(True)
+                            ui.notify(f"무료 Source 검사 시작 실패 ({type(exc).__name__}).", type="negative")
+
+                    pilot_start.on("click", lambda: launch_free("SOURCE_CHECK_PILOT"))
+                    worker_show.on("click", lambda: show_pilot_worker())
+                    pilot_apply.on("click", lambda: apply_pilot_capture())
+
+                    async def show_pilot_worker():
+                        current = runner.find_open_free_browser_capture_batch(run["run_id"], "SOURCE_CHECK_PILOT")
+                        if not current:
+                            ui.notify("열려 있는 Source Check 작업이 없습니다.", type="info"); return
+                        from .browser_capture_bridge import request_worker_show
+                        response = await request_worker_show(ui, current["browser_batch_run_id"])
+                        if response.get("state") != "ACKNOWLEDGED":
+                            pilot_notice.set_text("Browser Capture 확장프로그램 연결이 필요합니다. 연결 방법을 확인해 주세요.")
+                            pilot_manual_fallback.set_enabled(True)
+                            ui.notify("확장프로그램 응답을 받지 못했습니다.", type="warning")
+
+                    def open_current_source():
+                        current = runner.find_open_free_browser_capture_batch(run["run_id"], "SOURCE_CHECK_PILOT")
+                        if not current:
+                            ui.notify("열 수 있는 원본 상품이 없습니다.", type="info"); return
+                        item = current.get("current_item") or {}
+                        asin = item.get("asin")
+                        if not asin:
+                            ui.notify("현재 상품 링크를 찾지 못했습니다.", type="warning"); return
+                        with connect() as con:
+                            row = con.execute("SELECT search_payload_json FROM browser_capture_candidates WHERE run_id=? AND asin=? ORDER BY id DESC LIMIT 1",
+                                (current["capture_run_id"], asin)).fetchone()
+                        payload = json.loads(row["search_payload_json"] or "{}") if row else {}
+                        url = str(payload.get("url") or "")
+                        if not url.startswith(("https://www.amazon.com/", "https://amazon.com/")):
+                            ui.notify("안전한 Amazon 상품 링크가 없어 직접 열 수 없습니다.", type="warning"); return
+                        ui.run_javascript("window.open(" + json.dumps(url) + ", '_blank', 'noopener')")
+
+                    async def control_pilot(action):
+                        current = runner.find_open_free_browser_capture_batch(run["run_id"], "SOURCE_CHECK_PILOT")
+                        if not current:
+                            ui.notify("진행 중인 무료 파일럿이 없습니다.", type="info"); return
+                        from ..capture.batch import BatchSourcingService
+                        batches = BatchSourcingService()
+                        try:
+                            if action == "PAUSE":
+                                if current["browser_status"] not in {"PAUSED", "PAUSED_NEEDS_USER"}:
+                                    await asyncio.to_thread(batches.action, current["browser_batch_run_id"], "PAUSE")
+                            elif action == "RESUME":
+                                await asyncio.to_thread(runner.resume_free_browser_capture_batch, current["browser_batch_run_id"])
+                                from .browser_capture_bridge import request_batch_open_next
+                                response = await request_batch_open_next(ui, current["browser_batch_run_id"])
+                                if response.get("state") != "ACKNOWLEDGED":
+                                    pilot_notice.set_text("Browser Capture 확장프로그램 연결이 필요합니다. 연결 방법을 확인해 주세요.")
+                            elif action == "STOP":
+                                await asyncio.to_thread(batches.action, current["browser_batch_run_id"], "CANCEL")
+                                await asyncio.to_thread(runner.free_source_batch_control, run["run_id"], "STOP")
+                            elif action == "RETRY":
+                                if current["browser_status"] == "DONE_WITH_ERRORS":
+                                    await asyncio.to_thread(batches.action, current["browser_batch_run_id"], "RETRY")
+                                elif (current.get("current_item") or {}).get("state") == "DETAIL_OPENED":
+                                    await asyncio.to_thread(batches.recover_open_item, current["browser_batch_run_id"])
+                                else:
+                                    await asyncio.to_thread(runner.resume_free_browser_capture_batch, current["browser_batch_run_id"])
+                                from .browser_capture_bridge import request_batch_open_next
+                                await request_batch_open_next(ui, current["browser_batch_run_id"])
+                            refreshed = runner.find_open_free_browser_capture_batch(run["run_id"], "SOURCE_CHECK_PILOT")
+                            update_pilot_view(refreshed)
+                        except Exception as exc:
+                            ui.notify(f"파일럿 제어 실패 ({type(exc).__name__}).", type="warning")
+
+                    async def apply_pilot_capture():
+                        current = runner.find_open_free_browser_capture_batch(run["run_id"], "SOURCE_CHECK_PILOT")
+                        if not current or int(current.get("captured_count", 0)) < int(current.get("target_count", 0)):
+                            ui.notify("모든 파일럿 캡처가 끝난 뒤 결과를 반영할 수 있습니다. 미완료 항목은 PENDING으로 유지됩니다.", type="warning"); return
+                        try:
+                            result = await asyncio.to_thread(runner.apply_free_browser_capture_results,
+                                run["run_id"], current["release_batch_id"], confirmed=True)
+                            update_pilot_view(runner.find_open_free_browser_capture_batch(run["run_id"], "SOURCE_CHECK_PILOT", include_completed=True))
+                            render(result["production_run"]); open_gate_action()
+                            ui.notify(f"캡처 결과 반영: {result.get('verified_items', 0)}개 fresh IN_STOCK · 나머지는 검토 필요", type="positive" if result.get("status") == "COMPLETE" else "warning")
+                        except Exception as exc:
+                            ui.notify(f"Browser Capture 결과 반영 실패 ({type(exc).__name__}).", type="negative")
+
                     if draft["target_count"] == 0:
                         ui.label("검사할 미처리 PRIMARY source 후보가 없습니다. 분류·ASIN·원본 URL 또는 기존 batch 상태를 확인하세요.").classes("ss-help")
                     candidate_rows = free.unprocessed_source_candidates(str(run["store_id"]))
@@ -432,33 +589,17 @@ class OperatorUI:
                         try:
                             result = await asyncio.to_thread(runner.prepare_free_browser_capture_batch,
                                 run["run_id"], "SOURCE_VALIDATION_BATCH", selected_product_ids=ids, confirmed=True)
+                            browser_run_id = result["browser_batch_run_id"]
+                            await asyncio.to_thread(runner.resume_free_browser_capture_batch, browser_run_id)
+                            from .browser_capture_bridge import request_batch_open_next
+                            bridge = await request_batch_open_next(ui, browser_run_id)
+                            ui.notify("Validation batch 첫 상품 작업을 요청했습니다." if bridge.get("state") == "ACKNOWLEDGED" else "Browser Capture 확장프로그램 연결이 필요합니다.", type="positive" if bridge.get("state") == "ACKNOWLEDGED" else "warning")
                             render(runner.service.get(run["run_id"])); open_gate_action()
                         except Exception as exc:
                             ui.notify(f"검증 batch 준비 실패 ({type(exc).__name__}).", type="negative")
                     ui.button("100~200개 Source Validation Batch", on_click=run_validation_batch).props("outline" + (" disable" if not validation_ready or len(candidate_options) < 100 else ""))
-                    ui.button("다음 Source Batch", on_click=lambda: prepare_free("REMAINING_SOURCE_CHECK")).props("outline" + (" disable" if not validation_ready or not candidate_options else ""))
+                    ui.button("다음 Source Batch", on_click=lambda: launch_free("REMAINING_SOURCE_CHECK")).props("outline" + (" disable" if not validation_ready or not candidate_options else ""))
                     ui.label("Shopify 10개 DRAFT 업로드 파일럿은 G14에서 진행합니다.").classes("ss-help")
-                    async def apply_latest_capture():
-                        with connect() as con:
-                            latest = con.execute("SELECT batch_id FROM source_safety_release_batches WHERE store_id=? AND status='WAITING_FOR_INPUT' ORDER BY created_at DESC LIMIT 1", (str(run["store_id"]),)).fetchone()
-                        if not latest:
-                            ui.notify("반영할 대기 중 Source Safety batch가 없습니다.", type="info"); return
-                        try:
-                            result = await asyncio.to_thread(runner.apply_free_browser_capture_results,
-                                run["run_id"], latest["batch_id"], confirmed=True)
-                            if result.get("status") == "WAITING_FOR_INPUT":
-                                ui.notify(f"브라우저 확인이 아직 남았습니다: {result.get('captured', 0)} / {result.get('target_count', 0)}개. CAPTCHA/차단 페이지는 우회하지 말고 직접 확인하세요.", type="warning")
-                                return
-                            render(result["production_run"]); open_gate_action()
-                            ui.notify(f"캡처 결과 반영: {result.get('verified_items', 0)}개 fresh IN_STOCK · 나머지는 검토 필요", type="positive" if result.get("status") == "COMPLETE" else "warning")
-                        except Exception as exc:
-                            ui.notify(f"Browser Capture 결과 반영 실패 ({type(exc).__name__}).", type="negative")
-                    ui.button("Browser Capture 결과 반영", on_click=apply_latest_capture).props("outline")
-                    with ui.row().classes("gap-2"):
-                        ui.button("Pause", on_click=lambda: runner.free_source_batch_control(run["run_id"], "PAUSE")).props("outline")
-                        ui.button("Resume", on_click=lambda: runner.free_source_batch_control(run["run_id"], "RESUME")).props("outline")
-                        ui.button("Stop", on_click=lambda: runner.free_source_batch_control(run["run_id"], "STOP")).props("outline color=negative")
-                        ui.button("Retry failed", on_click=lambda: runner.free_source_batch_control(run["run_id"], "RETRY_FAILED")).props("outline")
                     with ui.expansion("선택 유료 Provider · Keepa (무료 기본 검사에는 불필요)").classes("w-full"):
                         ui.label("Keepa profile은 기존 호환을 위해 유지됩니다. Keepa 미설정은 정상이며 무료 G2 경로를 막지 않습니다. 사용자가 선택하지 않는 한 Keepa API 호출은 하지 않습니다.").classes("ss-help")
                         keepa_key = ui.input("Keepa API key · 선택 유료 사용 시에만", password=True).props("autocomplete=new-password").classes("w-full")
