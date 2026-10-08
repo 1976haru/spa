@@ -207,6 +207,9 @@ class HomepagePrerequisiteService:
                 if operation == "FEATURED_PREVIEW":
                     from .homepage_automation import discover_homepage_sections, _hash
                     feature_preview = FeaturedProductAssignmentService(db=self.db).build_theme_preview(saved_featured, snapshot)
+                    feature_preview.update(store_id=str(store_id), theme=snapshot.get("theme"),
+                        template_filename=snapshot.get("template_filename"),
+                        featured_products_plan_id=saved_featured.get("plan_id"))
                     section_discovery = discover_homepage_sections(snapshot.get("theme_files") or {})
                     category_supported = bool(section_discovery.get("category"))
                     hero_supported = bool(section_discovery.get("hero"))

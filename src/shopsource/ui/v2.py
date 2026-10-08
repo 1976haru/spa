@@ -33,7 +33,7 @@ from ..homepage_automation import (HomepageAutomationService, assignment_banner_
     approve_hero_asset, generate_hero_image, latest_hero_asset, register_manual_hero_asset,
     suggested_theme_image_ref, upload_approved_hero_asset, validate_homepage_image)
 from ..homepage_assignment import HomepageAssignmentService, homepage_assignment_workflow
-from ..homepage_featured_products import FeaturedProductAssignmentService
+from ..homepage_featured_products import FeaturedProductAssignmentService, FeaturedProductThemeApplyService
 from ..homepage_session import HomepagePrerequisiteService
 from ..automation import AutomationTaskError, WorkflowAutomationService, collection_prerequisite_workflow
 from ..collection_prerequisite import CollectionPrerequisiteService, prepare_homepage_prerequisites
@@ -1966,7 +1966,8 @@ class OperatorUI:
         state = {"plan": None, "snapshot": None, "preview": None, "assignment_preview": None,
                  "collection_plan": None, "brand": None, "prompt_set": None, "backup_id": None,
                  "local_candidates": [], "store_id": self.current_store, "session_context": None,
-                 "snapshot_store_id": None, "snapshot_read_at": None, "current_stage": "STORE_SELECTED"}
+                 "snapshot_store_id": None, "snapshot_read_at": None, "current_stage": "STORE_SELECTED",
+                 "featured_apply_status": "NOT RUN", "featured_human_checks": {"desktop": False, "mobile": False}}
         homepage_prerequisites = HomepagePrerequisiteService()
         with ui.card().classes("w-full border-2 border-sky-200 bg-sky-50"):
             brand_name = next((row["store_name"] for row in self.stores if row["store_id"] == self.current_store), self.current_store)
@@ -1992,6 +1993,8 @@ class OperatorUI:
                 ui.label("추천 상품(신상품)").classes("text-lg font-semibold")
                 featured_status = ui.label("선택된 상품: 0 / 4 · 상태: REVIEW REQUIRED")
                 featured_diagnostics = ui.label("로컬 관리 상품 후보: 0 · Shopify 기존 상품 후보: 0 · 최종 사용 가능: 0").classes("ss-help")
+                featured_apply_persistent = ui.label("미리보기: NOT READY · Shopify 적용: NOT RUN").classes("ss-help")
+                featured_post_apply_actions = ui.row().classes("flex-wrap gap-2")
                 featured_table = ui.column().classes("w-full gap-1")
                 with ui.dialog() as featured_review_dialog, ui.card().classes("w-[min(1000px,95vw)] max-h-[85vh] overflow-auto"):
                     ui.label("추천 상품 4개 확인").classes("text-xl font-bold")
@@ -2091,6 +2094,7 @@ class OperatorUI:
                         return
                     preview = (context.canonical_preview or {}).get("featured_products_preview") or {}
                     state["featured_products_preview"] = preview
+                    featured_apply_persistent.set_text(f"미리보기: {preview.get('status', 'NOT READY')} · 변경 범위: 추천 상품 section 1개 · Shopify 적용: {state.get('featured_apply_status', 'NOT RUN')}")
                     render()
                     if preview.get("status") == "PREVIEW":
                         ui.notify("추천 상품 미리보기 준비 완료 · canonical homepage 제안에 포함 · Shopify 변경 없음", type="positive")
@@ -2098,7 +2102,75 @@ class OperatorUI:
                         ui.notify("추천 상품 미리보기 수동 확인 필요: " + str(preview.get("reason") or "현재 테마에 안전하게 확인된 상품 리스트 섹션이 없습니다."), type="warning", multi_line=True)
 
                 def featured_apply_gate():
-                    ui.notify("FEATURED PRODUCTS ASSIGNMENT UI READY · 실제 적용은 검토된 preview에서 명시적으로 확인해야 합니다.", type="warning")
+                    plan, preview = state.get("featured_products_plan"), state.get("featured_products_preview")
+                    if not plan or not preview or preview.get("status") != "PREVIEW":
+                        ui.notify("추천 상품 미리보기를 먼저 준비하세요. 전체 홈페이지 상태와는 별개입니다.", type="warning"); return
+                    theme = preview.get("theme") or {}
+                    with ui.dialog() as dialog, ui.card().classes("w-[min(680px,95vw)]"):
+                        ui.label("추천 상품 4개를 Shopify에 적용").classes("text-xl font-bold")
+                        ui.label(f"Store: {self.current_store} | {brand_name} · Theme: {theme.get('name') or theme.get('id') or '확인 필요'} · Section: {preview.get('section_id')}")
+                        ui.label(f"Selected products: {len(plan.get('items', []))}")
+                        ui.label("변경 범위: 추천 상품 section 하나만 · Hero/Category/Product data 변경 없음")
+                        ui.label("적용 전 exact raw backup 생성, 적용 후 4개 product ID와 무관 section 재검증")
+                        confirmed = ui.checkbox("추천 상품 section만 Shopify 테마에 적용하는 것을 확인했습니다.")
+                        async def perform_apply():
+                            if not confirmed.value: ui.notify("확인 체크박스를 선택해야 합니다.", type="warning"); return
+                            result = await asyncio.to_thread(FeaturedProductThemeApplyService().apply,
+                                plan["plan_id"], preview, store_id=self.current_store, confirmed=True)
+                            state["featured_apply_status"] = result.get("status", "FAILED")
+                            state["backup_id"] = result.get("backup_id")
+                            featured_apply_persistent.set_text(f"미리보기: {'CURRENT' if result.get('status') == 'VERIFIED' else 'PREVIEW'} · Shopify 적용: {result.get('status')} · 검증 상품: {'4/4' if result.get('status') == 'VERIFIED' else '확인 필요'}")
+                            if result.get("status") == "VERIFIED":
+                                config = get_shopify_connection(self.current_store) or {}
+                                domain = str(config.get("shop_domain") or "").strip().casefold()
+                                if re.fullmatch(r"[a-z0-9][a-z0-9-]*\.myshopify\.com", domain):
+                                    featured_post_apply_actions.clear()
+                                    with featured_post_apply_actions:
+                                        ui.link("스토어에서 확인", f"https://{domain}/", new_tab=True).classes("text-primary")
+                                        def export_featured_report():
+                                            folder = FeaturedProductAssignmentService().export_report(plan["plan_id"])
+                                            ui.notify("추천 상품 과제 보고서를 저장했습니다: " + str(folder), type="positive")
+                                        ui.button("추천 상품 보고서 내보내기", on_click=export_featured_report, icon="download").props("outline")
+                            dialog.close()
+                            ui.notify("추천 상품 isolated apply: " + result.get("status", "FAILED"), type="positive" if result.get("status") == "VERIFIED" else "warning")
+                        ui.button("취소", on_click=dialog.close).props("outline")
+                        ui.button("추천 상품만 적용", on_click=perform_apply).props("color=primary")
+                    dialog.open()
+
+                async def rollback_featured():
+                    backup_id = state.get("backup_id")
+                    if not backup_id: ui.notify("추천 상품 적용 backup이 없습니다.", type="warning"); return
+                    with ui.dialog() as dialog, ui.card():
+                        ui.label("추천 상품 section만 exact raw backup으로 롤백합니다.")
+                        confirmed = ui.checkbox("추천 상품 section 롤백을 확인했습니다.")
+                        async def perform_rollback():
+                            if not confirmed.value: ui.notify("확인 체크박스를 선택하세요.", type="warning"); return
+                            result = await asyncio.to_thread(FeaturedProductThemeApplyService().rollback, backup_id, confirmed=True)
+                            state["featured_apply_status"] = result.get("status", "FAILED")
+                            featured_apply_persistent.set_text("Shopify 적용: " + result.get("status", "FAILED"))
+                            dialog.close()
+                            ui.notify("추천 상품 전용 롤백: " + result.get("status", "FAILED"), type="positive" if result.get("status") == "ROLLED_BACK" else "warning")
+                        ui.button("취소", on_click=dialog.close).props("outline")
+                        ui.button("추천 상품만 롤백", on_click=perform_rollback).props("color=negative")
+                    dialog.open()
+
+                def featured_assignment_check():
+                    plan = state.get("featured_products_plan") or {}
+                    verified = state.get("featured_apply_status") == "VERIFIED"
+                    checks = FeaturedProductAssignmentService().checklist(plan, section_visible=verified, remote_verified=verified)
+                    with ui.dialog() as dialog, ui.card().classes("w-[min(720px,95vw)]"):
+                        ui.label("추천 상품 과제 확인").classes("text-xl font-bold")
+                        for key, passed in checks["checks"].items():
+                            ui.label(("✓ " if passed else "확인 필요 · ") + key.replace("_", " ")).classes("text-green-700" if passed else "text-amber-800")
+                        desktop = ui.checkbox("실제 storefront Desktop 화면 확인", value=state.get("featured_human_checks", {}).get("desktop", False))
+                        mobile = ui.checkbox("실제 storefront Mobile 화면 확인", value=state.get("featured_human_checks", {}).get("mobile", False))
+                        def save_checks():
+                            state["featured_human_checks"] = {"desktop": bool(desktop.value), "mobile": bool(mobile.value)}
+                            state["featured_assignment_status"] = "ASSIGNMENT_READY" if verified and all(state["featured_human_checks"].values()) else "REVIEW_READY" if verified else "REVIEW_REQUIRED"
+                            ui.notify("추천 상품 상태: " + state["featured_assignment_status"], type="positive" if state["featured_assignment_status"] == "ASSIGNMENT_READY" else "info")
+                            dialog.close()
+                        ui.button("확인 저장", on_click=save_checks).props("color=primary")
+                    dialog.open()
 
                 with ui.row().classes("flex-wrap gap-2"):
                     ui.button("추천 상품 자동 구성", on_click=select_featured_products, icon="auto_awesome").props("color=primary")
@@ -2107,7 +2179,8 @@ class OperatorUI:
                     ui.button("Shopify 상품 다시 읽기", on_click=lambda: select_featured_products(True), icon="cloud_download").props("outline")
                     ui.button("추천 상품 미리보기", on_click=featured_preview, icon="preview").props("outline")
                     ui.button("Shopify 적용", on_click=featured_apply_gate, icon="publish").props("outline")
-                    ui.button("과제 제출용 확인", on_click=lambda: ui.notify("원격 section 검증 후 ASSIGNMENT_READY가 됩니다.", type="info"), icon="checklist").props("outline")
+                    ui.button("추천 상품 롤백", on_click=rollback_featured, icon="undo").props("outline")
+                    ui.button("과제 제출용 확인", on_click=featured_assignment_check, icon="checklist").props("outline")
                 render_featured()
 
             async def save_hero_upload(event):

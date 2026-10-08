@@ -1,8 +1,4 @@
-"""Local-first featured-product planning for homepage assignments.
-
-The service references MASTER and Shopify mapping rows, produces guarded theme
-previews and reports, and deliberately contains no remote-write client.
-"""
+"""Local-first featured-product planning, read-only catalog discovery and preview."""
 from __future__ import annotations
 
 import hashlib
@@ -11,6 +7,7 @@ import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from copy import deepcopy
 
 from .db import connect, init_db
 from .paths import EXPORT_DIR
@@ -21,6 +18,42 @@ from .shopify_theme_json import ShopifyJsonDocumentError, parse_shopify_json_doc
 MODES = {"NEW_ARRIVALS", "BALANCED_CATEGORIES", "MANUAL_SELECTION"}
 ELIGIBLE_DECISIONS = {"PRIMARY", "RESERVE_A", "RESERVE_B", "PRODUCTION_CANDIDATE"}
 VERIFIED_MAPPING_STATES = {"SYNCED", "VERIFIED", "NO CHANGE", "NO_CHANGE"}
+FEATURED_THEME_FILE_QUERY = "query FeaturedCurrentTheme($id: ID!, $filenames: [String!]!) { theme(id: $id) { id name role files(first: 1, filenames: $filenames) { nodes { filename body { __typename ... on OnlineStoreThemeFileBodyText { content } ... on OnlineStoreThemeFileBodyBase64 { contentBase64 } } } userErrors { code filename } } } }"
+FEATURED_SCOPES_QUERY = "query FeaturedScopes { currentAppInstallation { accessScopes { handle } } }"
+
+
+def validate_isolated_featured_diff(before: dict, proposed: dict, section_id: str) -> dict:
+    """Permit only the ShopSource-owned section and its own order placement to differ."""
+    unexpected = []
+    if not isinstance(before, dict) or not isinstance(proposed, dict):
+        return {"safe": False, "unexpected_paths": ["$"], "allowed_changes": []}
+    left, right = deepcopy(before), deepcopy(proposed)
+    left.setdefault("sections", {})
+    right.setdefault("sections", {})
+    left.setdefault("order", [])
+    right.setdefault("order", [])
+    left_sections, right_sections = left.get("sections", {}), right.get("sections", {})
+    if not isinstance(left_sections, dict) or not isinstance(right_sections, dict):
+        return {"safe": False, "unexpected_paths": ["sections"], "allowed_changes": []}
+    old_section, new_section = left_sections.pop(section_id, None), right_sections.pop(section_id, None)
+    left_order, right_order = left.get("order", []), right.get("order", [])
+    if not isinstance(left_order, list) or not isinstance(right_order, list):
+        return {"safe": False, "unexpected_paths": ["order"], "allowed_changes": []}
+    old_order = [item for item in left_order if item != section_id]
+    new_order = [item for item in right_order if item != section_id]
+    left["order"], right["order"] = old_order, new_order
+    if left != right:
+        for key in sorted(set(left) | set(right)):
+            if left.get(key) != right.get(key): unexpected.append(key)
+        if not unexpected: unexpected.append("$")
+    if len([item for item in left_order if item == section_id]) > 1 or len([item for item in right_order if item == section_id]) != 1:
+        unexpected.append("order")
+    if new_section is None:
+        unexpected.append(f"sections.{section_id}")
+    allowed = []
+    if old_section != new_section: allowed.append(f"sections.{section_id}")
+    if left_order != right_order: allowed.append("order(featured section only)")
+    return {"safe": not unexpected, "unexpected_paths": sorted(set(unexpected)), "allowed_changes": allowed}
 
 
 def _now(): return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -49,6 +82,10 @@ def _install(db=None):
         CREATE TABLE IF NOT EXISTS homepage_featured_product_remote_cache(
           store_id TEXT PRIMARY KEY,fetched_at TEXT NOT NULL,product_count INTEGER NOT NULL,
           source_hash TEXT NOT NULL,candidates_json TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS homepage_featured_theme_backups(
+          backup_id TEXT PRIMARY KEY,store_id TEXT NOT NULL,theme_id TEXT NOT NULL,filename TEXT NOT NULL,
+          plan_id TEXT NOT NULL,preview_hash TEXT NOT NULL,section_id TEXT NOT NULL,folder TEXT NOT NULL,
+          before_raw_hash TEXT NOT NULL,proposed_raw_hash TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL);
         """)
         columns = {row["name"] for row in con.execute("PRAGMA table_info(homepage_featured_product_items)")}
         if "source_kind" not in columns:
@@ -487,3 +524,158 @@ class FeaturedProductAssignmentService:
                   "## 제출 메모", "", "실제 검증된 상품만 사용해 추천 상품 영역을 구성했습니다. 선택된 카테고리와 링크는 위 목록을 기준으로 확인합니다."]
         (folder / "assignment_featured_products.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
         return folder
+
+
+class FeaturedProductThemeApplyService:
+    """Guarded one-section theme writer; deliberately separate from homepage apply."""
+    def __init__(self, *, db=None, export_dir: str | Path | None = None, client_factory=ShopifyGraphQLClient):
+        self.db, self.export_dir, self.client_factory = db, Path(export_dir) if export_dir else EXPORT_DIR, client_factory
+        _install(db)
+
+    @staticmethod
+    def _remote_document(theme: dict, filename: str):
+        import base64
+        nodes = ((theme.get("files") or {}).get("nodes") or [])
+        row = next((item for item in nodes if item.get("filename") == filename), None)
+        if row is None: raise ValueError("TEMPLATE_BODY_MISSING")
+        body = row.get("body") or {}; raw = body.get("content")
+        if raw is None and body.get("contentBase64"):
+            try: raw = base64.b64decode(body["contentBase64"], validate=True).decode("utf-8")
+            except (ValueError, UnicodeDecodeError): raw = None
+        if raw is None: raise ValueError("TEMPLATE_BODY_MISSING")
+        return raw, parse_shopify_json_document(raw)
+
+    @staticmethod
+    def _four_ready(plan: dict) -> bool:
+        items = plan.get("items") or []
+        ids = [str(x.get("shopify_product_id") or "") for x in items]
+        handles = [str(x.get("shopify_handle") or "") for x in items]
+        if not (plan.get("status") == "READY" and plan.get("requested_count") == 4 and len(items) == 4
+                and len(set(ids)) == 4 and len(set(handles)) == 4
+                and all(x.startswith("gid://shopify/Product/") for x in ids)):
+            return False
+        for item in items:
+            try: priced = float(item.get("price") or 0) > 0
+            except (TypeError, ValueError): priced = False
+            if item.get("remote_status") != "ACTIVE" or not priced or not item.get("image_url") or not item.get("shopify_handle"):
+                return False
+        return True
+
+    def apply(self, plan_id: str, preview: dict, *, store_id: str, confirmed: bool = False, client=None) -> dict:
+        if confirmed is not True: return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Explicit user confirmation required", "write_performed": False}
+        if not isinstance(preview, dict) or preview.get("status") != "PREVIEW" or preview.get("plan_id") != plan_id:
+            return {"status": "CONFLICT", "reason": "Current featured preview is missing or stale", "write_performed": False}
+        with connect(self.db) as con:
+            row = con.execute("SELECT * FROM homepage_featured_product_plans WHERE plan_id=?", (plan_id,)).fetchone()
+            latest = con.execute("SELECT plan_id FROM homepage_featured_product_plans WHERE store_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1", (str(store_id),)).fetchone()
+        if not row or row["store_id"] != str(store_id) or not latest or latest["plan_id"] != plan_id:
+            return {"status": "CONFLICT", "reason": "Store or latest featured plan changed", "write_performed": False}
+        plan = FeaturedProductAssignmentService(db=self.db).get_plan(plan_id)
+        if not self._four_ready(plan): return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Exactly four unique ACTIVE products with price, image and handle are required", "write_performed": False}
+        source = preview.get("source_document") or {}; theme = preview.get("theme") or {}
+        filename, section_id = preview.get("template_filename"), preview.get("section_id")
+        expected_section = "ss_featured_products_" + hashlib.sha1(str(store_id).encode()).hexdigest()[:8]
+        if (preview.get("store_id") != str(store_id) or preview.get("featured_products_plan_id") != plan_id
+                or source.get("filename") != filename or preview.get("capability", {}).get("mode") != "DIRECT_PRODUCTS" or section_id != expected_section
+                or filename != "templates/index.json" or not theme.get("id") or theme.get("role") != "MAIN"
+                or not source.get("before_raw_hash") or not source.get("before_semantic_hash")
+                or not row["preview_hash"] or row["preview_hash"] != preview.get("preview_hash")):
+            return {"status": "CONFLICT", "reason": "Unsupported capability or preview identity/hash mismatch", "write_performed": False}
+        config, token = get_connection(store_id, db=self.db), get_shopify_token(store_id, db=self.db)[0]
+        if not config or not token: return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Shopify connection or credential missing", "write_performed": False}
+        client = client or self.client_factory(config["shop_domain"], token, config["api_version"])
+        scopes = {x.get("handle") for x in (client.execute(FEATURED_SCOPES_QUERY).get("currentAppInstallation") or {}).get("accessScopes", [])}
+        if not {"read_themes", "write_themes"}.issubset(scopes):
+            return {"status": "MANUAL_ACTION_REQUIRED", "reason": "read_themes and write_themes scopes are required", "write_performed": False}
+        remote = client.execute(FEATURED_THEME_FILE_QUERY, {"id": theme["id"], "filenames": [filename]}).get("theme") or {}
+        if remote.get("id") != theme["id"] or remote.get("role") != "MAIN":
+            return {"status": "CONFLICT", "reason": "MAIN theme identity changed", "write_performed": False}
+        try: before_raw, document = self._remote_document(remote, filename)
+        except (ValueError, ShopifyJsonDocumentError) as exc:
+            return {"status": "CONFLICT", "reason": str(exc), "write_performed": False}
+        if document.raw_hash != source["before_raw_hash"] or document.semantic_hash != source["before_semantic_hash"]:
+            return {"status": "CONFLICT", "reason": "Remote source raw/semantic hash drifted", "write_performed": False}
+        proposed = preview.get("proposed")
+        guard = validate_isolated_featured_diff(document.parsed, proposed, section_id)
+        if not guard["safe"]: return {"status": "CONFLICT", "reason": "Unexpected semantic changes", "unexpected_paths": guard["unexpected_paths"], "write_performed": False}
+        expected_ids = [x["shopify_product_id"] for x in plan["items"]]
+        selected_section = ((proposed.get("sections") or {}).get(section_id) or {}) if isinstance(proposed, dict) else {}
+        field_id = (preview.get("capability", {}).get("product_field") or {}).get("id")
+        proposed_ids = (selected_section.get("settings") or {}).get(field_id) if field_id else None
+        if proposed_ids != expected_ids:
+            return {"status": "CONFLICT", "reason": "Featured preview product IDs no longer match the current four-item plan", "write_performed": False}
+        proposed_raw = render_shopify_json_document(document, proposed)
+        proposed_doc = parse_shopify_json_document(proposed_raw)
+        if (proposed_doc.prefix != document.prefix or proposed_doc.suffix != document.suffix
+                or (source.get("proposed_raw_hash") and proposed_doc.raw_hash != source["proposed_raw_hash"])):
+            return {"status": "CONFLICT", "reason": "Comment-aware raw render mismatch", "write_performed": False}
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        folder = self.export_dir / "theme_backups" / str(store_id) / (stamp + "-featured-products")
+        folder.mkdir(parents=True, exist_ok=False)
+        items = [{key: item.get(key) for key in ("shopify_product_id", "shopify_handle", "title", "price", "image_url")} for item in plan["items"]]
+        metadata = {"store_id": str(store_id), "theme_id": theme["id"], "theme_role": "MAIN", "template_filename": filename,
+            "plan_id": plan_id, "preview_hash": preview["preview_hash"], "section_id": section_id,
+            "before_raw_hash": document.raw_hash, "before_semantic_hash": document.semantic_hash,
+            "proposed_raw_hash": proposed_doc.raw_hash, "selected_products": items, "timestamp": _now()}
+        (folder / "before.raw.json").write_text(before_raw, encoding="utf-8", newline="")
+        (folder / "proposed.raw.json").write_text(proposed_raw, encoding="utf-8", newline="")
+        (folder / "before.parsed.json").write_text(json.dumps(document.parsed, ensure_ascii=False, indent=2), encoding="utf-8")
+        (folder / "proposed.parsed.json").write_text(json.dumps(proposed, ensure_ascii=False, indent=2), encoding="utf-8")
+        (folder / "selected_products.json").write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+        (folder / "diff.md").write_text("# Isolated featured-products change\n\n" + "\n".join(f"- {x}" for x in guard["allowed_changes"]) + "\n", encoding="utf-8")
+        (folder / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        backup_id = "HFPB_" + secrets.token_hex(8)
+        with connect(self.db) as con:
+            con.execute("INSERT INTO homepage_featured_theme_backups VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (backup_id, str(store_id), theme["id"], filename, plan_id, preview["preview_hash"], section_id,
+                 str(folder), document.raw_hash, proposed_doc.raw_hash, "BACKED_UP", _now()))
+        try:
+            from .homepage_automation import UPSERT_THEME_FILES
+            response = client.execute(UPSERT_THEME_FILES, {"themeId": theme["id"], "files": [{"filename": filename, "body": {"type": "TEXT", "value": proposed_raw}}]}).get("themeFilesUpsert") or {}
+        except RuntimeError as exc:
+            return {"status": "MANUAL_ACTION_REQUIRED" if "access denied" in str(exc).casefold() else "FAILED", "reason": "Shopify rejected the isolated theme write", "backup_id": backup_id, "write_performed": True}
+        if response.get("userErrors"):
+            return {"status": "FAILED", "backup_id": backup_id, "errors": response["userErrors"], "write_performed": True}
+        after_theme = client.execute(FEATURED_THEME_FILE_QUERY, {"id": theme["id"], "filenames": [filename]}).get("theme") or {}
+        try: after_raw, after_doc = self._remote_document(after_theme, filename)
+        except (ValueError, ShopifyJsonDocumentError): after_raw, after_doc = None, None
+        after = after_doc.parsed if after_doc else None
+        after_guard = validate_isolated_featured_diff(document.parsed, after, section_id) if isinstance(after, dict) else {"safe": False, "unexpected_paths": ["$"], "allowed_changes": []}
+        actual_ids = (((after or {}).get("sections") or {}).get(section_id) or {}).get("settings", {}).get(preview["capability"]["product_field"]["id"], [])
+        verified = bool(after_theme.get("id") == theme["id"] and after_theme.get("role") == "MAIN" and after == proposed
+                        and after_doc and after_doc.raw_hash == proposed_doc.raw_hash and after_doc.prefix == document.prefix
+                        and after_doc.suffix == document.suffix and actual_ids == expected_ids and len(actual_ids) == 4 and after_guard["safe"])
+        status = "VERIFIED" if verified else "VERIFY_FAILED"
+        with connect(self.db) as con:
+            con.execute("UPDATE homepage_featured_theme_backups SET status=? WHERE backup_id=?", (status, backup_id))
+            if verified: con.execute("UPDATE homepage_featured_product_plans SET status='VERIFIED',remote_verified=1,updated_at=? WHERE plan_id=?", (_now(), plan_id))
+        return {"status": status, "backup_id": backup_id, "theme_id": theme["id"], "product_ids_match": actual_ids == expected_ids,
+                "unrelated_sections_unchanged": after_guard["safe"], "write_performed": True}
+
+    def rollback(self, backup_id: str, *, confirmed: bool = False, client=None) -> dict:
+        if confirmed is not True: return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Explicit rollback confirmation required", "write_performed": False}
+        with connect(self.db) as con: row = con.execute("SELECT * FROM homepage_featured_theme_backups WHERE backup_id=?", (backup_id,)).fetchone()
+        if not row: return {"status": "NOT_FOUND", "write_performed": False}
+        folder = Path(row["folder"]); before_raw = (folder / "before.raw.json").read_text(encoding="utf-8")
+        proposed_raw = (folder / "proposed.raw.json").read_text(encoding="utf-8")
+        config, token = get_connection(row["store_id"], db=self.db), get_shopify_token(row["store_id"], db=self.db)[0]
+        if not config or not token: return {"status": "MANUAL_ACTION_REQUIRED", "write_performed": False}
+        client = client or self.client_factory(config["shop_domain"], token, config["api_version"])
+        scopes = {x.get("handle") for x in (client.execute(FEATURED_SCOPES_QUERY).get("currentAppInstallation") or {}).get("accessScopes", [])}
+        if not {"read_themes", "write_themes"}.issubset(scopes): return {"status": "MANUAL_ACTION_REQUIRED", "write_performed": False}
+        current_theme = client.execute(FEATURED_THEME_FILE_QUERY, {"id": row["theme_id"], "filenames": [row["filename"]]}).get("theme") or {}
+        try: current_raw, current_doc = self._remote_document(current_theme, row["filename"])
+        except (ValueError, ShopifyJsonDocumentError): return {"status": "CONFLICT", "reason": "Current template is unreadable", "write_performed": False}
+        if current_theme.get("id") != row["theme_id"] or current_theme.get("role") != "MAIN" or current_raw != proposed_raw:
+            return {"status": "CONFLICT", "reason": "Merchant changes detected; rollback will not overwrite them", "write_performed": False}
+        from .homepage_automation import UPSERT_THEME_FILES
+        result = client.execute(UPSERT_THEME_FILES, {"themeId": row["theme_id"], "files": [{"filename": row["filename"], "body": {"type": "TEXT", "value": before_raw}}]}).get("themeFilesUpsert") or {}
+        if result.get("userErrors"): return {"status": "FAILED", "backup_id": backup_id, "write_performed": True}
+        restored_theme = client.execute(FEATURED_THEME_FILE_QUERY, {"id": row["theme_id"], "filenames": [row["filename"]]}).get("theme") or {}
+        try: restored_raw, _ = self._remote_document(restored_theme, row["filename"])
+        except (ValueError, ShopifyJsonDocumentError): restored_raw = None
+        verified = restored_theme.get("role") == "MAIN" and restored_theme.get("id") == row["theme_id"] and restored_raw == before_raw
+        with connect(self.db) as con:
+            con.execute("UPDATE homepage_featured_theme_backups SET status=? WHERE backup_id=?", ("ROLLED_BACK" if verified else "ROLLBACK_VERIFY_FAILED", backup_id))
+            if verified: con.execute("UPDATE homepage_featured_product_plans SET status='READY',remote_verified=0,updated_at=? WHERE plan_id=?", (_now(), row["plan_id"]))
+        return {"status": "ROLLED_BACK" if verified else "ROLLBACK_VERIFY_FAILED", "backup_id": backup_id, "write_performed": True}

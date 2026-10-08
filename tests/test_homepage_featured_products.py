@@ -1,11 +1,12 @@
 import json
+import hashlib
 from pathlib import Path
 
 from shopsource.db import connect, init_db
 from shopsource.homepage_assignment import HomepageAssignmentService, homepage_assignment_workflow
 from shopsource.homepage_featured_products import (
     FeaturedProductAssignmentService, ShopifyExistingProductReader, discover_featured_product_schema,
-    merchandising_suitability, normalize_merchandising_group,
+    merchandising_suitability, normalize_merchandising_group, validate_isolated_featured_diff,
 )
 from shopsource.store_build import STAGES
 from shopsource.store_completion import DOMAINS, StoreCompletionService
@@ -44,6 +45,135 @@ def theme_files(mode="direct"):
     field = {"type": "product_list", "id": "products", "label": "Products"} if mode == "direct" else {"type": "collection", "id": "collection", "label": "Collection"}
     schema = {"name": "Featured products", "settings": [field, {"type": "text", "id": "heading", "label": "Heading"}]}
     return {"sections/featured-products.liquid": "{% schema %}" + json.dumps(schema) + "{% endschema %}"}
+
+
+def test_isolated_featured_diff_allows_only_managed_section_create():
+    before = {"sections": {"hero": {"type": "hero"}}, "order": ["hero"], "settings": {"x": 1}}
+    after = {"sections": {"hero": {"type": "hero"}, "ss_featured_products_test": {"type": "featured", "settings": {"products": ["a"]}}},
+             "order": ["hero", "ss_featured_products_test"], "settings": {"x": 1}}
+    result = validate_isolated_featured_diff(before, after, "ss_featured_products_test")
+    assert result["safe"] and result["unexpected_paths"] == []
+
+
+def test_isolated_featured_diff_allows_managed_section_update_and_existing_order():
+    before = {"sections": {"ss_featured_products_test": {"settings": {"products": ["old"]}}},
+              "order": ["hero", "ss_featured_products_test", "footer"], "other": True}
+    after = {"sections": {"ss_featured_products_test": {"settings": {"products": ["new"]}}},
+             "order": ["hero", "ss_featured_products_test", "footer"], "other": True}
+    assert validate_isolated_featured_diff(before, after, "ss_featured_products_test")["safe"]
+
+
+def test_isolated_featured_diff_blocks_any_unrelated_change():
+    before = {"sections": {"hero": {"settings": {"title": "old"}}}, "order": ["hero"]}
+    after = {"sections": {"hero": {"settings": {"title": "new"}}, "ss_featured_products_test": {"type": "featured"}},
+             "order": ["hero", "ss_featured_products_test"]}
+    result = validate_isolated_featured_diff(before, after, "ss_featured_products_test")
+    assert not result["safe"] and result["unexpected_paths"]
+
+
+def test_isolated_featured_diff_blocks_category_and_repeated_managed_order():
+    before = {"sections": {"category": {"type": "collection-list"}}, "order": ["category"]}
+    after = {"sections": {"category": {"type": "changed"}, "ss_featured_products_test": {"type": "featured"}},
+             "order": ["category", "ss_featured_products_test", "ss_featured_products_test"]}
+    result = validate_isolated_featured_diff(before, after, "ss_featured_products_test")
+    assert not result["safe"] and "order" in result["unexpected_paths"]
+
+
+def isolated_apply_fixture(tmp_path, monkeypatch):
+    import shopsource.homepage_featured_products as feature_module
+    db, planner = service(tmp_path)
+    seed_four(db)
+    plan = planner.create_plan("s1", requested_count=4)
+    raw = '/* Shopify header comment */\n{"sections":{"hero":{"type":"hero","settings":{"title":"Keep"}}},"order":["hero"]}\n'
+    snapshot = {"template_status": "READY", "template_filename": "templates/index.json",
+        "template": json.loads(raw.split("*/", 1)[1]), "theme_files": {"templates/index.json": raw,
+            "sections/featured-products.liquid": "{% schema %}" + json.dumps({"name": "Featured products", "settings": [
+                {"type": "product_list", "id": "products", "label": "Products"}]}) + "{% endschema %}"},
+        "theme": {"id": "gid://shopify/OnlineStoreTheme/55", "name": "MAIN theme", "role": "MAIN"}}
+    preview = planner.build_theme_preview(plan, snapshot)
+    preview.update(store_id="s1", featured_products_plan_id=plan["plan_id"],
+                   theme=snapshot["theme"], template_filename="templates/index.json")
+    monkeypatch.setattr(feature_module, "get_connection", lambda *a, **k: {"shop_domain": "sample.myshopify.com", "api_version": "2026-07"})
+    monkeypatch.setattr(feature_module, "get_shopify_token", lambda *a, **k: ("not-a-real-token", "test"))
+
+    class FakeClient:
+        def __init__(self): self.raw, self.write_count, self.calls, self.write_files = raw, 0, [], []
+        def execute(self, query, variables=None):
+            self.calls.append(query)
+            if "FeaturedScopes" in query:
+                return {"currentAppInstallation": {"accessScopes": [{"handle": "read_themes"}, {"handle": "write_themes"}]}}
+            if "themeFilesUpsert" in query:
+                self.write_count += 1
+                self.write_files.extend(file["filename"] for file in variables["files"])
+                self.raw = variables["files"][0]["body"]["value"]
+                return {"themeFilesUpsert": {"userErrors": [], "upsertedThemeFiles": [{"filename": variables["files"][0]["filename"]}]}}
+            return {"theme": {"id": snapshot["theme"]["id"], "role": "MAIN", "name": "MAIN theme",
+                "files": {"nodes": [{"filename": "templates/index.json", "body": {"__typename": "OnlineStoreThemeFileBodyText", "content": self.raw}}]}}}
+    client = FakeClient()
+    writer = feature_module.FeaturedProductThemeApplyService(db=db, export_dir=tmp_path / "exports")
+    return db, plan, preview, client, writer
+
+
+def test_isolated_feature_apply_confirmation_and_one_file_write_with_comment_backup(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    refused = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=False, client=client)
+    assert refused["status"] == "MANUAL_ACTION_REQUIRED" and client.write_count == 0
+    result = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, client=client)
+    assert result["status"] == "VERIFIED" and result["product_ids_match"]
+    assert client.write_count == 1 and client.raw.startswith("/* Shopify header comment */")
+    assert client.write_files == ["templates/index.json"]
+    folder = next((tmp_path / "exports" / "theme_backups" / "s1").iterdir())
+    assert {"before.raw.json", "proposed.raw.json", "before.parsed.json", "proposed.parsed.json",
+            "selected_products.json", "diff.md", "metadata.json"}.issubset({x.name for x in folder.iterdir()})
+
+
+def test_isolated_feature_apply_blocks_proposal_drift_and_rollback_checks_merchant_drift(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    preview["proposed"]["sections"]["hero"]["settings"]["title"] = "changed"
+    blocked = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, client=client)
+    assert blocked["status"] == "CONFLICT" and client.write_count == 0
+
+
+def test_isolated_feature_rollback_restores_exact_raw_and_refuses_merchant_drift(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    original_raw = client.raw
+    applied = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, client=client)
+    assert applied["status"] == "VERIFIED" and client.write_count == 1
+    restored = writer.rollback(applied["backup_id"], confirmed=True, client=client)
+    assert restored["status"] == "ROLLED_BACK" and client.raw == original_raw and client.write_count == 2
+
+    merchant_dir = tmp_path / "merchant"
+    merchant_dir.mkdir()
+    db2, plan2, preview2, client2, writer2 = isolated_apply_fixture(merchant_dir, monkeypatch)
+    applied2 = writer2.apply(plan2["plan_id"], preview2, store_id="s1", confirmed=True, client=client2)
+    assert applied2["status"] == "VERIFIED"
+    client2.raw += "\n/* merchant drift */"
+    refused = writer2.rollback(applied2["backup_id"], confirmed=True, client=client2)
+    assert refused["status"] == "CONFLICT" and client2.write_count == 1
+
+
+def test_isolated_feature_apply_rejects_stale_plan_and_raw_semantic_drift(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    service_for_db = FeaturedProductAssignmentService(db=db)
+    service_for_db.create_plan("s1", requested_count=4)
+    stale = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, client=client)
+    assert stale["status"] == "CONFLICT" and client.write_count == 0
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    db2, plan2, preview2, client2, writer2 = isolated_apply_fixture(raw_dir, monkeypatch)
+    client2.raw += " "
+    raw_drift = writer2.apply(plan2["plan_id"], preview2, store_id="s1", confirmed=True, client=client2)
+    assert raw_drift["status"] == "CONFLICT" and client2.write_count == 0
+
+    semantic_dir = tmp_path / "semantic"
+    semantic_dir.mkdir()
+    db3, plan3, preview3, client3, writer3 = isolated_apply_fixture(semantic_dir, monkeypatch)
+    source = preview3["source_document"]
+    source["before_raw_hash"] = hashlib.sha256(client3.raw.encode("utf-8")).hexdigest()
+    source["before_semantic_hash"] = "deliberately-stale-semantic-hash"
+    semantic_drift = writer3.apply(plan3["plan_id"], preview3, store_id="s1", confirmed=True, client=client3)
+    assert semantic_drift["status"] == "CONFLICT" and client3.write_count == 0
 
 
 def test_featured_products_requires_real_mapping_and_handle(tmp_path):
@@ -148,7 +278,8 @@ def test_ui_ready_labels_and_no_network_or_write_path():
     for label in ("추천 상품 자동 구성", "상품 4개 보기", "다시 선택", "추천 상품 미리보기", "Shopify 적용", "과제 제출용 확인"):
         assert label in source
     module = (Path(__file__).parents[1] / "src/shopsource/homepage_featured_products.py").read_text(encoding="utf-8")
-    assert "class ShopifyExistingProductReader" in module and "mutation " not in module
+    assert "class ShopifyExistingProductReader" in module
+    assert "class FeaturedProductThemeApplyService" in module and "confirmed is not True" in module
 
 
 def test_protected_store_file_untouched():
