@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 
 from ..connectors.spark_center_package import (
@@ -1984,6 +1985,46 @@ class OperatorUI:
                 featured_status = ui.label("선택된 상품: 0 / 4 · 상태: REVIEW REQUIRED")
                 featured_diagnostics = ui.label("로컬 관리 상품 후보: 0 · Shopify 기존 상품 후보: 0 · 최종 사용 가능: 0").classes("ss-help")
                 featured_table = ui.column().classes("w-full gap-1")
+                with ui.dialog() as featured_review_dialog, ui.card().classes("w-[min(1000px,95vw)] max-h-[85vh] overflow-auto"):
+                    ui.label("추천 상품 4개 확인").classes("text-xl font-bold")
+                    featured_review_cards = ui.column().classes("w-full gap-3")
+                    ui.button("닫기", on_click=featured_review_dialog.close).props("outline")
+
+                def safe_featured_url(item):
+                    from urllib.parse import urlparse
+                    from ..shopify_collections import get_connection
+                    direct = str(item.get("product_link") or "")
+                    parsed = urlparse(direct)
+                    if parsed.scheme == "https" and parsed.netloc and not parsed.username and parsed.path.startswith("/"):
+                        return direct
+                    handle = str(item.get("shopify_handle") or "")
+                    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", handle): return None
+                    config = get_connection(self.current_store)
+                    domain = str((config or {}).get("shop_domain") or "").strip().casefold()
+                    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*\.myshopify\.com", domain): return None
+                    return f"https://{domain}/products/{handle}"
+
+                def show_featured_review():
+                    plan = state.get("featured_products_plan")
+                    featured_review_cards.clear()
+                    if not plan:
+                        ui.notify("먼저 추천 상품을 구성해 주세요.", type="warning"); return
+                    with featured_review_cards:
+                        for item in plan.get("items", []):
+                            with ui.card().classes("w-full"):
+                                with ui.row().classes("w-full items-start no-wrap"):
+                                    if item.get("image_url"):
+                                        ui.image(item["image_url"]).classes("w-28 h-28 object-contain rounded bg-gray-50")
+                                    with ui.column().classes("w-full gap-1"):
+                                        ui.label(f"{item['position']}. {item.get('title') or '제목 없음'}").classes("font-semibold")
+                                        ui.label(f"{item.get('merchandising_group', 'Other')} · ${float(item.get('price') or 0):.2f} · {item.get('remote_status') or '-'}")
+                                        ui.label(f"출처: {item.get('source_kind') or '-'} · 검증: {item.get('verification_status') or '-'}")
+                                        ui.label(f"선정 이유: {item.get('selection_reason') or '-'}").classes("text-sm")
+                                        ui.label(f"상품 handle: {item.get('shopify_handle') or '-'}").classes("text-xs text-gray-600")
+                                        product_url = safe_featured_url(item)
+                                        if product_url: ui.link("스토어에서 보기", product_url, new_tab=True).classes("text-primary")
+                                        else: ui.label("스토어 주소를 확인할 수 없어 링크를 만들지 않았습니다.").classes("text-xs text-amber-700")
+                    featured_review_dialog.open()
 
                 def render_featured(plan=None):
                     plan = plan or state.get("featured_products_plan")
@@ -1998,19 +2039,26 @@ class OperatorUI:
                         f"이미지 없음 {excluded.get('NEEDS_IMAGE', 0)} / 가격 없음 {excluded.get('MISSING_VALID_RETAIL_PRICE', 0)} / 기타 {sum(v for k, v in excluded.items() if k not in {'NOT_STOREFRONT_ELIGIBLE','NEEDS_IMAGE','MISSING_VALID_RETAIL_PRICE'})}")
                     with featured_table:
                         for item in (plan or {}).get("items", []):
-                            ui.label(f"{item['position']}. {item['title']} · {item.get('category_key') or '-'} · ${item.get('price') or 0:.2f} · {item['remote_status']} · /products/{item['shopify_handle']} · {item['selection_reason']} · {item['verification_status']}")
+                            ui.label(f"{item['position']}. {item['title']} · {item.get('merchandising_group') or 'Other'} · ${item.get('price') or 0:.2f} · {item['remote_status']}")
                         if not count:
                             ui.label("실제 Shopify mapping, 판매가, 이미지, ACTIVE 상태가 검증된 상품이 필요합니다.").classes("ss-help")
 
-                def select_featured_products(force_remote=False):
+                def select_featured_products(force_remote=False, reselect=False):
                     try:
                         service = FeaturedProductAssignmentService()
-                        plan = service.create_plan(self.current_store, mode="BALANCED_CATEGORIES", requested_count=4,
-                            heading="New Arrivals", subheading="Fresh picks to keep your car clean, organized, and ready to go." if self.current_store == "001" else "",
-                            include_existing=True, force_remote=bool(force_remote))
+                        previous = state.get("featured_products_plan")
+                        if reselect and previous:
+                            plan = service.reselect(previous)
+                        else:
+                            plan = service.create_plan(self.current_store, mode="BALANCED_CATEGORIES", requested_count=4,
+                                heading="New Arrivals", subheading="Fresh picks to keep your car clean, organized, and ready to go." if self.current_store == "001" else "",
+                                include_existing=True, force_remote=bool(force_remote))
                         state["featured_products_plan"] = plan
+                        state["featured_products_preview"] = None
                         render_featured(plan)
-                        if plan.get("diagnostics", {}).get("status") == "MISSING_READ_PRODUCTS_SCOPE":
+                        if reselect and plan.get("reselection_reused_previous"):
+                            ui.notify("다른 적격 상품이 충분하지 않아 기존 상품을 일부 다시 사용했습니다.", type="warning")
+                        elif plan.get("diagnostics", {}).get("status") == "MISSING_READ_PRODUCTS_SCOPE":
                             ui.notify("Shopify 기존 상품을 읽으려면 read_products 권한이 필요합니다. 설정 > Shopify 연결에서 권한을 새로 확인하세요.", type="warning")
                         else:
                             ui.notify("추천 상품 계획을 로컬에 저장했습니다. Shopify write는 실행하지 않았습니다.", type="positive" if plan["status"] == "READY" else "warning")
@@ -2028,8 +2076,8 @@ class OperatorUI:
 
                 with ui.row().classes("flex-wrap gap-2"):
                     ui.button("추천 상품 자동 구성", on_click=select_featured_products, icon="auto_awesome").props("color=primary")
-                    ui.button("상품 4개 보기", on_click=lambda: render_featured(), icon="view_list").props("outline")
-                    ui.button("다시 선택", on_click=select_featured_products, icon="refresh").props("outline")
+                    ui.button("상품 4개 보기", on_click=show_featured_review, icon="view_list").props("outline")
+                    ui.button("다시 선택", on_click=lambda: select_featured_products(reselect=True), icon="refresh").props("outline")
                     ui.button("Shopify 상품 다시 읽기", on_click=lambda: select_featured_products(True), icon="cloud_download").props("outline")
                     ui.button("추천 상품 미리보기", on_click=featured_preview, icon="preview").props("outline")
                     ui.button("Shopify 적용", on_click=featured_apply_gate, icon="publish").props("outline")

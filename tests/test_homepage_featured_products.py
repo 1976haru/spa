@@ -5,6 +5,7 @@ from shopsource.db import connect, init_db
 from shopsource.homepage_assignment import HomepageAssignmentService, homepage_assignment_workflow
 from shopsource.homepage_featured_products import (
     FeaturedProductAssignmentService, ShopifyExistingProductReader, discover_featured_product_schema,
+    merchandising_suitability, normalize_merchandising_group,
 )
 from shopsource.store_build import STAGES
 from shopsource.store_completion import DOMAINS, StoreCompletionService
@@ -266,3 +267,58 @@ def test_featured_ui_auto_refresh_scope_message_and_diagnostics():
     source = (Path(__file__).parents[1] / "src/shopsource/ui/v2.py").read_text(encoding="utf-8")
     assert "include_existing=True" in source and "Shopify 상품 다시 읽기" in source
     assert "read_products 권한이 필요합니다" in source and "최종 사용 가능" in source
+
+
+def test_featured_review_ui_is_dialog_with_cards_images_and_safe_links():
+    source = (Path(__file__).parents[1] / "src/shopsource/ui/v2.py").read_text(encoding="utf-8")
+    assert "ui.dialog() as featured_review_dialog" in source
+    assert "featured_review_cards" in source and "ui.image(item[\"image_url\"])" in source
+    assert "ui.link(\"스토어에서 보기\"" in source and "on_click=show_featured_review" in source
+    assert "myshopify\\.com" in source
+    render = source.split("def render_featured", 1)[1].split("def select_featured_products", 1)[0]
+    assert "selection_reason" not in render and "verification_status" not in render
+
+
+def test_merchandising_groups_normalize_taxonomy_and_keywords():
+    assert normalize_merchandising_group({"category_key": "Automotive Interior Accessories Consoles Organizers Seat Back Organizers"}) == "Seat & Backseat"
+    assert normalize_merchandising_group({"title": "Foldable Trunk Cargo Organizer"}) == "Trunk & Cargo"
+    assert normalize_merchandising_group({"title": "Backseat Organizer"}) == "Seat & Backseat"
+    assert normalize_merchandising_group({"title": "Center Console Storage Organizer"}) == "Console & Small Storage"
+    assert normalize_merchandising_group({"title": "Car Trash Can"}) == "Trash & Cleanup"
+
+
+def test_vehicle_replacement_ranks_below_organizer():
+    organizer = {"title": "Universal Trunk Organizer Storage", "product_type": "Cargo Organizer"}
+    fitment_part = {"title": "Center Console Lid Replacement Fits 1999-2007 Silverado Sierra OEM", "product_type": "Interior Part"}
+    assert merchandising_suitability(organizer) > merchandising_suitability(fitment_part)
+
+
+def test_reselection_changes_set_deterministically_and_invalidates_preview(tmp_path, monkeypatch):
+    products = []
+    for number in range(1, 9):
+        row = remote_product(number, product_type="Organizer")
+        row["title"] = f"Universal organizer storage {number}"
+        products.append(row)
+    db, remote_reader = reader(tmp_path, monkeypatch, products)
+    svc = FeaturedProductAssignmentService(db=db)
+    original = svc.create_plan("s1", include_existing=True, reader=remote_reader)
+    snapshot = {"theme_files": theme_files(), "template": {"sections": {}, "order": []}}
+    preview = svc.build_theme_preview(original, snapshot)
+    assert preview["status"] == "PREVIEW"
+    first = svc.reselect(original, reader=remote_reader)
+    second = svc.reselect(original, reader=remote_reader)
+    ids = lambda plan: [x["shopify_product_id"] for x in plan["items"]]
+    assert len(first["items"]) == 4 and ids(first) != ids(original)
+    assert ids(first) == ids(second)
+    assert not set(ids(first)) & set(ids(original))
+    with connect(db) as con:
+        assert con.execute("SELECT preview_hash FROM homepage_featured_product_plans WHERE plan_id=?", (original["plan_id"],)).fetchone()[0] is None
+    assert all(x["remote_status"] == "ACTIVE" and x["price"] > 0 and x["image_url"] for x in first["items"])
+
+
+def test_reselection_reuses_only_when_alternatives_insufficient(tmp_path):
+    db, svc = service(tmp_path); seed_four(db)
+    first = svc.create_plan("s1")
+    second = svc.reselect(first)
+    assert len(second["items"]) == 4 and second["reselection_reused_previous"] is True
+    assert {x["shopify_product_id"] for x in second["items"]} == {x["shopify_product_id"] for x in first["items"]}

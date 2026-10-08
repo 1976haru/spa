@@ -68,6 +68,11 @@ def _install(db=None):
               selection_reason,verification_status,NULL,NULL FROM homepage_featured_product_items_phase43;
             DROP TABLE homepage_featured_product_items_phase43;
             """)
+            columns = {row["name"] for row in con.execute("PRAGMA table_info(homepage_featured_product_items)")}
+        if "merchandising_group" not in columns:
+            con.execute("ALTER TABLE homepage_featured_product_items ADD COLUMN merchandising_group TEXT NOT NULL DEFAULT 'Other'")
+        if "suitability_score" not in columns:
+            con.execute("ALTER TABLE homepage_featured_product_items ADD COLUMN suitability_score INTEGER NOT NULL DEFAULT 50")
 
 
 EXISTING_PRODUCTS_QUERY = """query ShopSourceExistingProducts($first:Int!,$after:String) {
@@ -158,6 +163,41 @@ class ShopifyExistingProductReader:
 def _title_group(title) -> str:
     words = re.findall(r"[a-z0-9]+", str(title or "").casefold())
     return " ".join(words[:2]) or "uncategorized"
+
+
+def normalize_merchandising_group(candidate: dict) -> str:
+    """Return a short display/diversity group without changing source taxonomy."""
+    text = " ".join(str(candidate.get(key) or "") for key in
+                     ("collection_name", "collection", "category_key", "product_type", "tags", "title")).casefold()
+    rules = (
+        ("Trash & Cleanup", ("trash", "garbage", "waste", "cleanup")),
+        ("Trunk & Cargo", ("trunk", "cargo")),
+        ("Seat & Backseat", ("backseat", "seat back", "seat-back", "seat organizer")),
+        ("Console & Small Storage", ("console organizer", "console storage", "center console organizer", "console")),
+        ("Cup Holder & Convenience", ("cup holder", "cupholder")),
+        ("Document & Visor", ("visor", "document holder", "registration holder")),
+        ("General Organization", ("organizer", "organization", "storage", "holder")),
+    )
+    for label, needles in rules:
+        if any(needle in text for needle in needles): return label
+    return "Other"
+
+
+def merchandising_suitability(candidate: dict) -> int:
+    """Rank broad organizing products ahead of fitment-specific replacement parts."""
+    title = str(candidate.get("title") or "").casefold()
+    context = " ".join([title, str(candidate.get("product_type") or ""), " ".join(map(str, candidate.get("tags") or []))]).casefold()
+    score = 50
+    for word, points in (("organizer", 24), ("storage", 18), ("trash", 18), ("holder", 14), ("cargo", 14),
+                         ("trunk", 12), ("backseat", 14), ("seat back", 12), ("travel", 8), ("cup holder", 8), ("visor", 8)):
+        if word in context: score += points
+    for word, points in (("replacement", 45), ("trim", 24), ("lid", 20), ("panel", 28), ("oem", 35),
+                         ("direct-fit", 30), ("direct fit", 30), ("repair", 24), ("assembly", 18), ("replacement part", 35)):
+        if word in context: score -= points
+    if re.search(r"\b(?:19|20)\d{2}\s*(?:-|–|to)\s*(?:19|20)\d{2}\b", context): score -= 45
+    if re.search(r"\b(?:fits?|for)\s+\d{4}\b", context): score -= 24
+    if re.search(r"\b[A-Z0-9]{2,}[- ]\d{3,}\b", str(candidate.get("title") or ""), re.I): score -= 18
+    return score
 
 
 def discover_featured_product_schema(section_files: dict[str, str]) -> dict:
@@ -259,13 +299,20 @@ class FeaturedProductAssignmentService:
     def create_plan(self, store_id: str, *, mode="BALANCED_CATEGORIES", requested_count=4,
                     heading="New Arrivals", subheading="", manual_product_ids=None,
                     collection_key=None, collection_handle=None, include_existing=False,
-                    force_remote=False, reader=None) -> dict:
+                    force_remote=False, reader=None, exclude_shopify_ids=None) -> dict:
         mode = str(mode).upper()
         if mode not in MODES: raise ValueError(f"Unsupported featured-product mode: {mode}")
         requested_count = max(1, int(requested_count))
         union = self.candidate_union(store_id, force_remote=force_remote, reader=reader) if include_existing else None
         candidates = union["candidates"] if union else self.eligible_products(store_id)
         eligible = [x for x in candidates if x["eligible"]]
+        excluded = set(map(str, exclude_shopify_ids or []))
+        alternatives = [x for x in eligible if str(x.get("shopify_product_id")) not in excluded]
+        reused_previous = bool(excluded and len(alternatives) < requested_count)
+        if excluded and not reused_previous: eligible = alternatives
+        for row in eligible:
+            row["merchandising_group"] = normalize_merchandising_group(row)
+            row["suitability_score"] = merchandising_suitability(row)
         if mode == "MANUAL_SELECTION":
             wanted = list(manual_product_ids or [])
             by_id = {(x["master_product_id"] if x.get("master_product_id") is not None else x["source_key"]): x for x in eligible}
@@ -273,13 +320,15 @@ class FeaturedProductAssignmentService:
         elif mode == "NEW_ARRIVALS":
             selected = sorted(eligible, key=lambda x: (x.get("created_at") or x.get("synced_at") or "", x["source_key"]), reverse=True)[:requested_count]
         else:
+            ranked = sorted(eligible, key=lambda x: (x["suitability_score"],
+                str(x.get("created_at") or x.get("synced_at") or ""), str(x.get("shopify_product_id") or "")), reverse=True)
             selected, seen = [], set()
-            for row in eligible:
-                key = str(row.get("category_key") or "uncategorized").casefold()
+            for row in ranked:
+                key = row["merchandising_group"]
                 if key not in seen: selected.append(row); seen.add(key)
                 if len(selected) == requested_count: break
             if len(selected) < requested_count:
-                selected.extend(x for x in eligible if x not in selected)
+                selected.extend(x for x in ranked if x not in selected)
                 selected = selected[:requested_count]
         ids, handles = [x["shopify_product_id"] for x in selected], [x["shopify_handle"].casefold() for x in selected]
         reasons = []
@@ -295,22 +344,45 @@ class FeaturedProductAssignmentService:
                         (plan_id, store_id, mode, heading, subheading, requested_count, collection_key,
                          collection_handle, status, _hash(fingerprint), None, now, now))
             for position, row in enumerate(selected, 1):
-                why = "manual order" if mode == "MANUAL_SELECTION" else ("newly created" if row.get("source_kind") == "EXISTING_SHOPIFY" else "recently synced") if mode == "NEW_ARRIVALS" else f"category diversity: {row['category_key']}"
-                con.execute("INSERT INTO homepage_featured_product_items VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                why = "manual order" if mode == "MANUAL_SELECTION" else ("newly created" if row.get("source_kind") == "EXISTING_SHOPIFY" else "recently synced") if mode == "NEW_ARRIVALS" else f"{row['merchandising_group']} · suitability {row['suitability_score']} · balanced ranking"
+                con.execute("""INSERT INTO homepage_featured_product_items(
+                    plan_id,position,source_kind,source_key,master_product_id,shopify_product_id,shopify_handle,title,
+                    category_key,image_url,price,remote_status,selection_reason,verification_status,created_at,updated_at,
+                    merchandising_group,suitability_score) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                             (plan_id, position, row.get("source_kind", "SHOPSOURCE_MANAGED"), row.get("source_key", ""),
                              row.get("master_product_id"), row["shopify_product_id"], row["shopify_handle"], row["title"],
                              row["category_key"], row["image_url"], row["price"], row.get("remote_status") or row.get("storefront_status"),
-                             why, row.get("verification_status", "LOCAL_ELIGIBILITY_VERIFIED"), now, now))
+                             why, row.get("verification_status", "LOCAL_ELIGIBILITY_VERIFIED"), now, now,
+                             row["merchandising_group"], row["suitability_score"]))
         plan = self.get_plan(plan_id, reasons=reasons)
+        plan["reselection_reused_previous"] = reused_previous
         plan["diagnostics"] = union or {"managed_count": len(eligible), "remote_product_count": 0, "remote_eligible_count": 0,
                                         "eligible_count": len(eligible), "reason_counts": {}, "duplicate_count": 0}
         return plan
+
+    def reselect(self, previous_plan: dict, *, reader=None) -> dict:
+        """Create a new deterministic plan, avoiding the immediately previous IDs when possible."""
+        old_ids = [x.get("shopify_product_id") for x in previous_plan.get("items", [])]
+        if old_ids:
+            with connect(self.db) as con:
+                con.execute("UPDATE homepage_featured_product_plans SET preview_hash=NULL,updated_at=? WHERE plan_id=?",
+                            (_now(), previous_plan["plan_id"]))
+        return self.create_plan(previous_plan["store_id"], mode=previous_plan.get("mode") or "BALANCED_CATEGORIES",
+            requested_count=previous_plan.get("requested_count", 4), heading=previous_plan.get("heading", "New Arrivals"),
+            subheading=previous_plan.get("subheading", ""), collection_key=previous_plan.get("collection_key"),
+            collection_handle=previous_plan.get("collection_handle"), include_existing=True, reader=reader,
+            exclude_shopify_ids=old_ids)
 
     def get_plan(self, plan_id: str, *, reasons=None) -> dict:
         with connect(self.db) as con:
             row = con.execute("SELECT * FROM homepage_featured_product_plans WHERE plan_id=?", (plan_id,)).fetchone()
             if not row: raise KeyError(plan_id)
             items = [dict(x) for x in con.execute("SELECT * FROM homepage_featured_product_items WHERE plan_id=? ORDER BY position", (plan_id,))]
+        for item in items:
+            candidate = {"title": item.get("title"), "category_key": item.get("category_key")}
+            item["merchandising_group"] = item.get("merchandising_group") or normalize_merchandising_group(candidate)
+            if item.get("suitability_score") == 50:
+                item["suitability_score"] = merchandising_suitability(candidate)
         return {**dict(row), "items": items, "reasons": list(reasons or []), "write_performed": False}
 
     def checklist(self, plan: dict, *, section_visible=False, remote_verified=False) -> dict:
