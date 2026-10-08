@@ -44,6 +44,7 @@ from ..production_runner import ProductionEvidenceRunner
 from ..security import redact_text
 from ..intelligence.keyword_engine import KeywordEngine
 from ..paths import AMAZON_INBOX_DIR, EXPORT_DIR, STORE_DIR
+from ..store_portfolio import production_bootstrap, selector_label, store_metadata
 from ..importer import import_amazon_source
 from ..sourcing.credentials import delete_api_key, get_api_key, save_api_key
 from ..sourcing.engine import SourcingEngine, new_run_id
@@ -287,7 +288,7 @@ class OperatorUI:
         with ui.header().classes("bg-white text-slate-900 border-b border-slate-200 items-center"):
             ui.label(title).classes("text-lg font-semibold")
             ui.space()
-            options = {store["store_id"]: f"{store['store_id']} | {store['store_name']}" for store in self.stores}
+            options = {store["store_id"]: selector_label(store["profile"], store_metadata(store["store_id"])) for store in self.stores}
             ui.select(options, value=self.current_store, label="Store").classes("w-64").on_value_change(
                 lambda event: self._set_store(event.value, path)
             )
@@ -315,7 +316,23 @@ class OperatorUI:
 
     def _production_golden_path(self):
         ui = self.ui
-        self._heading("실전 스토어 완성", "Cabin Tidy의 소싱부터 출시 전 점검까지 증거가 확인된 항목만 통과시킵니다. 확인되지 않은 내용은 준비 완료로 추정하지 않습니다.")
+        selected = next((row for row in self.stores if row["store_id"] == self.current_store), None)
+        if selected:
+            bootstrap = production_bootstrap(selected["profile"], store_metadata(self.current_store))
+            with ui.card().classes("w-full border border-slate-200 p-4"):
+                if bootstrap.get("role") == "GOLDEN_REFERENCE":
+                    ui.label("001 | Cabin Tidy — GOLDEN REFERENCE").classes("text-xl font-bold")
+                    ui.label(f"PAUSED_REFERENCE · ShopSource evidence {bootstrap['evidence']} = {bootstrap['progress_percent']}% · read-only reference")
+                else:
+                    ui.label("002 | Garage / Workshop — PRODUCTION BUILD").classes("text-xl font-bold")
+                    ui.label(f"Brand: {bootstrap['brand']} · Reference: 001 Cabin Tidy · Shopify: {bootstrap['shopify']}")
+                    ui.label(f"Current step: {bootstrap['current_step']} · Store 002 real production progress: {bootstrap['progress_percent']}%")
+                    if bootstrap.get("blocker"):
+                        ui.label(bootstrap["blocker"]).classes("text-orange-700 font-semibold")
+        if selected and bootstrap.get("role") == "PRODUCTION_BUILD":
+            self._heading("Store 002 Production Build", "현재 단계와 다음 실제 행동을 우선합니다. 코드 capability는 Store 002 실전 진행률에 합산하지 않습니다.")
+        else:
+            self._heading("Golden Reference", "Cabin Tidy는 비교용 quality reference입니다. 기존 evidence와 pilot/batch 상태를 변경하지 않습니다.")
         service = ProductionGoldenPathService()
         runner = ProductionEvidenceRunner(service=service)
         state = {"run": None, "selected_gate": None}
@@ -324,6 +341,10 @@ class OperatorUI:
             start = ui.button("실전 점검 자동 진행", icon="rocket_launch").props("color=primary size=lg")
             ui.button("기존 점검 다시 열기", icon="history", on_click=lambda: load_latest()).props("outline size=lg")
         notice = ui.label("게이트를 열어 내용을 확인하는 것만으로 외부 검사는 시작되지 않습니다. 외부 작업은 별도의 승인 버튼이 필요합니다.").classes("ss-help")
+        if selected and production_bootstrap(selected["profile"], store_metadata(self.current_store)).get("read_only"):
+            new_run_button.props("disable")
+            start.props("disable")
+            notice.set_text("GOLDEN REFERENCE는 read-only입니다. 기존 pilot/batch를 완료 처리하거나 재실행하지 않습니다.")
         board = ui.element("div").classes("ss-gate-board w-full")
         action_dialog = ui.dialog()
         with action_dialog, ui.card().classes("w-[min(95vw,1000px)] max-h-[88vh] overflow-auto"):

@@ -1,0 +1,71 @@
+{
+  "store_id": "002",
+  "store_name": "Garage / Workshop",
+  "category": "Garage / Workshop Organization",
+  "strategy": "HOME PROBLEM SOLVER",
+  "promise": "Every tool where you left it.",
+  "target_customer": "United States homeowners and practical DIY workshop users",
+  "target_country": "United States",
+  "brand_personality": [
+    "practical",
+    "trustworthy",
+    "modern",
+    "workshop"
+  ],
+  "brand_name_status": "NOT_SELECTED",
+  "working_name": "The Garage Fix",
+  "working_name_clearance": "UNVERIFIED",
+  "reference_store_id": "001",
+  "lifecycle": "PLANNING",
+  "shopify_status": "NOT_CONNECTED",
+  "shopify_gate": "WAITING_FOR_SHOPIFY_STORE",
+  "current_step": "BRAND / SHOPIFY SETUP",
+  "production_progress_percent": 0,
+  "collections": [
+    "Wall Systems",
+    "Tool Order",
+    "Floor Clear"
+  ],
+  "problems": [
+    "tool organization",
+    "wall utilization",
+    "cable tangles"
+  ],
+  "initial_product_concepts": [
+    "wall-mounted tool board",
+    "magnetic tool holder",
+    "cable organizer reel"
+  ],
+  "representative_price_usd": 85,
+  "production_score": 84.4,
+  "spami_signal": 4,
+  "risk": "LOW",
+  "wave": "1차 확장",
+  "sourcing_provider": "SPARK",
+  "source_catalog_policy": "INDEPENDENT_FROM_REFERENCE",
+  "build_steps": [
+    "Concept",
+    "Shopify Store",
+    "Brand Name",
+    "Logo/Favicon",
+    "Spark Sourcing",
+    "G1 Sourcing Quality",
+    "G2 Free Source Safety",
+    "Product Content",
+    "Media Rights",
+    "Pricing/Margin",
+    "Collections",
+    "Collection Images",
+    "Brand/Header/Menu",
+    "Homepage",
+    "Product/Collection Templates",
+    "Pages/Policies",
+    "SEO/Mobile",
+    "Commerce",
+    "10 DRAFT Pilot",
+    "Storefront Comparison",
+    "100-200 Batch",
+    "Remaining Catalog",
+    "ACTIVE Approval"
+  ]
+}

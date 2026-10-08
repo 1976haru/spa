@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "stores": {
+    "001": {
+      "role": "GOLDEN_REFERENCE",
+      "build_origin": "EXTERNAL_SERVICE",
+      "display_name": "Cabin Tidy",
+      "production_mode": "PAUSED_REFERENCE",
+      "evidence_verified": 3,
+      "evidence_denominator": 14,
+      "evidence_percent": 21
+    },
+    "002": {
+      "role": "PRODUCTION_BUILD",
+      "build_origin": "SHOPSOURCE_STUDIO",
+      "display_name": "Brand TBD",
+      "reference_store_id": "001"
+    }
+  }
+}

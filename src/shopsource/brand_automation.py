@@ -164,7 +164,9 @@ def brand_profile_from_store(store_id, *, overrides=None, db=None):
     store = get_store(store_id, db)
     existing = get_brand_profile(store_id, db=db)
     raw = dict(store)
-    brand_name = (existing or {}).get("profile", {}).get("brand_name") or raw.get("brand_name") or raw.get("brand") or raw.get("store_name") or store_id
+    name_not_selected = raw.get("brand_name_status") == "NOT_SELECTED"
+    brand_name = ((existing or {}).get("profile", {}).get("brand_name") or raw.get("brand_name") or raw.get("brand")
+                  or ("" if name_not_selected else raw.get("store_name")) or ("" if name_not_selected else store_id))
     sourcing = raw.get("sourcing") if isinstance(raw.get("sourcing"), dict) else {}
     category = raw.get("primary_category") or raw.get("category") or ", ".join(raw.get("sourcing_categories", []) or [])
     profile = {
@@ -225,6 +227,7 @@ def brand_name_prompt(store_id, *, db=None):
             "different strategic directions. Do not claim trademark/domain clearance; state that both require review. "
             f"Store category: {p['primary_category']}; customers: {p['target_customer']}; country: {p['target_country']}; "
             f"personality/keywords: {p['personality']} / {p['brand_keywords']}. Desired image/keywords: {p.get('desired_brand_image', p['personality'])}. "
+            f"Working-name seed (candidate only, never auto-select): {get_store(store_id, db).get('working_name') or 'none'}. "
             f"Do not repeat the current name '{p['brand_name']}' among candidates; it must not be renamed or auto-selected. "
             "Do not claim trademark/domain clearance. Provide manual steps: search official trademark registers and domain registrars, "
             "record conflicts, and get qualified legal advice where needed.")
