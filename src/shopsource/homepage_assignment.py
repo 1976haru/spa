@@ -155,13 +155,26 @@ class HomepageAssignmentService:
             "applied": bool(applied), "remote_verified": bool(verified),
         }
         if preview.get("featured_products_required"):
+            canonical = preview.get("canonical_homepage_preview") or {}
+            canonical_template = canonical.get("proposed") or {}
+            feature_preview = canonical.get("featured_products_preview") or {}
+            feature_section_id = feature_preview.get("section_id")
+            feature_section = (canonical_template.get("sections") or {}).get(feature_section_id) if feature_section_id else None
+            feature_settings = (feature_section or {}).get("settings") or {}
+            expected_ids = [x.get("shopify_product_id") for x in product_items]
+            feature_visible = bool(feature_section and any(value == expected_ids for value in feature_settings.values()))
             checks.update({
                 "featured_products_count": len(product_items) >= int(featured.get("requested_count", 4)),
-                "featured_products_unique": len({x.get("shopify_product_id") for x in product_items}) == len(product_items),
+                "featured_products_unique": len({x.get("shopify_product_id") for x in product_items}) == len(product_items) and len({x.get("shopify_handle") for x in product_items}) == len(product_items),
+                "featured_products_active": bool(product_items) and all(x.get("remote_status") == "ACTIVE" for x in product_items),
                 "featured_products_real_links": bool(product_items) and all(x.get("shopify_handle") for x in product_items),
                 "featured_products_price_valid": bool(product_items) and all(float(x.get("price") or 0) > 0 for x in product_items),
                 "featured_products_images_ready": bool(product_items) and all(x.get("image_url") for x in product_items),
                 "featured_products_storefront_eligible": bool(product_items) and all(x.get("remote_status") == "ACTIVE" for x in product_items),
+                "featured_products_visible_in_proposal": feature_visible,
+                "homepage_preview_current": canonical.get("status") == "PREVIEW" and canonical.get("featured_products_plan_id") == featured.get("plan_id"),
+                "homepage_preview_not_stale": canonical.get("status") != "STALE",
+                "write_not_run": not bool(preview.get("applied")),
             })
         ready = all(checks.values()) and preview["capability"]["status"] in {"NATIVE_THEME_AUTO", "NATIVE_THEME_REVIEW_REQUIRED"}
         return {"checks": checks, "status": "ASSIGNMENT_READY" if ready else "REVIEW_REQUIRED",

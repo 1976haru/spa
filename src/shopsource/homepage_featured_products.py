@@ -202,13 +202,17 @@ def merchandising_suitability(candidate: dict) -> int:
 
 def discover_featured_product_schema(section_files: dict[str, str]) -> dict:
     """Use only proven schema field types/ids; never infer from a theme name."""
+    if not isinstance(section_files, dict):
+        return {"status": "MANUAL_ACTION_REQUIRED", "confidence": "LOW", "reason": "테마 section schema 목록 형식이 올바르지 않습니다."}
     candidates = []
     for filename, raw in sorted(section_files.items()):
+        if not isinstance(filename, str) or not isinstance(raw, str): continue
         match = re.search(r"\{%[- ]*schema[- ]*%\}(.*?)\{%[- ]*endschema[- ]*%\}", raw, re.S | re.I)
         if not match: continue
         try: schema = json.loads(match.group(1).strip())
         except (json.JSONDecodeError, TypeError): continue
         settings = schema.get("settings") or []
+        if not isinstance(settings, list) or any(not isinstance(field, dict) for field in settings): continue
         collection = next((x for x in settings if x.get("type") == "collection"), None)
         product_list = next((x for x in settings if x.get("type") in {"product_list", "product"}), None)
         if not collection and not product_list: continue
@@ -226,7 +230,7 @@ def discover_featured_product_schema(section_files: dict[str, str]) -> dict:
                            "columns_desktop_field": field("columns desktop"),
                            "columns_mobile_field": field("columns mobile"), "image_ratio_field": field("image ratio")})
     if not candidates:
-        return {"status": "MANUAL_ACTION_REQUIRED", "confidence": "LOW", "reason": "No proven product-list or featured-collection schema"}
+        return {"status": "MANUAL_ACTION_REQUIRED", "confidence": "LOW", "reason": "현재 테마에 안전하게 확인된 상품 리스트 섹션이 없습니다."}
     candidates.sort(key=lambda x: (x["mode"] != "DIRECT_PRODUCTS", x["filename"]))
     return {"status": "READY", **candidates[0]}
 
@@ -337,6 +341,8 @@ class FeaturedProductAssignmentService:
         if len(handles) != len(set(handles)): reasons.append("DUPLICATE_SHOPIFY_HANDLE")
         status = "READY" if not reasons else "MANUAL_ACTION_REQUIRED"
         plan_id, now = "HFP_" + secrets.token_hex(10), _now()
+        from .homepage_automation import invalidate_homepage_previews
+        invalidate_homepage_previews(store_id, reason="Featured product selection changed", db=self.db)
         fingerprint = {"store_id": store_id, "mode": mode, "requested_count": requested_count,
                        "selected": [(x.get("source_kind"), x.get("source_key"), x["shopify_product_id"], x["shopify_handle"], x.get("created_at") or x.get("synced_at")) for x in selected]}
         with connect(self.db) as con:
@@ -363,6 +369,8 @@ class FeaturedProductAssignmentService:
     def reselect(self, previous_plan: dict, *, reader=None) -> dict:
         """Create a new deterministic plan, avoiding the immediately previous IDs when possible."""
         old_ids = [x.get("shopify_product_id") for x in previous_plan.get("items", [])]
+        from .homepage_automation import invalidate_homepage_previews
+        invalidate_homepage_previews(previous_plan["store_id"], reason="Featured product selection changed", db=self.db)
         if old_ids:
             with connect(self.db) as con:
                 con.execute("UPDATE homepage_featured_product_plans SET preview_hash=NULL,updated_at=? WHERE plan_id=?",
@@ -414,7 +422,7 @@ class FeaturedProductAssignmentService:
         if capability.get("subheading_field") and plan.get("subheading"): settings[capability["subheading_field"]["id"]] = plan["subheading"]
         if capability["mode"] == "DIRECT_PRODUCTS": settings[capability["product_field"]["id"]] = [x["shopify_product_id"] for x in plan["items"]]
         elif plan.get("collection_handle"): settings[capability["collection_field"]["id"]] = plan["collection_handle"]
-        else: return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Managed New Arrivals collection mapping required", "fallback": {
+        else: return {"status": "MANUAL_ACTION_REQUIRED", "reason": "추천 컬렉션 handle이 연결되지 않았습니다. 컬렉션 연결을 먼저 확인하세요.", "fallback": {
             "collection_key": plan.get("collection_key") or "homepage-new-arrivals", "title": plan["heading"],
             "owned_tag": "shopsource:homepage:featured-products", "preserve_merchant_tags": True}, "write_performed": False}
         before = sections.get(section_id); desired = {"type": capability["type"], "settings": settings}

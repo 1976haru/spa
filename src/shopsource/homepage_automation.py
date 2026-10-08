@@ -33,6 +33,35 @@ def _hash(value):
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
 
 
+def normalize_text_value(value: Any, *, _depth: int = 0, _seen: set[int] | None = None) -> str:
+    """Safely flatten profile values used as prompt/display text without mutation."""
+    if value is None or _depth > 8:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    seen = _seen if _seen is not None else set()
+    ident = id(value)
+    if ident in seen:
+        return ""
+    if isinstance(value, dict):
+        seen.add(ident)
+        parts = [f"{normalize_text_value(key, _depth=_depth+1, _seen=seen)}: {normalize_text_value(item, _depth=_depth+1, _seen=seen)}"
+                 for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))]
+        seen.discard(ident)
+        return ", ".join(part for part in parts if part and not part.endswith(": "))
+    if isinstance(value, (list, tuple, set, frozenset)):
+        seen.add(ident)
+        items = sorted(value, key=lambda item: str(item)) if isinstance(value, (set, frozenset)) else value
+        parts = [normalize_text_value(item, _depth=_depth+1, _seen=seen) for item in items]
+        seen.discard(ident)
+        return ", ".join(part for part in parts if part)
+    return str(value).strip()
+
+
 def _install(db=None):
     init_db(db)
     with connect(db) as con:
@@ -76,6 +105,7 @@ def _safe_store(value: str) -> str:
 
 
 def _section_schema(raw: str) -> dict | None:
+    if not isinstance(raw, str): return None
     match = re.search(r"\{%[- ]*schema[- ]*%\}(.*?)\{%[- ]*endschema[- ]*%\}", raw, re.S | re.I)
     if not match:
         return None
@@ -109,9 +139,10 @@ def _field_semantics(schema: dict) -> dict[str, dict]:
 
 def discover_homepage_sections(theme_files: dict[str, str]) -> dict:
     """Find hero and category section schemas without theme-name assumptions."""
+    if not isinstance(theme_files, dict): theme_files = {}
     heroes, categories = [], []
     for filename, raw in sorted(theme_files.items()):
-        if not filename.startswith("sections/") or not filename.endswith(".liquid"):
+        if not isinstance(filename, str) or not isinstance(raw, str) or not filename.startswith("sections/") or not filename.endswith(".liquid"):
             continue
         schema = _section_schema(raw)
         if not schema:
@@ -139,11 +170,13 @@ def discover_homepage_sections(theme_files: dict[str, str]) -> dict:
 
 def hero_copy(brand: dict, collections: list[dict], collection_handles: dict[str, str] | None = None) -> dict:
     profile = brand.get("profile", brand) if isinstance(brand, dict) else {}
-    brand_name = str(profile.get("brand_name") or "our store").strip()
-    category = str(profile.get("primary_category") or "everyday essentials").strip().lower()
-    market = str(profile.get("target_country") or "").strip()
-    handles = collection_handles or {}
-    first = next((row for row in collections if row.get("enabled", 1) and handles.get(row.get("collection_key"))), None)
+    if not isinstance(profile, dict): profile = {}
+    brand_name = normalize_text_value(profile.get("brand_name")) or "our store"
+    category = normalize_text_value(profile.get("primary_category")).lower() or "everyday essentials"
+    market = normalize_text_value(profile.get("target_country"))
+    handles = collection_handles if isinstance(collection_handles, dict) else {}
+    collections = collections if isinstance(collections, list) else []
+    first = next((row for row in collections if isinstance(row, dict) and row.get("enabled", 1) and handles.get(row.get("collection_key"))), None)
     cta_target = f"/collections/{handles[first['collection_key']]}" if first else None
     cta_label = f"Shop {first.get('title')}" if first else "Explore collections"
     # Copy remains category-oriented and avoids claims, urgency, discounts, or social proof.
@@ -164,10 +197,11 @@ def hero_copy(brand: dict, collections: list[dict], collection_handles: dict[str
 
 def hero_image_prompt(brand: dict) -> str:
     profile = brand.get("profile", brand) if isinstance(brand, dict) else {}
-    category = profile.get("primary_category", "the store's product category")
-    palette = profile.get("colors", "the approved brand palette")
-    tone = profile.get("personality", profile.get("brand_keywords", "clean, practical, premium"))
-    avoid = profile.get("avoid_styles", "").strip()
+    if not isinstance(profile, dict): profile = {}
+    category = normalize_text_value(profile.get("primary_category")) or "the store's product category"
+    palette = normalize_text_value(profile.get("colors")) or "the approved brand palette"
+    tone = normalize_text_value(profile.get("personality") or profile.get("brand_keywords")) or "clean, practical, premium"
+    avoid = normalize_text_value(profile.get("avoid_styles"))
     return (f"Photorealistic premium lifestyle wide desktop ecommerce hero for {category}. "
             f"Match this brand tone and palette: {tone}; {palette}. Keep the main subject mobile-safe near center, "
             "with clear negative space on one side for headline and CTA overlay, realistic natural lighting, "
@@ -179,7 +213,11 @@ def category_shortcuts(collection_plan: dict, *, collection_handles: dict[str, s
                        collection_assets: dict[str, dict] | None = None, maximum: int = 8, brand: dict | None = None) -> dict:
     handles, assets = collection_handles or {}, collection_assets or {}
     rows = []
-    for source in collection_plan.get("collections", []):
+    if not isinstance(collection_plan, dict): collection_plan = {}
+    source_rows = collection_plan.get("collections", [])
+    if not isinstance(source_rows, list): source_rows = []
+    for source in source_rows:
+        if not isinstance(source, dict): continue
         if not source.get("enabled", 1): continue
         warnings = [str(item).upper() for item in source.get("warnings", [])]
         if any(any(token in warning for token in ("ZERO_MATCH", "CONFLICT", "MISSING", "EXTREME_OVERLAP")) for warning in warnings):
@@ -187,9 +225,10 @@ def category_shortcuts(collection_plan: dict, *, collection_handles: dict[str, s
         rows.append(dict(source))
     rows.sort(key=lambda row: (int(row.get("priority", 999)), -int(row.get("estimated_product_count", 0)), row.get("collection_key", "")))
     result, warnings, seen_targets, seen_assets = [], [], {}, {}
-    profile = (brand or {}).get("profile", brand or {})
-    brand_tone = profile.get("personality", profile.get("brand_keywords", "clean, practical, premium"))
-    brand_palette = profile.get("colors", "approved brand palette")
+    profile = (brand or {}).get("profile", brand or {}) if isinstance(brand, dict) else {}
+    if not isinstance(profile, dict): profile = {}
+    brand_tone = normalize_text_value(profile.get("personality") or profile.get("brand_keywords")) or "clean, practical, premium"
+    brand_palette = normalize_text_value(profile.get("colors")) or "approved brand palette"
     target_limit = min(8, max(4, int(maximum)), len(rows)) if rows else 0
     for row in rows[:target_limit]:
         key = str(row.get("collection_key") or _slug(row.get("title", "category")))
@@ -229,6 +268,9 @@ def build_homepage_plan(*, store_id: str, brand: dict, collection_plan: dict,
                         collection_assets: dict[str, dict] | None = None, maximum_categories: int = 8,
                         db=None) -> dict:
     """Persist a canonical hero + category plan; no Shopify calls are made."""
+    if not isinstance(brand, dict): raise ValueError("brand_profile must be an object")
+    if not isinstance(collection_plan, dict) or not isinstance(collection_plan.get("collections", []), list):
+        raise ValueError("collection_plan.collections must be a list")
     _install(db)
     copy = hero_copy(brand, collection_plan.get("collections", []), collection_handles)
     hero = {**copy, "hero_key": "primary", "image_prompt": hero_image_prompt(brand),
@@ -247,6 +289,10 @@ def build_homepage_plan(*, store_id: str, brand: dict, collection_plan: dict,
                "category_summary": {k: categories[k] for k in ("ready_count", "skipped_count")}}
     now = _now()
     with connect(db) as con:
+        previous = con.execute("SELECT source_hash FROM store_homepage_plans WHERE store_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1", (str(store_id),)).fetchone()
+    if previous and previous["source_hash"] != source_hash:
+        invalidate_homepage_previews(store_id, reason="Brand or collection plan changed", db=db)
+    with connect(db) as con:
         con.execute("INSERT OR REPLACE INTO store_homepage_plans VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (plan_id, store_id, str(payload.get("brand_profile_id") or "") or None,
                      str(payload.get("collection_plan_id") or "") or None, "3.9.0", "DRAFT", source_hash,
@@ -260,6 +306,10 @@ def _managed_id(kind: str, key: str) -> str:
 
 def build_homepage_preview(plan: dict, snapshot: dict, *, db=None) -> dict:
     """Create a hash-bound, minimal homepage JSON proposal using discovered schemas."""
+    if not isinstance(plan, dict) or not isinstance(plan.get("hero"), dict) or not isinstance(plan.get("categories"), list):
+        return {"status": "INVALID_DATA", "error": {"path": "homepage_plan.hero|categories", "message": "홈페이지 계획 형식이 올바르지 않습니다."}, "write_performed": False}
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("theme_files", {}), dict):
+        return {"status": "INVALID_DATA", "error": {"path": "theme_snapshot.theme_files", "message": "Shopify 테마 정보 형식이 올바르지 않습니다."}, "write_performed": False}
     _install(db)
     current = snapshot.get("template")
     files = snapshot.get("theme_files") or {}
@@ -437,8 +487,9 @@ def build_homepage_preview(plan: dict, snapshot: dict, *, db=None) -> dict:
     return preview_payload
 
 
-def compose_homepage_preview(plan: dict, snapshot: dict, collection_plan: dict, *, collection_handles: dict[str, str] | None = None, db=None) -> dict:
-    """Compose hero/category sections with existing Phase 3.4 featured collections."""
+def compose_homepage_preview(plan: dict, snapshot: dict, collection_plan: dict, *, collection_handles: dict[str, str] | None = None,
+                             featured_products_plan: dict | None = None, db=None) -> dict:
+    """Build the one canonical homepage proposal, including featured products when supplied."""
     from .homepage_collections import build_homepage_plan as build_featured_plan
     featured = build_featured_plan(snapshot, collection_plan, collection_handles=collection_handles or {}, db=db)
     if featured.get("status") == "CONFLICT":
@@ -460,6 +511,24 @@ def compose_homepage_preview(plan: dict, snapshot: dict, collection_plan: dict, 
         preview["warnings"].append({"code": "FEATURED_COLLECTION_MANUAL_FALLBACK"})
     preview["diff"] = {"before_hash": _hash(preview["current"]), "proposed_hash": _hash(preview["proposed"])}
     preview["source_hash"] = _hash({"base": preview["source_hash"], "featured": featured.get("diff")})
+    if featured_products_plan:
+        from .homepage_featured_products import FeaturedProductAssignmentService
+        feature_service = FeaturedProductAssignmentService(db=db)
+        feature_preview = feature_service.build_theme_preview(featured_products_plan,
+            {**snapshot, "template": preview.get("proposed")})
+        preview["featured_products_plan_id"] = featured_products_plan.get("plan_id")
+        preview["featured_products_source_hash"] = featured_products_plan.get("source_hash")
+        preview["featured_products_preview"] = feature_preview
+        if feature_preview.get("status") == "PREVIEW":
+            preview["proposed"] = feature_preview["proposed"]
+            preview["actions"].append({"action": "FEATURED_PRODUCTS_PREVIEW", "kind": "FEATURED_PRODUCTS",
+                                       "section_id": feature_preview.get("section_id"), "status": "PREVIEW"})
+        else:
+            preview["actions"].append({"action": "MANUAL_ACTION_REQUIRED", "kind": "FEATURED_PRODUCTS",
+                                       "reason": feature_preview.get("reason") or "현재 테마에서 상품 리스트 구성을 안전하게 확인할 수 없습니다."})
+        preview["source_hash"] = _hash({"base": preview["source_hash"], "featured_products": feature_preview,
+                                        "featured_products_plan": featured_products_plan.get("source_hash")})
+        preview["diff"] = {"before_hash": _hash(preview["current"]), "proposed_hash": _hash(preview["proposed"])}
     preview["status"] = ("CONFLICT" if any(a.get("action") == "CONFLICT" for a in preview["actions"])
                          else "MANUAL_ACTION_REQUIRED" if any(a.get("action") == "MANUAL_ACTION_REQUIRED" for a in preview["actions"])
                          else preview["status"])
@@ -467,6 +536,23 @@ def compose_homepage_preview(plan: dict, snapshot: dict, collection_plan: dict, 
         con.execute("UPDATE store_homepage_previews SET source_hash=?,status=?,preview_json=? WHERE preview_id=?",
                     (preview["source_hash"], preview["status"], _json(preview), preview["preview_id"]))
     return preview
+
+
+def invalidate_homepage_previews(store_id: str, *, reason: str = "Homepage inputs changed", db=None) -> int:
+    """Mark downstream persisted homepage proposals stale without dropping plans/caches."""
+    _install(db)
+    changed = 0
+    with connect(db) as con:
+        rows = con.execute("SELECT preview_id,preview_json FROM store_homepage_previews WHERE store_id=? AND status NOT IN ('STALE','CONFLICT')", (str(store_id),)).fetchall()
+        for row in rows:
+            try: payload = json.loads(row["preview_json"])
+            except (TypeError, json.JSONDecodeError): payload = {}
+            payload["status"] = "STALE"
+            payload["stale_reason"] = str(reason)
+            con.execute("UPDATE store_homepage_previews SET status='STALE',preview_json=? WHERE preview_id=?",
+                        (_json(payload), row["preview_id"]))
+            changed += 1
+    return changed
 
 
 class HomepageAutomationService:
@@ -481,6 +567,8 @@ class HomepageAutomationService:
             row = con.execute("SELECT * FROM store_homepage_previews WHERE preview_id=?", (preview_id,)).fetchone()
             latest = con.execute("SELECT preview_id FROM store_homepage_previews WHERE store_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1", (row["store_id"],)).fetchone() if row else None
             latest_plan = con.execute("SELECT plan_id FROM store_homepage_plans WHERE store_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1", (row["store_id"],)).fetchone() if row else None
+            has_featured_plans = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='homepage_featured_product_plans'").fetchone() if row else None
+            latest_featured = con.execute("SELECT plan_id FROM homepage_featured_product_plans WHERE store_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1", (row["store_id"],)).fetchone() if has_featured_plans else None
         if not row:
             raise KeyError(preview_id)
         preview = json.loads(row["preview_json"])
@@ -488,6 +576,10 @@ class HomepageAutomationService:
             return {"status": "CONFLICT", "reason": "A newer homepage preview exists"}
         if latest_plan and latest_plan["plan_id"] != row["plan_id"]:
             return {"status": "CONFLICT", "reason": "Homepage inputs changed after preview"}
+        if preview.get("status") == "STALE":
+            return {"status": "CONFLICT", "reason": preview.get("stale_reason") or "Homepage preview is stale"}
+        if preview.get("featured_products_plan_id") and (not latest_featured or latest_featured["plan_id"] != preview["featured_products_plan_id"]):
+            return {"status": "CONFLICT", "reason": "Featured product selection changed after preview"}
         hero_asset = preview.get("asset_mapping", {}).get("hero", {})
         if preview["status"] != "PREVIEW" or not approved_assets or not hero_asset.get("url") or not hero_asset.get("approved") or not hero_asset.get("theme_image_ref") or not hero_asset.get("theme_image_ref_confirmed"):
             return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Resolve preview warnings and approve all referenced assets first"}

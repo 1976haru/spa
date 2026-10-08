@@ -164,11 +164,12 @@ def brand_profile_from_store(store_id, *, overrides=None, db=None):
     store = get_store(store_id, db)
     existing = get_brand_profile(store_id, db=db)
     raw = dict(store)
+    from .homepage_automation import normalize_text_value
     name_not_selected = raw.get("brand_name_status") == "NOT_SELECTED"
     brand_name = ((existing or {}).get("profile", {}).get("brand_name") or raw.get("brand_name") or raw.get("brand")
                   or ("" if name_not_selected else raw.get("store_name")) or ("" if name_not_selected else store_id))
     sourcing = raw.get("sourcing") if isinstance(raw.get("sourcing"), dict) else {}
-    category = raw.get("primary_category") or raw.get("category") or ", ".join(raw.get("sourcing_categories", []) or [])
+    category = raw.get("primary_category") or raw.get("category") or normalize_text_value(raw.get("sourcing_categories"))
     profile = {
         "store_id": store_id, "brand_name": str(brand_name), "tagline": raw.get("tagline"),
         "primary_category": str(category or "General merchandise"),

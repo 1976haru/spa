@@ -29,10 +29,12 @@ from ..homepage_automation import (HomepageAutomationService, assignment_banner_
     assignment_category_check, build_homepage_plan as build_storefront_homepage_plan,
     build_homepage_preview as build_storefront_homepage_preview, compose_homepage_preview,
     discover_homepage_sections,
+    invalidate_homepage_previews, normalize_text_value,
     approve_hero_asset, generate_hero_image, latest_hero_asset, register_manual_hero_asset,
     suggested_theme_image_ref, upload_approved_hero_asset, validate_homepage_image)
 from ..homepage_assignment import HomepageAssignmentService, homepage_assignment_workflow
 from ..homepage_featured_products import FeaturedProductAssignmentService
+from ..homepage_session import HomepagePrerequisiteService
 from ..automation import AutomationTaskError, WorkflowAutomationService, collection_prerequisite_workflow
 from ..collection_prerequisite import CollectionPrerequisiteService, prepare_homepage_prerequisites
 from ..prompt_assets import PromptAssetService
@@ -1963,12 +1965,18 @@ class OperatorUI:
         ui.label("Preview is read-only. Shopify theme changes require a separate explicit confirmation; paid image generation stays off until opted in.").classes("text-sm text-amber-800")
         state = {"plan": None, "snapshot": None, "preview": None, "assignment_preview": None,
                  "collection_plan": None, "brand": None, "prompt_set": None, "backup_id": None,
-                 "local_candidates": []}
+                 "local_candidates": [], "store_id": self.current_store, "session_context": None,
+                 "snapshot_store_id": None, "snapshot_read_at": None, "current_stage": "STORE_SELECTED"}
+        homepage_prerequisites = HomepagePrerequisiteService()
         with ui.card().classes("w-full border-2 border-sky-200 bg-sky-50"):
             brand_name = next((row["store_name"] for row in self.stores if row["store_id"] == self.current_store), self.current_store)
             ui.label(f"Store: {self.current_store} | Brand: {brand_name}").classes("text-xl font-bold")
             summary = ui.label("Hero: not planned · Categories: not planned · Theme: not checked").classes("font-medium")
             prereq_status = ui.label("○ Brand Profile   ○ Collection Plan   ○ Homepage Plan   ○ Prompt Set").classes("ss-help")
+            with ui.card().classes("w-full border border-sky-300 bg-white"):
+                ui.label("현재 진행 상태").classes("font-semibold")
+                homepage_session_status = ui.label("Brand: WAITING · Collections: WAITING · Theme read: WAITING · Featured: WAITING · Homepage preview: NOT READY · Shopify write: NOT RUN").classes("ss-help")
+                homepage_next_action = ui.label("다음: 홈페이지 자동 설계").classes("font-medium text-primary")
             actions = ui.column().classes("w-full gap-2")
             preview_area = ui.column().classes("w-full gap-2")
             hero_url = ui.input("Shopify Files hero image URL (optional)").classes("w-full")
@@ -2048,14 +2056,26 @@ class OperatorUI:
                         service = FeaturedProductAssignmentService()
                         previous = state.get("featured_products_plan")
                         if reselect and previous:
+                            context = resolve_homepage_context("FEATURED_PLAN")
+                            previous = context.featured_product_plan or previous
                             plan = service.reselect(previous)
                         else:
-                            plan = service.create_plan(self.current_store, mode="BALANCED_CATEGORIES", requested_count=4,
-                                heading="New Arrivals", subheading="Fresh picks to keep your car clean, organized, and ready to go." if self.current_store == "001" else "",
-                                include_existing=True, force_remote=bool(force_remote))
+                            context = resolve_homepage_context("FEATURED_PLAN", force_products=bool(force_remote))
+                            plan = context.featured_product_plan
+                            if context.error and not plan:
+                                ui.notify(context.error.get("message") or "추천 상품 준비에 필요한 정보를 확인하세요.", type="warning", multi_line=True)
+                                return
+                            if not plan:
+                                plan = service.create_plan(self.current_store, mode="BALANCED_CATEGORIES", requested_count=4,
+                                    heading="New Arrivals", subheading="Fresh picks to keep your car clean, organized, and ready to go." if self.current_store == "001" else "",
+                                    include_existing=True, force_remote=bool(force_remote))
                         state["featured_products_plan"] = plan
                         state["featured_products_preview"] = None
+                        state["preview"] = None
+                        state["current_stage"] = "FEATURED_PRODUCTS_READY"
                         render_featured(plan)
+                        homepage_session_status.set_text(f"Brand: READY · Collections: READY · Theme read: {((state.get('snapshot') or {}).get('status') or 'WAITING')} · Featured: {len(plan.get('items', []))}/4 {plan.get('status')} · Homepage preview: STALE · Shopify write: NOT RUN")
+                        homepage_next_action.set_text("다음: 추천 상품 미리보기")
                         if reselect and plan.get("reselection_reused_previous"):
                             ui.notify("다른 적격 상품이 충분하지 않아 기존 상품을 일부 다시 사용했습니다.", type="warning")
                         elif plan.get("diagnostics", {}).get("status") == "MISSING_READ_PRODUCTS_SCOPE":
@@ -2065,11 +2085,17 @@ class OperatorUI:
                     except Exception as exc: ui.notify(_safe_error(exc), type="negative")
 
                 def featured_preview():
-                    plan = state.get("featured_products_plan")
-                    if not plan: ui.notify("먼저 추천 상품 자동 구성을 실행하세요.", type="warning"); return
-                    preview = FeaturedProductAssignmentService().build_theme_preview(plan, state.get("snapshot") or {})
+                    context = resolve_homepage_context("FEATURED_PREVIEW")
+                    if context.error:
+                        ui.notify(context.error.get("message") or "추천 상품 미리보기에 필요한 정보를 확인하세요.", type="warning", multi_line=True)
+                        return
+                    preview = (context.canonical_preview or {}).get("featured_products_preview") or {}
                     state["featured_products_preview"] = preview
-                    ui.notify(f"추천 상품 미리보기: {preview['status']} · Shopify write 없음", type="positive" if preview["status"] == "PREVIEW" else "warning")
+                    render()
+                    if preview.get("status") == "PREVIEW":
+                        ui.notify("추천 상품 미리보기 준비 완료 · canonical homepage 제안에 포함 · Shopify 변경 없음", type="positive")
+                    else:
+                        ui.notify("추천 상품 미리보기 수동 확인 필요: " + str(preview.get("reason") or "현재 테마에 안전하게 확인된 상품 리스트 섹션이 없습니다."), type="warning", multi_line=True)
 
                 def featured_apply_gate():
                     ui.notify("FEATURED PRODUCTS ASSIGNMENT UI READY · 실제 적용은 검토된 preview에서 명시적으로 확인해야 합니다.", type="warning")
@@ -2094,6 +2120,48 @@ class OperatorUI:
                 except Exception as exc: ui.notify(_safe_error(exc), type="negative")
 
             hero_upload = ui.upload(label="배너 이미지 파일 선택", auto_upload=True, on_upload=save_hero_upload).props("accept=.png,.jpg,.jpeg,.webp").classes("w-full")
+
+            def resolve_homepage_context(operation, *, force_theme=False, force_products=False):
+                state["hero_overrides"] = {"image_url": normalize_text_value(hero_url.value),
+                    "asset_approved": bool(hero_approved.value),
+                    "theme_image_ref": normalize_text_value(theme_image_ref.value),
+                    "theme_image_ref_confirmed": bool(theme_ref_confirmed.value)}
+                context = homepage_prerequisites.resolve(self.current_store, operation, state=state,
+                    force_theme=force_theme, force_products=force_products,
+                    maximum_categories=int(max_categories.value or 8))
+                state["session_context"] = context.to_dict()
+                state["current_stage"] = context.stage
+                state["plan"], state["collection_plan"], state["brand"] = context.homepage_plan, context.collection_plan, context.brand_profile
+                state["prompt_set"], state["snapshot"], state["featured_products_plan"] = context.prompt_set, context.theme_snapshot, context.featured_product_plan
+                state["assignment_preview"] = context.assignment_preview
+                state["preview"] = context.canonical_preview
+                if context.canonical_preview:
+                    state["featured_products_preview"] = context.canonical_preview.get("featured_products_preview")
+                statuses = context.statuses
+                preview_status = statuses.get("preview", "NOT READY")
+                homepage_session_status.set_text(
+                    f"Brand: {statuses.get('brand', 'WAITING')} · Collections: {statuses.get('collections', 'WAITING')} · "
+                    f"Theme read: {statuses.get('theme', 'WAITING')} · Hero: {'READY' if context.homepage_plan and context.homepage_plan.get('hero') else 'NEEDS INPUT'} · "
+                    f"Category shortcuts: {len((context.homepage_plan or {}).get('categories', []))} · "
+                    f"Featured: {len((context.featured_product_plan or {}).get('items', []))}/4 {statuses.get('featured_products', 'WAITING')} · "
+                    f"Homepage preview: {preview_status} · Shopify write: NOT RUN")
+                homepage_next_action.set_text("다음: 과제 제출용 확인" if context.canonical_preview and context.canonical_preview.get("status") == "PREVIEW" else
+                    "다음: 테마 section 수동 확인" if context.canonical_preview else
+                    "다음: 추천 상품 미리보기" if context.featured_product_plan and context.featured_product_plan.get("status") == "READY" else
+                    "다음: 추천 상품 자동 구성" if context.homepage_plan else "다음: 홈페이지 자동 설계")
+                if context.featured_product_plan: render_featured(context.featured_product_plan)
+                if context.error:
+                    logging.getLogger(__name__).warning("homepage prerequisite %s %s", operation,
+                        redact_text(context.error.get("developer_path") or context.error.get("reason") or context.error.get("status"), limit=180))
+                return context
+
+            def invalidate_current_homepage_preview(reason):
+                state["preview"] = None
+                state["featured_products_preview"] = None
+                state["assignment_preview"] = None
+                invalidate_homepage_previews(self.current_store, reason=reason)
+                homepage_session_status.set_text("Homepage preview: STALE · Shopify write: NOT RUN")
+                homepage_next_action.set_text("다음: 홈페이지 미리보기")
 
             def approve_latest_hero():
                 plan = state.get("plan")
@@ -2147,88 +2215,31 @@ class OperatorUI:
 
             def design(discover_theme=True):
                 try:
-                    from ..brand_automation import brand_profile_from_store, get_brand_profile
-                    brand = get_brand_profile(self.current_store) or brand_profile_from_store(self.current_store)
-                    prereq_status.set_text("✓ Brand Profile   ⟳ Collection Plan 자동 준비 중   ○ Homepage Plan   ○ Prompt Set")
-                    prereq_status.update()
-                    prerequisite = resolve_homepage_collection_plan()
-                    if prerequisite["status"] != "READY":
-                        store_row = next((item for item in self.stores if item["store_id"] == self.current_store), {"store_name": self.current_store})
-                        prepared = prepare_homepage_prerequisites(self.current_store, store=store_row,
-                            brand_profile=brand, maximum_categories=int(max_categories.value or 8))
-                        state.update(plan=prepared["homepage_plan"], snapshot={"status": "NOT_CHECKED", "theme_files": {}, "template": {"sections": {}}},
-                            collection_plan=None, brand=prepared["brand"], prompt_set=prepared["prompt_set"],
-                            preview=None, assignment_preview=None)
-                        update_homepage_prerequisite_status(False)
-                        render()
-                        ui.notify("배너/헤더 프롬프트는 준비했습니다. 컬렉션/카테고리 프롬프트는 컬렉션 설계 후 자동 추가됩니다.", type="warning", multi_line=True)
-                        return
-                    with connect() as con:
-                        row = con.execute("SELECT plan_id FROM store_collection_plans WHERE store_id=? ORDER BY version DESC LIMIT 1", (self.current_store,)).fetchone()
-                    if not row: raise ValueError("먼저 컬렉션 자동 설계를 완료하세요.")
-                    collection_plan = prerequisite["plan"]
-                    brand = get_brand_profile(self.current_store) or brand_profile_from_store(self.current_store)
-                    with connect() as con:
-                        has_map = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='shopify_collection_mappings'").fetchone()
-                        mapping_rows = [dict(item) for item in con.execute("SELECT collection_key,handle,shopify_collection_id,image_url FROM shopify_collection_mappings WHERE store_id=?", (self.current_store,))] if has_map else []
-                        mappings = {item["collection_key"]: item["handle"] for item in mapping_rows}
-                        assignment_mappings = {item["collection_key"]: {**item, "remote_id": item["shopify_collection_id"], "status": "VERIFIED"} for item in mapping_rows}
-                    images = {key: {**asset, "approval_status": "APPROVED"} for key, asset in approved_collection_images(self.current_store).items()}
-                    plan = build_storefront_homepage_plan(store_id=self.current_store, brand=brand, collection_plan=collection_plan,
-                        collection_handles=mappings, collection_assets=images, maximum_categories=int(max_categories.value or 8))
-                    saved_hero = latest_hero_asset(self.current_store, plan["plan_id"])
-                    if saved_hero and saved_hero.get("approval_status") == "APPROVED" and saved_hero.get("shopify_url"):
-                        plan["hero"].update(image_url=saved_hero["shopify_url"], image_asset_id=saved_hero["asset_id"],
-                                            asset_sha256=saved_hero["sha256"], asset_approved=True, image_status="READY",
-                                            theme_image_ref=suggested_theme_image_ref(saved_hero),
-                                            theme_image_ref_confirmed=bool(theme_ref_confirmed.value))
-                        hero_url.set_value(saved_hero["shopify_url"])
-                        hero_approved.set_value(True)
-                        theme_image_ref.set_value(plan["hero"]["theme_image_ref"])
-                    saved_hero = latest_hero_asset(self.current_store, plan["plan_id"])
-                    if saved_hero and saved_hero.get("approval_status") == "APPROVED" and saved_hero.get("shopify_url"):
-                        plan["hero"].update(image_url=saved_hero["shopify_url"], image_asset_id=saved_hero["asset_id"], asset_approved=True, image_status="READY")
-                        hero_url.set_value(saved_hero["shopify_url"])
-                        hero_approved.set_value(True)
-                    snapshot = ShopifyThemeReader().discover(self.current_store) if discover_theme else {"status": "NOT_CHECKED", "theme_files": {}, "template": {"sections": {}}}
-                    plan["hero"]["image_url"] = (hero_url.value or "").strip() or None
-                    plan["hero"]["asset_approved"] = bool(hero_approved.value)
-                    plan["hero"]["theme_image_ref"] = (theme_image_ref.value or "").strip() or None
-                    plan["hero"]["theme_image_ref_confirmed"] = bool(theme_ref_confirmed.value)
-                    if plan["hero"]["image_url"]: plan["hero"]["image_asset_id"] = "SHOPIFY_FILES_URL"
-                    state["plan"], state["snapshot"], state["collection_plan"] = plan, snapshot, collection_plan
-                    state["brand"] = brand
-                    state["prompt_set"] = PromptAssetService().build(
-                        store=next((item for item in self.stores if item["store_id"] == self.current_store), {"store_name": self.current_store}),
-                        brand=brand, collection_plan=collection_plan, homepage_plan=plan)
-                    state["preview"] = compose_homepage_preview(plan, snapshot, collection_plan, collection_handles=mappings) if snapshot.get("status") == "CONNECTED" else None
-                    discovered = discover_homepage_sections(snapshot.get("theme_files") or {})
-                    category_schema = discovered.get("category") or {}
-                    theme_assignment = {"sections": ([{"mode": category_schema.get("mode")}] if category_schema else []),
-                                        "builder": snapshot.get("page_builder") or ""}
-                    hero_asset = saved_hero if saved_hero and saved_hero.get("approval_status") == "APPROVED" else None
-                    if hero_asset:
-                        hero_asset = {**hero_asset, "asset_id": hero_asset.get("asset_id"), "path": hero_asset.get("local_path"),
-                                      "url": hero_asset.get("shopify_url"), "provider": hero_asset.get("provider") or "MANUAL"}
-                    state["assignment_preview"] = HomepageAssignmentService().build(
-                        homepage={"hero": plan["hero"], "unrelated_sections": (snapshot.get("template") or {}).get("sections", {})},
-                        collection_plan=collection_plan, mappings=assignment_mappings,
-                        approved_images=images, theme=theme_assignment, hero_asset=hero_asset,
-                        featured_products=state.get("featured_products_plan"))
-                    HomepageAutomationService().export_report(plan, preview=state["preview"])
-                    update_homepage_prerequisite_status(True)
-                    summary.set_text(f"Hero: NEEDS IMAGE · Categories: {plan['category_summary']['ready_count']} READY / {plan['category_summary']['skipped_count']} SKIPPED · Theme: {snapshot.get('status', 'MANUAL ACTION')}")
+                    context = resolve_homepage_context("DESIGN", force_theme=bool(discover_theme))
+                    if context.homepage_plan:
+                        plan = context.homepage_plan
+                        plan["hero"]["image_url"] = normalize_text_value(hero_url.value) or None
+                        plan["hero"]["asset_approved"] = bool(hero_approved.value)
+                        plan["hero"]["theme_image_ref"] = normalize_text_value(theme_image_ref.value) or None
+                        plan["hero"]["theme_image_ref_confirmed"] = bool(theme_ref_confirmed.value)
+                        if plan["hero"]["image_url"]: plan["hero"]["image_asset_id"] = "SHOPIFY_FILES_URL"
+                        state["plan"] = plan
+                        update_homepage_prerequisite_status(bool(context.collection_plan))
+                        summary.set_text(f"Hero: NEEDS IMAGE · Categories: {len(plan.get('categories', []))} READY TO REVIEW · Theme: {context.statuses.get('theme', 'NOT_CHECKED')}")
+                    if context.error:
+                        ui.notify(context.error.get("message") or "홈페이지 준비에 필요한 정보를 확인하세요.", type="warning", multi_line=True)
+                    else:
+                        ui.notify("홈페이지 계획과 읽기 전용 준비 상태를 확인했습니다. Shopify 변경은 없습니다.", type="positive")
                     render()
-                    ui.notify("홈페이지 계획/preview를 저장했습니다. Shopify write는 실행하지 않았습니다.", type="positive")
-                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+                except Exception as exc:
+                    logging.getLogger(__name__).exception("Homepage design failed (%s)", type(exc).__name__)
+                    ui.notify("홈페이지 설계 중 오류가 발생했습니다. 연결 상태와 필수 입력을 확인하세요.", type="negative")
 
             def auto_complete():
                 """One beginner action: finish safe preview work, then wait at the write gate."""
-                design()
-                if not state.get("collection_plan"):
-                    ui.notify("배너/헤더 프롬프트는 준비했습니다. 컬렉션/카테고리 프롬프트는 컬렉션 계획이 준비된 뒤 이어집니다.", type="warning")
-                    return
-                if not state.get("plan"):
+                context = resolve_homepage_context("FULL_PREVIEW")
+                if context.error:
+                    ui.notify(context.error.get("message") or "홈페이지 미리보기 준비에 필요한 정보를 확인하세요.", type="warning", multi_line=True)
                     return
                 tasks = homepage_assignment_workflow(state["assignment_preview"],
                     preview_id=(state.get("preview") or {}).get("preview_id"),
@@ -2239,31 +2250,17 @@ class OperatorUI:
                 ui.notify(f"안전한 단계 완료 · {status['progress_percent']}% · 실제 적용 승인 대기", type="positive")
 
             def assignment_ready_check():
-                plan = state.get("plan")
-                if not plan:
-                    ui.notify("먼저 홈페이지 자동 완성을 실행하세요.", type="warning")
+                context = resolve_homepage_context("ASSIGNMENT_CHECK")
+                if context.error:
+                    ui.notify(context.error.get("message") or "과제 확인에 필요한 준비 단계를 완료하지 못했습니다.", type="warning", multi_line=True)
                     return
-                hero = assignment_banner_check(plan)
-                categories = assignment_category_check(plan)
-                items = categories["items"]
-                duplicate = len({x.get("target") for x in items if x.get("target")}) != len([x for x in items if x.get("target")])
-                checks = [
-                    ("Hero 표시", bool(plan.get("hero", {}).get("enabled", True))),
-                    ("제목/설명", bool(hero.get("headline") and hero.get("body"))),
-                    ("CTA와 실제 링크", bool(hero.get("cta") and hero.get("cta_link") not in {None, "", "#"})),
-                    ("승인된 배너 이미지", bool(hero.get("image") and plan["hero"].get("asset_approved"))),
-                    ("Category shortcut 4개 이상", len([x for x in items if x.get("target")]) >= 4),
-                    ("각 shortcut 이미지", bool(items) and all(x.get("image_asset") for x in items)),
-                    ("정확한 컬렉션 연결", not categories["warnings"]),
-                    ("# / blank 링크 없음", all(x.get("target") not in {None, "", "#"} for x in items)),
-                    ("잘못된 중복 target 없음", not duplicate),
-                    ("Desktop / mobile 확인", False),
-                ]
+                checks = (context.assignment_check or {}).get("checks", {})
                 with ui.dialog() as dialog, ui.card().classes("w-[680px] max-w-full"):
                     ui.label("과제 제출용 확인").classes("ss-card-title")
-                    for label, passed in checks:
-                        ui.label(("✓ " if passed else "확인 필요 · ") + label).classes("text-green-700" if passed else "text-amber-800")
-                    ui.label("Desktop/mobile 화면은 실제 Theme 미리보기에서 사람이 마지막으로 확인해야 합니다.").classes("ss-help")
+                    for key, passed in checks.items():
+                        ui.label(("✓ " if passed else "확인 필요 · ") + key.replace("_", " ")).classes("text-green-700" if passed else "text-amber-800")
+                    ui.label(f"Preview: {(context.assignment_check or {}).get('preview_status', 'NOT_READY')} · Shopify write: NOT RUN").classes("ss-help")
+                    ui.label("Desktop/mobile 확인은 실제 storefront 미리보기에서 사람이 마지막으로 확인해야 합니다.").classes("ss-help")
                     ui.button("닫기", on_click=dialog.close).props("outline")
                 dialog.open()
 
@@ -2297,22 +2294,26 @@ class OperatorUI:
 
             def refresh_preview():
                 try:
-                    if not state.get("plan") or not state.get("snapshot"): raise ValueError("홈페이지 자동 설계를 먼저 실행하세요.")
-                    state["plan"]["hero"]["image_url"] = (hero_url.value or "").strip() or None
-                    state["plan"]["hero"]["asset_approved"] = bool(hero_approved.value)
-                    state["plan"]["hero"]["theme_image_ref"] = (theme_image_ref.value or "").strip() or None
-                    state["plan"]["hero"]["theme_image_ref_confirmed"] = bool(theme_ref_confirmed.value)
-                    if hero_url.value and not state["plan"]["hero"].get("image_asset_id"):
-                        state["plan"]["hero"]["image_asset_id"] = "SHOPIFY_FILES_URL"
-                    state["preview"] = compose_homepage_preview(state["plan"], state["snapshot"], state["collection_plan"])
-                    HomepageAutomationService().export_report(state["plan"], preview=state["preview"])
+                    context = resolve_homepage_context("FULL_PREVIEW")
+                    if context.error:
+                        ui.notify(context.error.get("message") or "홈페이지 미리보기에 필요한 정보를 확인하세요.", type="warning", multi_line=True)
+                        return
+                    if context.homepage_plan:
+                        context.homepage_plan["hero"]["image_url"] = normalize_text_value(hero_url.value) or None
+                        context.homepage_plan["hero"]["asset_approved"] = bool(hero_approved.value)
+                        context.homepage_plan["hero"]["theme_image_ref"] = normalize_text_value(theme_image_ref.value) or None
+                        context.homepage_plan["hero"]["theme_image_ref_confirmed"] = bool(theme_ref_confirmed.value)
+                        state["plan"] = context.homepage_plan
                     render()
-                except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+                    ui.notify(f"홈페이지 미리보기: {context.canonical_preview.get('status') if context.canonical_preview else 'NOT_READY'} · Shopify 변경 없음", type="positive" if context.canonical_preview and context.canonical_preview.get("status") == "PREVIEW" else "warning")
+                except Exception as exc:
+                    logging.getLogger(__name__).exception("Homepage preview failed (%s)", type(exc).__name__)
+                    ui.notify("홈페이지 미리보기를 준비하지 못했습니다. Brand Profile, 컬렉션, Shopify 테마 권한을 확인하세요.", type="negative")
 
-            hero_url.on_value_change(lambda _: state.update(preview=None))
-            hero_approved.on_value_change(lambda _: state.update(preview=None))
-            theme_image_ref.on_value_change(lambda _: state.update(preview=None))
-            theme_ref_confirmed.on_value_change(lambda _: state.update(preview=None))
+            hero_url.on_value_change(lambda _: invalidate_current_homepage_preview("Hero image input changed"))
+            hero_approved.on_value_change(lambda _: invalidate_current_homepage_preview("Hero approval changed"))
+            theme_image_ref.on_value_change(lambda _: invalidate_current_homepage_preview("Theme image reference changed"))
+            theme_ref_confirmed.on_value_change(lambda _: invalidate_current_homepage_preview("Theme image reference confirmation changed"))
 
             def inspect_image():
                 from ..image_validation import inspect_image as inspect_asset
@@ -2490,7 +2491,9 @@ class OperatorUI:
 
             def apply_confirm():
                 preview = state.get("preview")
-                if not preview: ui.notify("적용 전 최신 미리보기가 필요합니다.", type="warning"); return
+                if not preview or preview.get("status") != "PREVIEW":
+                    ui.notify("적용 전 현재 입력으로 만든 안전한 canonical 미리보기가 필요합니다.", type="warning"); return
+                state["current_stage"] = "APPLY_CONFIRMATION_REQUIRED"
                 with ui.dialog() as dialog, ui.card():
                     ui.label("현재 미리보기의 최소 homepage JSON 변경을 Shopify theme에 적용합니다. 계속할까요?")
                     with ui.row():
@@ -2511,6 +2514,7 @@ class OperatorUI:
                 if not backup_id:
                     ui.notify("이 화면에서 확인된 적용 백업이 없습니다.", type="warning")
                     return
+                state["current_stage"] = "APPLY_CONFIRMATION_REQUIRED"
                 with ui.dialog() as dialog, ui.card():
                     ui.label("이 적용 전 homepage JSON을 Shopify에 복원합니다. 원격 drift가 있으면 복원을 거부합니다.")
                     with ui.row():

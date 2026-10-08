@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .paths import EXPORT_DIR
+from .homepage_automation import normalize_text_value
 
 
 DEFAULT_CABIN_CONTEXT = {
@@ -29,13 +30,16 @@ def _slug(value: str) -> str:
 
 def _safe_context(store: dict | None, brand: dict | None) -> dict:
     result = dict(DEFAULT_CABIN_CONTEXT)
-    for source in (store or {}, (brand or {}).get("profile", brand or {})):
+    brand_profile = (brand or {}).get("profile", brand or {}) if isinstance(brand, dict) else {}
+    sources = (store if isinstance(store, dict) else {}, brand_profile if isinstance(brand_profile, dict) else {})
+    for source in sources:
         aliases = {"brand_name": "store_name", "personality": "brand_style", "target_country": "market",
                    "primary_category": "main_category", "colors": "colors", "brand_keywords": "brand_style"}
         for key, value in source.items():
             dest = aliases.get(key, key)
-            if dest in result and isinstance(value, (str, int, float)) and str(value).strip():
-                result[dest] = str(value).strip()
+            normalized = normalize_text_value(value)
+            if dest in result and normalized:
+                result[dest] = normalized
     # Public exports contain only recognized descriptive fields, never arbitrary profile secrets.
     return result
 
@@ -80,7 +84,10 @@ class PromptAssetService:
             f"Write one concise, factual alt-text sentence describing only visible content in the approved {category} lifestyle image. Do not include keywords, claims, CTA text, or information that is not visible.",
             "Text only", "N/A", "<store>-hero-alt.txt", f"Organized car storage scene for {name}",
             notes="After selecting an image, edit the suggestion so it matches the actual image exactly.")
-        for collection in (collection_plan or {}).get("collections", []):
+        collection_rows = collection_plan.get("collections", []) if isinstance(collection_plan, dict) else []
+        collection_rows = collection_rows if isinstance(collection_rows, list) else []
+        for collection in collection_rows:
+            if not isinstance(collection, dict): continue
             if not collection.get("enabled", True):
                 continue
             title = str(collection.get("title") or collection.get("collection_key") or "Collection")
@@ -116,7 +123,7 @@ class PromptAssetService:
             "notes_for_local_generator": "Do not send the logo through image generation; reuse the approved source asset.",
             "notes_for_shopify_placement": "Preserve approved logo and favicon mappings; preview before any explicit theme apply."})
         run_id = "AP_" + secrets.token_hex(8)
-        has_collection_plan = bool(collection_plan and collection_plan.get("collections"))
+        has_collection_plan = bool(isinstance(collection_plan, dict) and collection_plan.get("collections"))
         groups = {
             "hero": {"status": "READY", "asset_types": ["HERO_BANNER", "HERO_MOBILE_CROP_GUIDE", "HERO_ALT_TEXT"]},
             "collection": {"status": "READY" if has_collection_plan else "WAITING_FOR_COLLECTION_PLAN",

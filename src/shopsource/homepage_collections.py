@@ -54,6 +54,7 @@ def _install_schema(db=None) -> None:
 
 
 def _section_schema(raw: str) -> dict | None:
+    if not isinstance(raw, str): return None
     match = re.search(r"\{%[- ]*schema[- ]*%\}(.*?)\{%[- ]*endschema[- ]*%\}", raw, flags=re.S | re.I)
     if not match:
         return None
@@ -66,12 +67,16 @@ def _section_schema(raw: str) -> dict | None:
 
 def detect_featured_collection_schemas(section_files: dict[str, str]) -> list[dict]:
     """Return section types whose real schema can select one collection."""
+    if not isinstance(section_files, dict): return []
     found = []
     for filename, raw in sorted(section_files.items()):
+        if not isinstance(filename, str): continue
         schema = _section_schema(raw)
         if not schema:
             continue
         settings = schema.get("settings") or []
+        if not isinstance(settings, list): continue
+        settings = [field for field in settings if isinstance(field, dict)]
         collection_fields = [field for field in settings if field.get("type") == "collection"]
         collection_list_fields = [field for field in settings if field.get("type") in {"collection_list", "collection_list_picker"}]
         searchable = " ".join([str(schema.get("name", "")), filename, *(str(f.get("label", "")) for f in settings)]).casefold()
@@ -238,7 +243,7 @@ def build_homepage_plan(snapshot: dict, plan: dict, *, collection_handles: dict[
             continue
         desired_settings = {managed_collection_field: handle if schema_info.get("collection_mode") == "SINGLE" else [handle]}
         ratio_field = next((field for field in schema_info.get("ratio_fields", [])
-                            if any(option.get("value", "").casefold() == "square" for option in field.get("options", []))), None)
+            if any(str(option.get("value", "")).casefold() == "square" for option in field.get("options", []) if isinstance(option, dict))), None)
         ratio_status = "THEME_DEFAULT"
         if ratio_field:
             desired_settings[ratio_field["id"]] = "square"
