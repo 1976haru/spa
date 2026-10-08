@@ -1,0 +1,701 @@
+ShopSource Studio — HOMEPAGE AUTOMATION STABILIZATION MASTER
+ONE-TIME INTEGRATION HARDENING BEFORE NEXT SPAMY ASSIGNMENT
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+
+IMPORTANT
+This master task SUPERSEDES the unexecuted per-bug prompt:
+- CODEX_PHASE_4_3_3_HOMEPAGE_PREVIEW_TYPE_SAFETY_HOTFIX.txt
+
+Do NOT implement that prompt separately first.
+Absorb its required fixes into this stabilization task.
+
+Why this task exists
+Recent homepage-assignment work repeatedly passed hundreds of unit tests but still failed in the actual user click path:
+- Featured products initially returned 0/4 because existing Shopify products were not represented in ShopSource.
+- [상품 4개 보기] initially appeared to do nothing because it only re-rendered existing text.
+- Product selection quality initially allowed a vehicle-specific replacement part.
+- Homepage auto design then crashed with:
+  'list' object has no attribute 'strip'
+- Featured product preview then fell into MANUAL_ACTION_REQUIRED because theme snapshot/prerequisites were not ready.
+
+This pattern means the main problem is no longer one isolated bug.
+The problem is insufficient integration validation across the real beginner workflow.
+
+Mission
+Stabilize the ENTIRE homepage automation path before adding any new assignment feature.
+
+The user should be able to perform the normal Cabin Tidy flow without needing to understand internal prerequisites:
+
+앱 실행
+→ 001 | Cabin Tidy 선택
+→ 홈페이지
+→ 추천 상품 자동 구성
+→ 상품 4개 보기
+→ 추천 상품 미리보기
+→ 홈페이지 미리보기
+→ 과제 제출용 확인
+→ 실제 Shopify 적용 직전 확인 게이트
+
+The flow must be robust against valid Brand Profile field shapes, fresh UI sessions, missing cached state, and already-existing Shopify store content.
+
+DO NOT optimize for a green unit-test count alone.
+Completion requires an end-to-end golden-path integration test and, when credentials/network permit, a READ-ONLY Cabin Tidy smoke run.
+
+======================================================================
+0. DEVELOPMENT FREEZE / SCOPE
+======================================================================
+
+For this task:
+- Do NOT add unrelated features.
+- Do NOT redesign the whole application.
+- Do NOT add a new parallel homepage architecture.
+- Do NOT change product sourcing behavior.
+- Do NOT change Cabin Tidy catalog.
+- Do NOT perform real Shopify writes.
+- Do NOT perform paid image generation.
+- Do NOT automate PageFly/Shopify GUI clicks.
+
+Focus only on stabilizing the existing homepage automation stack and its immediate dependencies.
+
+======================================================================
+1. BASELINE / AUDIT FIRST
+======================================================================
+
+Before editing:
+
+1. Record:
+   git rev-parse HEAD
+   git status --short
+   git rev-list --left-right --count main...origin/main
+
+2. Read fully:
+   AGENTS.md
+   CLAUDE.md
+   docs/MASTER_SPEC.md if present
+
+3. Audit these modules and their tests:
+   src/shopsource/homepage_automation.py
+   src/shopsource/homepage_assignment.py
+   src/shopsource/homepage_featured_products.py
+   src/shopsource/homepage_collections.py
+   src/shopsource/collection_prerequisite.py
+   src/shopsource/prompt_assets.py
+   src/shopsource/brand_automation.py
+   src/shopsource/automation.py
+   src/shopsource/shopify_collections.py
+   src/shopsource/shopify_products.py
+   src/shopsource/store_build.py
+   src/shopsource/store_completion.py
+   src/shopsource/ui/v2.py
+   tests related to homepage/featured/brand/theme/automation
+
+4. Produce a short internal dependency map before changing code:
+   Brand Profile
+   → Collection prerequisite
+   → Homepage plan
+   → Theme snapshot
+   → Featured product plan
+   → Theme preview
+   → Assignment checklist
+   → Apply gate
+
+Do not code until the dependency/order problem is understood.
+
+======================================================================
+2. DEFINE A SINGLE HOMEPAGE SESSION CONTRACT
+======================================================================
+
+The current UI keeps loosely-coupled state fields such as:
+- plan
+- snapshot
+- preview
+- assignment_preview
+- collection_plan
+- brand
+- prompt_set
+- featured_products_plan
+- featured_products_preview
+
+Create or formalize ONE coherent homepage session/state contract.
+
+It may be a dataclass, TypedDict, lightweight service object, or equivalent.
+
+Required conceptual states:
+- STORE_SELECTED
+- BRAND_READY
+- COLLECTIONS_READY
+- HOMEPAGE_PLAN_READY
+- THEME_SNAPSHOT_READY
+- FEATURED_PRODUCTS_READY
+- HOMEPAGE_PREVIEW_READY
+- ASSIGNMENT_REVIEW_READY
+- APPLY_CONFIRMATION_REQUIRED
+- VERIFIED
+
+Requirements:
+- explicit prerequisite checks
+- no hidden assumptions about which button was clicked earlier
+- fresh UI session can recover required state from durable data/read-only Shopify
+- stale dependent preview is invalidated when upstream plan/product selection changes
+- no duplicated state ownership across multiple UI callbacks
+
+Do not introduce a giant framework; keep it small and testable.
+
+======================================================================
+3. ONE PREREQUISITE RESOLVER
+======================================================================
+
+Implement one reusable resolver, e.g.:
+HomepagePrerequisiteService / ensure_homepage_context()
+
+It should be callable from ANY homepage action.
+
+Inputs:
+- store_id
+- desired operation, e.g. FEATURED_PREVIEW / FULL_PREVIEW / ASSIGNMENT_CHECK
+- current in-memory state if present
+- force_remote flags where relevant
+
+Responsibilities:
+- ensure Brand Profile exists
+- normalize Brand Profile values safely for prompt/display use
+- ensure collection plan exists or return an exact actionable reason
+- ensure homepage plan exists
+- ensure Shopify theme snapshot is present and sufficiently fresh
+- ensure featured product plan exists when required
+- return a coherent context object
+
+Important:
+The user must not be required to know that "홈페이지 자동 설계" has to be clicked before "추천 상품 미리보기".
+
+Any action should automatically ensure its READ-ONLY prerequisites.
+
+No write.
+
+======================================================================
+4. TYPE-SAFE INPUT NORMALIZATION AT MODULE BOUNDARIES
+======================================================================
+
+Fix the known crash:
+'list' object has no attribute 'strip'
+
+Known source:
+homepage_automation.py hero_image_prompt() assumes avoid_styles is a string.
+
+Add a small reusable normalization helper for text-like profile values.
+
+Requirements:
+- None -> ""
+- str -> strip
+- list/tuple/set -> normalize/flatten and join
+- dict -> stable readable representation, not Python repr noise
+- number/bool -> string
+- nested containers -> safe finite normalization
+- malformed/unexpected values must not crash homepage planning
+
+Audit ALL homepage-related code for unsafe assumptions such as:
+- value.strip()
+- ",".join(value)
+- direct string concatenation
+- casefold/lower on non-string
+- list expected but string supplied
+- dict expected but list supplied
+
+Fix at boundaries, not via scattered try/except.
+
+Do NOT mutate persisted Brand Profile merely to satisfy display/prompt code.
+
+======================================================================
+5. STRONG DATA CONTRACT VALIDATION
+======================================================================
+
+Add lightweight validators for:
+- Brand Profile input
+- collection plan
+- homepage plan
+- theme snapshot
+- featured product plan
+- featured theme preview
+
+Validation behavior:
+- distinguish INVALID_DATA from MISSING_PREREQUISITE
+- include exact field/path in developer logs
+- show concise Korean message in UI
+- never surface a bare AttributeError to the user
+
+Examples:
+"Brand Profile의 avoid_styles 형식을 안전하게 정규화했습니다."
+"Shopify 테마 정보를 읽지 못했습니다. read_themes 권한 또는 연결 상태를 확인하세요."
+"컬렉션 계획이 없어 카테고리 바로가기를 만들 수 없습니다."
+
+======================================================================
+6. FEATURED PRODUCT PREVIEW MUST BE ONE-CLICK
+======================================================================
+
+Current behavior must be replaced.
+
+When user clicks:
+[추천 상품 미리보기]
+
+The program must:
+1. ensure current 4/4 featured plan
+2. auto-read/reuse current theme snapshot READ-ONLY
+3. validate supported section schema
+4. build preview
+5. render preview result
+6. never write Shopify
+
+If snapshot is missing/stale:
+- auto-discover it
+
+If read_themes is missing:
+- exact actionable message
+
+If theme lacks safe direct product-list support:
+- return precise fallback/manual reason
+- do not show a generic MANUAL_ACTION_REQUIRED with no explanation
+
+Toast/status examples:
+- "추천 상품 미리보기 준비 완료 · Shopify 변경 없음"
+- "추천 상품 미리보기 수동 확인 필요: 현재 테마에 안전하게 확인된 상품 리스트 섹션이 없습니다."
+- "Shopify 테마 읽기 실패: read_themes 권한을 확인하세요."
+
+======================================================================
+7. BUTTON EFFECT CONTRACT — NO MORE "CLICK DOES NOTHING"
+======================================================================
+
+Audit every beginner homepage button.
+
+At minimum:
+- 홈페이지 자동 설계
+- 홈페이지 자동 완성
+- 메인 배너 자동 만들기
+- 카테고리 바로가기 자동 만들기
+- 추천 상품 자동 구성
+- 상품 4개 보기
+- 다시 선택
+- Shopify 상품 다시 읽기
+- 추천 상품 미리보기
+- 홈페이지 미리보기
+- 과제 제출용 확인
+- Shopify 적용
+- 롤백
+
+For each button define:
+- prerequisites
+- visible UI effect
+- state mutation
+- remote read/write behavior
+- success status
+- failure status
+
+Every button must produce a visible, testable effect:
+- state text change
+- dialog
+- preview panel
+- status badge
+- notification with reason
+
+No button may only re-render identical content with no visible delta.
+
+======================================================================
+8. BEGINNER GOLDEN PATH
+======================================================================
+
+Create a first-class deterministic golden-path scenario for homepage assignment.
+
+Golden Path A — fresh session, existing Shopify store:
+1. app starts
+2. choose store 001
+3. open homepage
+4. click 추천 상품 자동 구성
+5. 4/4 READY
+6. click 상품 4개 보기
+7. four visible product cards
+8. click 추천 상품 미리보기
+9. theme snapshot auto-read/reused
+10. featured preview becomes PREVIEW or an exact theme-capability reason
+11. click 홈페이지 미리보기
+12. full homepage preview rendered
+13. click 과제 제출용 확인
+14. checklist dialog shows pass/fail items
+15. stop before write gate
+
+Golden Path B — no cached theme snapshot
+- must still work by auto-discovering read-only theme metadata
+
+Golden Path C — Brand Profile fields are lists/dicts
+- must not crash
+
+Golden Path D — no read_products
+- exact scope message
+
+Golden Path E — no read_themes
+- exact scope message
+
+Golden Path F — unsupported/external PageFly theme
+- no GUI automation
+- exact manual fallback
+
+======================================================================
+9. END-TO-END TEST HARNESS
+======================================================================
+
+Add a real integration test at service/UI-workflow boundary.
+
+Do not rely only on isolated unit tests.
+
+The E2E test should use:
+- temporary DB
+- realistic Cabin-Tidy-like Brand Profile
+- realistic collection plan
+- 4+ existing Shopify product fixtures
+- realistic Shopify theme fixture with supported product/collection/hero schema
+- fake GraphQL client with read operations
+- no real network
+- zero mutation calls
+
+Assert the ENTIRE workflow in order.
+
+At minimum create tests similar to:
+
+test_homepage_golden_path_fresh_session_to_assignment_review
+test_homepage_golden_path_brand_profile_list_fields
+test_homepage_golden_path_no_cached_snapshot_auto_reads_theme
+test_homepage_golden_path_featured_review_four_cards
+test_homepage_golden_path_featured_preview
+test_homepage_golden_path_full_preview
+test_homepage_golden_path_assignment_check
+test_homepage_golden_path_no_remote_write
+test_homepage_button_contracts_have_visible_effect
+test_homepage_upstream_change_invalidates_downstream_preview
+test_homepage_errors_are_contextual_not_raw_attribute_errors
+
+======================================================================
+10. STATE INVALIDATION / STALE PREVIEW RULES
+======================================================================
+
+Formalize invalidation.
+
+Changing any of:
+- Brand Profile
+- collection plan
+- hero asset/reference
+- category mapping
+- selected featured products
+- Shopify theme snapshot/version
+
+must invalidate only the dependent downstream previews.
+
+Examples:
+featured reselection
+→ featured preview stale
+→ full homepage preview stale
+but should NOT destroy Shopify product cache unnecessarily.
+
+Do not allow an old preview to be applied after inputs changed.
+
+======================================================================
+11. FULL HOMEPAGE PREVIEW COMPOSITION
+======================================================================
+
+Audit whether the full homepage preview actually includes:
+- hero
+- category shortcuts
+- existing featured collections
+- featured products / New Arrivals
+
+If current compose_homepage_preview() does NOT include Phase 4.3 featured products,
+fix the composition architecture so the final preview reflects what will actually be applied.
+
+Do not create two unrelated preview systems where:
+- featured preview says one thing
+- full homepage preview/apply uses another thing
+
+There must be one canonical final proposed homepage template.
+
+Featured product section should be included in the canonical final preview when supported.
+
+======================================================================
+12. APPLY GATE CONSISTENCY
+======================================================================
+
+Do not perform a live write in this task.
+
+But verify code path consistency:
+
+Shopify 적용 must require:
+- current store identity
+- fresh theme snapshot
+- current canonical preview
+- non-stale input hashes
+- approved required assets
+- high-confidence theme schema
+- explicit user confirmation
+- backup before mutation
+- read-after-write verification
+
+If featured products are part of preview, apply must include them in the same canonical proposal.
+
+No separate hidden featured-product write.
+
+======================================================================
+13. ASSIGNMENT CHECKLIST MUST REFLECT CURRENT FEATURE
+======================================================================
+
+Current 과제 제출용 확인 must include featured products.
+
+Required checks:
+- featured products 4/4
+- four unique Shopify IDs/handles
+- ACTIVE
+- image
+- price
+- real links
+- visible in proposed section
+- theme preview current
+- no stale selection
+- desktop/mobile human-check placeholders
+- write status clearly separated from preview status
+
+Do not report ASSIGNMENT_READY if featured products are absent from the actual proposed homepage.
+
+======================================================================
+14. UI CLARITY
+======================================================================
+
+Simplify the homepage screen.
+
+Add a compact "현재 진행 상태" card near the top:
+
+Brand: READY
+Collections: READY
+Theme read: READY
+Hero: READY / NEEDS IMAGE
+Category shortcuts: READY
+Featured products: 4/4 READY
+Homepage preview: READY / STALE / NOT READY
+Shopify write: NOT RUN
+
+Show one recommended next action:
+"다음: 추천 상품 미리보기"
+or
+"다음: 배너 이미지 승인"
+
+Do not make the beginner infer next step from 15 buttons.
+
+Keep expert controls available but secondary.
+
+======================================================================
+15. ERROR OBSERVABILITY
+======================================================================
+
+User UI:
+- concise Korean error
+- exact next action
+
+Developer log:
+- exception type
+- module/function
+- normalized field path if data contract issue
+- sanitized traceback
+- no token/secret leakage
+
+Never expose only:
+'list' object has no attribute 'strip'
+
+Never swallow exceptions silently.
+
+======================================================================
+16. EXISTING FUNCTIONALITY MUST REMAIN
+======================================================================
+
+Preserve:
+- Phase 4.3 existing Shopify read-only product intake
+- 500-product bounded read behavior / cache
+- 4/4 selection
+- product review dialog
+- images/price/status
+- clickable links
+- merchandising groups
+- suitability ranking
+- deterministic reselection
+- no product mutation
+- no DRAFT auto-activation
+- existing hero/category automation
+- existing safety boundaries
+- protected dirty files
+
+======================================================================
+17. LIVE READ-ONLY CABIN TIDY SMOKE IS A RELEASE GATE
+======================================================================
+
+If credentials/network are available on the user's machine, perform this real READ-ONLY smoke before declaring ready:
+
+A. Read current Brand Profile
+B. Build homepage plan
+C. Confirm NO list.strip or type crash
+D. Read Shopify product catalog
+E. Confirm 4/4 featured selection
+F. Open/serialize review-card data
+G. Read published theme snapshot
+H. Build featured preview
+I. Build canonical full homepage preview
+J. Run assignment checklist
+K. Confirm no write mutation occurred
+
+Report each as PASS/FAIL.
+
+If external network is unavailable:
+- do NOT claim the real Cabin Tidy flow is verified
+- report LIVE READ-ONLY SMOKE = NOT_TESTED_NETWORK
+- but the fake-GraphQL E2E golden path must pass.
+
+======================================================================
+18. TEST STRATEGY
+======================================================================
+
+Run in this order:
+
+1. New focused data-normalization tests
+2. Featured-products tests
+3. Homepage automation tests
+4. New E2E golden-path tests
+5. Full suite
+
+Quality commands:
+
+python -m compileall -q src tests
+
+python -m pytest -q tests/test_homepage_featured_products.py
+
+Run relevant homepage tests explicitly.
+
+Run the new golden-path integration tests explicitly.
+
+python -m pytest -q
+
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+A passing full suite without the golden-path test does NOT count as completion.
+
+======================================================================
+19. PROTECTED FILES / DATA
+======================================================================
+
+Do not reset, checkout, overwrite, clean, stage, or commit user-local changes in:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env
+- credentials/tokens
+- live theme backups
+- user-generated assets
+- existing .phase* folders
+
+Record protected-file hashes/status before and after.
+
+======================================================================
+20. CODE QUALITY
+======================================================================
+
+Follow AGENTS.md:
+- local-first
+- small reusable services
+- backwards-compatible migrations
+- no giant rewrite
+
+Follow CLAUDE.md:
+- no hard-coded Cabin Tidy logic in reusable core
+- preserve DB integrity
+- Windows paths
+- connector isolation
+
+Prefer:
+- one normalization helper
+- one prerequisite resolver
+- one canonical preview composition
+- one state contract
+
+Avoid:
+- callback-local patches
+- duplicated Shopify theme reads
+- duplicated feature preview models
+- new "phase" modules for every error
+
+======================================================================
+21. COMMIT / PUSH
+======================================================================
+
+After all required gates pass:
+
+git status
+git diff --check
+
+Commit only implementation/tests/docs needed for this stabilization.
+
+Suggested commit:
+git commit -m "Stabilize homepage automation golden path"
+
+git push origin main
+
+Confirm:
+git rev-list --left-right --count main...origin/main
+must be:
+0 0
+
+======================================================================
+22. COMPLETION REPORT
+======================================================================
+
+Report exactly:
+
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] dependency/state audit findings
+[5] homepage session contract
+[6] prerequisite resolver
+[7] type normalization / list.strip fix
+[8] button-effect audit
+[9] canonical preview composition
+[10] stale preview invalidation
+[11] assignment checklist upgrade
+[12] focused tests
+[13] golden-path E2E tests
+[14] full test pass count
+[15] protected files before/after
+[16] live read-only Cabin Tidy smoke:
+     Brand profile
+     Homepage plan
+     Product catalog
+     Featured 4/4
+     Theme snapshot
+     Featured preview
+     Full preview
+     Assignment checklist
+     Write count
+[17] unresolved risks, if any
+[18] commit/push status
+[19] exact next user action in Korean
+
+Final flags:
+
+HOMEPAGE AUTOMATION STABILIZED = YES/NO
+GOLDEN PATH E2E = PASS/FAIL
+LIVE CABIN TIDY READ-ONLY = PASS/FAIL/NOT_TESTED_NETWORK
+SAFE TO RESUME SPAMY ASSIGNMENT = YES/NO
+
+Do not say YES to SAFE TO RESUME SPAMY ASSIGNMENT unless:
+- type-safe planning passes
+- golden-path E2E passes
+- full suite passes
+- canonical preview contains featured products when theme supports it
+- no test performs real Shopify write
