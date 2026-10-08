@@ -329,6 +329,7 @@ class HomepagePrerequisiteService:
         selected = [x.get("shopify_product_id") for x in (featured or {}).get("items", [])]
         visible = bool(section and any(value == selected or (isinstance(value, list) and value == selected) for value in settings.values()))
         items = (featured or {}).get("items", [])
+        storefront_confirmed = bool((featured or {}).get("storefront_verified"))
         checks = {"featured_products_4_of_4": len(items) == 4,
                   "featured_products_unique_ids_handles": len({x.get("shopify_product_id") for x in items}) == 4 and len({x.get("shopify_handle") for x in items}) == 4,
                   "featured_products_active": len(items) == 4 and all(x.get("remote_status") == "ACTIVE" for x in items),
@@ -338,7 +339,9 @@ class HomepagePrerequisiteService:
                   "featured_products_visible_in_proposal": visible,
                   "canonical_preview_current": preview.get("status") == "PREVIEW" and preview.get("featured_products_plan_id") == featured.get("plan_id"),
                   "not_stale": preview.get("status") != "STALE",
-                  "desktop_human_check": False, "mobile_human_check": False,
+                  "featured_products_remote_json_verified": bool((featured or {}).get("remote_json_verified")),
+                  "featured_products_storefront_verified": storefront_confirmed,
+                  "desktop_human_check": storefront_confirmed, "mobile_human_check": storefront_confirmed,
                   "shopify_write_not_run": True}
         ready = all(checks.values())
         return {"status": "ASSIGNMENT_READY" if ready else "REVIEW_REQUIRED", "ready": ready,

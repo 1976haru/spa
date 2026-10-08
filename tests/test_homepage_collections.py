@@ -11,6 +11,7 @@ from shopsource.homepage_collections import (
     HomepageCollectionService, ShopifyThemeReader, build_homepage_plan,
     detect_featured_collection_schemas,
 )
+from shopsource.shopify_theme_ids import is_valid_shopify_instance_id, legacy_collection_section_id
 from shopsource.shopify_collections import save_connection
 
 
@@ -83,7 +84,8 @@ def test_theme_apply_minimal_diff():
     assert result["proposed"]["sections"]["footer"] == snapshot["template"]["sections"]["footer"]
     assert result["proposed"]["order"][0] == "hero"
     assert result["proposed"]["order"][-1] == "footer"
-    assert any(section_id.startswith("ss_") for section_id in result["proposed"]["order"][1:-1])
+    assert any(section_id in result["diff"]["managed_section_ids"] and is_valid_shopify_instance_id(section_id)
+               for section_id in result["proposed"]["order"][1:-1])
     assert all("products_to_show" not in row["settings"] for row in result["proposed"]["sections"].values() if row.get("type") == "featured-picks")
 
 
@@ -96,7 +98,24 @@ def test_theme_repeat_apply_no_duplicate(tmp_path):
     service.record_applied_state(first)  # Isolated simulation; this does not call Shopify.
     second = make_plan({**snapshot, "template": first["proposed"]}, db=db)
     assert not any(row["action"] == "CREATE SECTION" for row in second["operations"])
-    assert len([key for key in second["proposed"]["sections"] if key.startswith("ss_")]) == 4
+    assert len([key for key in second["diff"]["managed_section_ids"] if key in second["proposed"]["sections"]]) == 4
+
+
+def test_collection_preview_migrates_only_selected_legacy_instance_ids(tmp_path):
+    db = tmp_path / "migration.sqlite3"
+    snapshot = fixture_snapshot()
+    first = make_plan(snapshot, db=db)
+    legacy_template = json.loads(json.dumps(first["proposed"]))
+    old_ids = []
+    for row in first["operations"]:
+        if row.get("collection_key") and row.get("section_id") in legacy_template["sections"]:
+            old_id, new_id = legacy_collection_section_id(row["collection_key"]), row["section_id"]
+            legacy_template["sections"][old_id] = legacy_template["sections"].pop(new_id)
+            legacy_template["order"] = [old_id if item == new_id else item for item in legacy_template["order"]]
+            old_ids.append(old_id)
+    second = make_plan({**snapshot, "template": legacy_template}, db=db)
+    assert old_ids and all(old not in second["proposed"]["sections"] and old not in second["proposed"]["order"] for old in old_ids)
+    assert not any(operation["action"] == "CONFLICT" for operation in second["operations"])
 
 
 def test_theme_drift_conflict(tmp_path):
@@ -107,7 +126,7 @@ def test_theme_drift_conflict(tmp_path):
     service.save_safe_patch(first)
     service.record_applied_state(first)  # Isolated simulation; this does not call Shopify.
     changed = json.loads(json.dumps(first["proposed"]))
-    managed_id = next(key for key in changed["sections"] if key.startswith("ss_seat_"))
+    managed_id = next(key for key in changed["sections"] if key not in snapshot["template"]["sections"])
     changed["sections"][managed_id]["settings"]["collection"] = "manually-changed"
     result = make_plan({**snapshot, "template": changed}, db=db)
     assert result["status"] == "CONFLICT"

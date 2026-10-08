@@ -13,6 +13,7 @@ from shopsource.homepage_automation import (
     discover_homepage_sections, generate_hero_image, hero_copy, hero_image_prompt,
     validate_homepage_image,
 )
+from shopsource.shopify_theme_ids import is_valid_shopify_instance_id, legacy_managed_id
 from shopsource.store_build import STAGES
 
 
@@ -156,7 +157,7 @@ def test_theme_detect_multicolumn_fallback(db, brand, collections, snapshot):
     assert preview["discovery"]["category"] == "CATEGORY_SUPPORTED_REVIEW_REQUIRED"
     category = next(action for action in preview["actions"] if action.get("kind") == "CATEGORY")
     assert category["action"] == "CREATE_SECTION"
-    category_section = next(v for k, v in preview["proposed"]["sections"].items() if k.startswith("ss_categories_"))
+    category_section = next(v for k, v in preview["proposed"]["sections"].items() if is_valid_shopify_instance_id(k) and v.get("type") == "multicolumn")
     assert all("/collections/" in block["settings"]["link"] for block in category_section["blocks"].values())
 
 
@@ -180,7 +181,7 @@ def test_repeat_apply_no_duplicate_hero(db, brand, collections, snapshot):
     plan = make_plan(db, brand, collections)
     first = build_homepage_preview(plan, snapshot, db=db)
     second = build_homepage_preview(plan, snapshot, db=db)
-    hero_ids = [key for key in second["proposed"]["sections"] if key.startswith("ss_hero_")]
+    hero_ids = [key for key, value in second["proposed"]["sections"].items() if is_valid_shopify_instance_id(key) and value.get("type") == "image-banner"]
     assert len(hero_ids) == 1
     assert len([a for a in second["actions"] if a.get("kind") == "HERO" and a["action"] == "CREATE_SECTION"]) == 1
 
@@ -188,8 +189,26 @@ def test_repeat_apply_no_duplicate_hero(db, brand, collections, snapshot):
 def test_repeat_apply_no_duplicate_category_section(db, brand, collections, snapshot):
     plan = make_plan(db, brand, collections)
     preview = build_homepage_preview(plan, snapshot, db=db)
-    category_ids = [key for key in preview["proposed"]["sections"] if key.startswith("ss_categories_")]
+    category_ids = [key for key in preview["proposed"]["sections"] if key == hp._managed_id("categories", plan["store_id"])]
     assert len(category_ids) == 1
+
+
+def test_homepage_preview_migrates_only_exact_legacy_hero_and_category_ids(db, brand, collections, snapshot):
+    plan = make_plan(db, brand, collections)
+    plan["hero"]["image_url"] = "https://cdn.example/hero.png"
+    current = build_homepage_preview(plan, snapshot, db=db)["proposed"]
+    legacy = json.loads(json.dumps(current))
+    pairs = [(legacy_managed_id("hero", "primary"), hp._managed_id("hero", "primary")),
+             (legacy_managed_id("categories", plan["store_id"]), hp._managed_id("categories", plan["store_id"]))]
+    for old, new in pairs:
+        if new in legacy["sections"]:
+            legacy["sections"][old] = legacy["sections"].pop(new)
+            legacy["order"] = [old if item == new else item for item in legacy["order"]]
+    migrated = build_homepage_preview(plan, {**snapshot, "template": legacy}, db=db)
+    for old, new in pairs:
+        if old in legacy["sections"]:
+            assert old not in migrated["proposed"]["sections"] and new in migrated["proposed"]["sections"]
+            assert old not in migrated["proposed"]["order"] and migrated["proposed"]["order"].count(new) == 1
 
 
 def test_homepage_preview_invalidated_on_change(db, brand, collections, snapshot):

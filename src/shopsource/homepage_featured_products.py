@@ -14,6 +14,7 @@ from .paths import EXPORT_DIR
 from .shopify_products import _install_schema as install_product_schema
 from .shopify_collections import ShopifyGraphQLClient, get_connection, get_shopify_token
 from .shopify_theme_json import ShopifyJsonDocumentError, parse_shopify_json_document, render_shopify_json_document
+from .shopify_theme_ids import is_valid_shopify_instance_id, legacy_featured_id_for_store, legacy_shopify_instance_kind, shopify_instance_id
 
 MODES = {"NEW_ARRIVALS", "BALANCED_CATEGORIES", "MANUAL_SELECTION"}
 ELIGIBLE_DECISIONS = {"PRIMARY", "RESERVE_A", "RESERVE_B", "PRODUCTION_CANDIDATE"}
@@ -22,38 +23,50 @@ FEATURED_THEME_FILE_QUERY = "query FeaturedCurrentTheme($id: ID!, $filenames: [S
 FEATURED_SCOPES_QUERY = "query FeaturedScopes { currentAppInstallation { accessScopes { handle } } }"
 
 
-def validate_isolated_featured_diff(before: dict, proposed: dict, section_id: str) -> dict:
-    """Permit only the ShopSource-owned section and its own order placement to differ."""
-    unexpected = []
-    if not isinstance(before, dict) or not isinstance(proposed, dict):
-        return {"safe": False, "unexpected_paths": ["$"], "allowed_changes": []}
+def validate_isolated_featured_diff(before: dict, proposed: dict, section_id: str, *, legacy_id: str | None = None,
+                                   store_id: str | None = None) -> dict:
+    """Allow only the new featured instance plus an exact proven legacy migration."""
+    unexpected, allowed = [], []
+    result = {"safe": False, "allowed_changes": allowed, "unexpected_paths": unexpected,
+              "legacy_removed": None, "new_section_id": section_id}
+    if not isinstance(before, dict) or not isinstance(proposed, dict) or not is_valid_shopify_instance_id(section_id):
+        result["unexpected_paths"].append("$"); return result
     left, right = deepcopy(before), deepcopy(proposed)
-    left.setdefault("sections", {})
-    right.setdefault("sections", {})
-    left.setdefault("order", [])
-    right.setdefault("order", [])
-    left_sections, right_sections = left.get("sections", {}), right.get("sections", {})
-    if not isinstance(left_sections, dict) or not isinstance(right_sections, dict):
-        return {"safe": False, "unexpected_paths": ["sections"], "allowed_changes": []}
-    old_section, new_section = left_sections.pop(section_id, None), right_sections.pop(section_id, None)
-    left_order, right_order = left.get("order", []), right.get("order", [])
-    if not isinstance(left_order, list) or not isinstance(right_order, list):
-        return {"safe": False, "unexpected_paths": ["order"], "allowed_changes": []}
-    old_order = [item for item in left_order if item != section_id]
-    new_order = [item for item in right_order if item != section_id]
+    left.setdefault("sections", {}); right.setdefault("sections", {})
+    left.setdefault("order", []); right.setdefault("order", [])
+    ls, rs, lo, ro = left.get("sections"), right.get("sections"), left.get("order"), right.get("order")
+    if not isinstance(ls, dict) or not isinstance(rs, dict): result["unexpected_paths"].append("sections"); return result
+    if not isinstance(lo, list) or not isinstance(ro, list): result["unexpected_paths"].append("order"); return result
+    # Legacy deletion is accepted only for the exact expected Store ID-derived featured ID.
+    old_featured = [key for key in ls if legacy_shopify_instance_kind(key) == "featured_products"]
+    if legacy_id is None and old_featured:
+        result["unexpected_paths"].append("legacy_featured_id"); return result
+    if legacy_id is not None:
+        if (legacy_id not in old_featured or len(old_featured) != 1
+                or (store_id is not None and legacy_id != legacy_featured_id_for_store(store_id))):
+            result["unexpected_paths"].append("legacy_featured_id"); return result
+        if lo.count(legacy_id) != 1:
+            result["unexpected_paths"].append("order.legacy_featured_count"); return result
+        del ls[legacy_id]
+        if legacy_id in rs: result["unexpected_paths"].append(f"sections.{legacy_id}")
+        lo = [x for x in lo if x != legacy_id]
+        if legacy_id in ro: result["unexpected_paths"].append("order.legacy_featured_id")
+        result["legacy_removed"] = legacy_id
+        allowed.extend([f"sections.{legacy_id}(legacy removal)", "order(legacy featured removal)"])
+    old_section, new_section = ls.pop(section_id, None), rs.pop(section_id, None)
+    old_order = [x for x in lo if x != section_id]
+    new_order = [x for x in ro if x != section_id]
     left["order"], right["order"] = old_order, new_order
     if left != right:
-        for key in sorted(set(left) | set(right)):
-            if left.get(key) != right.get(key): unexpected.append(key)
-        if not unexpected: unexpected.append("$")
-    if len([item for item in left_order if item == section_id]) > 1 or len([item for item in right_order if item == section_id]) != 1:
-        unexpected.append("order")
-    if new_section is None:
-        unexpected.append(f"sections.{section_id}")
-    allowed = []
+        result["unexpected_paths"].append("unrelated_semantic_change")
+    if sum(x == section_id for x in ro) != 1: result["unexpected_paths"].append("order.new_section_count")
+    if new_section is None: result["unexpected_paths"].append(f"sections.{section_id}")
     if old_section != new_section: allowed.append(f"sections.{section_id}")
-    if left_order != right_order: allowed.append("order(featured section only)")
-    return {"safe": not unexpected, "unexpected_paths": sorted(set(unexpected)), "allowed_changes": allowed}
+    if lo != ro: allowed.append("order(new featured placement)")
+    result["allowed_changes"] = allowed
+    result["unexpected_paths"] = sorted(set(result["unexpected_paths"]))
+    result["safe"] = not result["unexpected_paths"]
+    return result
 
 
 def _now(): return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -69,7 +82,8 @@ def _install(db=None):
           plan_id TEXT PRIMARY KEY,store_id TEXT NOT NULL,mode TEXT NOT NULL,heading TEXT NOT NULL,
           subheading TEXT NOT NULL DEFAULT '',requested_count INTEGER NOT NULL,collection_key TEXT,
           collection_handle TEXT,status TEXT NOT NULL,source_hash TEXT NOT NULL,preview_hash TEXT,
-          remote_verified INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+          remote_verified INTEGER NOT NULL DEFAULT 0,remote_json_verified INTEGER NOT NULL DEFAULT 0,
+          storefront_verified INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_featured_product_plan_store
           ON homepage_featured_product_plans(store_id,created_at DESC);
         CREATE TABLE IF NOT EXISTS homepage_featured_product_items(
@@ -87,6 +101,11 @@ def _install(db=None):
           plan_id TEXT NOT NULL,preview_hash TEXT NOT NULL,section_id TEXT NOT NULL,folder TEXT NOT NULL,
           before_raw_hash TEXT NOT NULL,proposed_raw_hash TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL);
         """)
+        plan_columns = {row["name"] for row in con.execute("PRAGMA table_info(homepage_featured_product_plans)")}
+        if "remote_json_verified" not in plan_columns:
+            con.execute("ALTER TABLE homepage_featured_product_plans ADD COLUMN remote_json_verified INTEGER NOT NULL DEFAULT 0")
+        if "storefront_verified" not in plan_columns:
+            con.execute("ALTER TABLE homepage_featured_product_plans ADD COLUMN storefront_verified INTEGER NOT NULL DEFAULT 0")
         columns = {row["name"] for row in con.execute("PRAGMA table_info(homepage_featured_product_items)")}
         if "source_kind" not in columns:
             con.executescript("""
@@ -384,7 +403,9 @@ class FeaturedProductAssignmentService:
         fingerprint = {"store_id": store_id, "mode": mode, "requested_count": requested_count,
                        "selected": [(x.get("source_kind"), x.get("source_key"), x["shopify_product_id"], x["shopify_handle"], x.get("created_at") or x.get("synced_at")) for x in selected]}
         with connect(self.db) as con:
-            con.execute("INSERT INTO homepage_featured_product_plans VALUES(?,?,?,?,?,?,?,?,?,?,?,0,?,?)",
+            con.execute("""INSERT INTO homepage_featured_product_plans(
+                plan_id,store_id,mode,heading,subheading,requested_count,collection_key,collection_handle,
+                status,source_hash,preview_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (plan_id, store_id, mode, heading, subheading, requested_count, collection_key,
                          collection_handle, status, _hash(fingerprint), None, now, now))
             for position, row in enumerate(selected, 1):
@@ -431,7 +452,7 @@ class FeaturedProductAssignmentService:
                 item["suitability_score"] = merchandising_suitability(candidate)
         return {**dict(row), "items": items, "reasons": list(reasons or []), "write_performed": False}
 
-    def checklist(self, plan: dict, *, section_visible=False, remote_verified=False) -> dict:
+    def checklist(self, plan: dict, *, section_visible=False, remote_verified=False, storefront_verified=False) -> dict:
         items, required = plan.get("items", []), int(plan.get("requested_count", 4))
         checks = {"featured_products_count": len(items) >= required,
                   "featured_products_unique": len({x.get('shopify_product_id') for x in items}) == len(items) and len({x.get('shopify_handle') for x in items}) == len(items),
@@ -440,8 +461,9 @@ class FeaturedProductAssignmentService:
                   "featured_products_price_valid": bool(items) and all(float(x.get("price") or 0) > 0 for x in items),
                   "featured_products_images_ready": bool(items) and all(x.get("image_url") for x in items),
                   "featured_products_storefront_eligible": bool(items) and all(x.get("remote_status") == "ACTIVE" for x in items),
-                  "featured_products_section_visible": bool(section_visible),
-                  "featured_products_remote_verified": bool(remote_verified)}
+                  "featured_products_section_visible": bool(section_visible or storefront_verified or plan.get("storefront_verified")),
+                  "featured_products_remote_json_verified": bool(remote_verified or plan.get("remote_json_verified")),
+                  "featured_products_storefront_verified": bool(storefront_verified or plan.get("storefront_verified"))}
         status = "ASSIGNMENT_READY" if all(checks.values()) else "REVIEW_REQUIRED"
         return {"status": status, "ready": status == "ASSIGNMENT_READY", "checks": checks}
 
@@ -469,7 +491,12 @@ class FeaturedProductAssignmentService:
                 return {"status": "BLOCKED", "reason": "Homepage source document root is not an object.",
                         "template_status": "INVALID_THEME_JSON", "write_performed": False}
         proposed = json.loads(json.dumps(current)); sections = proposed.setdefault("sections", {}); order = proposed.setdefault("order", [])
-        section_id = "ss_featured_products_" + hashlib.sha1(plan["store_id"].encode()).hexdigest()[:8]
+        section_id = shopify_instance_id("featuredproducts", plan["store_id"])
+        expected_legacy_id = legacy_featured_id_for_store(plan["store_id"])
+        legacy_ids = [key for key in sections if legacy_shopify_instance_kind(key) == "featured_products"]
+        if legacy_ids and legacy_ids != [expected_legacy_id]:
+            return {"status": "CONFLICT", "reason": "Legacy featured section does not match current store identity", "write_performed": False}
+        legacy_id = expected_legacy_id if expected_legacy_id in sections else None
         settings = {}
         if capability.get("heading_field"): settings[capability["heading_field"]["id"]] = plan["heading"]
         if capability.get("subheading_field") and plan.get("subheading"): settings[capability["subheading_field"]["id"]] = plan["subheading"]
@@ -479,6 +506,19 @@ class FeaturedProductAssignmentService:
             "collection_key": plan.get("collection_key") or "homepage-new-arrivals", "title": plan["heading"],
             "owned_tag": "shopsource:homepage:featured-products", "preserve_merchant_tags": True}, "write_performed": False}
         before = sections.get(section_id); desired = {"type": capability["type"], "settings": settings}
+        if legacy_id:
+            legacy_section = sections.get(legacy_id) or {}
+            legacy_settings = legacy_section.get("settings") or {}
+            legacy_products = legacy_settings.get((capability.get("product_field") or {}).get("id"))
+            expected_products = [x["shopify_product_id"] for x in plan["items"]]
+            if legacy_section.get("type") != capability["type"] or (legacy_products is not None and legacy_products != expected_products):
+                return {"status": "CONFLICT", "reason": "Legacy section type or product selection differs from current plan", "write_performed": False}
+            if order.count(legacy_id) != 1:
+                return {"status": "CONFLICT", "reason": "Legacy featured section order is missing or duplicated", "write_performed": False}
+            del sections[legacy_id]
+            order[:] = [value for value in order if value != legacy_id]
+            if legacy_id in order or order.count(section_id) > 1:
+                return {"status": "CONFLICT", "reason": "Legacy featured section order is ambiguous", "write_performed": False}
         sections[section_id] = desired
         if section_id not in order:
             footer = next((i for i, x in enumerate(order) if "footer" in str(x).casefold()), len(order)); order.insert(footer, section_id)
@@ -494,6 +534,7 @@ class FeaturedProductAssignmentService:
                            "suffix_hash": hashlib.sha256(document.suffix.encode("utf-8")).hexdigest()} if document else None)
         return {"status": "PREVIEW", "plan_id": plan["plan_id"], "capability": capability, "current": current,
                 "proposed": proposed, "section_id": section_id, "action": "NO_CHANGE" if before == desired else "UPDATE" if before else "CREATE",
+                "migration": {"from": legacy_id, "to": section_id} if legacy_id else None,
                 "preview_hash": preview_hash, "source_document": source_document,
                 "write_performed": False, "unrelated_sections_preserved": True}
 
@@ -504,11 +545,31 @@ class FeaturedProductAssignmentService:
         visible = bool(remote_section and remote_section.get("visible", True))
         remote_ids = list((remote_section or {}).get("product_ids") or [])
         expected = [x["shopify_product_id"] for x in plan["items"]]
-        verified = visible and remote_ids == expected
+        verified = remote_section is not None and remote_ids == expected
         if verified:
-            with connect(self.db) as con: con.execute("UPDATE homepage_featured_product_plans SET status='VERIFIED',remote_verified=1,updated_at=? WHERE plan_id=?", (_now(), plan_id))
-        return {"status": "VERIFIED" if verified else "REVIEW_REQUIRED", "section_visible": visible,
+            with connect(self.db) as con:
+                con.execute("UPDATE homepage_featured_product_plans SET status='REMOTE_JSON_VERIFIED',remote_json_verified=1,storefront_verified=0,remote_verified=0,updated_at=? WHERE plan_id=?", (_now(), plan_id))
+        return {"status": "REMOTE_JSON_VERIFIED" if verified else "REVIEW_REQUIRED", "section_visible": False,
                 "product_ids_match": remote_ids == expected, "write_performed": False}
+
+    def confirm_storefront(self, plan_id: str, *, checks: dict, confirmed: bool = False) -> dict:
+        """Persist an explicit local human observation of the rendered storefront."""
+        required = {"desktop_title", "four_cards", "product_links", "mobile_section"}
+        if confirmed is not True or not isinstance(checks, dict) or not required.issubset(checks) or not all(checks.get(key) is True for key in required):
+            return {"status": "REVIEW_REQUIRED", "reason": "All four storefront checks and explicit confirmation are required", "write_performed": False}
+        plan = self.get_plan(plan_id)
+        content_checks = self.checklist(plan)
+        required_content = ("featured_products_count", "featured_products_unique", "featured_products_real_remote_ids",
+                            "featured_products_real_links", "featured_products_price_valid", "featured_products_images_ready",
+                            "featured_products_storefront_eligible", "featured_products_remote_json_verified")
+        if not all(content_checks["checks"].get(key) for key in required_content):
+            return {"status": "REVIEW_REQUIRED", "reason": "Featured product prerequisites are not ready", "write_performed": False}
+        with connect(self.db) as con:
+            row = con.execute("SELECT remote_json_verified FROM homepage_featured_product_plans WHERE plan_id=?", (plan_id,)).fetchone()
+            if not row or not row["remote_json_verified"]:
+                return {"status": "REVIEW_REQUIRED", "reason": "Remote JSON must be verified before storefront confirmation", "write_performed": False}
+            con.execute("UPDATE homepage_featured_product_plans SET status='STOREFRONT_VERIFIED',storefront_verified=1,updated_at=? WHERE plan_id=?", (_now(), plan_id))
+        return {"status": "STOREFRONT_VERIFIED", "assignment_ready": True, "write_performed": False}
 
     def export_report(self, plan_id: str) -> Path:
         plan = self.get_plan(plan_id); folder = self.export_dir / "homepage_reports" / plan["store_id"] / plan_id
@@ -574,9 +635,11 @@ class FeaturedProductThemeApplyService:
         if not self._four_ready(plan): return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Exactly four unique ACTIVE products with price, image and handle are required", "write_performed": False}
         source = preview.get("source_document") or {}; theme = preview.get("theme") or {}
         filename, section_id = preview.get("template_filename"), preview.get("section_id")
-        expected_section = "ss_featured_products_" + hashlib.sha1(str(store_id).encode()).hexdigest()[:8]
+        expected_section = shopify_instance_id("featuredproducts", str(store_id))
+        expected_legacy = legacy_featured_id_for_store(store_id)
         if (preview.get("store_id") != str(store_id) or preview.get("featured_products_plan_id") != plan_id
                 or source.get("filename") != filename or preview.get("capability", {}).get("mode") != "DIRECT_PRODUCTS" or section_id != expected_section
+                or not is_valid_shopify_instance_id(section_id)
                 or filename != "templates/index.json" or not theme.get("id") or theme.get("role") != "MAIN"
                 or not source.get("before_raw_hash") or not source.get("before_semantic_hash")
                 or not row["preview_hash"] or row["preview_hash"] != preview.get("preview_hash")):
@@ -596,7 +659,11 @@ class FeaturedProductThemeApplyService:
         if document.raw_hash != source["before_raw_hash"] or document.semantic_hash != source["before_semantic_hash"]:
             return {"status": "CONFLICT", "reason": "Remote source raw/semantic hash drifted", "write_performed": False}
         proposed = preview.get("proposed")
-        guard = validate_isolated_featured_diff(document.parsed, proposed, section_id)
+        migration = preview.get("migration") or {}
+        legacy_id = migration.get("from")
+        if legacy_id and (legacy_id != expected_legacy or legacy_shopify_instance_kind(legacy_id) != "featured_products"):
+            return {"status": "CONFLICT", "reason": "Unrecognized legacy migration identity", "write_performed": False}
+        guard = validate_isolated_featured_diff(document.parsed, proposed, section_id, legacy_id=legacy_id, store_id=store_id)
         if not guard["safe"]: return {"status": "CONFLICT", "reason": "Unexpected semantic changes", "unexpected_paths": guard["unexpected_paths"], "write_performed": False}
         expected_ids = [x["shopify_product_id"] for x in plan["items"]]
         selected_section = ((proposed.get("sections") or {}).get(section_id) or {}) if isinstance(proposed, dict) else {}
@@ -640,15 +707,15 @@ class FeaturedProductThemeApplyService:
         try: after_raw, after_doc = self._remote_document(after_theme, filename)
         except (ValueError, ShopifyJsonDocumentError): after_raw, after_doc = None, None
         after = after_doc.parsed if after_doc else None
-        after_guard = validate_isolated_featured_diff(document.parsed, after, section_id) if isinstance(after, dict) else {"safe": False, "unexpected_paths": ["$"], "allowed_changes": []}
+        after_guard = validate_isolated_featured_diff(document.parsed, after, section_id, legacy_id=legacy_id, store_id=store_id) if isinstance(after, dict) else {"safe": False, "unexpected_paths": ["$"], "allowed_changes": []}
         actual_ids = (((after or {}).get("sections") or {}).get(section_id) or {}).get("settings", {}).get(preview["capability"]["product_field"]["id"], [])
         verified = bool(after_theme.get("id") == theme["id"] and after_theme.get("role") == "MAIN" and after == proposed
                         and after_doc and after_doc.raw_hash == proposed_doc.raw_hash and after_doc.prefix == document.prefix
                         and after_doc.suffix == document.suffix and actual_ids == expected_ids and len(actual_ids) == 4 and after_guard["safe"])
-        status = "VERIFIED" if verified else "VERIFY_FAILED"
+        status = "REMOTE_JSON_VERIFIED" if verified else "VERIFY_FAILED"
         with connect(self.db) as con:
             con.execute("UPDATE homepage_featured_theme_backups SET status=? WHERE backup_id=?", (status, backup_id))
-            if verified: con.execute("UPDATE homepage_featured_product_plans SET status='VERIFIED',remote_verified=1,updated_at=? WHERE plan_id=?", (_now(), plan_id))
+            if verified: con.execute("UPDATE homepage_featured_product_plans SET status='REMOTE_JSON_VERIFIED',remote_verified=0,remote_json_verified=1,storefront_verified=0,updated_at=? WHERE plan_id=?", (_now(), plan_id))
         return {"status": status, "backup_id": backup_id, "theme_id": theme["id"], "product_ids_match": actual_ids == expected_ids,
                 "unrelated_sections_unchanged": after_guard["safe"], "write_performed": True}
 
@@ -677,5 +744,5 @@ class FeaturedProductThemeApplyService:
         verified = restored_theme.get("role") == "MAIN" and restored_theme.get("id") == row["theme_id"] and restored_raw == before_raw
         with connect(self.db) as con:
             con.execute("UPDATE homepage_featured_theme_backups SET status=? WHERE backup_id=?", ("ROLLED_BACK" if verified else "ROLLBACK_VERIFY_FAILED", backup_id))
-            if verified: con.execute("UPDATE homepage_featured_product_plans SET status='READY',remote_verified=0,updated_at=? WHERE plan_id=?", (_now(), row["plan_id"]))
+            if verified: con.execute("UPDATE homepage_featured_product_plans SET status='READY',remote_verified=0,remote_json_verified=0,storefront_verified=0,updated_at=? WHERE plan_id=?", (_now(), row["plan_id"]))
         return {"status": "ROLLED_BACK" if verified else "ROLLBACK_VERIFY_FAILED", "backup_id": backup_id, "write_performed": True}

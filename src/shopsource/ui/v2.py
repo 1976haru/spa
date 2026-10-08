@@ -1967,7 +1967,7 @@ class OperatorUI:
                  "collection_plan": None, "brand": None, "prompt_set": None, "backup_id": None,
                  "local_candidates": [], "store_id": self.current_store, "session_context": None,
                  "snapshot_store_id": None, "snapshot_read_at": None, "current_stage": "STORE_SELECTED",
-                 "featured_apply_status": "NOT RUN", "featured_human_checks": {"desktop": False, "mobile": False}}
+                 "featured_apply_status": "NOT RUN", "featured_human_checks": {"desktop_title": False, "four_cards": False, "product_links": False, "mobile_section": False}}
         homepage_prerequisites = HomepagePrerequisiteService()
         with ui.card().classes("w-full border-2 border-sky-200 bg-sky-50"):
             brand_name = next((row["store_name"] for row in self.stores if row["store_id"] == self.current_store), self.current_store)
@@ -2119,8 +2119,8 @@ class OperatorUI:
                                 plan["plan_id"], preview, store_id=self.current_store, confirmed=True)
                             state["featured_apply_status"] = result.get("status", "FAILED")
                             state["backup_id"] = result.get("backup_id")
-                            featured_apply_persistent.set_text(f"미리보기: {'CURRENT' if result.get('status') == 'VERIFIED' else 'PREVIEW'} · Shopify 적용: {result.get('status')} · 검증 상품: {'4/4' if result.get('status') == 'VERIFIED' else '확인 필요'}")
-                            if result.get("status") == "VERIFIED":
+                            featured_apply_persistent.set_text(f"Shopify 적용: {result.get('status')} · storefront 확인 필요")
+                            if result.get("status") == "REMOTE_JSON_VERIFIED":
                                 config = get_shopify_connection(self.current_store) or {}
                                 domain = str(config.get("shop_domain") or "").strip().casefold()
                                 if re.fullmatch(r"[a-z0-9][a-z0-9-]*\.myshopify\.com", domain):
@@ -2132,7 +2132,7 @@ class OperatorUI:
                                             ui.notify("추천 상품 과제 보고서를 저장했습니다: " + str(folder), type="positive")
                                         ui.button("추천 상품 보고서 내보내기", on_click=export_featured_report, icon="download").props("outline")
                             dialog.close()
-                            ui.notify("추천 상품 isolated apply: " + result.get("status", "FAILED"), type="positive" if result.get("status") == "VERIFIED" else "warning")
+                            ui.notify("추천 상품 isolated apply: " + result.get("status", "FAILED"), type="positive" if result.get("status") == "REMOTE_JSON_VERIFIED" else "warning")
                         ui.button("취소", on_click=dialog.close).props("outline")
                         ui.button("추천 상품만 적용", on_click=perform_apply).props("color=primary")
                     dialog.open()
@@ -2156,18 +2156,26 @@ class OperatorUI:
 
                 def featured_assignment_check():
                     plan = state.get("featured_products_plan") or {}
-                    verified = state.get("featured_apply_status") == "VERIFIED"
-                    checks = FeaturedProductAssignmentService().checklist(plan, section_visible=verified, remote_verified=verified)
+                    verified = state.get("featured_apply_status") == "REMOTE_JSON_VERIFIED"
+                    checks = FeaturedProductAssignmentService().checklist(plan, remote_verified=verified,
+                        storefront_verified=bool(plan.get("storefront_verified")))
                     with ui.dialog() as dialog, ui.card().classes("w-[min(720px,95vw)]"):
                         ui.label("추천 상품 과제 확인").classes("text-xl font-bold")
                         for key, passed in checks["checks"].items():
                             ui.label(("✓ " if passed else "확인 필요 · ") + key.replace("_", " ")).classes("text-green-700" if passed else "text-amber-800")
-                        desktop = ui.checkbox("실제 storefront Desktop 화면 확인", value=state.get("featured_human_checks", {}).get("desktop", False))
-                        mobile = ui.checkbox("실제 storefront Mobile 화면 확인", value=state.get("featured_human_checks", {}).get("mobile", False))
+                        human = state.get("featured_human_checks", {})
+                        desktop_title = ui.checkbox("Desktop에서 New Arrivals 제목 확인", value=human.get("desktop_title", False))
+                        four_cards = ui.checkbox("상품 카드 4개 확인", value=human.get("four_cards", False))
+                        product_links = ui.checkbox("4개 상품 링크 확인", value=human.get("product_links", False))
+                        mobile_section = ui.checkbox("Mobile에서 section 확인", value=human.get("mobile_section", False))
                         def save_checks():
-                            state["featured_human_checks"] = {"desktop": bool(desktop.value), "mobile": bool(mobile.value)}
-                            state["featured_assignment_status"] = "ASSIGNMENT_READY" if verified and all(state["featured_human_checks"].values()) else "REVIEW_READY" if verified else "REVIEW_REQUIRED"
-                            ui.notify("추천 상품 상태: " + state["featured_assignment_status"], type="positive" if state["featured_assignment_status"] == "ASSIGNMENT_READY" else "info")
+                            state["featured_human_checks"] = {"desktop_title": bool(desktop_title.value), "four_cards": bool(four_cards.value),
+                                "product_links": bool(product_links.value), "mobile_section": bool(mobile_section.value)}
+                            confirmation = FeaturedProductAssignmentService().confirm_storefront(plan["plan_id"],
+                                checks=state["featured_human_checks"], confirmed=verified)
+                            state["featured_assignment_status"] = confirmation["status"]
+                            state["featured_products_plan"] = FeaturedProductAssignmentService().get_plan(plan["plan_id"])
+                            ui.notify("추천 상품 상태: " + state["featured_assignment_status"], type="positive" if state["featured_assignment_status"] == "STOREFRONT_VERIFIED" else "info")
                             dialog.close()
                         ui.button("확인 저장", on_click=save_checks).props("color=primary")
                     dialog.open()

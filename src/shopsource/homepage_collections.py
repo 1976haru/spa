@@ -20,6 +20,7 @@ from .db import connect, init_db
 from .paths import EXPORT_DIR
 from .shopify_collections import ShopifyGraphQLClient, get_connection, get_shopify_token
 from .shopify_theme_json import ShopifyJsonDocumentError, parse_shopify_json_document
+from .shopify_theme_ids import legacy_collection_section_id, legacy_shopify_instance_kind, shopify_instance_id
 
 THEME_READ_SCOPE = "read_themes"
 THEMES_QUERY = "query ShopSourceThemes { themes(first: 50) { nodes { id name role } } }"
@@ -202,9 +203,7 @@ def recommend_collections(plan: dict, *, image_ready: set[str] | None = None, ma
 
 
 def _section_id(key: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "_", str(key).casefold()).strip("_")[:12] or "collection"
-    digest = hashlib.sha1(str(key).encode()).hexdigest()[:8]
-    return f"ss_{slug}_{digest}"
+    return shopify_instance_id("collection", key)
 
 
 def _schema_setting(schema: dict, identifiers: list[str]) -> dict | None:
@@ -240,14 +239,27 @@ def build_homepage_plan(snapshot: dict, plan: dict, *, collection_handles: dict[
     operations, warnings = [], []
     # Existing unmanaged sections and all unrelated JSON remain byte-for-byte semantic copies.
     managed_ids = {_section_id(row["collection_key"]): row for row in selected}
+    legacy_to_current = {}
+    for row in selected:
+        old_id, new_id = legacy_collection_section_id(row["collection_key"]), _section_id(row["collection_key"])
+        if old_id in sections:
+            if new_id in sections:
+                operations.append({"action": "CONFLICT", "section_id": new_id, "reason": "Both legacy and current collection instance IDs exist"})
+                continue
+            sections[new_id] = sections.pop(old_id)
+            order[:] = [new_id if item == old_id else item for item in order]
+            legacy_to_current[old_id] = new_id
     if db and snapshot.get("theme"):
         with connect(db) as con:
             state = con.execute("SELECT managed_json FROM homepage_theme_state WHERE store_id=?", (plan["store_id"],)).fetchone()
         previous = json.loads(state["managed_json"]) if state else {}
     else:
         previous = {}
-    prior_order = previous.get("order", [])
-    existing_managed_order = [section_id for section_id in order if section_id.startswith("ss_")]
+    prior_order = [legacy_to_current.get(section_id, section_id) for section_id in previous.get("order", [])]
+    if legacy_to_current:
+        previous["sections"] = {legacy_to_current.get(key, key): value for key, value in previous.get("sections", {}).items()}
+    known_managed = set(prior_order) | {sid for sid in sections if legacy_shopify_instance_kind(sid)}
+    existing_managed_order = [section_id for section_id in order if section_id in known_managed]
     drifted = bool(prior_order and existing_managed_order != prior_order)
     if drifted:
         operations.append({"action": "CONFLICT", "reason": "Shopify Theme Editor order differs from the last ShopSource-managed order"})
@@ -320,7 +332,8 @@ def build_homepage_plan(snapshot: dict, plan: dict, *, collection_handles: dict[
     return {"status": "CONFLICT" if any(op["action"] == "CONFLICT" for op in operations) else "DRY_RUN",
             "store_id": plan["store_id"], "theme": snapshot["theme"], "template_filename": snapshot["template_filename"],
             "section_type": schema_info["type"], "current": current_copy, "proposed": proposed,
-            "diff": {"operations": operations, "before_hash": _hash(current_copy), "proposed_hash": _hash(proposed)},
+            "diff": {"operations": operations, "before_hash": _hash(current_copy), "proposed_hash": _hash(proposed),
+                     "managed_section_ids": sorted(set(prior_order) | set(managed_ids))},
             "operations": operations, "warnings": warnings, "image_ratio": "Square" if all(x.get("image_ratio") != "THEME_DEFAULT" for x in operations if x.get("collection_key")) else "Theme default",
             "products_per_section": product_count_default if product_count_default is not None else "Theme default",
             "manual_patch_mode": True}
@@ -362,8 +375,10 @@ class HomepageCollectionService:
         """Record a verified state after an external/mock apply; never performs that apply."""
         if result.get("status") == "CONFLICT":
             raise RuntimeError("Cannot record a conflicted homepage proposal")
-        managed = {"order": [key for key in result.get("proposed", {}).get("order", []) if key.startswith("ss_")],
-                   "sections": {key: value for key, value in result.get("proposed", {}).get("sections", {}).items() if key.startswith("ss_")}}
+        operated = {op.get("section_id") for op in result.get("operations", []) if op.get("section_id")}
+        operated.update(op for op in result.get("diff", {}).get("managed_section_ids", []) if op)
+        managed = {"order": [key for key in result.get("proposed", {}).get("order", []) if key in operated],
+                   "sections": {key: value for key, value in result.get("proposed", {}).get("sections", {}).items() if key in operated}}
         with connect(self.db) as con:
             con.execute("""INSERT INTO homepage_theme_state(store_id,theme_id,template_filename,managed_json,updated_at)
               VALUES(?,?,?,?,?) ON CONFLICT(store_id) DO UPDATE SET theme_id=excluded.theme_id,

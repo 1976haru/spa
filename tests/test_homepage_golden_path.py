@@ -11,6 +11,7 @@ from shopsource.homepage_assignment import discover_assignment_capability
 from shopsource.homepage_automation import hero_image_prompt, normalize_text_value
 from shopsource.homepage_collections import ShopifyThemeReader
 from shopsource.homepage_featured_products import ShopifyExistingProductReader
+from shopsource.shopify_theme_ids import legacy_featured_id_for_store, is_valid_shopify_instance_id
 from shopsource.homepage_session import HOMEPAGE_BUTTON_CONTRACTS, HomepagePrerequisiteService, validate_homepage_contract
 from shopsource.shopify_collections import _install_schema as install_shopify_schema
 
@@ -76,11 +77,13 @@ class FakeReadOnlyShopifyGraphQL:
         if "themes(first" in query:
             return {"themes": {"nodes": [{"id": "gid://shopify/OnlineStoreTheme/1", "name": "Fixture", "role": "MAIN"}]}}
         if "theme(id:" in query:
+            legacy_featured = legacy_featured_id_for_store("001")
             template_raw = "/* Shopify header comment: Cabin Tidy homepage template */\n" + json.dumps({
                 "sections": {"header": {"type": "header", "settings": {}},
+                             legacy_featured: {"type": "featured-products", "settings": {}},
                              "merchant": {"type": "rich-text", "settings": {"text": "Preserve"}},
                              "footer": {"type": "footer", "settings": {}}},
-                "order": ["header", "merchant", "footer"]})
+                "order": ["header", legacy_featured, "merchant", "footer"]})
             files = [{"filename": "templates/index.json", "body": {"content": template_raw}}]
             files.extend({"filename": name, "body": {"content": raw}} for name, raw in _theme_files().items())
             return {"theme": {"id": "gid://shopify/OnlineStoreTheme/1", "name": "Fixture", "role": "MAIN",
@@ -158,12 +161,18 @@ def test_homepage_golden_path_fresh_session_to_assignment_review(golden_service)
     assert featured_preview.canonical_preview["capabilities"]["categories"] == "AUTO"
     fp = featured_preview.canonical_preview["featured_products_preview"]
     assert fp["status"] == "PREVIEW"
+    assert fp["migration"]["from"] == legacy_featured_id_for_store("001")
+    assert is_valid_shopify_instance_id(fp["section_id"])
+    assert fp["migration"]["from"] not in featured_preview.canonical_preview["proposed"]["sections"]
+    assert fp["migration"]["from"] not in featured_preview.canonical_preview["proposed"]["order"]
+    assert featured_preview.canonical_preview["proposed"]["order"].count(fp["section_id"]) == 1
     product_section = featured_preview.canonical_preview["proposed"]["sections"][fp["section_id"]]
     assert len(product_section["settings"]["products"]) == 4
     full = service.resolve("001", "FULL_PREVIEW", state={**state, "snapshot": featured_preview.theme_snapshot})
     assert full.canonical_preview["status"] == "PREVIEW"
     assert full.canonical_preview["proposed"]["sections"][fp["section_id"]] == product_section
     checklist = service.resolve("001", "ASSIGNMENT_CHECK", state={**state, "snapshot": full.theme_snapshot})
+    assert checklist.assignment_check["status"] == "REVIEW_REQUIRED"
     assert checklist.assignment_check["checks"]["featured_products_visible_in_proposal"] is True
     assert checklist.assignment_check["checks"]["featured_products_4_of_4"] is True
     assert checklist.assignment_check["write_status"] == "NOT_RUN"

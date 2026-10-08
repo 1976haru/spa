@@ -8,6 +8,9 @@ from shopsource.homepage_featured_products import (
     FeaturedProductAssignmentService, ShopifyExistingProductReader, discover_featured_product_schema,
     merchandising_suitability, normalize_merchandising_group, validate_isolated_featured_diff,
 )
+from shopsource.shopify_theme_ids import is_valid_shopify_instance_id, legacy_featured_id_for_store, legacy_shopify_instance_kind, shopify_instance_id
+from shopsource.homepage_automation import _managed_id
+from shopsource.homepage_collections import _section_id
 from shopsource.store_build import STAGES
 from shopsource.store_completion import DOMAINS, StoreCompletionService
 
@@ -48,35 +51,72 @@ def theme_files(mode="direct"):
 
 
 def test_isolated_featured_diff_allows_only_managed_section_create():
+    sid = shopify_instance_id("featuredproducts", "test")
     before = {"sections": {"hero": {"type": "hero"}}, "order": ["hero"], "settings": {"x": 1}}
-    after = {"sections": {"hero": {"type": "hero"}, "ss_featured_products_test": {"type": "featured", "settings": {"products": ["a"]}}},
-             "order": ["hero", "ss_featured_products_test"], "settings": {"x": 1}}
-    result = validate_isolated_featured_diff(before, after, "ss_featured_products_test")
+    after = {"sections": {"hero": {"type": "hero"}, sid: {"type": "featured", "settings": {"products": ["a"]}}},
+             "order": ["hero", sid], "settings": {"x": 1}}
+    result = validate_isolated_featured_diff(before, after, sid)
     assert result["safe"] and result["unexpected_paths"] == []
 
 
 def test_isolated_featured_diff_allows_managed_section_update_and_existing_order():
-    before = {"sections": {"ss_featured_products_test": {"settings": {"products": ["old"]}}},
-              "order": ["hero", "ss_featured_products_test", "footer"], "other": True}
-    after = {"sections": {"ss_featured_products_test": {"settings": {"products": ["new"]}}},
-             "order": ["hero", "ss_featured_products_test", "footer"], "other": True}
-    assert validate_isolated_featured_diff(before, after, "ss_featured_products_test")["safe"]
+    sid = shopify_instance_id("featuredproducts", "test")
+    before = {"sections": {sid: {"settings": {"products": ["old"]}}}, "order": ["hero", sid, "footer"], "other": True}
+    after = {"sections": {sid: {"settings": {"products": ["new"]}}}, "order": ["hero", sid, "footer"], "other": True}
+    assert validate_isolated_featured_diff(before, after, sid)["safe"]
 
 
 def test_isolated_featured_diff_blocks_any_unrelated_change():
+    sid = shopify_instance_id("featuredproducts", "test")
     before = {"sections": {"hero": {"settings": {"title": "old"}}}, "order": ["hero"]}
-    after = {"sections": {"hero": {"settings": {"title": "new"}}, "ss_featured_products_test": {"type": "featured"}},
-             "order": ["hero", "ss_featured_products_test"]}
-    result = validate_isolated_featured_diff(before, after, "ss_featured_products_test")
+    after = {"sections": {"hero": {"settings": {"title": "new"}}, sid: {"type": "featured"}}, "order": ["hero", sid]}
+    result = validate_isolated_featured_diff(before, after, sid)
     assert not result["safe"] and result["unexpected_paths"]
 
 
 def test_isolated_featured_diff_blocks_category_and_repeated_managed_order():
+    sid = shopify_instance_id("featuredproducts", "test")
     before = {"sections": {"category": {"type": "collection-list"}}, "order": ["category"]}
-    after = {"sections": {"category": {"type": "changed"}, "ss_featured_products_test": {"type": "featured"}},
-             "order": ["category", "ss_featured_products_test", "ss_featured_products_test"]}
-    result = validate_isolated_featured_diff(before, after, "ss_featured_products_test")
-    assert not result["safe"] and "order" in result["unexpected_paths"]
+    after = {"sections": {"category": {"type": "changed"}, sid: {"type": "featured"}}, "order": ["category", sid, sid]}
+    result = validate_isolated_featured_diff(before, after, sid)
+    assert not result["safe"] and any(path.startswith("order") for path in result["unexpected_paths"])
+
+
+def test_shopify_instance_id_contract_and_historical_recognition():
+    assert is_valid_shopify_instance_id(shopify_instance_id("featured_products", "001"))
+    assert shopify_instance_id("Hero", "primary") == shopify_instance_id("hero", "primary")
+    assert shopify_instance_id("hero", "primary") != shopify_instance_id("categories", "primary")
+    assert legacy_shopify_instance_kind(legacy_featured_id_for_store("001")) == "featured_products"
+    assert legacy_shopify_instance_kind("ss_unrelated_section") is None
+    assert all(is_valid_shopify_instance_id(value) for value in (
+        shopify_instance_id("featuredproducts", "s1"), _managed_id("hero", "primary"),
+        _managed_id("categories", "s1"), _managed_id("cat", "collection_a"), _section_id("collection_a")))
+
+
+def test_isolated_diff_allows_only_exact_legacy_migration():
+    store_id = "001"
+    legacy = legacy_featured_id_for_store(store_id)
+    new = shopify_instance_id("featuredproducts", store_id)
+    before = {"sections": {"hero": {"type": "hero"}, legacy: {"type": "featured"}},
+              "order": ["hero", legacy]}
+    after = {"sections": {"hero": {"type": "hero"}, new: {"type": "featured"}},
+             "order": ["hero", new]}
+    result = validate_isolated_featured_diff(before, after, new, legacy_id=legacy, store_id=store_id)
+    assert result["safe"] and result["legacy_removed"] == legacy and result["new_section_id"] == new
+    changed = {"sections": {new: {"type": "featured"}}, "order": [new]}
+    assert not validate_isolated_featured_diff(before, changed, new, legacy_id=legacy, store_id="other")["safe"]
+
+
+def test_storefront_confirmation_requires_remote_json_and_four_human_checks(tmp_path):
+    db, svc = service(tmp_path)
+    seed_four(db)
+    plan = svc.create_plan("s1")
+    incomplete = svc.confirm_storefront(plan["plan_id"], checks={"desktop_title": True}, confirmed=True)
+    assert incomplete["status"] == "REVIEW_REQUIRED"
+    checks = {"desktop_title": True, "four_cards": True, "product_links": True, "mobile_section": True}
+    assert svc.confirm_storefront(plan["plan_id"], checks=checks, confirmed=True)["status"] == "REVIEW_REQUIRED"
+    with connect(db) as con: con.execute("UPDATE homepage_featured_product_plans SET remote_json_verified=1 WHERE plan_id=?", (plan["plan_id"],))
+    assert svc.confirm_storefront(plan["plan_id"], checks=checks, confirmed=True)["status"] == "STOREFRONT_VERIFIED"
 
 
 def isolated_apply_fixture(tmp_path, monkeypatch):
@@ -84,13 +124,19 @@ def isolated_apply_fixture(tmp_path, monkeypatch):
     db, planner = service(tmp_path)
     seed_four(db)
     plan = planner.create_plan("s1", requested_count=4)
-    raw = '/* Shopify header comment */\n{"sections":{"hero":{"type":"hero","settings":{"title":"Keep"}}},"order":["hero"]}\n'
+    legacy = legacy_featured_id_for_store("s1")
+    raw = '/* Shopify header comment */\n' + json.dumps({"sections": {
+        "hero": {"type": "hero", "settings": {"title": "Keep"}},
+        legacy: {"type": "featured-products", "settings": {}},
+        "merchant": {"type": "rich-text", "settings": {"text": "Preserve"}}},
+        "order": ["hero", legacy, "merchant"]}) + "\n"
     snapshot = {"template_status": "READY", "template_filename": "templates/index.json",
         "template": json.loads(raw.split("*/", 1)[1]), "theme_files": {"templates/index.json": raw,
             "sections/featured-products.liquid": "{% schema %}" + json.dumps({"name": "Featured products", "settings": [
                 {"type": "product_list", "id": "products", "label": "Products"}]}) + "{% endschema %}"},
         "theme": {"id": "gid://shopify/OnlineStoreTheme/55", "name": "MAIN theme", "role": "MAIN"}}
     preview = planner.build_theme_preview(plan, snapshot)
+    assert preview["migration"] == {"from": legacy, "to": preview["section_id"]}
     preview.update(store_id="s1", featured_products_plan_id=plan["plan_id"],
                    theme=snapshot["theme"], template_filename="templates/index.json")
     monkeypatch.setattr(feature_module, "get_connection", lambda *a, **k: {"shop_domain": "sample.myshopify.com", "api_version": "2026-07"})
@@ -119,12 +165,26 @@ def test_isolated_feature_apply_confirmation_and_one_file_write_with_comment_bac
     refused = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=False, client=client)
     assert refused["status"] == "MANUAL_ACTION_REQUIRED" and client.write_count == 0
     result = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, client=client)
-    assert result["status"] == "VERIFIED" and result["product_ids_match"]
+    assert result["status"] == "REMOTE_JSON_VERIFIED" and result["product_ids_match"]
+    assert "ss_featured_products_" not in client.raw
     assert client.write_count == 1 and client.raw.startswith("/* Shopify header comment */")
+    parsed = json.loads(client.raw.split("*/", 1)[1])
+    assert parsed["sections"]["merchant"]["settings"]["text"] == "Preserve"
+    assert is_valid_shopify_instance_id(preview["section_id"])
+    with connect(db) as con:
+        state = con.execute("SELECT status,remote_verified,remote_json_verified,storefront_verified FROM homepage_featured_product_plans WHERE plan_id=?", (plan["plan_id"],)).fetchone()
+    assert tuple(state) == ("REMOTE_JSON_VERIFIED", 0, 1, 0)
     assert client.write_files == ["templates/index.json"]
     folder = next((tmp_path / "exports" / "theme_backups" / "s1").iterdir())
     assert {"before.raw.json", "proposed.raw.json", "before.parsed.json", "proposed.parsed.json",
             "selected_products.json", "diff.md", "metadata.json"}.issubset({x.name for x in folder.iterdir()})
+
+
+def test_isolated_apply_rejects_non_alphanumeric_generated_id_before_write(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    preview["section_id"] = "ss_featured_products_invalid"
+    result = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, client=client)
+    assert result["status"] == "CONFLICT" and client.write_count == 0
 
 
 def test_isolated_feature_apply_blocks_proposal_drift_and_rollback_checks_merchant_drift(tmp_path, monkeypatch):
@@ -138,7 +198,7 @@ def test_isolated_feature_rollback_restores_exact_raw_and_refuses_merchant_drift
     db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
     original_raw = client.raw
     applied = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, client=client)
-    assert applied["status"] == "VERIFIED" and client.write_count == 1
+    assert applied["status"] == "REMOTE_JSON_VERIFIED" and client.write_count == 1
     restored = writer.rollback(applied["backup_id"], confirmed=True, client=client)
     assert restored["status"] == "ROLLED_BACK" and client.raw == original_raw and client.write_count == 2
 
@@ -146,7 +206,7 @@ def test_isolated_feature_rollback_restores_exact_raw_and_refuses_merchant_drift
     merchant_dir.mkdir()
     db2, plan2, preview2, client2, writer2 = isolated_apply_fixture(merchant_dir, monkeypatch)
     applied2 = writer2.apply(plan2["plan_id"], preview2, store_id="s1", confirmed=True, client=client2)
-    assert applied2["status"] == "VERIFIED"
+    assert applied2["status"] == "REMOTE_JSON_VERIFIED"
     client2.raw += "\n/* merchant drift */"
     refused = writer2.rollback(applied2["backup_id"], confirmed=True, client=client2)
     assert refused["status"] == "CONFLICT" and client2.write_count == 1
@@ -214,7 +274,8 @@ def test_assignment_check_requires_four_unique_real_products(tmp_path):
     db, svc = service(tmp_path); seed_four(db)
     plan = svc.create_plan("s1")
     check = svc.checklist(plan, section_visible=True, remote_verified=True)
-    assert check["status"] == "ASSIGNMENT_READY" and all(check["checks"].values())
+    assert check["status"] == "REVIEW_REQUIRED"
+    assert svc.checklist(plan, section_visible=True, remote_verified=True, storefront_verified=True)["status"] == "ASSIGNMENT_READY"
     plan["items"] = plan["items"][:3]
     assert not svc.checklist(plan, section_visible=True, remote_verified=True)["checks"]["featured_products_count"]
 
@@ -252,7 +313,7 @@ def test_stale_preview_conflict_and_remote_verify(tmp_path):
     assert svc.verify_remote(plan["plan_id"], preview_hash="stale", remote_section={})["status"] == "CONFLICT"
     ids = [x["shopify_product_id"] for x in plan["items"]]
     result = svc.verify_remote(plan["plan_id"], preview_hash=preview["preview_hash"], remote_section={"visible": True, "product_ids": ids})
-    assert result["status"] == "VERIFIED" and not result["write_performed"]
+    assert result["status"] == "REMOTE_JSON_VERIFIED" and not result["write_performed"]
 
 
 def test_report_and_assignment_workflow_include_featured_products(tmp_path):
@@ -391,7 +452,7 @@ def test_featured_remote_cache_and_force_refresh(tmp_path, monkeypatch):
 def test_assignment_check_accepts_existing_shopify_source(tmp_path, monkeypatch):
     db, remote_reader = reader(tmp_path, monkeypatch, [remote_product(i) for i in range(1, 5)])
     svc = FeaturedProductAssignmentService(db=db); plan = svc.create_plan("s1", include_existing=True, reader=remote_reader)
-    assert svc.checklist(plan, section_visible=True, remote_verified=True)["status"] == "ASSIGNMENT_READY"
+    assert svc.checklist(plan, section_visible=True, remote_verified=True)["status"] == "REVIEW_REQUIRED"
 
 
 def test_featured_ui_auto_refresh_scope_message_and_diagnostics():

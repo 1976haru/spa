@@ -25,6 +25,7 @@ from .shopify_theme_json import (
     render_shopify_json_document,
     shopify_json_semantic_hash,
 )
+from .shopify_theme_ids import legacy_managed_id, legacy_shopify_instance_kind, shopify_instance_id
 
 UPSERT_THEME_FILES = "mutation HomepageFiles($themeId: ID!, $files: [OnlineStoreThemeFilesUpsertFileInput!]!) { themeFilesUpsert(themeId: $themeId, files: $files) { upsertedThemeFiles { filename } userErrors { field message } } }"
 
@@ -363,7 +364,7 @@ def build_homepage_plan(*, store_id: str, brand: dict, collection_plan: dict,
 
 
 def _managed_id(kind: str, key: str) -> str:
-    return "ss_" + kind + "_" + hashlib.sha1(key.encode()).hexdigest()[:10]
+    return shopify_instance_id(kind, key)
 
 
 def build_homepage_preview(plan: dict, snapshot: dict, *, db=None) -> dict:
@@ -386,9 +387,33 @@ def build_homepage_preview(plan: dict, snapshot: dict, *, db=None) -> dict:
     else:
         sections = proposed.setdefault("sections", {})
         order = proposed.setdefault("order", [])
-        previous_ids = {key for key in sections if str(key).startswith("ss_")}
+        previous_ids = {key for key in sections if legacy_shopify_instance_kind(key)}
         hero_schema, category_schema = discovery["hero"], discovery["category"]
         hero = plan["hero"]
+        # Migrate only the exact historical IDs implied by this preview's store/category identity.
+        migration_pairs = [(legacy_managed_id("hero", "primary"), _managed_id("hero", "primary"), "HERO")]
+        migration_pairs.append((legacy_managed_id("categories", plan["store_id"]),
+                                _managed_id("categories", plan["store_id"]), "CATEGORY"))
+        previous_ids.update(new_id for _, new_id, _ in migration_pairs if new_id in sections)
+        block_id_map = {legacy_managed_id("cat", row["collection_key"]): _managed_id("cat", row["collection_key"])
+                        for row in plan.get("categories", []) if row.get("collection_key")}
+        for old_id, new_id, kind in migration_pairs:
+            if old_id not in sections:
+                continue
+            if new_id in sections:
+                actions.append({"action": "CONFLICT", "kind": kind, "reason": "Both legacy and current managed section IDs exist"})
+                continue
+            migrated = sections.pop(old_id)
+            if kind == "CATEGORY" and isinstance(migrated.get("blocks"), dict):
+                if any(block_id not in block_id_map for block_id in migrated["blocks"]):
+                    sections[old_id] = migrated
+                    actions.append({"action": "CONFLICT", "kind": kind, "reason": "Legacy category block identity cannot be proven from current plan"})
+                    continue
+                migrated["blocks"] = {block_id_map[block_id]: value for block_id, value in migrated["blocks"].items()}
+                migrated["block_order"] = [block_id_map.get(block_id, block_id) for block_id in migrated.get("block_order", [])]
+            sections[new_id] = migrated
+            order[:] = [new_id if item == old_id else item for item in order]
+            previous_ids.add(new_id)
         if not hero.get("image_asset_id") and not hero.get("image_url"):
             warnings.append({"code": "HERO_IMAGE_MISSING"})
         if not hero.get("cta_valid"):
@@ -750,8 +775,10 @@ class HomepageAutomationService:
                         and after_document.raw_hash == proposed_raw_hash)
         if verified:
             with connect(self.db) as con:
+                managed_ids = {action.get("section_id") for action in preview.get("actions", [])
+                               if action.get("kind") in {"HERO", "CATEGORY"} and action.get("section_id")}
                 for section_id, section in (after.get("sections") or {}).items():
-                    if section_id.startswith(("ss_hero_", "ss_categories_")):
+                    if section_id in managed_ids:
                         con.execute("INSERT INTO store_homepage_managed_state VALUES(?,?,?,?,?) ON CONFLICT(store_id,theme_id,section_id) DO UPDATE SET section_json=excluded.section_json,updated_at=excluded.updated_at",
                                     (row["store_id"], row["theme_id"], section_id, _json(section), _now()))
         return {"status": "VERIFIED" if verified else "VERIFY_FAILED", "backup_id": backup_id,
