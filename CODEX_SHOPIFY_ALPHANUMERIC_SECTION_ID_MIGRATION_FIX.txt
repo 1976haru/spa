@@ -1,0 +1,433 @@
+ShopSource Studio — SHOPIFY ALPHANUMERIC SECTION-ID MIGRATION + STOREFRONT VERIFICATION FIX
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Expected baseline: 4e5669b8b61ddd388ec2d88f0d1f0cfc179b3c46
+
+CONFIRMED ROOT CAUSE
+The live featured-products section was written to templates/index.json with:
+  ss_featured_products_e193a01e
+
+Shopify's JSON template specification requires section instance IDs and block IDs to contain ONLY alphanumeric characters.
+Underscores are invalid.
+
+Official Shopify docs:
+- JSON template section data: <SectionID> accepts only alphanumeric characters.
+- <BlockID> also accepts only alphanumeric characters.
+
+Current code generates multiple invalid managed IDs with underscores:
+- homepage_featured_products.py:
+  ss_featured_products_<hash>
+- homepage_automation.py:
+  _managed_id() returns ss_<kind>_<hash>
+- homepage_collections.py:
+  _section_id() returns ss_<slug>_<hash>
+- category block IDs can also inherit invalid underscores.
+
+Observed consequence
+- Isolated apply returned VERIFIED because it verified JSON write/readback and product IDs.
+- Public storefront did not render the New Arrivals section.
+- Current "VERIFIED" therefore means remote JSON equality, NOT storefront visibility.
+
+Mission
+Fix the ID architecture once, migrate the already-written invalid ShopSource featured section safely, and prevent future false-positive storefront verification.
+
+Do NOT perform a real Shopify write during implementation/testing.
+
+======================================================================
+1. CENTRAL SHOPIFY INSTANCE-ID GENERATOR
+======================================================================
+
+Create ONE reusable helper for JSON-template section/block instance IDs, e.g.:
+
+shopify_instance_id(namespace: str, key: str, *, prefix="ss") -> str
+
+Requirements:
+- deterministic
+- unique enough via hash
+- ONLY [A-Za-z0-9]
+- no underscore
+- no hyphen
+- no whitespace
+- stable across Windows/Linux
+- namespace normalized to alphanumeric
+- hash lowercase hex is acceptable
+- validate with fullmatch(r"[A-Za-z0-9]+")
+
+Suggested examples:
+- featured products: ssfeaturede193a01e
+- hero: sshero<digest>
+- categories: sscategories<digest>
+- category block: sscat<digest>
+
+Do not hardcode Cabin Tidy-specific IDs.
+
+Add:
+is_valid_shopify_instance_id(value) -> bool
+
+======================================================================
+2. REPLACE ALL GENERATED SECTION/BLOCK IDS
+======================================================================
+
+Audit and replace generated IDs in:
+- homepage_featured_products.py
+- homepage_automation.py
+- homepage_collections.py
+- any other homepage/theme JSON builder
+
+This includes BOTH:
+- section instance IDs
+- block IDs
+
+Existing merchant section IDs must never be rewritten.
+
+Do not modify IDs already present in the merchant theme unless they are positively identified as legacy ShopSource-managed IDs.
+
+======================================================================
+3. LEGACY SHOPSource ID RECOGNITION
+======================================================================
+
+Add strict recognizers for OLD ShopSource-generated IDs only.
+
+Examples:
+- ^ss_featured_products_[0-9a-f]{8}$
+- ^ss_hero_[0-9a-f]{10}$
+- ^ss_categories_[0-9a-f]{10}$
+- old collection IDs produced by homepage_collections._section_id()
+- old category block IDs produced by _managed_id("cat", ...)
+
+Do NOT use a broad startswith("ss_") deletion rule.
+
+Return:
+legacy_kind
+legacy_id
+new_id
+
+Only migrate IDs that can be proven to match one of ShopSource's historical deterministic patterns.
+
+======================================================================
+4. SAFE ONE-TIME FEATURED SECTION MIGRATION
+======================================================================
+
+For the CURRENT live bad featured section:
+  ss_featured_products_e193a01e
+
+The next FEATURED_PREVIEW must propose:
+- remove the exact legacy invalid ShopSource section from sections
+- remove the exact legacy ID from order
+- create the new valid alphanumeric ShopSource section ID
+- insert the new valid ID exactly once into order
+- preserve the same 4 selected products
+- preserve all unrelated theme content
+
+Do not keep both old and new sections.
+
+The preview should report:
+MIGRATION:
+  from = ss_featured_products_e193a01e
+  to = <new alphanumeric id>
+
+If the legacy ID exists but does NOT match the expected current ShopSource plan/store identity:
+=> CONFLICT
+=> no write
+
+======================================================================
+5. UPDATE ISOLATED DIFF GUARD
+======================================================================
+
+validate_isolated_featured_diff() currently permits only:
+- target section change
+- target order placement
+
+Extend it SAFELY for a legacy migration.
+
+Allowed paths ONLY:
+- delete one proven legacy featured ShopSource section
+- delete that exact legacy ID from order
+- create/update the new valid ShopSource featured section
+- insert/move only the new valid ID in order
+
+Still block:
+- hero
+- category
+- merchant sections
+- unknown keys
+- other order movements
+- other ShopSource sections
+
+Return explicit fields:
+{
+  safe,
+  allowed_changes,
+  unexpected_paths,
+  legacy_removed,
+  new_section_id
+}
+
+======================================================================
+6. APPLY SERVICE ID CONTRACT
+======================================================================
+
+FeaturedProductThemeApplyService currently expects:
+  ss_featured_products_<hash>
+
+Replace with the central alphanumeric generator.
+
+Before write:
+- validate new section ID with is_valid_shopify_instance_id()
+- validate any new block IDs if applicable
+- reject invalid IDs
+- recognize/allow only exact legacy migration
+- verify semantic diff guard
+
+The isolated apply must be able to migrate the old live invalid section to the new valid ID in one guarded templates/index.json mutation.
+
+======================================================================
+7. STOP CALLING JSON READBACK "STOREFRONT VERIFIED"
+======================================================================
+
+Current apply status "VERIFIED" is misleading.
+
+Separate statuses:
+
+A. REMOTE_JSON_VERIFIED
+Means:
+- mutation succeeded
+- raw/semantic document readback matches
+- 4 product references persisted
+- unrelated sections unchanged
+- comment preserved
+
+B. STOREFRONT_VERIFIED
+Means:
+- section was actually observed in storefront rendering
+  OR
+- user explicitly performed desktop/mobile human confirmation
+
+Do NOT mark plan remote_verified/storefront-visible based only on JSON equality.
+
+Suggested persistent state:
+- remote_json_verified = 1
+- storefront_verified = 0 initially
+
+If backwards-compatible schema migration is needed, make it additive/idempotent.
+
+UI after apply:
+"Shopify 저장: REMOTE_JSON_VERIFIED · storefront 확인 필요"
+
+Only after storefront human confirmation:
+"Shopify 적용: STOREFRONT_VERIFIED · 상품 4/4"
+
+Do not claim ASSIGNMENT_READY before storefront confirmation.
+
+======================================================================
+8. STORE FRONT HUMAN CONFIRMATION
+======================================================================
+
+Because the current store can be password-protected, automated public HTML verification may be unavailable.
+
+After REMOTE_JSON_VERIFIED:
+- show [스토어에서 확인]
+- show checklist:
+  □ Desktop에서 New Arrivals 제목 확인
+  □ 상품 카드 4개 확인
+  □ 4개 상품 링크 확인
+  □ Mobile에서 섹션 확인
+
+When user confirms these:
+- set storefront_verified / assignment human check state locally
+- status can become STOREFRONT_VERIFIED / ASSIGNMENT_READY
+
+Do not require unauthenticated public HTML fetch.
+
+If a safe automated storefront/Section Rendering read is available and succeeds, it may assist, but human confirmation remains accepted for password-protected stores.
+
+======================================================================
+9. PRODUCT_LIST VALUE FORMAT — DO NOT GUESS
+======================================================================
+
+The previous diagnosis could not verify whether raw product_list values should be GIDs/handles/other.
+
+Before changing this format:
+- inspect live theme schema/read-only when network works
+- inspect any existing working product/product_list resource setting in the theme
+- keep current GID representation unless evidence proves it is wrong
+
+Do NOT mix this uncertainty into the confirmed section-ID fix.
+
+However add diagnostics to report:
+- product setting type
+- stored current values
+- whether Liquid resolves a nonblank product list when a safe render check is available
+
+======================================================================
+10. ROOT-FIX OTHER INVALID GENERATED IDS
+======================================================================
+
+Even though the current assignment is featured products, prevent the same defect in future tasks.
+
+Update:
+- hero generated section ID
+- category generated section ID
+- category block IDs
+- collection shortcut/featured collection generated IDs
+
+Add unit tests proving every generated ShopSource section/block ID is alphanumeric.
+
+Do NOT automatically migrate unrelated live hero/category sections during the featured-products isolated apply.
+
+Migration of legacy hero/category IDs should occur only when those feature-specific previews are later applied.
+
+======================================================================
+11. TESTS
+======================================================================
+
+Add at minimum:
+
+test_shopify_instance_id_is_alphanumeric
+test_shopify_instance_id_is_deterministic
+test_shopify_instance_id_namespaces_differ
+test_generated_featured_section_id_has_no_underscore
+test_generated_hero_section_id_has_no_underscore
+test_generated_category_section_id_has_no_underscore
+test_generated_category_block_id_has_no_underscore
+test_legacy_featured_id_recognized
+test_unrelated_ss_like_id_not_recognized
+test_featured_preview_migrates_legacy_invalid_id
+test_featured_preview_removes_legacy_id_from_order
+test_featured_preview_adds_new_id_once
+test_isolated_diff_allows_exact_legacy_featured_migration
+test_isolated_diff_blocks_unrelated_section_delete
+test_isolated_diff_blocks_unrelated_order_move
+test_apply_rejects_non_alphanumeric_new_id
+test_apply_migration_preserves_comment
+test_apply_migration_preserves_unrelated_sections
+test_json_readback_status_is_remote_json_verified_not_storefront_verified
+test_assignment_ready_requires_storefront_human_confirmation
+test_password_protected_store_can_use_human_confirmation
+test_existing_comment_json_tests_still_pass
+test_no_real_network_or_write_in_tests
+
+======================================================================
+12. GOLDEN PATH FIXTURE
+======================================================================
+
+Update Golden Path fixture to include a legacy invalid ShopSource featured section:
+
+sections:
+  ss_featured_products_<digest>: ...
+
+order:
+  [..., ss_featured_products_<digest>, ...]
+
+Then assert preview/apply mock migrates it to an alphanumeric ID and removes the legacy ID.
+
+The fake theme must still include:
+- Shopify leading block comment
+- merchant sections to preserve
+- 4 featured products
+
+======================================================================
+13. LIVE READ-ONLY RELEASE GATE
+======================================================================
+
+If credentials/network work, perform READ-ONLY smoke only.
+
+Read current MAIN index.json and report:
+- legacy section exists
+- legacy ID in order
+- computed new alphanumeric ID
+- proposed migration semantic diff
+- unrelated sections unchanged
+- selected products still 4/4
+- zero Shopify writes
+
+Expected:
+LEGACY FEATURED SECTION FOUND = YES
+NEW SECTION ID ALPHANUMERIC = YES
+MIGRATION DIFF SAFE = YES
+SHOPIFY WRITE COUNT = 0
+
+Do NOT execute migration during Codex development.
+
+======================================================================
+14. PROTECTED FILES
+======================================================================
+
+Do not stage/commit:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env / tokens
+- theme backups
+- .phase*
+- user assets
+
+======================================================================
+15. QUALITY GATES
+======================================================================
+
+Run:
+python -m compileall -q src tests
+
+Run new ID/migration tests explicitly.
+
+python -m pytest -q tests/test_homepage_featured_products.py
+python -m pytest -q tests/test_homepage_golden_path.py
+python -m pytest -q
+
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+No live Shopify write.
+
+======================================================================
+16. COMMIT / PUSH
+======================================================================
+
+After passing all gates:
+
+Suggested commit:
+git commit -m "Fix Shopify theme instance IDs and storefront verification"
+
+git push origin main
+
+Confirm main...origin/main = 0 0.
+
+======================================================================
+17. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] confirmed section-ID root cause
+[5] central alphanumeric ID generator
+[6] all generated section/block ID call sites fixed
+[7] legacy featured migration logic
+[8] isolated diff migration guard
+[9] apply status split: remote JSON vs storefront
+[10] human storefront verification flow
+[11] product_list format handling
+[12] tests/pass count
+[13] protected files
+[14] live read-only Cabin Tidy migration smoke
+[15] unresolved risks
+[16] commit/push
+[17] exact next user action
+
+Final flags:
+
+SHOPIFY GENERATED IDS ALPHANUMERIC = YES/NO
+LEGACY FEATURED MIGRATION READY = YES/NO
+ISOLATED MIGRATION DIFF GUARD = PASS/FAIL
+REMOTE JSON VS STOREFRONT STATUS SPLIT = YES/NO
+LIVE CABIN TIDY MIGRATION PREVIEW = PASS/FAIL/NOT_TESTED_NETWORK
+SHOPIFY WRITE COUNT DURING DEVELOPMENT = 0/<N>
+SAFE FOR USER-CONFIRMED LEGACY FEATURED MIGRATION = YES/NO
