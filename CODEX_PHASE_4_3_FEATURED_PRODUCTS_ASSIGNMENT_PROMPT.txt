@@ -1,0 +1,585 @@
+ShopSource Studio — Phase 4.3
+FEATURED PRODUCTS / NEW ARRIVALS ASSIGNMENT AUTOMATION
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: main
+
+Context
+- Store 001 | Cabin Tidy is the first real Shopify store and has already been built as the challenge/pilot store.
+- Existing homepage assignment automation already supports:
+  HERO
+  CATEGORY_SHORTCUTS
+  FEATURED_COLLECTIONS
+  LINK_CHECK
+  THEME_PREVIEW
+  guarded THEME_WRITE
+  REMOTE_VERIFY
+- The next Spamy challenge assignment is:
+  "스토어 메인 화면에 추천 상품(신상품) 영역을 넣어 고객에게 먼저 보여 줄 상품을 배치합니다."
+- The lesson video demonstrates a product/collection grid in PageFly, but ShopSource must NOT automate external PageFly GUI clicks.
+- The goal is to solve the assignment through ShopSource/Codex automation while making the feature reusable for future stores.
+- This is NOT a Cabin-Tidy-only hack. Cabin Tidy is the first fixture/pilot; generic behavior must live in reusable services and Store/Profile settings.
+
+Current relevant modules
+- src/shopsource/homepage_assignment.py
+- src/shopsource/homepage_automation.py
+- src/shopsource/homepage_collections.py
+- src/shopsource/shopify_products.py
+- src/shopsource/shopify_collections.py
+- src/shopsource/store_build.py
+- src/shopsource/store_completion.py
+- src/shopsource/ui/v2.py
+- tests/
+- AGENTS.md
+- CLAUDE.md
+
+Goal
+Add a safe reusable "추천 상품(신상품) / Featured Products / New Arrivals" automation layer.
+
+Desired user experience in UI V2:
+
+### 홈페이지 자동화
+
+Store:
+001 | Cabin Tidy
+
+Hero Banner:
+READY
+
+Category Shortcuts:
+READY
+
+Featured Products / New Arrivals:
+4 products / READY
+
+[추천 상품 자동 구성]
+[추천 상품 미리보기]
+[홈페이지 미리보기]
+[Shopify 적용]
+[과제 제출용 확인]
+
+Cabin Tidy default copy:
+Heading:
+New Arrivals
+
+Optional subheading:
+Fresh picks to keep your car clean, organized, and ready to go.
+
+Default product count:
+4
+
+Default first-pilot category diversity target:
+- Trunk / Cargo organization
+- Seat / Backseat organization
+- Console / Small storage
+- Trash / Cleanup
+Use actual verified products; these are category diversity targets, not hard-coded product titles.
+
+======================================================================
+1. FEATURED PRODUCT PLAN MODEL
+======================================================================
+
+Create persistent/reusable structures for homepage product showcase planning.
+
+Suggested DB models (names may adapt to current architecture):
+
+homepage_featured_product_plans
+- plan_id
+- store_id
+- mode
+- heading
+- subheading
+- requested_count
+- collection_key nullable
+- collection_handle nullable
+- status
+- source_hash
+- created_at
+- updated_at
+
+homepage_featured_product_items
+- plan_id
+- position
+- master_product_id
+- shopify_product_id
+- shopify_handle
+- title
+- category_key nullable
+- image_url nullable
+- price nullable
+- remote_status
+- selection_reason
+- verification_status
+
+Do not duplicate product source blobs.
+Reference MASTER and existing Shopify mapping rows.
+
+======================================================================
+2. SELECTION MODES
+======================================================================
+
+Support:
+- NEW_ARRIVALS
+- BALANCED_CATEGORIES
+- MANUAL_SELECTION
+
+Default assignment mode:
+BALANCED_CATEGORIES
+
+NEW_ARRIVALS:
+- rank verified products by latest real Shopify mapping/sync freshness when available
+- never invent Shopify created_at if not available
+- if remote created_at is required but not currently read, add a bounded read-only query or clearly use synced_at as "recently synced", not "newly created"
+
+BALANCED_CATEGORIES:
+- prefer one product from different important store categories
+- maximize useful category diversity
+- Cabin Tidy may naturally choose trunk, seat, console, trash/cleanup when real products exist
+- generic stores derive categories from collection plan / product tags, not hard-coded Cabin Tidy strings
+
+MANUAL_SELECTION:
+- allow user to select mapped product IDs in UI
+- preserve selected order
+
+======================================================================
+3. PRODUCT ELIGIBILITY — HARD RULES
+======================================================================
+
+A product can be shown only if:
+- it exists in MASTER
+- it has a store decision eligible for this store
+- it has a shopify_product_mappings row
+- remote Shopify identity matches the mapping
+- product link/handle is non-empty and real
+- product is storefront-eligible for the intended live section
+- price is valid
+- image is available for assignment-quality presentation, or item is marked NEEDS_IMAGE and blocked from final assignment-ready status
+- no duplicate shopify_product_id
+- no duplicate handle
+
+Do NOT:
+- fabricate product IDs
+- fabricate links
+- reuse source acquisition price as retail price
+- activate DRAFT products automatically
+- publish products automatically just to satisfy the assignment
+- add fake discounts
+- add fake urgency
+- add fake stock countdown
+- add fake reviews/social proof
+
+If there are fewer than 4 eligible visible products:
+status = MANUAL_ACTION_REQUIRED or BLOCKED
+with an exact reason.
+
+======================================================================
+4. RECOMMENDED PRODUCTS COLLECTION STRATEGY
+======================================================================
+
+The assignment should work across theme capabilities.
+
+Preferred reusable strategy:
+A. If theme supports direct product-list/product blocks with proven schema:
+   render selected verified products directly.
+
+B. Else if theme supports Featured Collection:
+   use a ShopSource-managed showcase collection, e.g.
+   collection_key = homepage-new-arrivals
+   title = New Arrivals
+
+Do not create a separate unrelated collection subsystem.
+Reuse existing collection publisher and product owned-tag behavior where possible.
+
+If a managed New Arrivals collection is needed:
+- use ShopSource-owned tag/rule semantics
+- add only ShopSource-owned tag(s), never replace merchant tags
+- collection membership must reflect selected assignment items
+- avoid destructive deletes
+- if an existing merchant New Arrivals collection conflicts, return CONFLICT / SAFE_ADOPT options
+- never silently hijack an unrelated merchant collection with the same title
+
+C. If neither safe native pattern exists:
+MANUAL_ACTION_REQUIRED
+Generate exact Shopify Theme Editor/PageFly manual instructions.
+Do not automate external GUI clicks.
+
+======================================================================
+5. THEME DISCOVERY
+======================================================================
+
+Extend schema discovery safely.
+
+Detect capabilities from actual section schema, not theme name:
+- featured-collection
+- product-list / product grid
+- multicolumn/product blocks only if product links/images can be mapped safely
+
+Capture proven setting IDs for:
+- heading/title
+- collection or product references
+- product count
+- columns desktop/mobile when supported
+- image ratio when supported
+- show price/title/button when supported
+
+Never guess setting IDs.
+
+If mapping confidence is not HIGH:
+MANUAL_ACTION_REQUIRED.
+
+======================================================================
+6. HOMEPAGE PLACEMENT
+======================================================================
+
+Desired default order:
+
+Hero
+→ Category Shortcuts
+→ Featured Products / New Arrivals
+→ existing merchant sections
+→ Footer
+
+However:
+- preserve all unrelated merchant sections
+- do not reorder merchant sections unless required
+- minimal diff only
+- if a merchant already has a featured-product section, inspect/adopt/update only with safe ownership rules
+- repeated runs must be idempotent and must not duplicate the section
+
+Managed section IDs should use existing ShopSource stable-id conventions.
+
+======================================================================
+7. CABIN TIDY ASSIGNMENT DEFAULTS
+======================================================================
+
+These are fixture/default values only, not hard-coded core logic.
+
+Store:
+001 | Cabin Tidy
+
+Heading:
+New Arrivals
+
+Subheading:
+Fresh picks to keep your car clean, organized, and ready to go.
+
+Count:
+4
+
+Selection preference:
+different major auto-interior organization categories where real eligible products exist.
+
+If four real products cannot be found:
+do not fake them.
+Show the reason and exact next action.
+
+======================================================================
+8. HOMEPAGE ASSIGNMENT FLOW UPGRADE
+======================================================================
+
+Upgrade homepage_assignment.py.
+
+Current sequence roughly includes:
+HERO
+CATEGORY_SHORTCUTS
+FEATURED_COLLECTIONS
+LINK_CHECK
+THEME_PREVIEW
+THEME_WRITE_CONFIRMATION
+REMOTE_VERIFY
+ASSIGNMENT_READY
+
+Add explicit Featured Products stages:
+
+HERO
+CATEGORY_SHORTCUTS
+FEATURED_PRODUCTS_PLAN
+FEATURED_PRODUCTS_VERIFY
+LINK_CHECK
+THEME_PREVIEW
+THEME_WRITE_CONFIRMATION
+REMOTE_VERIFY
+ASSIGNMENT_READY
+
+Do not confuse:
+FEATURED_COLLECTIONS = homepage collection/category merchandising
+FEATURED_PRODUCTS = assignment product showcase / New Arrivals
+
+Keep both if both are useful.
+The assignment checklist must explicitly verify the product showcase.
+
+======================================================================
+9. ASSIGNMENT CHECKLIST
+======================================================================
+
+Add checks:
+
+featured_products_count >= 4
+featured_products_unique
+featured_products_real_remote_ids
+featured_products_real_links
+featured_products_price_valid
+featured_products_images_ready
+featured_products_storefront_eligible
+featured_products_section_visible
+featured_products_remote_verified
+
+Assignment ready only when all required checks pass.
+
+Expose a simple result:
+ASSIGNMENT_READY
+REVIEW_REQUIRED
+MANUAL_ACTION_REQUIRED
+BLOCKED
+
+======================================================================
+10. UI V2
+======================================================================
+
+Add a beginner-friendly card/step under 홈페이지 자동화.
+
+Korean labels:
+
+추천 상품(신상품)
+선택된 상품: 0 / 4
+상태: READY / REVIEW REQUIRED / BLOCKED
+
+Buttons:
+[추천 상품 자동 구성]
+[상품 4개 보기]
+[다시 선택]
+[추천 상품 미리보기]
+[Shopify 적용]
+[과제 제출용 확인]
+
+Preview table/cards should show:
+- order
+- product image
+- title
+- category
+- price
+- Shopify status
+- product link
+- selection reason
+- verification status
+
+For manual selection:
+simple checkbox/selection UI from eligible mapped products.
+Do not expose raw IDs as the primary beginner UI.
+
+======================================================================
+11. STORE BUILD INTEGRATION
+======================================================================
+
+Integrate into StoreBuild without giant rewrite.
+
+Suggested stages:
+FEATURED_PRODUCTS_PLAN
+FEATURED_PRODUCTS_PREVIEW
+FEATURED_PRODUCTS_APPLY
+FEATURED_PRODUCTS_VERIFY
+
+Place after product/collection verification and before final homepage verify.
+
+Respect existing confirmation/preview patterns.
+No live write during tests.
+
+======================================================================
+12. STORE COMPLETION INTEGRATION
+======================================================================
+
+Homepage completion domain should distinguish:
+- Hero
+- Category shortcuts
+- Featured collections
+- Featured products / New Arrivals
+
+Featured products = VERIFIED only after remote readback confirms the section/collection mapping and product links.
+
+======================================================================
+13. SAFETY / WRITE GATES
+======================================================================
+
+Before real theme write:
+- correct store identity
+- published theme identity
+- fresh theme snapshot
+- backup
+- high-confidence schema mapping
+- eligible product set unchanged
+- real product IDs/handles verified
+- explicit user confirmation
+
+If any condition changed after preview:
+CONFLICT / stale preview
+No write.
+
+If theme write is unavailable:
+MANUAL_ACTION_REQUIRED + exact steps.
+
+Do not automate PageFly or Shopify Theme Editor GUI clicks.
+
+======================================================================
+14. REPORT / SUBMISSION SUPPORT
+======================================================================
+
+Generate:
+exports/homepage_reports/<store>/<plan>/featured_products.json
+exports/homepage_reports/<store>/<plan>/assignment_featured_products.md
+
+The assignment markdown should include:
+- store
+- heading
+- four selected product titles
+- why they were selected
+- verified links
+- section status
+- screenshot checklist
+- short Korean submission memo
+
+Cabin Tidy Korean memo template may be generated from actual verified state, not assumptions:
+
+"이번 과제에서는 Cabin Tidy 메인 화면에 추천 상품(신상품) 영역을 구성해 고객이 대표 상품을 먼저 확인할 수 있도록 했습니다. 트렁크, 시트, 콘솔, 청소/정리 등 주요 사용 영역이 겹치지 않도록 상품을 배치해 스토어의 핵심 구성을 한눈에 이해할 수 있도록 했습니다."
+
+Only include category examples that actually appear in the selected items.
+
+======================================================================
+15. TESTS
+======================================================================
+
+Add focused tests, for example:
+
+test_featured_products_requires_real_mapping
+test_featured_products_requires_valid_handle
+test_featured_products_no_duplicate_remote_id
+test_featured_products_no_duplicate_handle
+test_featured_products_requires_valid_price
+test_featured_products_image_required_for_assignment_ready
+test_featured_products_draft_not_auto_activated
+test_featured_products_balances_categories
+test_featured_products_manual_selection_preserves_order
+test_featured_products_new_arrivals_uses_real_freshness_signal
+test_featured_products_collection_fallback_uses_owned_tag
+test_featured_products_does_not_replace_merchant_tags
+test_featured_products_existing_collection_conflict
+test_featured_products_theme_schema_high_confidence
+test_featured_products_unknown_theme_manual_fallback
+test_featured_products_preserves_unrelated_homepage_sections
+test_featured_products_repeat_run_idempotent
+test_featured_products_stale_preview_conflict
+test_featured_products_backup_before_write
+test_featured_products_remote_verify
+test_assignment_check_requires_four_products
+test_store_build_featured_product_stage_order
+test_store_completion_tracks_featured_products
+test_no_real_network_in_featured_product_tests
+test_protected_store_file_untouched
+
+All existing tests must remain green.
+
+======================================================================
+16. PROTECTED / DO NOT TOUCH
+======================================================================
+
+stores/001_cabin_tidy.json
+Do not reset, checkout, overwrite, clean, stage, or commit this file if it has user-local changes.
+
+Never commit:
+- data/*.sqlite3
+- .env
+- secrets/tokens
+- bulk product exports
+- live theme backups
+- user-generated media unless intentionally tracked
+
+======================================================================
+17. QUALITY GATE
+======================================================================
+
+Before completion run:
+
+python -m compileall -q src tests
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Also run focused featured-products tests separately first.
+
+No real Shopify mutation in test suite.
+No paid image call.
+No Amazon run.
+No Spark upload.
+
+======================================================================
+18. IMPLEMENTATION STYLE
+======================================================================
+
+Follow AGENTS.md:
+- one small phase
+- preserve backwards compatibility
+- avoid giant rewrite
+- local-first
+- generic 100-200 store architecture
+
+Follow CLAUDE.md:
+- do not hard-code Cabin Tidy business logic into reusable core
+- preserve DB integrity
+- preserve manual override behavior
+- Windows path handling
+- connector isolation
+
+Reuse existing services instead of parallel duplicate systems.
+
+======================================================================
+19. COMMIT / PUSH
+======================================================================
+
+After tests pass:
+- show git status
+- do not include protected/user files
+- commit implementation only
+
+Suggested commit:
+git commit -m "Add featured products homepage assignment automation"
+
+Push:
+git push origin main
+
+Confirm:
+git rev-list --left-right --count main...origin/main
+must be:
+0 0
+
+======================================================================
+20. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] featured-product selection architecture
+[5] theme capability discovery
+[6] New Arrivals collection fallback
+[7] homepage minimal-diff integration
+[8] assignment checklist
+[9] StoreBuild integration
+[10] StoreCompletion integration
+[11] tests / pass count
+[12] protected file status
+[13] commit/push
+[14] FEATURED PRODUCTS ASSIGNMENT READY = YES/NO
+[15] exact next buttons for the user to click in Korean
+
+IMPORTANT EXECUTION BOUNDARY
+- Implement and validate first.
+- Do NOT perform a real Shopify theme/product/collection write automatically during Codex/Claude implementation.
+- After implementation, stop at:
+  FEATURED PRODUCTS ASSIGNMENT UI READY
+- The real Cabin Tidy apply begins only when the user opens ShopSource and explicitly confirms the preview/write in the UI.
