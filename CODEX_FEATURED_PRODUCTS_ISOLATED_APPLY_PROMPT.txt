@@ -1,0 +1,537 @@
+ShopSource Studio — FEATURED PRODUCTS ISOLATED APPLY
+SPAMY RECOMMENDED/NEW PRODUCTS ASSIGNMENT — SAFE WRITE PHASE
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Expected baseline: 299ac43d92164d46bdeb7d913c90a1d9708ead5c
+
+Confirmed current real Cabin Tidy state
+- Store: 001 | Cabin Tidy
+- MAIN theme: "Design by klarjoy"
+- read_themes: available
+- templates/index.json exists
+- Shopify leading block-comment JSON is now supported safely
+- Featured products: 4/4 READY
+- Real read-only FEATURED_PREVIEW = PREVIEW
+- Featured capability = AUTO
+- Featured section id = ss_featured_products_e193a01e
+- Full homepage preview = CONFLICT because unrelated existing hero + collection-handle issues
+- Category capability = MANUAL
+- Shopify write count during validation = 0
+
+Important architecture decision
+DO NOT use the full-homepage apply path for this assignment.
+The full homepage has unrelated hero/category conflicts.
+
+Implement an ISOLATED FEATURED-PRODUCT SECTION APPLY that safely changes ONLY the managed featured-products section in templates/index.json.
+
+The feature-specific apply must be independent of unresolved hero/category conflicts.
+
+======================================================================
+1. SCOPE / NON-GOALS
+======================================================================
+
+Goal:
+Allow the user to complete the Spamy "추천 상품(신상품)" assignment safely from ShopSource Studio.
+
+Do:
+- apply only the current validated 4-product featured section
+- preserve all unrelated homepage content
+- use the existing comment-aware Shopify JSON document parser
+- require explicit human confirmation
+- backup before write
+- verify after write
+- expose rollback
+
+Do NOT:
+- modify hero/banner
+- modify category shortcuts
+- modify featured collections
+- modify Shopify products
+- modify tags
+- activate DRAFT products
+- automate PageFly/browser UI
+- perform a real Shopify write during Codex implementation/testing
+- use the full canonical homepage proposal when it contains unrelated changes/conflicts
+
+======================================================================
+2. FEATURE-SPECIFIC WRITE CONTRACT
+======================================================================
+
+Add a dedicated service, preferably in homepage_featured_products.py or a small focused module, e.g.:
+
+FeaturedProductThemeApplyService
+
+Conceptual methods:
+- prepare_apply(plan_id, snapshot/preview)
+- apply(preview_token or plan_id, confirmed=True)
+- verify(...)
+- rollback(..., confirmed=True)
+
+The write contract must be based on the current FEATURED_PREVIEW, not the FULL_PREVIEW.
+
+Required preconditions:
+- current store matches plan
+- plan status READY
+- exactly requested 4 items
+- 4 unique Shopify product IDs
+- 4 unique handles
+- all ACTIVE
+- valid price/image
+- feature preview status PREVIEW
+- feature capability DIRECT_PRODUCTS or another explicitly safe supported mode
+- current MAIN theme identity matches preview
+- exact template filename matches
+- read_themes + write_themes scopes available
+- latest featured plan matches preview plan
+- preview_hash is current
+- source raw hash and semantic hash match current remote document
+- managed section id is ShopSource-owned expected id
+
+Any mismatch:
+=> CONFLICT / MANUAL_ACTION_REQUIRED
+=> zero write
+
+======================================================================
+3. STRICT SEMANTIC DIFF GUARD
+======================================================================
+
+This is critical.
+
+Before allowing the mutation, compare:
+A. current parsed remote index.json
+B. featured-preview proposed parsed index.json
+
+The only allowed semantic differences are:
+
+1. sections[FEATURED_SECTION_ID]
+   - create it if absent
+   - or update only that exact ShopSource-managed section
+
+2. order
+   - insert FEATURED_SECTION_ID once in the intended location
+   - or move that same managed section if required
+   - no other order changes
+
+Everything else MUST be identical:
+- all other sections
+- all other settings
+- header/footer
+- hero
+- category sections
+- merchant-created sections
+- presets/groups
+- any unknown keys
+
+Implement a reusable validator:
+validate_isolated_featured_diff(before, proposed, section_id)
+
+Return:
+{
+  "safe": true/false,
+  "unexpected_paths": [...],
+  "allowed_changes": [...]
+}
+
+If unexpected_paths is non-empty:
+BLOCK WRITE.
+
+Do not rely only on hashes for this check.
+
+======================================================================
+4. COMMENT-AWARE RAW SAFETY
+======================================================================
+
+Use src/shopsource/shopify_theme_json.py everywhere.
+
+At apply:
+1. re-read exact remote raw templates/index.json
+2. parse_shopify_json_document()
+3. verify raw hash == preview source before_raw_hash
+4. verify semantic hash == preview source before_semantic_hash
+5. build feature-only proposed parsed document against THIS fresh document
+6. validate isolated semantic diff
+7. render_shopify_json_document(fresh_document, proposed)
+8. verify preserved prefix/suffix hashes
+9. only then permit mutation
+
+Never write plain json.dumps(proposed) without the preserved Shopify prefix/suffix.
+
+======================================================================
+5. BACKUP BEFORE MUTATION
+======================================================================
+
+Before any actual mutation, create local backup under a dedicated folder, e.g.:
+
+exports/theme_backups/<store>/<timestamp>-featured-products/
+
+Required files:
+- before.raw.json
+- proposed.raw.json
+- before.parsed.json
+- proposed.parsed.json
+- selected_products.json
+- diff.md
+- metadata.json
+
+metadata must include:
+- store_id
+- theme_id
+- template_filename
+- plan_id
+- preview_hash
+- section_id
+- before_raw_hash
+- before_semantic_hash
+- proposed_raw_hash
+- selected Shopify product IDs/handles
+- timestamp
+
+Do not include token/credential.
+
+Persist a backup/apply record in a backward-compatible table if useful.
+
+======================================================================
+6. ACTUAL SHOPIFY MUTATION PATH
+======================================================================
+
+Use the existing supported themeFilesUpsert GraphQL mutation abstraction.
+
+Important:
+- one file only: templates/index.json
+- body = comment-preserving proposed raw document
+- no product/collection writes
+- no second unrelated theme mutation
+
+Require:
+confirmed is True
+
+UI should never call the mutation without the explicit confirmation dialog.
+
+If write_themes is missing/rejected:
+return actionable MANUAL_ACTION_REQUIRED.
+Do not try browser automation.
+
+======================================================================
+7. READ-AFTER-WRITE VERIFY
+======================================================================
+
+Immediately after mutation:
+- re-read exact templates/index.json
+- parse with comment-aware parser
+- verify theme still MAIN/current
+- verify exact expected proposed semantic document
+- verify Shopify comment prefix/suffix preserved
+- verify feature section exists
+- verify selected product IDs exactly match current 4
+- verify section is in order exactly once
+- verify every unrelated section equals the before snapshot
+- verify no unexpected semantic diff
+
+Success:
+status = VERIFIED
+
+Persist:
+- plan remote_verified=1
+- plan status VERIFIED
+- verified_at
+- backup id
+- remote raw/semantic hashes if schema supports safely
+
+Failure:
+status = VERIFY_FAILED
+- retain backup id
+- show "롤백 가능"
+- do not falsely mark assignment ready
+
+No silent success.
+
+======================================================================
+8. FEATURE-SPECIFIC ROLLBACK
+======================================================================
+
+Add a rollback action for this feature.
+
+For a new featured-products backup:
+- require explicit confirmation
+- read current remote first
+- make sure it corresponds to the applied proposal or detect drift
+- restore exact before.raw.json
+- verify exact raw hash and semantic content
+
+If merchant changed the theme after apply:
+return CONFLICT rather than overwriting their changes.
+
+Label:
+[추천 상품 롤백]
+
+Do not use full-homepage rollback for this isolated feature.
+
+======================================================================
+9. UI — MAKE THE TOP CARD ACTUALLY COMPLETE THE ASSIGNMENT
+======================================================================
+
+Current top-card button:
+[SHOPIFY 적용]
+is only a gate/notification.
+
+Replace it with real guarded isolated-feature apply.
+
+Recommended top-card flow:
+
+[추천 상품 자동 구성]
+[상품 4개 보기]
+[다시 선택]
+[Shopify 상품 다시 읽기]
+[추천 상품 미리보기]
+[Shopify 적용]
+[과제 제출용 확인]
+[추천 상품 롤백] (visible/enabled after verified apply)
+
+When user clicks top-card [Shopify 적용]:
+
+Open confirmation dialog:
+
+Title:
+"추천 상품 4개를 Shopify에 적용"
+
+Show:
+- Store: Cabin Tidy
+- Theme: Design by klarjoy
+- Section: New Arrivals / featured section
+- Selected products: 4
+- Change scope: 추천 상품 섹션 1개만
+- Hero 변경: 없음
+- Category 변경: 없음
+- Product data 변경: 없음
+- Backup: 적용 전 자동 저장
+- Verification: 적용 후 자동 확인
+
+Require checkbox:
+"추천 상품 섹션만 실제 Shopify 테마에 적용하는 것을 확인했습니다."
+
+Buttons:
+[취소]
+[추천 상품만 적용]
+
+No mutation until checkbox + confirmation.
+
+======================================================================
+10. UI PERSISTENT STATUS
+======================================================================
+
+Do not rely on transient toast only.
+
+In the Featured Products card show a persistent line:
+
+Before preview:
+미리보기: NOT READY · Shopify 적용: NOT RUN
+
+After preview:
+미리보기: PREVIEW · 변경 범위: 추천상품 섹션 1개 · Shopify 적용: NOT RUN
+
+After verified apply:
+미리보기: CURRENT · Shopify 적용: VERIFIED · 원격 상품: 4/4
+
+On failure:
+Shopify 적용: VERIFY_FAILED · 롤백 가능
+
+The user screenshot must visibly prove the assignment state.
+
+======================================================================
+11. ASSIGNMENT CHECK BUTTON
+======================================================================
+
+The TOP featured-products [과제 제출용 확인] button must become feature-specific.
+
+After remote VERIFIED, checklist:
+
+✓ 추천 상품 4개
+✓ 4개 고유 상품
+✓ ACTIVE
+✓ 판매가 있음
+✓ 이미지 있음
+✓ 실제 상품 링크
+✓ Shopify 추천상품 section 존재
+✓ section visible/in order
+✓ 원격 product IDs 4/4 일치
+✓ Shopify 적용 검증 완료
+○ Desktop 실제 화면 확인
+○ Mobile 실제 화면 확인
+
+Status:
+- VERIFIED but human responsive checks pending => REVIEW_READY
+- human checks confirmed => ASSIGNMENT_READY
+
+Do NOT require hero/category automation for the featured-products assignment checklist.
+
+======================================================================
+12. STORE FRONT REVIEW LINK
+======================================================================
+
+After VERIFIED apply, provide:
+[스토어에서 확인]
+
+Use a safely derived storefront homepage URL only from configured valid shop domain / known storefront URL.
+Do not expose token/admin secret.
+
+Optional:
+[Theme Editor에서 확인]
+only if a safe known Shopify admin link can be constructed from non-secret shop/theme ids; otherwise omit.
+
+======================================================================
+13. ASSIGNMENT REPORT / MEMO
+======================================================================
+
+After VERIFIED, export a business-facing report with the actual 4 selected products.
+
+Submission memo must NOT mention automation internals.
+
+Suggested Korean memo template:
+
+"이번 과제에서는 Cabin Tidy 메인 화면에 추천 상품 영역을 구성해 고객이 주요 상품을 먼저 확인할 수 있도록 했습니다. 차량용 정리·수납이라는 스토어 콘셉트에 맞춰 서로 다른 사용 목적의 상품 4개를 배치했으며, 각 상품의 이미지·가격·상세페이지 연결을 확인해 고객이 관심 상품으로 바로 이동할 수 있도록 구성했습니다."
+
+Adjust the categories/product wording to the actual verified selected products.
+
+======================================================================
+14. TESTS — NO REAL NETWORK / NO REAL WRITE
+======================================================================
+
+Add focused tests at minimum:
+
+test_isolated_feature_diff_allows_only_managed_section_create
+test_isolated_feature_diff_allows_managed_section_update
+test_isolated_feature_diff_allows_only_managed_order_insertion
+test_isolated_feature_diff_blocks_hero_change
+test_isolated_feature_diff_blocks_category_change
+test_isolated_feature_diff_blocks_unrelated_section_change
+test_isolated_feature_apply_requires_confirmation
+test_isolated_feature_apply_requires_current_preview
+test_isolated_feature_apply_blocks_stale_plan
+test_isolated_feature_apply_blocks_raw_hash_drift
+test_isolated_feature_apply_blocks_semantic_drift
+test_isolated_feature_apply_preserves_shopify_comment_prefix
+test_isolated_feature_apply_creates_backup_before_mutation
+test_isolated_feature_apply_uses_one_theme_file_mutation
+test_isolated_feature_apply_never_mutates_products_or_collections
+test_isolated_feature_verify_checks_exact_four_ids
+test_isolated_feature_verify_checks_unrelated_sections_unchanged
+test_isolated_feature_rollback_restores_exact_raw
+test_isolated_feature_rollback_blocks_merchant_drift
+test_featured_top_apply_button_opens_confirmation
+test_featured_persistent_status_visible
+test_featured_assignment_check_independent_of_hero_category
+test_no_real_network_in_tests
+
+All commented-JSON/parser Golden Path tests must remain green.
+
+======================================================================
+15. LIVE VALIDATION DURING IMPLEMENTATION
+======================================================================
+
+READ-ONLY live Cabin Tidy smoke is allowed:
+- current theme
+- current raw index
+- current 4/4 plan
+- feature preview
+- isolated diff validation
+
+DO NOT execute actual themeFilesUpsert during Codex work.
+
+Report:
+ISOLATED DIFF SAFE = YES/NO
+EXPECTED CHANGED SECTION = ss_featured_products_e193a01e
+UNEXPECTED PATHS = [...]
+SHOPIFY WRITE COUNT = 0
+
+======================================================================
+16. PROTECTED FILES
+======================================================================
+
+Do not reset/stage/commit:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env / credentials/tokens
+- existing theme backups
+- user-generated assets
+- .phase*
+
+Note:
+data/shopsource.sqlite3 may legitimately change from local planning/cache state.
+Do not restore it automatically and do not commit it.
+
+======================================================================
+17. QUALITY GATES
+======================================================================
+
+Run:
+
+python -m compileall -q src tests
+
+Run new isolated-feature tests.
+
+python -m pytest -q tests/test_homepage_featured_products.py
+python -m pytest -q tests/test_homepage_golden_path.py
+python -m pytest -q
+
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+No live mutation.
+No paid image generation.
+
+======================================================================
+18. COMMIT / PUSH
+======================================================================
+
+After all tests pass:
+
+git status
+
+Suggested commit:
+git commit -m "Add isolated featured product theme apply"
+
+git push origin main
+
+Confirm:
+git rev-list --left-right --count main...origin/main
+=> 0 0
+
+======================================================================
+19. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] isolated feature apply architecture
+[5] semantic diff guard
+[6] comment/raw safety
+[7] backup design
+[8] mutation scope
+[9] read-after-write verification
+[10] rollback
+[11] UI confirmation/status
+[12] feature-specific assignment checklist
+[13] tests/pass counts
+[14] protected files
+[15] live Cabin Tidy READ-ONLY isolated-diff smoke
+[16] unresolved risks
+[17] commit/push
+[18] exact next user click
+
+Final:
+
+FEATURED ISOLATED APPLY READY = YES/NO
+ISOLATED DIFF GUARD = PASS/FAIL
+COMMENTED JSON SAFETY = PASS/FAIL
+LIVE CABIN TIDY ISOLATED DIFF = PASS/FAIL/NOT_TESTED_NETWORK
+SHOPIFY WRITE COUNT DURING DEVELOPMENT = 0/<N>
+SAFE FOR USER-CONFIRMED FEATURED APPLY = YES/NO
