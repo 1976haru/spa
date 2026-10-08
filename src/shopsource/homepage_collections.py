@@ -19,10 +19,11 @@ from typing import Any, Callable
 from .db import connect, init_db
 from .paths import EXPORT_DIR
 from .shopify_collections import ShopifyGraphQLClient, get_connection, get_shopify_token
+from .shopify_theme_json import ShopifyJsonDocumentError, parse_shopify_json_document
 
 THEME_READ_SCOPE = "read_themes"
 THEMES_QUERY = "query ShopSourceThemes { themes(first: 50) { nodes { id name role } } }"
-THEME_FILES_QUERY = "query ShopSourceThemeFiles($id: ID!) { theme(id: $id) { id name role files(first: 250, filenames: [\"templates/index.json\", \"sections/*\", \"config/settings_schema.json\", \"config/settings_data.json\"]) { nodes { filename body { __typename ... on OnlineStoreThemeFileBodyText { content } ... on OnlineStoreThemeFileBodyBase64 { contentBase64 } } } } } }"
+THEME_FILES_QUERY = "query ShopSourceThemeFiles($id: ID!) { theme(id: $id) { id name role files(first: 250, filenames: [\"templates/index.json\", \"templates/index.*.json\", \"templates/index.liquid\", \"sections/*\", \"config/settings_schema.json\", \"config/settings_data.json\"]) { nodes { filename body { __typename ... on OnlineStoreThemeFileBodyText { content } ... on OnlineStoreThemeFileBodyBase64 { contentBase64 } } } userErrors { code filename } } } }"
 
 
 def _now() -> str:
@@ -148,23 +149,42 @@ class ShopifyThemeReader:
             return {"status": "NO_PUBLISHED_THEME", "store_id": store_id, "scopes": scopes, "theme": None,
                     "template": None, "schemas": [], "manual_patch_mode": True}
         payload = client.execute(THEME_FILES_QUERY, {"id": theme["id"]}).get("theme") or {}
-        files = {row["filename"]: _body_content(row.get("body") or {}) for row in payload.get("files", {}).get("nodes", [])}
-        files = {name: value for name, value in files.items() if value is not None}
-        template_name = "templates/index.json" if "templates/index.json" in files else next(
-            (name for name in files if name.startswith("templates/index.") and name.endswith(".json")), None)
+        file_connection = payload.get("files") or {}
+        rows = file_connection.get("nodes", [])
+        raw_files = {row["filename"]: _body_content(row.get("body") or {}) for row in rows if row.get("filename")}
+        files = {name: value for name, value in raw_files.items() if value is not None}
+        template_name = "templates/index.json" if "templates/index.json" in raw_files else next(
+            (name for name in raw_files if name.startswith("templates/index.") and name.endswith(".json")), None)
         template = None
+        template_document = None
+        template_status = "TEMPLATE_BODY_MISSING"
+        template_error = {"code": "TEMPLATE_BODY_MISSING", "message": "No readable templates/index*.json file was returned."}
         if template_name:
-            try:
-                template = json.loads(files[template_name])
-            except json.JSONDecodeError:
-                template = None
+            raw = raw_files.get(template_name)
+            if raw is None:
+                template_error = {"code": "TEMPLATE_BODY_MISSING", "message": "The homepage JSON template exists but its body was not readable."}
+            else:
+                try:
+                    document = parse_shopify_json_document(raw)
+                    if not isinstance(document.parsed, dict):
+                        raise ShopifyJsonDocumentError("INVALID_THEME_JSON", "Homepage JSON template root must be an object.")
+                    template = document.parsed
+                    template_status = "READY"
+                    template_error = None
+                    template_document = {"filename": template_name, **document.metadata(include_affixes=False)}
+                except ShopifyJsonDocumentError as exc:
+                    template_status = exc.code
+                    template_error = exc.as_dict()
         sections = {name: raw for name, raw in files.items() if name.startswith("sections/") and name.endswith(".liquid")}
         schemas = detect_featured_collection_schemas(sections)
         return {"status": "CONNECTED", "store_id": store_id, "shop_domain": config["shop_domain"],
                 "api_version": config["api_version"], "scopes": scopes,
                 "theme": {"id": theme["id"], "name": theme["name"], "role": theme["role"]},
-                "template_filename": template_name, "template": template, "schemas": schemas,
-                "theme_files": files,
+                "template_filename": template_name, "template": template,
+                "template_status": template_status, "template_error": template_error,
+                "template_document": template_document,
+                "theme_files": files, "theme_file_user_errors": file_connection.get("userErrors", []),
+                "schemas": schemas,
                 "manual_patch_mode": True, "warning": None if schemas else "No compatible featured-collection section schema was found."}
 
 

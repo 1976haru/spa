@@ -16,6 +16,7 @@ from .db import connect, init_db
 from .paths import EXPORT_DIR
 from .shopify_products import _install_schema as install_product_schema
 from .shopify_collections import ShopifyGraphQLClient, get_connection, get_shopify_token
+from .shopify_theme_json import ShopifyJsonDocumentError, parse_shopify_json_document, render_shopify_json_document
 
 MODES = {"NEW_ARRIVALS", "BALANCED_CATEGORIES", "MANUAL_SELECTION"}
 ELIGIBLE_DECISIONS = {"PRIMARY", "RESERVE_A", "RESERVE_B", "PRODUCTION_CANDIDATE"}
@@ -408,6 +409,10 @@ class FeaturedProductAssignmentService:
         return {"status": status, "ready": status == "ASSIGNMENT_READY", "checks": checks}
 
     def build_theme_preview(self, plan: dict, snapshot: dict) -> dict:
+        template_status = snapshot.get("template_status", "READY" if isinstance(snapshot.get("template"), dict) else "TEMPLATE_BODY_MISSING")
+        if template_status != "READY":
+            return {"status": "BLOCKED", "reason": (snapshot.get("template_error") or {}).get("message") or template_status,
+                    "template_status": template_status, "write_performed": False}
         capability = discover_featured_product_schema(snapshot.get("theme_files") or {})
         if capability["status"] != "READY":
             return {"status": "MANUAL_ACTION_REQUIRED", "reason": capability["reason"], "instructions": [
@@ -415,6 +420,17 @@ class FeaturedProductAssignmentService:
                 "Use the selected products in the saved ShopSource plan; do not activate DRAFT products automatically."], "write_performed": False}
         current = snapshot.get("template")
         if not isinstance(current, dict): return {"status": "BLOCKED", "reason": "Homepage JSON template unavailable", "write_performed": False}
+        filename = snapshot.get("template_filename")
+        raw = (snapshot.get("theme_files") or {}).get(filename) if filename else None
+        document = None
+        if raw is not None:
+            try:
+                document = parse_shopify_json_document(raw)
+            except ShopifyJsonDocumentError as exc:
+                return {"status": "BLOCKED", "reason": exc.message, "template_status": exc.code, "write_performed": False}
+            if not isinstance(document.parsed, dict):
+                return {"status": "BLOCKED", "reason": "Homepage source document root is not an object.",
+                        "template_status": "INVALID_THEME_JSON", "write_performed": False}
         proposed = json.loads(json.dumps(current)); sections = proposed.setdefault("sections", {}); order = proposed.setdefault("order", [])
         section_id = "ss_featured_products_" + hashlib.sha1(plan["store_id"].encode()).hexdigest()[:8]
         settings = {}
@@ -429,11 +445,20 @@ class FeaturedProductAssignmentService:
         sections[section_id] = desired
         if section_id not in order:
             footer = next((i for i, x in enumerate(order) if "footer" in str(x).casefold()), len(order)); order.insert(footer, section_id)
-        preview_hash = _hash({"source": plan["source_hash"], "theme": snapshot.get("theme"), "current": current, "proposed": proposed})
+        preview_hash = _hash({"source": plan["source_hash"], "theme": snapshot.get("theme"), "current": current, "proposed": proposed,
+                              "raw_hash": document.raw_hash if document else None,
+                              "semantic_hash": document.semantic_hash if document else _hash(current)})
         with connect(self.db) as con: con.execute("UPDATE homepage_featured_product_plans SET preview_hash=?,updated_at=? WHERE plan_id=?", (preview_hash, _now(), plan["plan_id"]))
+        source_document = ({"filename": filename, "before_raw_hash": document.raw_hash,
+                           "before_semantic_hash": document.semantic_hash,
+                           "proposed_raw_hash": hashlib.sha256(render_shopify_json_document(document, proposed).encode("utf-8")).hexdigest(),
+                           "had_leading_comment": document.had_leading_comment,
+                           "prefix_hash": hashlib.sha256(document.prefix.encode("utf-8")).hexdigest(),
+                           "suffix_hash": hashlib.sha256(document.suffix.encode("utf-8")).hexdigest()} if document else None)
         return {"status": "PREVIEW", "plan_id": plan["plan_id"], "capability": capability, "current": current,
                 "proposed": proposed, "section_id": section_id, "action": "NO_CHANGE" if before == desired else "UPDATE" if before else "CREATE",
-                "preview_hash": preview_hash, "write_performed": False, "unrelated_sections_preserved": True}
+                "preview_hash": preview_hash, "source_document": source_document,
+                "write_performed": False, "unrelated_sections_preserved": True}
 
     def verify_remote(self, plan_id: str, *, preview_hash: str, remote_section: dict | None) -> dict:
         plan = self.get_plan(plan_id)

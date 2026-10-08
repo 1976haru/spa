@@ -76,14 +76,15 @@ class FakeReadOnlyShopifyGraphQL:
         if "themes(first" in query:
             return {"themes": {"nodes": [{"id": "gid://shopify/OnlineStoreTheme/1", "name": "Fixture", "role": "MAIN"}]}}
         if "theme(id:" in query:
-            files = [{"filename": "templates/index.json", "body": {"content": json.dumps({
+            template_raw = "/* Shopify header comment: Cabin Tidy homepage template */\n" + json.dumps({
                 "sections": {"header": {"type": "header", "settings": {}},
                              "merchant": {"type": "rich-text", "settings": {"text": "Preserve"}},
                              "footer": {"type": "footer", "settings": {}}},
-                "order": ["header", "merchant", "footer"]})}}]
+                "order": ["header", "merchant", "footer"]})
+            files = [{"filename": "templates/index.json", "body": {"content": template_raw}}]
             files.extend({"filename": name, "body": {"content": raw}} for name, raw in _theme_files().items())
             return {"theme": {"id": "gid://shopify/OnlineStoreTheme/1", "name": "Fixture", "role": "MAIN",
-                              "files": {"nodes": files}}}
+                              "files": {"nodes": files, "userErrors": []}}}
         raise AssertionError(f"Unexpected read query: {query}")
 
 
@@ -138,6 +139,9 @@ def test_homepage_golden_path_fresh_session_to_assignment_review(golden_service)
     design = service.resolve("001", "DESIGN", state={})
     assert design.error is None and design.homepage_plan and design.collection_plan
     assert design.statuses["theme"] == "CONNECTED"
+    assert design.theme_snapshot["template_status"] == "READY"
+    assert design.theme_snapshot["template_document"]["had_leading_comment"] is True
+    assert design.theme_snapshot["template_document"]["raw_hash"]
     featured = design.featured_product_plan
     assert featured["status"] == "READY" and len(featured["items"]) == 4
     assert all("replacement" not in item["title"].casefold() for item in featured["items"])
@@ -149,6 +153,9 @@ def test_homepage_golden_path_fresh_session_to_assignment_review(golden_service)
              "snapshot_store_id": "001", "snapshot_read_at": "2026-10-08T00:00:00+00:00"}
     featured_preview = service.resolve("001", "FEATURED_PREVIEW", state=state)
     assert featured_preview.error is None
+    assert featured_preview.canonical_preview["status"] == "PREVIEW"
+    assert featured_preview.canonical_preview["capabilities"]["featured_products"] == "AUTO"
+    assert featured_preview.canonical_preview["capabilities"]["categories"] == "AUTO"
     fp = featured_preview.canonical_preview["featured_products_preview"]
     assert fp["status"] == "PREVIEW"
     product_section = featured_preview.canonical_preview["proposed"]["sections"][fp["section_id"]]
@@ -163,7 +170,7 @@ def test_homepage_golden_path_fresh_session_to_assignment_review(golden_service)
     assert FakeReadOnlyShopifyGraphQL.writes == 0
     assert all("mutation" not in query.casefold() for query in FakeReadOnlyShopifyGraphQL.calls)
     with connect(db) as con:
-        assert con.execute("SELECT COUNT(*) FROM store_homepage_previews WHERE store_id='001'").fetchone()[0] >= 3
+        assert con.execute("SELECT COUNT(*) FROM store_homepage_previews WHERE store_id='001'").fetchone()[0] >= 2
 
 
 def test_homepage_golden_path_no_cached_snapshot_auto_reads_theme(golden_service):
@@ -173,6 +180,28 @@ def test_homepage_golden_path_no_cached_snapshot_auto_reads_theme(golden_service
     assert result.error is None and result.theme_snapshot["status"] == "CONNECTED"
     assert any("themes(first" in query for query in FakeReadOnlyShopifyGraphQL.calls)
     assert result.canonical_preview["featured_products_preview"]["status"] == "PREVIEW"
+
+
+def test_featured_preview_is_independent_of_manual_category_capability(golden_service, monkeypatch):
+    import sys
+    fixtures = sys.modules[__name__]
+    service, _ = golden_service
+    original = fixtures._theme_files
+    monkeypatch.setattr(fixtures, "_theme_files", lambda: {
+        name: raw for name, raw in original().items() if name != "sections/collection-list.liquid"
+    })
+    featured = service.resolve("001", "FEATURED_PREVIEW", state={}, force_theme=True)
+    assert featured.error is None
+    assert featured.canonical_preview["status"] == "PREVIEW"
+    assert featured.canonical_preview["capabilities"]["featured_products"] == "AUTO"
+    assert featured.canonical_preview["capabilities"]["categories"] == "MANUAL"
+    assert featured.canonical_preview["manual_reasons"]
+    full = service.resolve("001", "FULL_PREVIEW", state={}, force_theme=True)
+    assert full.canonical_preview["status"] == "PARTIAL_PREVIEW"
+    assert full.canonical_preview["capabilities"]["categories"] == "MANUAL"
+    assert full.canonical_preview["proposed"]["sections"]["merchant"] == full.canonical_preview["current"]["sections"]["merchant"]
+    assert full.canonical_preview["featured_products_preview"]["status"] == "PREVIEW"
+    assert FakeReadOnlyShopifyGraphQL.writes == 0
 
 
 def test_homepage_golden_path_read_products_scope_failure_is_actionable(golden_service):

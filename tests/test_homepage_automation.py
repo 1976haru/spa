@@ -60,7 +60,8 @@ def snapshot():
                             "footer": {"type": "footer", "settings": {}}}, "order": ["header", "merchant", "footer"]}
     return {"status": "CONNECTED", "theme": {"id": "theme-1", "name": "Example", "role": "MAIN"},
             "scopes": ["read_themes", "write_themes"], "template_filename": "templates/index.json", "template": template,
-            "theme_files": {"sections/image-banner.liquid": hero, "sections/collection-list.liquid": category}}
+            "theme_files": {"templates/index.json": "/* Shopify header comment */\n" + json.dumps(template),
+                            "sections/image-banner.liquid": hero, "sections/collection-list.liquid": category}}
 
 
 def make_plan(db, brand, collections):
@@ -216,14 +217,19 @@ def test_homepage_apply_manual_for_review_required_mapping(db, brand, collection
 
 
 class FakeThemeClient:
-    def __init__(self, current): self.current = current; self.writes = 0
+    def __init__(self, current):
+        self.current = current
+        self.current_raw = "/* Shopify header comment */\n" + json.dumps(current)
+        self.writes = 0
     def execute(self, query, variables=None):
         if "Scopes" in query: return {"currentAppInstallation": {"accessScopes": [{"handle": "read_themes"}, {"handle": "write_themes"}]}}
         if "themeFilesUpsert" in query:
             self.writes += 1
-            self.current = json.loads(variables["files"][0]["body"]["value"])
+            self.current_raw = variables["files"][0]["body"]["value"]
+            from shopsource.shopify_theme_json import parse_shopify_json_document
+            self.current = parse_shopify_json_document(self.current_raw).parsed
             return {"themeFilesUpsert": {"userErrors": []}}
-        return {"theme": {"id": "theme-1", "role": "MAIN", "files": {"nodes": [{"filename": "templates/index.json", "body": {"content": json.dumps(self.current)}}]}}}
+        return {"theme": {"id": "theme-1", "role": "MAIN", "files": {"nodes": [{"filename": "templates/index.json", "body": {"content": self.current_raw}}], "userErrors": []}}}
 
 
 def test_homepage_backup_before_write(monkeypatch, tmp_path, db, brand, collections, snapshot):
@@ -236,9 +242,15 @@ def test_homepage_backup_before_write(monkeypatch, tmp_path, db, brand, collecti
     client = FakeThemeClient(snapshot["template"])
     service = HomepageAutomationService(db=db, export_dir=tmp_path)
     result = service.apply(preview["preview_id"], confirmed=True, approved_assets=True, client=client)
-    assert result["status"] == "VERIFIED" and client.writes == 1
+    assert result["status"] == "VERIFIED" and client.writes == 1, result
     backup = Path(tmp_path / "theme_backups" / "demo")
-    assert list(backup.rglob("before.json"))
+    before_raw_path = next(backup.rglob("before.raw.json"))
+    proposed_raw_path = next(backup.rglob("proposed.raw.json"))
+    assert before_raw_path.read_text(encoding="utf-8").startswith("/* Shopify header comment */\n")
+    assert proposed_raw_path.read_text(encoding="utf-8").startswith("/* Shopify header comment */\n")
+    assert list(backup.rglob("before.parsed.json")) and list(backup.rglob("proposed.parsed.json"))
+    assert client.current_raw.startswith("/* Shopify header comment */\n")
+    assert service.verify(preview["preview_id"], client=client)["status"] == "VERIFIED"
 
 
 def test_homepage_verify_after_write(monkeypatch, tmp_path, db, brand, collections, snapshot):
@@ -253,8 +265,45 @@ def test_homepage_rollback(monkeypatch, tmp_path, db, brand, collections, snapsh
     preview = build_homepage_preview(plan, snapshot, db=db); client = FakeThemeClient(snapshot["template"])
     service = HomepageAutomationService(db=db, export_dir=tmp_path)
     result = service.apply(preview["preview_id"], confirmed=True, approved_assets=True, client=client)
+    backup_folder = Path(tmp_path / "theme_backups" / "demo")
+    before_raw = next(backup_folder.rglob("before.raw.json")).read_text(encoding="utf-8")
     rollback = service.rollback(result["backup_id"], confirmed=True, client=client)
+    assert rollback["status"] == "VERIFIED" and rollback["rollback_mode"] == "EXACT_RAW_ROLLBACK"
+    assert client.current_raw == before_raw
+
+
+def test_legacy_rollback_still_supported(monkeypatch, tmp_path, db, brand, collections, snapshot):
+    monkeypatch.setattr(hp, "get_connection", lambda *a, **k: {"shop_domain": "test.myshopify.com", "api_version": "2026-07"})
+    monkeypatch.setattr(hp, "get_shopify_token", lambda *a, **k: ("fake-token", None))
+    plan = make_plan(db, brand, collections)
+    plan["hero"].update(image_url="https://cdn.example/hero.png", image_asset_id="asset", asset_approved=True,
+        theme_image_ref="shopify://shop_images/hero.png", theme_image_ref_confirmed=True)
+    preview = build_homepage_preview(plan, snapshot, db=db)
+    client = FakeThemeClient(snapshot["template"])
+    service = HomepageAutomationService(db=db, export_dir=tmp_path)
+    applied = service.apply(preview["preview_id"], confirmed=True, approved_assets=True, client=client)
+    backup_dir = next((tmp_path / "theme_backups" / "demo").iterdir())
+    (backup_dir / "before.raw.json").unlink()
+    (backup_dir / "proposed.raw.json").unlink()
+    rollback = service.rollback(applied["backup_id"], confirmed=True, client=client)
     assert rollback["status"] == "VERIFIED"
+    assert rollback["rollback_mode"] == "LEGACY_PARSED_ROLLBACK"
+
+
+def test_apply_drift_check_uses_raw_and_semantic_hash(monkeypatch, tmp_path, db, brand, collections, snapshot):
+    monkeypatch.setattr(hp, "get_connection", lambda *a, **k: {"shop_domain": "test.myshopify.com", "api_version": "2026-07"})
+    monkeypatch.setattr(hp, "get_shopify_token", lambda *a, **k: ("fake-token", None))
+    plan = make_plan(db, brand, collections)
+    plan["hero"].update(image_url="https://cdn.example/hero.png", asset_approved=True,
+        theme_image_ref="shopify://shop_images/hero.png", theme_image_ref_confirmed=True)
+    preview = build_homepage_preview(plan, snapshot, db=db)
+    client = FakeThemeClient(snapshot["template"])
+    client.current_raw = "/* Shopify header comment changed without semantic JSON change */\n" + json.dumps(snapshot["template"])
+    result = HomepageAutomationService(db=db, export_dir=tmp_path).apply(
+        preview["preview_id"], confirmed=True, approved_assets=True, client=client)
+    assert result["status"] == "CONFLICT"
+    assert "raw or semantic" in result["reason"]
+    assert client.writes == 0
 
 
 def test_repeat_apply_no_change_after_verified_write(monkeypatch, tmp_path, db, brand, collections, snapshot):
@@ -266,7 +315,8 @@ def test_repeat_apply_no_change_after_verified_write(monkeypatch, tmp_path, db, 
     client = FakeThemeClient(snapshot["template"]); service = HomepageAutomationService(db=db, export_dir=tmp_path)
     first = build_homepage_preview(plan, snapshot, db=db)
     assert service.apply(first["preview_id"], confirmed=True, approved_assets=True, client=client)["status"] == "VERIFIED"
-    next_snapshot = {**snapshot, "template": client.current}
+    next_snapshot = {**snapshot, "template": client.current,
+                     "theme_files": {**snapshot["theme_files"], "templates/index.json": client.current_raw}}
     second = build_homepage_preview(plan, next_snapshot, db=db)
     assert all(a["action"] == "NO_CHANGE" for a in second["actions"] if a.get("kind") in {"HERO", "CATEGORY"})
     writes = client.writes

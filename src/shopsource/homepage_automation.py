@@ -10,6 +10,7 @@ import hashlib
 import json
 import re
 import secrets
+import base64
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,13 @@ from typing import Any
 from .db import connect, init_db
 from .paths import EXPORT_DIR
 from .shopify_collections import ShopifyGraphQLClient, get_connection, get_shopify_token
+from .shopify_theme_json import (
+    ShopifyJsonDocument,
+    ShopifyJsonDocumentError,
+    parse_shopify_json_document,
+    render_shopify_json_document,
+    shopify_json_semantic_hash,
+)
 
 UPSERT_THEME_FILES = "mutation HomepageFiles($themeId: ID!, $files: [OnlineStoreThemeFilesUpsertFileInput!]!) { themeFilesUpsert(themeId: $themeId, files: $files) { upsertedThemeFiles { filename } userErrors { field message } } }"
 
@@ -31,6 +39,60 @@ def _json(value):
 
 def _hash(value):
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
+
+
+def _snapshot_document(snapshot: dict) -> ShopifyJsonDocument | None:
+    filename = snapshot.get("template_filename")
+    raw = (snapshot.get("theme_files") or {}).get(filename) if filename else None
+    if raw is None:
+        return None
+    return parse_shopify_json_document(raw)
+
+
+def _document_preview_metadata(snapshot: dict, proposed: dict | None = None) -> dict:
+    filename = snapshot.get("template_filename")
+    try:
+        document = _snapshot_document(snapshot)
+    except ShopifyJsonDocumentError as exc:
+        return {"filename": filename, "status": exc.code, "error": exc.as_dict()}
+    if document is None:
+        return {"filename": filename, "status": snapshot.get("template_status", "TEMPLATE_BODY_MISSING")}
+    return {
+        "filename": filename,
+        "status": "READY",
+        "before_raw_hash": document.raw_hash,
+        "before_semantic_hash": document.semantic_hash,
+        "proposed_raw_hash": _raw_hash(render_shopify_json_document(document, proposed)) if proposed is not None else None,
+        "had_leading_comment": document.had_leading_comment,
+        "prefix_hash": _raw_hash(document.prefix),
+        "suffix_hash": _raw_hash(document.suffix),
+    }
+
+
+def _raw_hash(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _remote_theme_document(theme: dict, filename: str) -> tuple[str, ShopifyJsonDocument]:
+    rows = ((theme.get("files") or {}).get("nodes") or [])
+    row = next((item for item in rows if item.get("filename") == filename), None)
+    if not row:
+        raise ShopifyJsonDocumentError("TEMPLATE_BODY_MISSING", f"Theme file {filename} was not returned.")
+    body = row.get("body") or {}
+    raw = body.get("content")
+    if raw is None and body.get("contentBase64"):
+        try:
+            raw = base64.b64decode(body["contentBase64"], validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            raw = None
+    if raw is None:
+        raise ShopifyJsonDocumentError("TEMPLATE_BODY_MISSING", f"Theme file {filename} body is not readable text.")
+    return raw, parse_shopify_json_document(raw)
+
+
+def _read_exact_text(path: Path) -> str:
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        return stream.read()
 
 
 def normalize_text_value(value: Any, *, _depth: int = 0, _seen: set[int] | None = None) -> str:
@@ -317,8 +379,10 @@ def build_homepage_preview(plan: dict, snapshot: dict, *, db=None) -> dict:
     warnings = list(plan.get("warnings", []))
     actions, proposed = [], json.loads(json.dumps(current)) if isinstance(current, dict) else None
     theme = snapshot.get("theme") or {}
-    if proposed is None or not snapshot.get("template_filename"):
-        actions.append({"action": "MANUAL_ACTION_REQUIRED", "reason": "Homepage JSON template unavailable"})
+    template_status = snapshot.get("template_status", "READY" if isinstance(current, dict) else "TEMPLATE_BODY_MISSING")
+    if proposed is None or not snapshot.get("template_filename") or template_status != "READY":
+        reason = (snapshot.get("template_error") or {}).get("message") or "Homepage JSON template unavailable"
+        actions.append({"action": "MANUAL_ACTION_REQUIRED", "reason": reason, "template_status": template_status})
     else:
         sections = proposed.setdefault("sections", {})
         order = proposed.setdefault("order", [])
@@ -466,9 +530,18 @@ def build_homepage_preview(plan: dict, snapshot: dict, *, db=None) -> dict:
         else:
             actions.append({"action": "MANUAL_ACTION_REQUIRED", "kind": "CATEGORY", "reason": "Collection-list or category section schema not found"})
     status = "CONFLICT" if any(x["action"] == "CONFLICT" for x in actions) else "MANUAL_ACTION_REQUIRED" if any(x["action"] == "MANUAL_ACTION_REQUIRED" for x in actions) else "PREVIEW"
+    source_document = _document_preview_metadata(snapshot, proposed)
+    capabilities = {
+        "hero": "AUTO" if discovery.get("hero") else "MANUAL",
+        "categories": "AUTO" if discovery.get("category") else "MANUAL",
+        "featured_products": "NOT_EVALUATED",
+        "theme_template": ("COMMENTED_JSON_SUPPORTED" if source_document.get("had_leading_comment") else "JSON_SUPPORTED")
+            if source_document.get("status") == "READY" else source_document.get("status", "BLOCKED"),
+    }
     preview_payload = {"status": status, "plan_id": plan["plan_id"], "store_id": plan["store_id"], "theme": theme,
         "shop_domain": snapshot.get("shop_domain"), "api_version": snapshot.get("api_version"),
         "template_filename": snapshot.get("template_filename"), "current": current, "proposed": proposed,
+        "source_document": source_document, "capabilities": capabilities,
         "actions": actions, "warnings": warnings, "discovery": {key: discovery[key]["status"] if discovery[key] else discovery[key+"_status"] for key in ("hero", "category")},
         "asset_mapping": {"hero": {"asset_id": plan["hero"].get("image_asset_id"), "url": plan["hero"].get("image_url"),
                                     "theme_image_ref": plan["hero"].get("theme_image_ref"),
@@ -492,17 +565,15 @@ def compose_homepage_preview(plan: dict, snapshot: dict, collection_plan: dict, 
     """Build the one canonical homepage proposal, including featured products when supplied."""
     from .homepage_collections import build_homepage_plan as build_featured_plan
     featured = build_featured_plan(snapshot, collection_plan, collection_handles=collection_handles or {}, db=db)
-    if featured.get("status") == "CONFLICT":
-        preview = build_homepage_preview(plan, snapshot, db=db)
-        preview["status"] = "CONFLICT"
-        preview["actions"].extend({"action": "CONFLICT", "kind": "FEATURED_COLLECTION", **item} for item in featured.get("operations", []) if item.get("action") == "CONFLICT")
-        with connect(db) as con:
-            con.execute("UPDATE store_homepage_previews SET status='CONFLICT',preview_json=? WHERE preview_id=?", (_json(preview), preview["preview_id"]))
-        return preview
-    composed_snapshot = {**snapshot, "template": featured.get("proposed") or snapshot.get("template")}
+    featured_conflict = featured.get("status") == "CONFLICT"
+    # Do not apply a partially conflicting featured-collection proposal, but keep
+    # independent homepage and featured-product previews visible for review.
+    collection_template = snapshot.get("template") if featured_conflict else (featured.get("proposed") or snapshot.get("template"))
+    composed_snapshot = {**snapshot, "template": collection_template}
     preview = build_homepage_preview(plan, composed_snapshot, db=db)
     preview["current"] = snapshot.get("template")
-    preview["proposed"] = composed_snapshot.get("template")
+    # Keep build_homepage_preview's hero/category proposal instead of replacing it
+    # with the pre-composition collection template.
     preview["featured_collection_actions"] = featured.get("operations", [])
     preview["actions"] = list(featured.get("operations", [])) + preview["actions"]
     if featured.get("status") == "MANUAL_PATCH_MODE":
@@ -519,6 +590,7 @@ def compose_homepage_preview(plan: dict, snapshot: dict, collection_plan: dict, 
         preview["featured_products_plan_id"] = featured_products_plan.get("plan_id")
         preview["featured_products_source_hash"] = featured_products_plan.get("source_hash")
         preview["featured_products_preview"] = feature_preview
+        preview["capabilities"]["featured_products"] = "AUTO" if feature_preview.get("status") == "PREVIEW" else "MANUAL"
         if feature_preview.get("status") == "PREVIEW":
             preview["proposed"] = feature_preview["proposed"]
             preview["actions"].append({"action": "FEATURED_PRODUCTS_PREVIEW", "kind": "FEATURED_PRODUCTS",
@@ -529,9 +601,22 @@ def compose_homepage_preview(plan: dict, snapshot: dict, collection_plan: dict, 
         preview["source_hash"] = _hash({"base": preview["source_hash"], "featured_products": feature_preview,
                                         "featured_products_plan": featured_products_plan.get("source_hash")})
         preview["diff"] = {"before_hash": _hash(preview["current"]), "proposed_hash": _hash(preview["proposed"])}
-    preview["status"] = ("CONFLICT" if any(a.get("action") == "CONFLICT" for a in preview["actions"])
-                         else "MANUAL_ACTION_REQUIRED" if any(a.get("action") == "MANUAL_ACTION_REQUIRED" for a in preview["actions"])
-                         else preview["status"])
+        preview["source_document"] = _document_preview_metadata(snapshot, preview.get("proposed"))
+        if preview["status"] == "MANUAL_ACTION_REQUIRED" and preview["capabilities"]["featured_products"] == "AUTO" and "categories" in preview["capabilities"]:
+            # A supported featured section remains useful even if unrelated homepage
+            # category/hero automation needs manual review; it is never apply-ready.
+            preview["status"] = "PARTIAL_PREVIEW"
+            preview["manual_reasons"] = ["추천 상품 자동 미리보기 가능 · 카테고리 바로가기는 수동 확인 필요"]
+        if preview.get("capabilities", {}).get("featured_products") == "AUTO" and preview.get("capabilities", {}).get("categories") == "MANUAL":
+            reason = "Featured products can be previewed automatically; category shortcuts require manual review."
+            preview.setdefault("manual_reasons", []).append(reason)
+            preview["actions"].append({"action": "MANUAL_ACTION_REQUIRED", "kind": "CATEGORY", "reason": reason})
+        preview["capabilities"]["theme_template"] = ("COMMENTED_JSON_SUPPORTED" if preview["source_document"].get("had_leading_comment") else "JSON_SUPPORTED") if preview["source_document"].get("status") == "READY" else preview["source_document"].get("status", "BLOCKED")
+    if any(a.get("action") == "CONFLICT" for a in preview["actions"]):
+        preview["status"] = "CONFLICT"
+    elif any(a.get("action") == "MANUAL_ACTION_REQUIRED" for a in preview["actions"]):
+        preview["status"] = ("PARTIAL_PREVIEW" if preview.get("capabilities", {}).get("featured_products") == "AUTO"
+                             else "MANUAL_ACTION_REQUIRED")
     with connect(db) as con:
         con.execute("UPDATE store_homepage_previews SET source_hash=?,status=?,preview_json=? WHERE preview_id=?",
                     (preview["source_hash"], preview["status"], _json(preview), preview["preview_id"]))
@@ -587,8 +672,6 @@ class HomepageAutomationService:
             return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Hero and category section mappings must both be high-confidence"}
         if not preview.get("theme_write_capability"):
             return {"status": "MANUAL_ACTION_REQUIRED", "reason": "write_themes capability missing"}
-        if preview.get("diff", {}).get("before_hash") == preview.get("diff", {}).get("proposed_hash"):
-            return {"status": "VERIFIED", "no_change": True, "theme_id": row["theme_id"]}
         config = get_connection(row["store_id"], db=self.db); token, _ = get_shopify_token(row["store_id"],db=self.db)
         if not config or not token:
             return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Shopify connection or credential missing"}
@@ -602,28 +685,51 @@ class HomepageAutomationService:
         scopes = {scope.get("handle") for scope in (scopes_result.get("currentAppInstallation") or {}).get("accessScopes", [])}
         if "read_themes" not in scopes or "write_themes" not in scopes:
             return {"status": "MANUAL_ACTION_REQUIRED", "reason": "read_themes and write_themes are required"}
-        file_query = "query HomepageCurrentTheme($id: ID!, $filenames: [String!]!) { theme(id: $id) { id role files(first: 1, filenames: $filenames) { nodes { filename body { __typename ... on OnlineStoreThemeFileBodyText { content } } } } } }"
+        file_query = "query HomepageCurrentTheme($id: ID!, $filenames: [String!]!) { theme(id: $id) { id role files(first: 1, filenames: $filenames) { nodes { filename body { __typename ... on OnlineStoreThemeFileBodyText { content } ... on OnlineStoreThemeFileBodyBase64 { contentBase64 } } } userErrors { code filename } } } }"
         fresh = client.execute(file_query, {"id": row["theme_id"], "filenames": [preview["template_filename"]]}).get("theme") or {}
-        nodes = (fresh.get("files") or {}).get("nodes", [])
-        try: observed = json.loads(nodes[0]["body"]["content"]) if nodes else None
-        except (IndexError, KeyError, TypeError, json.JSONDecodeError): observed = None
-        if fresh.get("id") != row["theme_id"] or fresh.get("role") != "MAIN" or _hash(observed) != preview["diff"]["before_hash"]:
-            return {"status": "CONFLICT", "reason": "Remote homepage drift detected since preview"}
+        try:
+            observed_raw, observed_document = _remote_theme_document(fresh, preview["template_filename"])
+        except ShopifyJsonDocumentError as exc:
+            return {"status": "CONFLICT", "reason": exc.message, "template_status": exc.code}
+        source_document = preview.get("source_document") or {}
+        if (fresh.get("id") != row["theme_id"] or fresh.get("role") != "MAIN"
+                or not isinstance(observed_document.parsed, dict)):
+            return {"status": "CONFLICT", "reason": "Remote theme identity or homepage template changed"}
+        if source_document.get("before_raw_hash"):
+            raw_matches = observed_document.raw_hash == source_document["before_raw_hash"]
+        else:
+            # Old previews lack raw hashes. They remain usable for clean legacy JSON,
+            # but cannot safely overwrite a commented source whose prefix was unseen.
+            raw_matches = not observed_document.had_leading_comment
+        expected_semantic_hash = source_document.get("before_semantic_hash") or preview["diff"].get("before_hash")
+        if not raw_matches or observed_document.semantic_hash != expected_semantic_hash:
+            return {"status": "CONFLICT", "reason": "Remote homepage raw or semantic content drifted since preview"}
+        if preview.get("diff", {}).get("before_hash") == preview.get("diff", {}).get("proposed_hash"):
+            return {"status": "VERIFIED", "no_change": True, "theme_id": row["theme_id"], "write_performed": False}
         if not isinstance(preview.get("proposed"), dict) or not preview.get("template_filename", "").startswith("templates/index"):
             return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Unsafe template path or empty proposal"}
+        proposed_raw = render_shopify_json_document(observed_document, preview["proposed"])
+        proposed_raw_hash = _raw_hash(proposed_raw)
+        if source_document.get("proposed_raw_hash") and source_document["proposed_raw_hash"] != proposed_raw_hash:
+            return {"status": "CONFLICT", "reason": "Rendered homepage proposal no longer matches its preview"}
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         folder = self.export_dir / "theme_backups" / _safe_store(row["store_id"]) / (stamp + "-homepage")
         folder.mkdir(parents=True, exist_ok=False)
-        (folder / "before.json").write_text(json.dumps(observed, ensure_ascii=False, indent=2), encoding="utf-8")
+        (folder / "before.raw.json").write_text(observed_raw, encoding="utf-8", newline="")
+        (folder / "proposed.raw.json").write_text(proposed_raw, encoding="utf-8", newline="")
+        (folder / "before.parsed.json").write_text(json.dumps(observed_document.parsed, ensure_ascii=False, indent=2), encoding="utf-8")
+        (folder / "proposed.parsed.json").write_text(json.dumps(preview["proposed"], ensure_ascii=False, indent=2), encoding="utf-8")
+        # Keep legacy parsed backup filenames for existing tools and tests.
+        (folder / "before.json").write_text(json.dumps(observed_document.parsed, ensure_ascii=False, indent=2), encoding="utf-8")
         (folder / "proposed.json").write_text(json.dumps(preview["proposed"], ensure_ascii=False, indent=2), encoding="utf-8")
         (folder / "diff.md").write_text("# Homepage patch\n\n" + "\n".join(f"- {x['action']}: {x.get('kind', '')}" for x in preview["actions"]) + "\n", encoding="utf-8")
         backup_id = "HMB_" + secrets.token_hex(8)
         with connect(self.db) as con:
             con.execute("INSERT INTO store_homepage_backups VALUES(?,?,?,?,?,?,?,?,?)", (backup_id, preview_id, row["store_id"], row["theme_id"],
-                        preview["template_filename"], str(folder), _json(observed), _json(preview["proposed"]), _now()))
+                        preview["template_filename"], str(folder), _json(observed_document.parsed), _json(preview["proposed"]), _now()))
         try:
             result = client.execute(UPSERT_THEME_FILES, {"themeId": row["theme_id"], "files": [{"filename": preview["template_filename"],
-                "body": {"type": "TEXT", "value": json.dumps(preview["proposed"], ensure_ascii=False)}}]}).get("themeFilesUpsert") or {}
+                "body": {"type": "TEXT", "value": proposed_raw}}]}).get("themeFilesUpsert") or {}
         except RuntimeError as exc:
             message = str(exc).casefold()
             if "access denied" in message or "write_themes" in message or "exemption" in message:
@@ -632,9 +738,16 @@ class HomepageAutomationService:
         if result.get("userErrors"):
             return {"status": "FAILED", "backup_id": backup_id, "errors": [{"field": e.get("field"), "message": e.get("message", "")[:180]} for e in result["userErrors"]]}
         verify = client.execute(file_query, {"id": row["theme_id"], "filenames": [preview["template_filename"]]}).get("theme") or {}
-        try: after = json.loads(verify["files"]["nodes"][0]["body"]["content"])
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError): after = None
-        verified = after == preview["proposed"]
+        try:
+            _, after_document = _remote_theme_document(verify, preview["template_filename"])
+            after = after_document.parsed
+        except ShopifyJsonDocumentError:
+            after_document, after = None, None
+        verified = bool(verify.get("id") == row["theme_id"] and verify.get("role") == "MAIN"
+                        and after == preview["proposed"] and after_document
+                        and after_document.prefix == observed_document.prefix
+                        and after_document.suffix == observed_document.suffix
+                        and after_document.raw_hash == proposed_raw_hash)
         if verified:
             with connect(self.db) as con:
                 for section_id, section in (after.get("sections") or {}).items():
@@ -642,7 +755,8 @@ class HomepageAutomationService:
                         con.execute("INSERT INTO store_homepage_managed_state VALUES(?,?,?,?,?) ON CONFLICT(store_id,theme_id,section_id) DO UPDATE SET section_json=excluded.section_json,updated_at=excluded.updated_at",
                                     (row["store_id"], row["theme_id"], section_id, _json(section), _now()))
         return {"status": "VERIFIED" if verified else "VERIFY_FAILED", "backup_id": backup_id,
-                "theme_id": row["theme_id"], "changed_file": preview["template_filename"]}
+                "theme_id": row["theme_id"], "changed_file": preview["template_filename"],
+                "raw_hash": after_document.raw_hash if verified else None, "write_performed": True}
 
     def rollback(self, backup_id: str, *, confirmed: bool = False, client=None) -> dict:
         if confirmed is not True:
@@ -654,21 +768,57 @@ class HomepageAutomationService:
         client = client or self.client_factory(config["shop_domain"], token, config["api_version"])
         scopes_result = client.execute("query HomepageRollbackScopes { currentAppInstallation { accessScopes { handle } } }")
         scopes = {scope.get("handle") for scope in (scopes_result.get("currentAppInstallation") or {}).get("accessScopes", [])}
-        if "write_themes" not in scopes:return {"status":"MANUAL_ACTION_REQUIRED","reason":"write_themes scope missing"}
-        current_query = "query HomepageRollbackCurrent($id: ID!, $filenames: [String!]!) { theme(id: $id) { files(first: 1, filenames: $filenames) { nodes { body { __typename ... on OnlineStoreThemeFileBodyText { content } } } } } }"
+        if "write_themes" not in scopes or "read_themes" not in scopes:
+            return {"status":"MANUAL_ACTION_REQUIRED","reason":"read_themes and write_themes scopes are required"}
+        current_query = "query HomepageRollbackCurrent($id: ID!, $filenames: [String!]!) { theme(id: $id) { id role files(first: 1, filenames: $filenames) { nodes { filename body { __typename ... on OnlineStoreThemeFileBodyText { content } ... on OnlineStoreThemeFileBodyBase64 { contentBase64 } } } userErrors { code filename } } } }"
         current_result = client.execute(current_query, {"id": row["theme_id"], "filenames": [row["filename"]]}).get("theme") or {}
-        try: current = json.loads(current_result["files"]["nodes"][0]["body"]["content"])
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError): current = None
-        if current != json.loads(row["proposed_json"]):return {"status":"CONFLICT","reason":"Remote homepage drifted since this backup was created"}
+        try:
+            current_raw, current_document = _remote_theme_document(current_result, row["filename"])
+        except ShopifyJsonDocumentError as exc:
+            return {"status": "CONFLICT", "reason": exc.message}
+        if current_result.get("id") != row["theme_id"] or current_result.get("role") != "MAIN":
+            return {"status": "CONFLICT", "reason": "Published theme identity changed since backup"}
+        proposed_parsed = json.loads(row["proposed_json"])
+        folder = Path(row["folder"])
+        proposed_raw_path = folder / "proposed.raw.json"
+        if proposed_raw_path.is_file():
+            proposed_raw = _read_exact_text(proposed_raw_path)
+            if (current_document.raw_hash != _raw_hash(proposed_raw)
+                    or current_document.semantic_hash != shopify_json_semantic_hash(proposed_parsed)):
+                return {"status": "CONFLICT", "reason": "Remote raw or semantic homepage drifted since this backup was created"}
+        elif current_document.parsed != proposed_parsed:
+            return {"status": "CONFLICT", "reason": "Remote homepage drifted since this legacy backup was created"}
+        before_raw_path = folder / "before.raw.json"
+        legacy = not before_raw_path.is_file()
+        if legacy:
+            before_parsed = json.loads(row["before_json"])
+            restore_raw = json.dumps(before_parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        else:
+            restore_raw = _read_exact_text(before_raw_path)
+            try:
+                before_document = parse_shopify_json_document(restore_raw)
+            except ShopifyJsonDocumentError as exc:
+                return {"status": "FAILED", "reason": f"Raw backup is not a valid Shopify JSON document: {exc.code}"}
+            if before_document.parsed != json.loads(row["before_json"]):
+                return {"status": "FAILED", "reason": "Raw backup and parsed backup disagree"}
         result = client.execute(UPSERT_THEME_FILES, {"themeId": row["theme_id"], "files": [{"filename": row["filename"],
-             "body": {"type": "TEXT", "value": row["before_json"]}}]}).get("themeFilesUpsert") or {}
+             "body": {"type": "TEXT", "value": restore_raw}}]}).get("themeFilesUpsert") or {}
         if result.get("userErrors"):
             return {"status": "FAILED", "backup_id": backup_id}
-        filename_query = "query HomepageRollbackVerify($id: ID!, $filenames: [String!]!) { theme(id: $id) { files(first: 1, filenames: $filenames) { nodes { body { __typename ... on OnlineStoreThemeFileBodyText { content } } } } } }"
+        filename_query = "query HomepageRollbackVerify($id: ID!, $filenames: [String!]!) { theme(id: $id) { id role files(first: 1, filenames: $filenames) { nodes { filename body { __typename ... on OnlineStoreThemeFileBodyText { content } ... on OnlineStoreThemeFileBodyBase64 { contentBase64 } } } userErrors { code filename } } } }"
         checked = client.execute(filename_query, {"id": row["theme_id"], "filenames": [row["filename"]]}).get("theme") or {}
-        try: restored = json.loads(checked["files"]["nodes"][0]["body"]["content"])
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError): restored = None
-        return {"status": "VERIFIED" if restored == json.loads(row["before_json"]) else "VERIFY_FAILED", "backup_id": backup_id}
+        try:
+            restored_raw, restored_document = _remote_theme_document(checked, row["filename"])
+        except ShopifyJsonDocumentError:
+            restored_raw, restored_document = None, None
+        before_parsed = json.loads(row["before_json"])
+        verified = bool(checked.get("id") == row["theme_id"] and checked.get("role") == "MAIN"
+                        and restored_document and restored_document.parsed == before_parsed)
+        if verified and not legacy:
+            verified = restored_document.raw_hash == _raw_hash(restore_raw)
+        return {"status": "VERIFIED" if verified else "VERIFY_FAILED", "backup_id": backup_id,
+                "rollback_mode": "LEGACY_PARSED_ROLLBACK" if legacy else "EXACT_RAW_ROLLBACK",
+                "raw_hash": restored_document.raw_hash if verified else None, "write_performed": True}
 
     def verify(self, preview_id: str, *, client=None) -> dict:
         with connect(self.db) as con: row = con.execute("SELECT * FROM store_homepage_previews WHERE preview_id=?", (preview_id,)).fetchone()
@@ -677,12 +827,24 @@ class HomepageAutomationService:
         config = get_connection(row["store_id"], db=self.db); token, _ = get_shopify_token(row["store_id"],db=self.db)
         if not config or not token: return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Shopify connection or credential missing"}
         client = client or self.client_factory(config["shop_domain"], token, config["api_version"])
-        query = "query HomepageVerify($id: ID!, $filenames: [String!]!) { theme(id: $id) { files(first: 1, filenames: $filenames) { nodes { body { __typename ... on OnlineStoreThemeFileBodyText { content } } } } } }"
+        query = "query HomepageVerify($id: ID!, $filenames: [String!]!) { theme(id: $id) { id role files(first: 1, filenames: $filenames) { nodes { filename body { __typename ... on OnlineStoreThemeFileBodyText { content } ... on OnlineStoreThemeFileBodyBase64 { contentBase64 } } } userErrors { code filename } } } }"
         result = client.execute(query, {"id": row["theme_id"], "filenames": [preview["template_filename"]]}).get("theme") or {}
-        try: observed = json.loads(result["files"]["nodes"][0]["body"]["content"])
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError): observed = None
-        return {"status": "VERIFIED" if observed == preview.get("proposed") else "MANUAL_ACTION_REQUIRED",
-                "observed_hash": _hash(observed), "expected_hash": preview.get("diff", {}).get("proposed_hash")}
+        try:
+            _, observed_document = _remote_theme_document(result, preview["template_filename"])
+            observed = observed_document.parsed
+        except ShopifyJsonDocumentError:
+            observed_document, observed = None, None
+        source_document = preview.get("source_document") or {}
+        valid = bool(result.get("id") == row["theme_id"] and result.get("role") == "MAIN"
+                     and observed_document and observed == preview.get("proposed"))
+        if valid and source_document.get("proposed_raw_hash"):
+            valid = (observed_document.raw_hash == source_document["proposed_raw_hash"]
+                     and _raw_hash(observed_document.prefix) == source_document.get("prefix_hash")
+                     and _raw_hash(observed_document.suffix) == source_document.get("suffix_hash"))
+        return {"status": "VERIFIED" if valid else "MANUAL_ACTION_REQUIRED",
+                "observed_hash": _hash(observed), "expected_hash": preview.get("diff", {}).get("proposed_hash"),
+                "observed_raw_hash": observed_document.raw_hash if observed_document else None,
+                "write_performed": False}
 
     def export_report(self, plan: dict, *, preview: dict | None = None) -> dict:
         root = self.export_dir / "homepage_reports" / _safe_store(plan["store_id"]) / plan["plan_id"]

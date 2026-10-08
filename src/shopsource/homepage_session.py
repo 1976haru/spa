@@ -204,8 +204,34 @@ class HomepagePrerequisiteService:
                         "write_performed": False}
                     session.error = {"status": "MISSING_PREREQUISITE", "message": session.canonical_preview["actions"][0]["reason"]}
                     return session
-                preview = compose_homepage_preview(homepage_plan, snapshot, collection_plan,
-                    collection_handles=mappings, featured_products_plan=saved_featured if saved_featured.get("status") == "READY" else None, db=self.db)
+                if operation == "FEATURED_PREVIEW":
+                    from .homepage_automation import discover_homepage_sections, _hash
+                    feature_preview = FeaturedProductAssignmentService(db=self.db).build_theme_preview(saved_featured, snapshot)
+                    section_discovery = discover_homepage_sections(snapshot.get("theme_files") or {})
+                    category_supported = bool(section_discovery.get("category"))
+                    hero_supported = bool(section_discovery.get("hero"))
+                    preview = {**feature_preview,
+                        "store_id": str(store_id), "theme": snapshot.get("theme"),
+                        "template_filename": snapshot.get("template_filename"),
+                        "featured_products_plan_id": saved_featured.get("plan_id"),
+                        "featured_products_preview": feature_preview,
+                        "discovery": {"hero": section_discovery.get("hero_status"),
+                                      "category": section_discovery.get("category_status")},
+                        "capabilities": {
+                            "hero": "AUTO" if hero_supported else "MANUAL",
+                            "categories": "AUTO" if category_supported else "MANUAL",
+                            "featured_products": "AUTO" if feature_preview.get("status") == "PREVIEW" else "MANUAL",
+                            "theme_template": "COMMENTED_JSON_SUPPORTED" if (snapshot.get("template_document") or {}).get("had_leading_comment") else "JSON_SUPPORTED",
+                        },
+                        "actions": ([{"action": "FEATURED_PRODUCTS_PREVIEW", "section_id": feature_preview.get("section_id"), "status": feature_preview.get("status")}]
+                                    if feature_preview.get("status") == "PREVIEW" else [{"action": "MANUAL_ACTION_REQUIRED", "reason": feature_preview.get("reason")}]),
+                        "write_performed": False}
+                    preview["diff"] = {"before_hash": _hash(preview.get("current")), "proposed_hash": _hash(preview.get("proposed"))}
+                    if not category_supported:
+                        preview["manual_reasons"] = ["추천 상품 자동 미리보기 가능 · 카테고리 바로가기는 수동 확인 필요"]
+                else:
+                    preview = compose_homepage_preview(homepage_plan, snapshot, collection_plan,
+                        collection_handles=mappings, featured_products_plan=saved_featured if saved_featured.get("status") == "READY" else None, db=self.db)
                 session.canonical_preview = preview
                 session.statuses["preview"] = preview.get("status", "NOT_READY")
                 if preview.get("status") == "PREVIEW": session.stage = "HOMEPAGE_PREVIEW_READY"

@@ -168,10 +168,11 @@ def test_no_live_theme_write_in_tests(tmp_path, monkeypatch):
             if "ShopSourceThemes" in query:
                 return {"themes": {"nodes": [{"id": "theme-1", "name": "Fixture Theme", "role": "MAIN"}]}}
             if "ShopSourceThemeFiles" in query:
+                template_raw = "/* Shopify header comment */\n" + json.dumps({"sections": {}, "order": []})
                 return {"theme": {"files": {"nodes": [
-                    {"filename": "templates/index.json", "body": {"content": json.dumps({"sections": {}, "order": []})}},
+                    {"filename": "templates/index.json", "body": {"content": template_raw}},
                     {"filename": "sections/featured-picks.liquid", "body": {"content": section_file()}},
-                ]}}}
+                ], "userErrors": []}}}
             raise AssertionError(query)
     mock = MockThemeClient()
     discovery = ShopifyThemeReader(db=db, client_factory=mock).discover("001")
@@ -179,5 +180,10 @@ def test_no_live_theme_write_in_tests(tmp_path, monkeypatch):
     service = HomepageCollectionService(db=db, export_dir=tmp_path / "exports")
     service.save_safe_patch(planned)
     assert discovery["theme"]["role"] == "MAIN"
+    assert discovery["template_status"] == "READY"
+    assert discovery["template"] == {"sections": {}, "order": []}
+    assert discovery["template_document"]["had_leading_comment"] is True
+    assert discovery["template_document"]["raw_hash"]
+    assert discovery["theme_files"]["templates/index.json"].startswith("/* Shopify header comment */")
     assert all("mutation" not in query.casefold() for query in mock.calls)
     assert not any("themeFilesUpsert" in query for query in mock.calls)
