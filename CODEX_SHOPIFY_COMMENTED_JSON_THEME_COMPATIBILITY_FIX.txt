@@ -1,0 +1,520 @@
+ShopSource Studio — SHOPIFY COMMENTED JSON THEME COMPATIBILITY FIX
+CONFIRMED ROOT-CAUSE ARCHITECTURE PATCH
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Current expected baseline: d7555bac91c48d45f65a5231629e6fb4b861a216
+
+IMPORTANT
+This is NOT a speculative bug hunt.
+The real Cabin Tidy published theme has now been diagnosed read-only.
+
+Confirmed real store facts:
+- THEME_STATUS = CONNECTED
+- PUBLISHED_THEME_NAME = Design by klarjoy
+- PUBLISHED_THEME_ROLE = MAIN
+- READ_THEMES_SCOPE = YES
+- INDEX_TEMPLATE_KIND = JSON
+- INDEX_TEMPLATE_FILENAME = templates/index.json
+- INDEX_BODY_READABLE = YES
+- PAGE_BUILDER_HINT = NONE
+- templates/index.liquid = NOT_FOUND (expected because index.json exists)
+- templates/index.json starts with a Shopify header block comment: /* ... */
+- current reader calls strict json.loads(raw)
+- that strict parse fails at the first character
+- removing ONLY the leading Shopify comment yields valid JSON
+- featured-product section schema is READY
+- therefore the current "Homepage JSON template unavailable" is a parser/representation bug, not a Shopify/theme incompatibility
+
+Mission
+Implement a safe, reusable Shopify JSON theme-file representation that:
+1. correctly parses JSON template files with leading Shopify block comments,
+2. preserves the original comment/prefix exactly,
+3. preserves raw content for drift detection and rollback,
+4. allows preview/composition to operate on parsed JSON,
+5. never silently strips comments from a real write,
+6. is used consistently by read / preview / apply / verify / rollback,
+7. adds a Golden Path fixture matching the REAL Cabin Tidy commented index.json shape.
+
+Do NOT add another ad-hoc .replace() or regex-only "strip comments then json.loads" patch inside one caller.
+
+======================================================================
+1. AUDIT ALL THEME JSON PARSE / SERIALIZE PATHS
+======================================================================
+
+Before editing, audit every homepage/theme code path that directly or indirectly parses or serializes Shopify theme JSON.
+
+At minimum inspect:
+- src/shopsource/homepage_collections.py
+- src/shopsource/homepage_automation.py
+- src/shopsource/homepage_featured_products.py
+- src/shopsource/homepage_session.py
+- src/shopsource/homepage_assignment.py
+- tests/test_homepage_golden_path.py
+- any other code using json.loads() on templates/index*.json
+- any code writing theme file bodies
+- apply / verify / rollback
+
+Find all strict JSON assumptions.
+
+Known unsafe locations already confirmed:
+A. ShopifyThemeReader.discover():
+    template = json.loads(files[template_name])
+
+B. HomepageAutomationService.apply():
+    observed = json.loads(nodes[0]["body"]["content"])
+
+C. apply verification:
+    after = json.loads(verify["files"]["nodes"][0]["body"]["content"])
+
+D. rollback:
+    current = json.loads(current_result[...] content)
+    restored = json.loads(checked[...] content)
+
+Do not leave one of these paths using the old strict parser.
+
+======================================================================
+2. CREATE ONE CANONICAL SHOPIFY JSON DOCUMENT PARSER
+======================================================================
+
+Create a small reusable module or helper, preferably something explicit like:
+
+src/shopsource/shopify_theme_json.py
+
+Suggested conceptual API:
+
+@dataclass
+class ShopifyJsonDocument:
+    raw: str
+    parsed: dict | list
+    prefix: str
+    suffix: str
+    raw_hash: str
+    semantic_hash: str
+    had_leading_comment: bool
+
+def parse_shopify_json_document(raw: str) -> ShopifyJsonDocument
+def render_shopify_json_document(document: ShopifyJsonDocument, parsed: Any) -> str
+
+Requirements:
+- accept UTF-8 BOM
+- preserve exact leading whitespace/BOM
+- preserve one or more leading /* ... */ block comments
+- preserve whitespace between leading comments and JSON
+- preserve trailing whitespace
+- parse JSON content after preserved prefix
+- DO NOT remove comment markers that occur inside JSON strings
+- DO NOT implement a broad regex that strips /*...*/ anywhere in the document
+- DO NOT accept arbitrary invalid JSON silently
+- if an inline/trailing JSON comment exists outside the confirmed safe leading-prefix pattern, return a precise unsupported/invalid result rather than modifying semantics
+- require parsed root type appropriate for template use when needed (dict for templates/index.json)
+- return actionable error metadata on malformed/unclosed leading comment
+
+A finite-state/prefix scanner is preferred over a broad regex.
+
+======================================================================
+3. PRESERVE COMMENTED RAW BODY IN THE THEME SNAPSHOT
+======================================================================
+
+Update ShopifyThemeReader.discover().
+
+For templates/index.json:
+- keep the current raw body available
+- parse through parse_shopify_json_document()
+- return parsed dict as snapshot["template"] for existing planning/composition code
+- additionally expose metadata, e.g.:
+  snapshot["template_document"] = {
+      "filename": ...,
+      "raw_hash": ...,
+      "semantic_hash": ...,
+      "had_leading_comment": true,
+      "prefix": ... SAFE INTERNAL USE ONLY,
+      "suffix": ...
+  }
+or another compact safe representation
+
+Do not dump the raw comment body into beginner UI.
+
+If the JSON template is valid with leading Shopify comment:
+- snapshot status must remain CONNECTED
+- template must be a dict
+- homepage preview must be supported
+
+If parse fails:
+- distinguish:
+  INVALID_THEME_JSON
+  UNSUPPORTED_THEME_JSON_COMMENT_SHAPE
+  TEMPLATE_BODY_MISSING
+
+Do not collapse all failures into template=None.
+
+======================================================================
+4. RAW + SEMANTIC DRIFT MODEL
+======================================================================
+
+Current preview drift logic hashes parsed JSON only.
+
+Upgrade safely:
+- semantic hash = hash(parsed JSON)
+- raw hash = hash(original raw text)
+
+When a canonical homepage preview is created, persist enough metadata to identify the exact source body:
+- before semantic hash
+- before raw hash
+- template filename
+- theme id
+
+At apply time:
+1. re-read the exact remote raw file
+2. parse with the canonical parser
+3. verify theme id/role
+4. compare the current raw hash against the preview's source raw hash
+5. compare semantic hash as a second invariant
+6. if either changed unexpectedly, return CONFLICT
+7. do not write over a remote comment/header change
+
+This is safer than silently ignoring comment-only drift.
+
+======================================================================
+5. COMMENT-PRESERVING RENDER FOR FUTURE APPLY
+======================================================================
+
+When constructing a future actual theme write:
+- serialize the proposed parsed JSON
+- wrap it with the EXACT preserved prefix/suffix from the fresh source document
+
+Conceptually:
+new_raw = render_shopify_json_document(fresh_document, preview["proposed"])
+
+The new raw must preserve:
+- Shopify header comment byte-for-byte/text-for-text
+- BOM if present
+- leading whitespace
+- trailing whitespace
+
+Do not write plain:
+json.dumps(preview["proposed"])
+because that would silently remove Shopify's header comment.
+
+The current task must NOT perform a real Shopify write.
+It should only make the guarded apply path safe for when the user later explicitly confirms.
+
+======================================================================
+6. BACKUP MUST PRESERVE RAW SOURCE
+======================================================================
+
+Current apply backup writes parsed JSON:
+- before.json
+- proposed.json
+
+Upgrade backup behavior for future real apply:
+- before.raw.json  (or before.theme)
+- proposed.raw.json
+- before.parsed.json
+- proposed.parsed.json
+- diff.md
+
+The ORIGINAL remote raw body must be recoverable exactly.
+
+If DB schema stores before_json/proposed_json, preserve backwards compatibility.
+Do not break old backup rows.
+
+A safe approach:
+- DB fields continue storing parsed JSON for compatibility
+- backup folder stores exact raw bodies
+- preview metadata records raw hashes
+- rollback prefers exact raw backup when available
+- legacy rollback falls back to old parsed JSON behavior only for old backups
+
+Do not require destructive DB migration unless necessary.
+
+======================================================================
+7. ROLLBACK MUST RESTORE EXACT RAW CONTENT
+======================================================================
+
+For new backups:
+- verify current remote file via canonical parser/raw hash
+- restore the exact before raw file body
+- verify exact raw hash after restore
+- also verify semantic parsed content
+
+For legacy backups without raw file:
+- retain existing fallback
+- mark result/report as LEGACY_PARSED_ROLLBACK when appropriate
+
+No live rollback in this task.
+
+======================================================================
+8. VERIFY PATH MUST USE THE SAME PARSER
+======================================================================
+
+HomepageAutomationService.verify() and apply read-after-write verification must:
+- use parse_shopify_json_document()
+- compare parsed proposed JSON
+- ensure preserved prefix is still present
+- optionally verify expected raw hash if available
+
+No strict json.loads() on raw template bodies should remain in these guarded paths.
+
+======================================================================
+9. FEATURED PRODUCT PREVIEW SHOULD NOW SUCCEED IN CABIN TIDY
+======================================================================
+
+After the reader fix, Cabin Tidy's actual index.json is a valid supported JSON template.
+
+Expected behavior:
+- Theme: CONNECTED
+- templates/index.json parsed successfully
+- featured-products schema discovery: READY
+- 4/4 selected product plan
+- [추천 상품 미리보기] produces PREVIEW when featured section itself is supported
+
+IMPORTANT:
+Do NOT allow an unrelated unsupported category-shortcut schema to turn the FEATURED_PREVIEW operation into a generic failure.
+
+For FEATURED_PREVIEW:
+- feature-specific preview capability should be evaluated independently
+- return PREVIEW if the featured-products section can be safely proposed
+- expose category capability separately, e.g. CATEGORY_MANUAL
+- do not pretend the whole homepage is fully automatable
+
+For FULL_PREVIEW:
+- preserve partial capability reporting
+- if category section is unsupported, show exactly:
+  "추천 상품 자동 미리보기 가능 · 카테고리 바로가기는 수동 확인 필요"
+or equivalent
+- canonical proposal must not corrupt/drop existing category content
+
+======================================================================
+10. CAPABILITY MODEL — SEPARATE FEATURE STATUS
+======================================================================
+
+Add/normalize explicit capability fields such as:
+
+capabilities = {
+  "hero": "AUTO" | "MANUAL" | "BLOCKED",
+  "categories": "AUTO" | "MANUAL" | "BLOCKED",
+  "featured_products": "AUTO" | "MANUAL" | "BLOCKED",
+  "theme_template": "COMMENTED_JSON_SUPPORTED"
+}
+
+The top-level status must not hide useful partial support.
+
+Examples:
+FEATURED_PREVIEW:
+- featured_products=AUTO
+- categories=MANUAL
+=> featured preview can still be PREVIEW
+
+FULL_PREVIEW:
+- status=PARTIAL_PREVIEW or REVIEW_REQUIRED if not all parts can auto-apply
+- exact manual reasons visible
+
+Do not loosen safety gates for final Shopify apply.
+Final apply still requires every section included in the write to be safely supported.
+
+======================================================================
+11. FIX THE GOLDEN PATH TEST FIXTURE
+======================================================================
+
+The current Golden Path fake theme uses clean json.dumps(...) only.
+That is why E2E passed while the real store failed.
+
+Update/add a fixture that matches the REAL discovered structure:
+
+"/* ... Shopify header comment ... */\n" + json.dumps({...})
+
+At minimum tests:
+
+test_shopify_json_document_parses_leading_block_comment
+test_shopify_json_document_preserves_exact_prefix
+test_shopify_json_document_preserves_bom_and_whitespace
+test_shopify_json_document_does_not_strip_comment_tokens_inside_strings
+test_shopify_json_document_rejects_unclosed_leading_comment
+test_shopify_json_document_rejects_unsupported_inline_comment_shape
+test_theme_reader_parses_commented_index_json
+test_theme_reader_keeps_raw_and_semantic_hashes
+test_golden_path_uses_commented_index_json_fixture
+test_golden_path_featured_preview_with_commented_index
+test_apply_drift_check_uses_raw_and_semantic_hash
+test_apply_render_preserves_header_comment
+test_verify_uses_comment_aware_parser
+test_new_rollback_restores_exact_raw_body
+test_legacy_rollback_still_supported
+test_featured_preview_not_blocked_by_unrelated_category_manual_capability
+test_no_real_shopify_write_in_tests
+
+Also keep all previous Golden Path tests green.
+
+======================================================================
+12. REAL READ-ONLY CABIN TIDY RELEASE GATE
+======================================================================
+
+This time the real read-only smoke is REQUIRED if network/credentials are available on the user's machine.
+
+Run after implementation:
+
+A. Read MAIN theme
+B. Read templates/index.json raw
+C. Confirm leading-comment parser:
+   - had_leading_comment = YES
+   - parsed template root = dict
+D. Confirm theme snapshot:
+   - status CONNECTED
+   - template_filename templates/index.json
+   - template available
+E. Confirm featured section schema = READY
+F. Confirm products 4/4
+G. Build FEATURED_PREVIEW
+H. Report:
+   - top-level status
+   - featured_products capability
+   - category capability
+   - section id
+   - selected count
+I. Build FULL_PREVIEW
+J. Confirm zero mutations / zero writes
+
+Expected minimum release result:
+COMMENTED INDEX PARSE = PASS
+FEATURED PREVIEW = PREVIEW
+SHOPIFY WRITE COUNT = 0
+
+If network fails:
+- report NOT_TESTED_NETWORK
+- do not falsely claim live validation
+
+======================================================================
+13. USER-FACING UI
+======================================================================
+
+When this works, the user should not see:
+"Homepage JSON template unavailable"
+
+For this exact Cabin Tidy theme the UI should show something like:
+- Theme: CONNECTED · commented JSON supported
+- 추천 상품: PREVIEW READY
+- 카테고리: MANUAL CHECK (if its section schema is unsupported)
+- Shopify write: 없음
+
+Do not mention parser implementation details in normal beginner UI unless opening technical details.
+
+======================================================================
+14. DO NOT REGRESS PRIOR STABILIZATION
+======================================================================
+
+Preserve all current functionality from d7555bac:
+- HomepageSession
+- prerequisite resolver
+- type-safe Brand Profile normalization
+- featured products 4/4
+- product review cards
+- selection quality ranking
+- deterministic reselection
+- current-state card
+- stale preview invalidation
+- assignment checklist
+- no PageFly GUI automation
+- no hidden writes
+- existing protected-file behavior
+
+======================================================================
+15. PROTECTED FILES
+======================================================================
+
+Do not reset, clean, stage, or commit:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env / tokens
+- live exports
+- theme backups
+- user-generated assets
+- .phase* local folders
+
+Record protected hashes/status before and after.
+
+======================================================================
+16. QUALITY GATES
+======================================================================
+
+Run:
+
+python -m compileall -q src tests
+
+Run new parser/theme tests explicitly.
+
+python -m pytest -q tests/test_homepage_golden_path.py
+python -m pytest -q tests/test_homepage_featured_products.py
+python -m pytest -q
+
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+A clean unit suite without the commented-index Golden Path does NOT count.
+
+======================================================================
+17. COMMIT / PUSH
+======================================================================
+
+After all gates pass:
+
+git status
+
+Commit implementation/tests only.
+
+Suggested commit:
+git commit -m "Support commented Shopify JSON templates"
+
+git push origin main
+
+Confirm:
+git rev-list --left-right --count main...origin/main
+=> 0 0
+
+======================================================================
+18. COMPLETION REPORT
+======================================================================
+
+Report exactly:
+
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] confirmed root cause
+[5] canonical Shopify JSON parser design
+[6] raw/prefix/suffix preservation
+[7] reader changes
+[8] preview/drift changes
+[9] apply/verify safety changes
+[10] backup/rollback compatibility
+[11] capability separation: hero/categories/featured
+[12] commented-index Golden Path tests
+[13] focused/full test pass counts
+[14] protected files before/after
+[15] live Cabin Tidy read-only smoke:
+     theme
+     commented parse
+     template
+     featured schema
+     products 4/4
+     FEATURED_PREVIEW
+     FULL_PREVIEW
+     category capability
+     write count
+[16] unresolved risks
+[17] commit/push
+[18] exact next user click
+
+Final flags:
+
+COMMENTED SHOPIFY JSON SUPPORTED = YES/NO
+COMMENT PRESERVATION SAFE = YES/NO
+COMMENTED-INDEX GOLDEN PATH = PASS/FAIL
+LIVE CABIN TIDY FEATURED PREVIEW = PASS/FAIL/NOT_TESTED_NETWORK
+SHOPIFY WRITE COUNT DURING VALIDATION = 0/<N>
+SAFE TO CONTINUE RECOMMENDED-PRODUCT ASSIGNMENT = YES/NO
