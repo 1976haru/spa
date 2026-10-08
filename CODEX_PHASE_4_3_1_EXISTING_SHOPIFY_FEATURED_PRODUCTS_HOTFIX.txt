@@ -1,0 +1,459 @@
+ShopSource Studio — Phase 4.3.1 HOTFIX
+EXISTING SHOPIFY CATALOG INTAKE FOR FEATURED PRODUCTS
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Current baseline expected: 42212dabbc4c83e9258f739f545da3dfa69c22b4
+
+Observed real Cabin Tidy failure
+- UI path: 스토어 디자인 → 홈페이지 → 추천 상품(신상품)
+- User clicked [추천 상품 자동 구성].
+- Result:
+  선택된 상품: 0 / 4
+  상태: MANUAL_ACTION_REQUIRED
+  Message:
+  "실제 Shopify mapping, 판매가, 이미지, ACTIVE 상태가 검증된 상품이 필요합니다."
+- UI notification said the plan was saved locally, but the assignment could not proceed.
+
+Root cause to fix
+Phase 4.3 only considers products already represented in ShopSource MASTER + store decision + shopify_product_mappings.
+Cabin Tidy is a pre-existing real Shopify store built before this new feature, so it can have valid ACTIVE Shopify products that are not yet ShopSource-managed/mapped.
+Featured-product merchandising must be able to safely use merchant-existing Shopify products read from Shopify without forcing ownership, rewriting product data, or fabricating MASTER records.
+
+Important design correction
+For homepage merchandising, "must exist in MASTER" was too strict for pre-existing stores.
+Do NOT solve this by:
+- creating fake ASINs
+- creating fake MASTER products
+- writing/updateing existing Shopify products
+- changing DRAFT to ACTIVE
+- overwriting merchant tags
+- scraping Shopify admin HTML
+- automating PageFly GUI
+- requiring the user to manually copy four product IDs
+
+Instead add a read-only EXISTING_SHOPIFY product source that can coexist with SHOPSOURCE_MANAGED candidates.
+
+======================================================================
+1. READ-ONLY SHOPIFY PRODUCT CATALOG READER
+======================================================================
+
+Add a reusable ShopifyExistingProductReader (name may vary).
+
+Use Admin GraphQL through the existing Shopify connection/token abstraction.
+Required scope:
+- read_products
+
+Query existing Shopify products in bounded pages.
+Need fields sufficient for assignment validation:
+- id
+- handle
+- title
+- status
+- createdAt
+- updatedAt
+- productType
+- tags
+- featuredMedia / featuredImage URL + alt where available
+- variants(first: bounded) with price / compareAtPrice
+- variantsCount
+- onlineStoreUrl if schema/API supports it; otherwise build /products/{handle} only after handle validation
+- publishedOnCurrentPublication / publication state if safely available through existing scopes/contracts
+Do not guess fields unsupported by 2026-07 schema; adapt to current API and tests/mocks.
+
+Return a normalized read-only candidate:
+{
+ source_kind: "EXISTING_SHOPIFY",
+ shopify_product_id,
+ shopify_handle,
+ title,
+ remote_status,
+ price,
+ image_url,
+ product_type,
+ tags,
+ created_at,
+ updated_at,
+ product_link,
+ storefront_eligible,
+ eligibility_reasons
+}
+
+No mutation.
+
+======================================================================
+2. CANDIDATE UNION
+======================================================================
+
+FeaturedProductAssignmentService must support two candidate sources:
+
+A. SHOPSOURCE_MANAGED
+- current MASTER + decision + mapping path
+- keep all existing safety rules
+
+B. EXISTING_SHOPIFY
+- real remote product readback
+- may not have master_product_id
+- must have real Shopify ID
+- non-empty handle
+- ACTIVE status
+- valid storefront retail price from Shopify variant
+- image
+- one-variant or safely resolved displayed price; if ambiguous multi-variant pricing cannot be summarized safely, still allow if a valid minimum/display price is explicitly read, otherwise block item
+- remote identity verified by the read itself
+
+Deduplicate union by:
+1. shopify_product_id
+2. normalized handle
+
+If a remote product is already mapped to a ShopSource-managed product:
+prefer SHOPSOURCE_MANAGED representation.
+
+======================================================================
+3. DATABASE MIGRATION
+======================================================================
+
+Current homepage_featured_product_items has master_product_id NOT NULL.
+Safely migrate it so selected items can represent remote-existing Shopify products without a fake MASTER ID.
+
+Preferred final columns:
+- plan_id
+- position
+- source_kind
+- source_key
+- master_product_id nullable
+- shopify_product_id
+- shopify_handle
+- title
+- category_key
+- image_url
+- price
+- remote_status
+- selection_reason
+- verification_status
+- created_at/updated_at if useful
+
+Migration requirements:
+- idempotent
+- preserve existing Phase 4.3 rows
+- no data loss
+- backward compatible get_plan()
+- UNIQUE plan/product ID and handle constraints preserved where practical
+
+If a safer additive side-table architecture is clearly superior, use it, but do not use sentinel master_product_id=0.
+
+======================================================================
+4. ONE-CLICK UI BEHAVIOR
+======================================================================
+
+The existing [추천 상품 자동 구성] button must become useful for a pre-existing store.
+
+On click:
+1. Inspect local eligible managed candidates.
+2. If fewer than requested_count=4 OR if remote refresh is stale/missing:
+   run read-only Shopify catalog refresh automatically.
+3. Union managed + existing Shopify candidates.
+4. Select four real eligible products.
+5. Persist plan.
+6. Render the four selected items.
+
+No second hidden/manual setup step should be required if read_products is already granted.
+
+UI status examples:
+- "Shopify 기존 상품 23개 확인 · 추천 후보 17개 · 4개 선택 완료"
+- "선택된 상품: 4 / 4 · 상태: READY"
+
+If read_products scope is missing:
+- do not just say MANUAL_ACTION_REQUIRED
+- show exact message:
+  "Shopify 기존 상품을 읽으려면 read_products 권한이 필요합니다."
+- show a button or exact existing connection/settings path to refresh authorization.
+- keep existing products untouched.
+
+If no 4 eligible remote products exist:
+show counts by failure reason:
+- ACTIVE 아님
+- 이미지 없음
+- 가격 없음
+- handle 없음
+- duplicate
+so the user knows why.
+
+======================================================================
+5. CATEGORIES / BALANCED SELECTION
+======================================================================
+
+BALANCED_CATEGORIES must work for EXISTING_SHOPIFY products.
+
+Category signal priority:
+1. matched ShopSource collection mapping/tag when available
+2. productType
+3. merchant tags
+4. normalized title keyword fallback ONLY for diversity grouping, never for eligibility/ownership
+
+Do not hard-code Cabin Tidy into core.
+Cabin Tidy examples such as trunk/seat/console/trash may exist only as fixture/profile hints.
+
+If all four products are same category but valid:
+select four valid products and mark diversity warning, rather than returning 0.
+
+======================================================================
+6. NEW_ARRIVALS MODE
+======================================================================
+
+For EXISTING_SHOPIFY candidates:
+use real Shopify createdAt as the true new-arrival signal.
+For SHOPSOURCE_MANAGED without remote createdAt:
+use the existing mapped/synced freshness but label it "recently synced", not "newly created".
+
+BALANCED_CATEGORIES remains the default assignment mode.
+
+======================================================================
+7. THEME PREVIEW
+======================================================================
+
+Do not require MASTER/mapping for direct product-list theme sections.
+A verified EXISTING_SHOPIFY ID can be used directly in the product-list setting.
+
+For Featured Collection fallback:
+do NOT mutate tags/products in this hotfix unless an existing safe collection membership path is already proven.
+If direct product-list is unavailable and fallback would require product mutation:
+return MANUAL_ACTION_REQUIRED with a precise reason.
+Do not silently create/write a collection in this hotfix unless existing guarded collection service can do it without changing merchant product data.
+
+======================================================================
+8. UI DIAGNOSTICS
+======================================================================
+
+Upgrade the recommendation card to make failures understandable.
+
+Under status, add compact diagnostic text:
+- 로컬 관리 상품 후보: N
+- Shopify 기존 상품 후보: N
+- 최종 사용 가능: N
+- 제외: ACTIVE 아님 N / 이미지 없음 N / 가격 없음 N / 기타 N
+
+Add optional button:
+[Shopify 상품 다시 읽기]
+This is read-only.
+
+Keep:
+[추천 상품 자동 구성]
+[상품 4개 보기]
+[다시 선택]
+[추천 상품 미리보기]
+[Shopify 적용]
+[과제 제출용 확인]
+
+For the user's current Cabin Tidy flow, after hotfix and with valid scope/products,
+[추천 상품 자동 구성] should be sufficient to reach 4/4 READY without manual IDs.
+
+======================================================================
+9. SCOPE CONTRACT
+======================================================================
+
+Use existing config/shopify_scope_contract.json PRODUCT_READ = read_products.
+
+Preflight scope before catalog query.
+Do not request write_products for this feature.
+
+Expose:
+READ_PRODUCTS_READY
+MISSING_READ_PRODUCTS_SCOPE
+
+Do not expand permissions unnecessarily.
+
+======================================================================
+10. REMOTE CACHE / RATE SAFETY
+======================================================================
+
+Avoid re-reading the full catalog on every render.
+
+Add a small local read-only cache/snapshot with:
+- store_id
+- fetched_at
+- product count
+- source hash
+- normalized candidate JSON or normalized table rows
+
+Default freshness window can be 5–15 minutes.
+[Shopify 상품 다시 읽기] bypasses cache explicitly.
+
+Use bounded pagination and Shopify throttle-aware handling already used elsewhere if available.
+
+======================================================================
+11. ASSIGNMENT CHECKLIST
+======================================================================
+
+Update featured product checklist.
+
+A selected item passes whether source_kind is:
+- SHOPSOURCE_MANAGED
+or
+- EXISTING_SHOPIFY
+
+Required:
+- 4 items
+- unique real Shopify product IDs
+- unique real handles
+- valid prices
+- images
+- ACTIVE/storefront eligible
+- real product links
+- section visible
+- remote section readback
+
+Do NOT require master_product_id for EXISTING_SHOPIFY.
+
+======================================================================
+12. STORE BUILD / COMPLETION
+======================================================================
+
+StoreBuild featured product stages must use the same candidate union.
+Do not make pre-existing stores fail merely because products were not created by ShopSource.
+
+StoreCompletion should identify source kind in evidence but use the same remote verification criteria.
+
+======================================================================
+13. REPORT
+======================================================================
+
+assignment_featured_products.md should show:
+- source kind for each selected product
+- actual title
+- actual Shopify link
+- actual category grouping signal
+- actual price
+- actual status
+
+Submission memo should remain business-facing; do not mention automation internals.
+
+======================================================================
+14. TESTS
+======================================================================
+
+Add focused tests at minimum:
+
+test_existing_shopify_reader_requires_read_products
+test_existing_shopify_reader_is_read_only
+test_existing_shopify_active_product_is_candidate
+test_existing_shopify_draft_is_excluded
+test_existing_shopify_requires_handle
+test_existing_shopify_requires_valid_price
+test_existing_shopify_requires_image
+test_existing_shopify_dedupes_against_managed_mapping
+test_existing_shopify_preexisting_store_can_reach_four
+test_existing_shopify_does_not_create_master_product
+test_existing_shopify_does_not_create_fake_asin
+test_existing_shopify_does_not_write_products
+test_existing_shopify_does_not_replace_tags
+test_balanced_categories_works_with_remote_products
+test_balanced_categories_all_same_category_still_selects_four
+test_new_arrivals_uses_shopify_created_at
+test_featured_plan_persists_remote_only_items
+test_featured_item_migration_preserves_old_rows
+test_featured_ui_auto_refreshes_when_local_less_than_four
+test_featured_ui_missing_scope_message
+test_featured_ui_diagnostics_counts
+test_featured_remote_cache_reused
+test_featured_remote_force_refresh_bypasses_cache
+test_assignment_check_accepts_existing_shopify_source
+test_no_real_network_in_tests
+test_protected_store_file_untouched
+
+All previous Phase 4.3 tests must remain green.
+
+======================================================================
+15. PROTECTED FILES
+======================================================================
+
+Do not touch/stage/commit user-local dirty files:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env / credentials
+- live exports/backups
+
+======================================================================
+16. QUALITY GATE
+======================================================================
+
+Run:
+python -m compileall -q src tests
+python -m pytest -q tests/test_homepage_featured_products.py
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+No real product/theme write in tests.
+No paid images.
+No Amazon/Spark action.
+
+======================================================================
+17. LIVE SMOKE BOUNDARY
+======================================================================
+
+After implementation, it is acceptable to perform READ-ONLY Cabin Tidy diagnostics if credentials/scopes are already configured:
+- scope readback
+- product catalog read
+- candidate counts
+
+Do NOT:
+- write product
+- write collection
+- write theme
+
+If read-only smoke is possible, report:
+Cabin Tidy Shopify products read = N
+ACTIVE + price + image + handle candidates = N
+Would select = 4/4 or reason not possible
+
+Do not expose tokens.
+
+======================================================================
+18. COMMIT / PUSH
+======================================================================
+
+After all tests pass:
+git status
+commit implementation only
+
+Suggested commit:
+git commit -m "Support existing Shopify products in featured assignments"
+
+git push origin main
+
+Confirm:
+git rev-list --left-right --count main...origin/main
+=> 0 0
+
+======================================================================
+19. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] root cause confirmed
+[5] existing Shopify read architecture
+[6] DB migration
+[7] candidate union / dedupe
+[8] one-click UI behavior
+[9] scope handling
+[10] remote cache
+[11] tests / pass count
+[12] protected files
+[13] commit/push
+[14] read-only Cabin Tidy smoke result
+[15] exact next user click
+
+Final status must distinguish:
+FEATURED PRODUCTS HOTFIX READY = YES/NO
+CABIN TIDY 4/4 READ-ONLY CANDIDATES = YES/NO/NOT_TESTED
+
