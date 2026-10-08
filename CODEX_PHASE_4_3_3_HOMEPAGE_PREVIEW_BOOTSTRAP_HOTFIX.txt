@@ -1,0 +1,246 @@
+ShopSource Studio — Phase 4.3.3 HOTFIX
+HOMEPAGE PLAN TYPE NORMALIZATION + FEATURED PREVIEW AUTO-BOOTSTRAP
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Expected baseline: 63021ed7b820075d65c4bd9431f57562fdf018b8
+
+Observed real Cabin Tidy failure
+1) User clicked homepage design / preview flow and got:
+   "'list' object has no attribute 'strip'"
+2) Then [추천 상품 미리보기] returned:
+   "MANUAL_ACTION_REQUIRED · Shopify write 없음"
+
+Confirmed root cause from current code
+- src/shopsource/homepage_automation.py
+- hero_image_prompt():
+    avoid = profile.get("avoid_styles", "").strip()
+- Current BrandProfile stores avoid_styles as a list in real Cabin Tidy data.
+- This throws AttributeError before homepage design can finish.
+- Because design aborts before a connected theme snapshot is stored in UI state,
+  featured_preview() later calls build_theme_preview(plan, state.get("snapshot") or {})
+  with an empty/unconnected snapshot, which then returns MANUAL_ACTION_REQUIRED.
+
+This is a real type-contract/UX bug. Fix both the data normalization and the preview bootstrap.
+
+======================================================================
+1. TYPE-SAFE BRAND PROFILE NORMALIZATION
+======================================================================
+
+Fix homepage prompt/copy generation so BrandProfile values can safely be either:
+- str
+- list/tuple/set
+- dict
+- None
+
+Do not call .strip() directly on an unvalidated profile value.
+
+Add a small reusable normalization helper in homepage_automation.py, e.g.
+_normalize_prompt_value(value, separator=", ")
+
+Rules:
+- None -> ""
+- str -> stripped string
+- list/tuple/set -> normalize non-empty members and join
+- dict -> deterministic readable key/value representation or stable JSON-like text
+- scalar -> str(value).strip()
+- nested structures should never crash prompt generation
+
+Use it at minimum for:
+- avoid_styles
+- personality / brand_keywords
+- colors
+- primary_category if needed
+- target_country if needed
+
+Do not mutate the stored BrandProfile.
+Only normalize when rendering text/prompts.
+
+Expected Cabin Tidy:
+avoid_styles=["3D","watermarks","busy patterns","thin details"]
+must produce something like:
+"Avoid: 3D, watermarks, busy patterns, thin details."
+and never throw.
+
+======================================================================
+2. REGRESSION TEST FOR LIST BRAND FIELDS
+======================================================================
+
+Add tests to tests/test_homepage_automation.py:
+
+test_hero_image_prompt_accepts_list_avoid_styles
+test_hero_image_prompt_accepts_list_personality
+test_hero_image_prompt_accepts_dict_colors
+test_homepage_plan_realistic_brand_profile_types_no_crash
+
+Use a realistic profile shape matching brand_automation/UI:
+{
+  "brand_name": "Cabin Tidy",
+  "primary_category": "car interior organization",
+  "target_country": "United States",
+  "personality": ["clean", "practical", "premium"],
+  "colors": {"primary":"#24364B","secondary":"#FFFFFF","accent":"#D7C7A6"},
+  "avoid_styles": ["3D","watermarks","busy patterns","thin details"]
+}
+
+======================================================================
+3. FEATURED PREVIEW AUTO-BOOTSTRAP
+======================================================================
+
+Current UX is fragile:
+featured_preview() assumes state["snapshot"] already exists and is CONNECTED.
+
+Upgrade src/shopsource/ui/v2.py so [추천 상품 미리보기] is self-sufficient.
+
+When clicked:
+1. Require current featured product plan (4/4 or current plan).
+2. If state.snapshot is missing or status != CONNECTED:
+   - run read-only ShopifyThemeReader().discover(current_store)
+   - store it in state["snapshot"]
+   - do NOT write theme
+3. If theme snapshot is CONNECTED:
+   call FeaturedProductAssignmentService().build_theme_preview(...)
+4. If theme read cannot connect:
+   show the exact reason/status.
+5. If theme schema is genuinely unsupported after a successful read:
+   show the exact capability reason separately from connection/bootstrap errors.
+
+Do not tell the user MANUAL_ACTION_REQUIRED merely because the snapshot was never loaded.
+
+======================================================================
+4. HOMEPAGE DESIGN ERROR VISIBILITY
+======================================================================
+
+Current generic toast only shows exception text.
+Improve the homepage auto-design flow so a failure does not silently leave stale/empty state.
+
+On design() exception:
+- clear state["snapshot"] or mark status ERROR
+- clear stale state["preview"]
+- notify:
+  "홈페이지 자동 설계 중 오류: <safe error>"
+- optionally log the stage name "HERO_PROMPT" / "THEME_DISCOVERY" if practical
+
+No stack trace in beginner UI.
+
+======================================================================
+5. FEATURED PREVIEW STATUS UI
+======================================================================
+
+Add a compact status label near 추천 상품(신상품), e.g.
+"추천 상품 미리보기: 아직 생성 안 됨"
+
+After click show one of:
+- PREVIEW READY · Shopify write 없음
+- THEME READ FAILED · <reason>
+- THEME SCHEMA MANUAL ACTION · <reason>
+
+Do not collapse all cases into generic MANUAL_ACTION_REQUIRED.
+
+======================================================================
+6. READ-ONLY BOUNDARY
+======================================================================
+
+This hotfix must remain read-only.
+No product write.
+No collection write.
+No theme write.
+No paid image generation.
+
+ShopifyThemeReader().discover is allowed.
+FeaturedProductAssignmentService().build_theme_preview is local preview only.
+
+======================================================================
+7. TESTS FOR UI/BOOTSTRAP
+======================================================================
+
+Add/adjust focused tests where architecture allows:
+
+test_featured_preview_bootstraps_theme_snapshot_when_missing
+test_featured_preview_does_not_use_empty_snapshot_after_theme_read
+test_featured_preview_theme_read_failure_has_specific_status
+test_featured_preview_unsupported_schema_has_specific_reason
+test_featured_preview_performs_no_write
+test_homepage_design_type_error_clears_stale_preview
+
+Keep existing 804+ suite green.
+
+======================================================================
+8. QUALITY GATE
+======================================================================
+
+Run:
+python -m compileall -q src tests
+python -m pytest -q tests/test_homepage_automation.py
+python -m pytest -q tests/test_homepage_featured_products.py
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.ui.v2 --help
+
+No real Shopify write in tests.
+
+======================================================================
+9. OPTIONAL READ-ONLY CABIN TIDY SMOKE
+======================================================================
+
+If credentials/network are available:
+- generate homepage plan with current real BrandProfile
+- confirm no list.strip error
+- read published theme snapshot
+- build current 4-product featured preview
+- report:
+  Homepage plan = READY/ERROR
+  Theme snapshot = CONNECTED/<status>
+  Featured preview = PREVIEW/MANUAL_ACTION_REQUIRED/<status>
+  Exact schema/capability reason if not PREVIEW
+
+No write.
+
+======================================================================
+10. PROTECTED FILES
+======================================================================
+
+Do not stage/commit:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env / secrets
+- live exports/backups
+
+======================================================================
+11. COMMIT / PUSH
+======================================================================
+
+After all tests pass:
+commit implementation only.
+
+Suggested commit:
+git commit -m "Fix homepage prompt types and preview bootstrap"
+
+git push origin main
+confirm main...origin/main = 0 0
+
+======================================================================
+12. COMPLETION REPORT
+======================================================================
+
+Report:
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] list.strip root cause and fix
+[5] prompt normalization behavior
+[6] featured preview auto-bootstrap
+[7] improved failure statuses
+[8] tests/pass count
+[9] protected files
+[10] commit/push
+[11] Cabin Tidy read-only smoke
+[12] exact next user click
+
+Final:
+HOMEPAGE TYPE NORMALIZATION READY = YES/NO
+FEATURED PREVIEW AUTO-BOOTSTRAP READY = YES/NO
