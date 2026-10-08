@@ -1,0 +1,350 @@
+ShopSource Studio — Phase 4.3.2 HOTFIX
+FEATURED PRODUCTS REVIEW UI + CABIN TIDY SELECTION QUALITY
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Current expected baseline: 86246dd3a81a940161039b78e85f7d7d6c8a2e54
+
+Observed real Cabin Tidy state
+- Featured products now reaches:
+  선택된 상품: 4 / 4 · 상태: READY
+- Read-only catalog smoke found 500 Shopify products, 498 eligible.
+- Current selected examples include:
+  1) car trash can
+  2) backseat organizer
+  3) center-console replacement part / vehicle-specific fitment part
+  4) trunk organizer
+
+Observed UI bug
+- User clicks [상품 4개 보기].
+- Nothing visibly changes.
+- In current UI code the button only calls render_featured(), which redraws the same one-line text already visible in the card.
+- There is no actual product review dialog/card view, no images, and no clickable live product links.
+
+Goal
+Make the 4 selected products actually reviewable in a beginner-friendly UI, and improve selection quality so Cabin Tidy favors broad organizing/problem-solving products over vehicle-specific replacement parts.
+
+======================================================================
+1. REAL "상품 4개 보기" REVIEW UI
+======================================================================
+
+Replace the current no-op-ish review behavior with a real dialog or dedicated review panel.
+
+Clicking [상품 4개 보기] must open a visible review UI containing 4 product cards.
+
+Each card must show:
+- product image thumbnail (remote Shopify image URL)
+- order 1–4
+- title
+- price
+- high-level category/group
+- Shopify ACTIVE status
+- source kind: EXISTING_SHOPIFY / SHOPSOURCE_MANAGED
+- selection reason
+- verification status
+- product handle
+- clickable [Shopify 상품 열기] or [스토어에서 보기] action
+
+Do not expose raw GID as the primary beginner UI.
+A small expandable "상세 정보" may show technical IDs if useful.
+
+If onlineStoreUrl is available, open it.
+Otherwise construct the storefront URL safely from configured shop domain + /products/{handle}.
+Do not invent a URL when shop/domain is unavailable.
+
+Use a NiceGUI dialog or obvious expanded panel that the user can see immediately.
+The current button must not merely rerender the existing text lines.
+
+======================================================================
+2. PRODUCT IMAGES
+======================================================================
+
+Use the already-read image_url.
+Display thumbnails with object-fit contain/cover and a reasonable max size.
+
+If an image URL fails:
+- show a placeholder / "이미지 불러오기 실패"
+- do not crash the dialog.
+
+No paid image generation.
+
+======================================================================
+3. CLICKABLE LINKS
+======================================================================
+
+Add an explicit clickable action for each selected product.
+
+Preferred labels:
+- "스토어에서 보기"
+- "Shopify 상품 확인"
+
+If only relative /products/{handle} is available, derive the absolute storefront URL only when a valid configured shop domain exists.
+Do not expose Admin URLs unless a safe Admin deep link is already available and proven.
+
+Open external product link in a new browser tab when supported.
+
+======================================================================
+4. MAIN CARD SUMMARY CLEANUP
+======================================================================
+
+The current main featured-products card is too dense: it prints long taxonomy strings and full product details inline.
+
+Keep the main card compact:
+- selected count/status
+- diagnostics counts
+- concise 4-row summary: title + short group + price + ACTIVE
+- buttons
+
+Move long fields, source kind, verification, handle, and full selection reason into the product review dialog.
+
+======================================================================
+5. CATEGORY / GROUP NORMALIZATION
+======================================================================
+
+Current category_key may be a very long Shopify taxonomy/productType string, e.g.
+"Automotive Interior Accessories Consoles Organizers Seat Back Organizers"
+This makes category diversity technically different but visually noisy.
+
+Add a normalized merchandising_group used ONLY for recommendation diversity/display.
+Do not change Shopify taxonomy.
+
+Generic derivation:
+1. existing ShopSource collection mapping/tag if available
+2. normalized productType / tags
+3. title keyword grouping fallback
+
+Suggested generic group labels for Cabin Tidy-like products:
+- Trunk & Cargo
+- Seat & Backseat
+- Console & Small Storage
+- Trash & Cleanup
+- Cup Holder & Convenience
+- Document & Visor
+- General Organization
+- Other
+
+Do not hard-code Cabin Tidy product IDs/titles.
+Keyword/group rules can live in a reusable merchandising classifier/profile layer.
+
+======================================================================
+6. CABIN TIDY QUALITY FILTER
+======================================================================
+
+The current sample selected a vehicle-specific replacement part:
+"Center Console Lid with Cup Holders Solid Black Fits 1999-2007 Silverado Sierra"
+
+For Cabin Tidy, broad organization/problem-solving items should rank above:
+- vehicle-specific replacement parts
+- fitment-specific trim/body parts
+- OEM replacement components
+- model-year-specific repair parts
+
+Do NOT delete/exclude these products from the store catalog.
+Only lower their homepage featured-product rank.
+
+Add a generic homepage merchandising suitability score, for example:
+positive signals:
+- organizer
+- storage
+- trash
+- holder
+- cargo
+- seat back
+- trunk
+- console organizer
+- cup holder organizer
+- visor organizer
+- travel organizer
+negative/rank-down signals:
+- "fits 19xx-20xx"
+- make/model names tied to fitment
+- replacement
+- trim
+- lid
+- panel
+- OEM / OE
+- direct-fit
+- part number style titles
+
+This scoring should be configurable/profile-aware and not Cabin-Tidy-only core hacks.
+
+BALANCED_CATEGORIES selection order should consider:
+1. eligibility
+2. merchandising suitability
+3. category diversity
+4. freshness
+
+Do not allow a low-suitability replacement part to displace a high-suitability organizer if a suitable organizer is available.
+
+======================================================================
+7. "다시 선택" MUST ACTUALLY RESELECT
+======================================================================
+
+Current [다시 선택] calls the same deterministic selection and can return the exact same set.
+
+Implement actual reselection behavior:
+- preserve all eligibility/safety rules
+- prefer the next-best combination
+- avoid the immediately previous selected Shopify IDs when enough alternatives exist
+- maintain category diversity
+- do not use randomness that makes tests flaky; use deterministic rotation/next-ranked set
+- if not enough alternatives, reuse items and show a message
+
+Button label can remain:
+[다시 선택]
+
+After reselection, update the 4-product review UI and status.
+
+======================================================================
+8. OPTIONAL MANUAL REPLACEMENT
+======================================================================
+
+In the review dialog, add a beginner-friendly action per card:
+[이 상품 바꾸기]
+
+It should open a bounded list of eligible alternatives for the same merchandising group first, then other groups.
+Selecting an alternative updates the plan order without writing Shopify.
+
+Do not require raw IDs.
+Do not perform theme write.
+
+If this is too large for this small hotfix, implement at minimum the review dialog + deterministic reselection, and report manual replacement as deferred.
+
+======================================================================
+9. PREVIEW GUARD
+======================================================================
+
+[추천 상품 미리보기] must use the currently reviewed/current plan.
+
+If plan changed through reselection, any older theme preview must be invalidated/stale.
+Do not allow stale selected products to proceed to apply.
+
+======================================================================
+10. UI TEXT
+======================================================================
+
+Use Korean beginner labels.
+
+Main card example:
+
+추천 상품(신상품)
+선택된 상품: 4 / 4 · 상태: READY
+Shopify 기존 상품 후보: 498 · 최종 사용 가능: 498
+
+1. 2-Pack Black Silicone Car Trash Cans... · Trash & Cleanup · $90.78 · ACTIVE
+2. Car Backseat Organizer... · Seat & Backseat · $100.98 · ACTIVE
+3. ...
+4. ...
+
+[추천 상품 자동 구성] [상품 4개 보기] [다시 선택] [Shopify 상품 다시 읽기] [추천 상품 미리보기]
+
+Dialog title:
+"추천 상품 4개 확인"
+
+======================================================================
+11. TESTS
+======================================================================
+
+Add/upgrade focused tests at minimum:
+
+test_featured_product_review_button_opens_visible_dialog_or_panel
+test_featured_review_contains_four_cards
+test_featured_review_contains_image_title_price_status
+test_featured_review_contains_clickable_product_link
+test_featured_review_link_uses_real_handle
+test_featured_review_missing_domain_does_not_invent_url
+test_featured_main_card_is_compact
+test_merchandising_group_normalizes_long_taxonomy
+test_merchandising_group_trunk
+test_merchandising_group_seat
+test_merchandising_group_console
+test_merchandising_group_trash
+test_vehicle_specific_replacement_part_ranked_below_organizer
+test_reselection_changes_set_when_alternatives_exist
+test_reselection_is_deterministic
+test_reselection_preserves_four_eligible_products
+test_reselection_invalidates_old_preview
+test_no_shopify_write_for_review_or_reselect
+test_existing_phase43_and_phase431_tests_still_pass
+test_no_real_network_in_tests
+
+All full-suite tests must remain green.
+
+======================================================================
+12. PROTECTED FILES
+======================================================================
+
+Do not stage/commit:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env / tokens
+- live exports/backups
+
+======================================================================
+13. QUALITY GATE
+======================================================================
+
+Run:
+python -m compileall -q src tests
+python -m pytest -q tests/test_homepage_featured_products.py
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.ui.v2 --help
+
+No real Shopify write.
+No paid image call.
+
+======================================================================
+14. READ-ONLY CABIN TIDY SMOKE
+======================================================================
+
+If configured credentials are available, perform read-only smoke:
+- reuse/refresh catalog
+- create BALANCED_CATEGORIES plan
+- confirm 4/4
+- print selected title + normalized merchandising_group + suitability score
+- confirm the obvious vehicle-specific replacement-part sample is not selected when better organizer alternatives exist
+- no write
+
+======================================================================
+15. COMMIT / PUSH
+======================================================================
+
+After tests pass:
+git status
+commit implementation only
+
+Suggested commit:
+git commit -m "Improve featured product review and selection"
+
+git push origin main
+
+Confirm main...origin/main = 0 0.
+
+======================================================================
+16. COMPLETION REPORT
+======================================================================
+
+Report:
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] review UI fix
+[5] clickable product links
+[6] merchandising group normalization
+[7] suitability ranking
+[8] reselection behavior
+[9] preview stale guard
+[10] tests / pass count
+[11] protected files
+[12] commit/push
+[13] Cabin Tidy read-only selected 4 products
+[14] exact next user click
+
+Final:
+FEATURED PRODUCT REVIEW UI READY = YES/NO
+CABIN TIDY SELECTION QUALITY READY = YES/NO
