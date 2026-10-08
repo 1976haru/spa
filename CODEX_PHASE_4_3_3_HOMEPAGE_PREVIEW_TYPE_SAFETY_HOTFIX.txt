@@ -1,0 +1,241 @@
+ShopSource Studio — Phase 4.3.3 HOTFIX
+HOMEPAGE PREVIEW TYPE-SAFETY + FEATURED PREVIEW AUTO-PREREQUISITE
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Expected baseline: 63021ed7b820075d65c4bd9431f57562fdf018b8
+
+Observed real Cabin Tidy failure
+1) Featured products selection/review is working:
+   - 4/4 READY
+   - review dialog works
+2) User then clicks Homepage Auto Design / Featured Product Preview.
+3) Error shown:
+   'list' object has no attribute 'strip'
+4) Featured preview then reports:
+   MANUAL_ACTION_REQUIRED · Shopify write 없음
+
+Root cause confirmed from current source
+In src/shopsource/homepage_automation.py, hero_image_prompt():
+    avoid = profile.get("avoid_styles", "").strip()
+But Brand Profile may validly store avoid_styles as a list.
+Calling .strip() on a list throws exactly:
+    'list' object has no attribute 'strip'
+Because homepage auto design crashes before a valid theme snapshot/preview is fully stored, Featured Product Preview then runs against an empty/not-checked snapshot and falls back to MANUAL_ACTION_REQUIRED.
+
+This hotfix must fix BOTH:
+A. the type-safety bug
+B. the poor UX where Featured Product Preview requires the user to separately know that homepage/theme prerequisites must already be loaded.
+
+======================================================================
+1. TYPE-SAFE BRAND PROFILE TEXT NORMALIZATION
+======================================================================
+
+Add a small reusable helper in an appropriate module, e.g.:
+normalize_prompt_text(value, separator=", ")
+
+Requirements:
+- None -> ""
+- str -> stripped string
+- list/tuple/set -> normalize each scalar element and join
+- dict -> stable readable text (prefer values or "key: value"; do not emit Python repr noise)
+- numbers/bool -> str(value)
+- nested lists -> flatten safely if reasonable
+- never throw merely because a BrandProfile text-like field is list/dict
+
+Use this helper in hero_image_prompt() for at least:
+- avoid_styles
+- personality
+- brand_keywords
+- colors/palette if needed
+and audit nearby homepage prompt code for the same unsafe assumption.
+
+Do NOT silently mutate the stored Brand Profile. This is display/prompt normalization only.
+
+======================================================================
+2. REGRESSION TEST FOR EXACT CRASH
+======================================================================
+
+Add an explicit test with:
+profile = {
+  "avoid_styles": ["3D", "watermarks", "busy patterns", "thin details"],
+  "personality": ["clean", "practical", "premium"],
+  "brand_keywords": ["organized", "car storage"]
+}
+
+hero_image_prompt(...) must return a valid string and must not throw.
+
+Also test string and dict variants.
+
+======================================================================
+3. FEATURED PREVIEW SHOULD AUTO-ENSURE THEME SNAPSHOT
+======================================================================
+
+Current UI featured_preview() calls:
+FeaturedProductAssignmentService().build_theme_preview(plan, state.get("snapshot") or {})
+
+This is fragile because a fresh UI session may have:
+- a valid featured-products plan
+- no homepage state snapshot yet
+
+Change featured_preview() so it is one-click beginner-safe:
+
+When clicked:
+1. Verify current featured plan exists.
+2. If state.snapshot is missing, NOT_CHECKED, stale, or lacks theme_files/template:
+   run READ-ONLY ShopifyThemeReader().discover(current_store)
+3. Store the snapshot in state.
+4. If the theme read fails/missing read_themes:
+   show a precise Korean message and stop.
+5. Call build_theme_preview() with the real fresh snapshot.
+6. Show the actual reason when status != PREVIEW.
+
+No Shopify write.
+
+Do not require the user to separately click "홈페이지 자동 설계" just to load theme metadata for featured preview.
+
+======================================================================
+4. HOMEPAGE AUTO DESIGN ERROR REPORTING
+======================================================================
+
+The generic _safe_error currently exposes only:
+'list' object has no attribute 'strip'
+
+Improve this path so Homepage Auto Design shows a contextual message, e.g.
+"홈페이지 프롬프트 생성 중 Brand Profile 필드 형식 오류"
+while still logging the sanitized technical detail.
+
+Do not hide useful developer diagnostics from logs.
+
+======================================================================
+5. FEATURED PREVIEW RESULT DETAIL
+======================================================================
+
+Current toast:
+"추천 상품 미리보기: MANUAL_ACTION_REQUIRED · Shopify write 없음"
+
+Upgrade to include reason:
+- PREVIEW -> "추천 상품 미리보기 준비 완료 · Shopify 변경 없음"
+- MANUAL_ACTION_REQUIRED -> "추천 상품 미리보기 수동 확인 필요: <reason>"
+- BLOCKED -> "추천 상품 미리보기 차단: <reason>"
+
+Also render a small status line/card beneath the buttons:
+- Theme: CONNECTED / missing
+- Featured section mode: DIRECT_PRODUCTS / FEATURED_COLLECTION / manual
+- Preview action: CREATE / UPDATE / NO_CHANGE
+- Write: 없음
+
+======================================================================
+6. DO NOT REGRESS FEATURED PRODUCT REVIEW
+======================================================================
+
+Keep all Phase 4.3.2 functionality:
+- 4-card review dialog
+- images
+- clickable product links
+- normalized merchandising groups
+- suitability ranking
+- deterministic reselection
+- no Shopify write during review/reselect
+
+======================================================================
+7. TESTS
+======================================================================
+
+Add focused tests at minimum:
+
+test_hero_image_prompt_accepts_avoid_styles_list
+test_hero_image_prompt_accepts_personality_list
+test_hero_image_prompt_accepts_brand_keywords_list
+test_prompt_text_normalizer_handles_none_string_list_dict_nested
+test_homepage_design_brand_profile_list_fields_no_crash
+test_featured_preview_auto_discovers_theme_when_snapshot_missing
+test_featured_preview_reuses_connected_snapshot
+test_featured_preview_missing_read_themes_precise_message
+test_featured_preview_manual_action_shows_reason
+test_featured_preview_does_not_write_shopify
+test_phase432_review_ui_still_passes
+
+Run full suite.
+
+======================================================================
+8. PROTECTED FILES
+======================================================================
+
+Do not stage/commit:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env / tokens
+- live exports/backups
+- user-generated assets
+
+======================================================================
+9. QUALITY GATE
+======================================================================
+
+Run:
+python -m compileall -q src tests
+python -m pytest -q tests/test_homepage_featured_products.py
+python -m pytest -q
+git diff --check
+
+$env:PYTHONPATH = (Resolve-Path src).Path
+python -m shopsource.ui.v2 --help
+
+No real Shopify write.
+No paid image generation.
+
+======================================================================
+10. READ-ONLY CABIN TIDY SMOKE
+======================================================================
+
+If credentials/network allow, read-only smoke:
+1. load Brand Profile
+2. build homepage plan (must not crash on list fields)
+3. read theme snapshot
+4. create featured product plan 4/4
+5. build featured theme preview
+6. report exact status/reason
+
+No Shopify write.
+
+======================================================================
+11. COMMIT / PUSH
+======================================================================
+
+After tests pass:
+git status
+commit implementation only
+
+Suggested:
+git commit -m "Fix homepage preview type safety and prerequisites"
+
+git push origin main
+
+Confirm:
+git rev-list --left-right --count main...origin/main
+=> 0 0
+
+======================================================================
+12. COMPLETION REPORT
+======================================================================
+
+Report:
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] exact strip crash root cause
+[5] normalization helper
+[6] featured preview auto-prerequisite behavior
+[7] improved UI status/reason
+[8] tests / pass count
+[9] protected files
+[10] commit/push
+[11] Cabin Tidy read-only smoke
+[12] exact next user click
+
+Final:
+HOMEPAGE LIST-STRIP BUG FIXED = YES/NO
+FEATURED PREVIEW ONE-CLICK READY = YES/NO
