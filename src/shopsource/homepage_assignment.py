@@ -108,7 +108,8 @@ class HomepageAssignmentService:
     """Compose a one-click, preview-first assignment flow."""
 
     def build(self, *, homepage: dict, collection_plan: dict, mappings: dict[str, dict],
-              approved_images: dict[str, dict], theme: dict, hero_asset: dict | None = None) -> dict:
+              approved_images: dict[str, dict], theme: dict, hero_asset: dict | None = None,
+              featured_products: dict | None = None) -> dict:
         original = deepcopy(homepage)
         targets = {f"/collections/{m['handle']}" for m in mappings.values()
                    if m.get("handle") and (m.get("remote_id") or m.get("shopify_collection_id"))}
@@ -117,14 +118,19 @@ class HomepageAssignmentService:
         featured = [x for x in categories["items"][:4]]
         proposed = deepcopy(original)
         proposed.update({"hero": banner["hero"], "category_shortcuts": categories["items"],
-                         "featured_collections": featured})
+                         "featured_collections": featured,
+                         "featured_products": deepcopy((featured_products or {}).get("items", []))})
         # Non-managed content is copied, never rebuilt.
         proposed["unrelated_sections"] = deepcopy(original.get("unrelated_sections", []))
         capability = categories["capability"]
-        can_apply = banner["status"] == "READY" and categories["status"] == "READY"
-        return {"sequence": ["HERO", "CATEGORY_SHORTCUTS", "FEATURED_COLLECTIONS", "LINK_CHECK",
+        featured_status = (featured_products or {}).get("status", "READY")
+        can_apply = banner["status"] == "READY" and categories["status"] == "READY" and featured_status in {"READY", "VERIFIED"}
+        return {"sequence": ["HERO", "CATEGORY_SHORTCUTS", "FEATURED_COLLECTIONS", "FEATURED_PRODUCTS_PLAN",
+                             "FEATURED_PRODUCTS_VERIFY", "LINK_CHECK",
                              "THEME_PREVIEW", "THEME_WRITE_CONFIRMATION", "REMOTE_VERIFY", "ASSIGNMENT_READY"],
                 "current": original, "proposed": proposed, "banner": banner, "categories": categories,
+                "featured_products": featured_products or {"status": "REVIEW_REQUIRED", "items": [], "reasons": ["FEATURED_PRODUCTS_PLAN_REQUIRED"]},
+                "featured_products_required": featured_products is not None,
                 "capability": capability, "theme_write_requires_confirmation": True,
                 "theme_write_allowed": can_apply, "external_gui_automation": False}
 
@@ -133,6 +139,8 @@ class HomepageAssignmentService:
         hero = preview["banner"]["hero"]
         cats = preview["categories"]
         items = cats["items"]
+        featured = preview.get("featured_products") or {"items": []}
+        product_items = featured.get("items", [])
         checks = {
             "hero_visible": bool(hero.get("enabled", True) and hero.get("image_asset_id")),
             "title_and_description": bool(hero.get("headline") and hero.get("body")),
@@ -146,6 +154,15 @@ class HomepageAssignmentService:
             "desktop_checked": bool(desktop_checked), "mobile_checked": bool(mobile_checked),
             "applied": bool(applied), "remote_verified": bool(verified),
         }
+        if preview.get("featured_products_required"):
+            checks.update({
+                "featured_products_count": len(product_items) >= int(featured.get("requested_count", 4)),
+                "featured_products_unique": len({x.get("shopify_product_id") for x in product_items}) == len(product_items),
+                "featured_products_real_links": bool(product_items) and all(x.get("shopify_handle") for x in product_items),
+                "featured_products_price_valid": bool(product_items) and all(float(x.get("price") or 0) > 0 for x in product_items),
+                "featured_products_images_ready": bool(product_items) and all(x.get("image_url") for x in product_items),
+                "featured_products_storefront_eligible": bool(product_items) and all(x.get("remote_status") == "ACTIVE" for x in product_items),
+            })
         ready = all(checks.values()) and preview["capability"]["status"] in {"NATIVE_THEME_AUTO", "NATIVE_THEME_REVIEW_REQUIRED"}
         return {"checks": checks, "status": "ASSIGNMENT_READY" if ready else "REVIEW_REQUIRED",
                 "ready": ready, "manual_reason": preview["capability"].get("reason")}
@@ -160,6 +177,10 @@ def homepage_assignment_workflow(preview: dict, *, preview_id: str | None = None
         {"task_key": "FEATURED_COLLECTIONS", "title": "추천 컬렉션 구성", "stage": "Featured Collections"},
         {"task_key": "LINK_CHECK", "title": "링크 검사", "stage": "링크 검사"},
         {"task_key": "THEME_PREVIEW", "title": "테마 미리보기", "stage": "테마 미리보기"},
+    ]
+    tasks[3:3] = [
+        {"task_key": "FEATURED_PRODUCTS_PLAN", "title": "추천 상품 자동 구성", "stage": "Featured Products plan"},
+        {"task_key": "FEATURED_PRODUCTS_VERIFY", "title": "추천 상품 검증", "stage": "Featured Products verify"},
     ]
     capability = preview["capability"]["status"]
     if capability in {"EXTERNAL_PAGE_BUILDER_MANUAL", "UNSUPPORTED_MANUAL"} or not preview_id:

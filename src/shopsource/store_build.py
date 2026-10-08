@@ -17,7 +17,8 @@ STAGES = ("PLAN", "BRAND_PLAN", "BRAND_ASSET_PREVIEW", "BRAND_ASSET_GENERATION",
           "COLLECTION_PLAN", "COLLECTION_IMAGE", "COLLECTION_SYNC_PREVIEW", "COLLECTION_SYNC", "COLLECTION_VERIFY",
           "NAVIGATION_PLAN", "NAVIGATION_SYNC_PREVIEW", "NAVIGATION_SYNC", "NAVIGATION_VERIFY", "MEGA_MENU_PREVIEW", "MEGA_MENU_APPLY",
           "HOMEPAGE_PLAN", "HERO_ASSET_PREVIEW", "HERO_ASSET_GENERATION", "CATEGORY_SHORTCUT_PLAN",
-          "CATEGORY_ASSET_PREVIEW", "CATEGORY_ASSET_GENERATION", "HOMEPAGE_SYNC_PREVIEW", "HOMEPAGE_SYNC",
+          "CATEGORY_ASSET_PREVIEW", "CATEGORY_ASSET_GENERATION", "FEATURED_PRODUCTS_PLAN", "FEATURED_PRODUCTS_PREVIEW",
+          "FEATURED_PRODUCTS_APPLY", "FEATURED_PRODUCTS_VERIFY", "HOMEPAGE_SYNC_PREVIEW", "HOMEPAGE_SYNC",
           "HOMEPAGE_VERIFY", "BRAND_APPLY_PREVIEW", "BRAND_APPLY",
           "PRODUCT_TEMPLATE", "COLLECTION_TEMPLATE", "STATIC_PAGES", "POLICIES", "FOOTER", "SEO",
           "SEARCH", "CART", "QUALITY_AUDIT", "COMMERCE_READINESS", "FINAL_VERIFY",
@@ -564,6 +565,52 @@ class StoreBuildOrchestrator:
         if stage == "CATEGORY_SHORTCUT_PLAN":
             plan = data.get("storefront_homepage_plan") or {}
             return {"status": "PLANNED" if plan.get("categories") else "SKIPPED", "count": len(plan.get("categories", []))}
+        if stage == "FEATURED_PRODUCTS_PLAN":
+            if not options.get("homepage_plan"): return {"stage_status": "SKIPPED"}
+            from .homepage_featured_products import FeaturedProductAssignmentService
+            plan = FeaturedProductAssignmentService(db=self.db, export_dir=self.export_dir).create_plan(
+                store_id, mode=options.get("featured_products_mode", "BALANCED_CATEGORIES"),
+                requested_count=int(options.get("featured_products_count", 4)),
+                heading=options.get("featured_products_heading", "New Arrivals"),
+                subheading=options.get("featured_products_subheading", ""),
+                manual_product_ids=options.get("featured_products_manual_ids"),
+                collection_key=options.get("featured_products_collection_key"),
+                collection_handle=options.get("featured_products_collection_handle"))
+            data["featured_products_plan_id"] = plan["plan_id"]
+            if plan["status"] != "READY":
+                return {"status": "MANUAL_ACTION_REQUIRED", "manual_gate": "FEATURED_PRODUCTS_SELECTION",
+                        "plan_id": plan["plan_id"], "instructions": "; ".join(plan["reasons"]) or "Select four eligible mapped products."}
+            return {"status": "READY", "counts": {"selected": len(plan["items"])}, "plan_id": plan["plan_id"]}
+        if stage == "FEATURED_PRODUCTS_PREVIEW":
+            if not options.get("homepage_plan"): return {"stage_status": "SKIPPED"}
+            from .homepage_featured_products import FeaturedProductAssignmentService
+            service = FeaturedProductAssignmentService(db=self.db, export_dir=self.export_dir)
+            plan = service.get_plan(data["featured_products_plan_id"])
+            preview = service.build_theme_preview(plan, options.get("featured_products_theme_snapshot") or {})
+            data["featured_products_preview"] = preview
+            service.export_report(plan["plan_id"])
+            if preview["status"] != "PREVIEW":
+                return {"status": "MANUAL_ACTION_REQUIRED", "manual_gate": "FEATURED_PRODUCTS_PREVIEW",
+                        "instructions": preview.get("instructions") or preview.get("reason"), "preview": preview}
+            return {"status": "PREVIEW", "preview_hash": preview["preview_hash"], "write_performed": False}
+        if stage == "FEATURED_PRODUCTS_APPLY":
+            if not options.get("featured_products_apply"):
+                return {"status": "MANUAL_ACTION_REQUIRED", "manual_gate": "FEATURED_PRODUCTS_APPLY",
+                        "instructions": "Review Featured Products preview, then explicitly confirm Shopify apply in the UI.",
+                        "write_performed": False}
+            return {"status": "MANUAL_ACTION_REQUIRED", "manual_gate": "FEATURED_PRODUCTS_APPLY",
+                    "instructions": "Featured Products apply remains behind the existing guarded homepage theme-write service.",
+                    "write_performed": False}
+        if stage == "FEATURED_PRODUCTS_VERIFY":
+            from .homepage_featured_products import FeaturedProductAssignmentService
+            preview = data.get("featured_products_preview") or {}
+            result = FeaturedProductAssignmentService(db=self.db).verify_remote(
+                data["featured_products_plan_id"], preview_hash=preview.get("preview_hash", ""),
+                remote_section=options.get("featured_products_remote_section"))
+            if result["status"] != "VERIFIED":
+                return {"status": "MANUAL_ACTION_REQUIRED", "manual_gate": "FEATURED_PRODUCTS_VERIFY",
+                        "instructions": "Apply explicitly, then run remote readback verification.", "verification": result}
+            return result
         if stage == "HOMEPAGE_SYNC_PREVIEW":
             if not options.get("homepage_plan"): return {"stage_status": "SKIPPED"}
             result = data.get("homepage_plan") or {}

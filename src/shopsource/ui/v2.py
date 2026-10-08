@@ -31,6 +31,7 @@ from ..homepage_automation import (HomepageAutomationService, assignment_banner_
     approve_hero_asset, generate_hero_image, latest_hero_asset, register_manual_hero_asset,
     suggested_theme_image_ref, upload_approved_hero_asset, validate_homepage_image)
 from ..homepage_assignment import HomepageAssignmentService, homepage_assignment_workflow
+from ..homepage_featured_products import FeaturedProductAssignmentService
 from ..automation import AutomationTaskError, WorkflowAutomationService, collection_prerequisite_workflow
 from ..collection_prerequisite import CollectionPrerequisiteService, prepare_homepage_prerequisites
 from ..prompt_assets import PromptAssetService
@@ -1978,6 +1979,51 @@ class OperatorUI:
             local_image = ui.input("배너 이미지 검사 경로").classes("w-full")
             paid_opt_in = ui.checkbox("유료 이미지 자동 생성 사용", value=False)
 
+            with ui.card().classes("w-full border border-indigo-200 bg-white"):
+                ui.label("추천 상품(신상품)").classes("text-lg font-semibold")
+                featured_status = ui.label("선택된 상품: 0 / 4 · 상태: REVIEW REQUIRED")
+                featured_table = ui.column().classes("w-full gap-1")
+
+                def render_featured(plan=None):
+                    plan = plan or state.get("featured_products_plan")
+                    featured_table.clear()
+                    count = len((plan or {}).get("items", []))
+                    featured_status.set_text(f"선택된 상품: {count} / 4 · 상태: {(plan or {}).get('status', 'REVIEW REQUIRED')}")
+                    with featured_table:
+                        for item in (plan or {}).get("items", []):
+                            ui.label(f"{item['position']}. {item['title']} · {item.get('category_key') or '-'} · ${item.get('price') or 0:.2f} · {item['remote_status']} · /products/{item['shopify_handle']} · {item['selection_reason']} · {item['verification_status']}")
+                        if not count:
+                            ui.label("실제 Shopify mapping, 판매가, 이미지, ACTIVE 상태가 검증된 상품이 필요합니다.").classes("ss-help")
+
+                def select_featured_products():
+                    try:
+                        service = FeaturedProductAssignmentService()
+                        plan = service.create_plan(self.current_store, mode="BALANCED_CATEGORIES", requested_count=4,
+                            heading="New Arrivals", subheading="Fresh picks to keep your car clean, organized, and ready to go." if self.current_store == "001" else "")
+                        state["featured_products_plan"] = plan
+                        render_featured(plan)
+                        ui.notify("추천 상품 계획을 로컬에 저장했습니다. Shopify write는 실행하지 않았습니다.", type="positive" if plan["status"] == "READY" else "warning")
+                    except Exception as exc: ui.notify(_safe_error(exc), type="negative")
+
+                def featured_preview():
+                    plan = state.get("featured_products_plan")
+                    if not plan: ui.notify("먼저 추천 상품 자동 구성을 실행하세요.", type="warning"); return
+                    preview = FeaturedProductAssignmentService().build_theme_preview(plan, state.get("snapshot") or {})
+                    state["featured_products_preview"] = preview
+                    ui.notify(f"추천 상품 미리보기: {preview['status']} · Shopify write 없음", type="positive" if preview["status"] == "PREVIEW" else "warning")
+
+                def featured_apply_gate():
+                    ui.notify("FEATURED PRODUCTS ASSIGNMENT UI READY · 실제 적용은 검토된 preview에서 명시적으로 확인해야 합니다.", type="warning")
+
+                with ui.row().classes("flex-wrap gap-2"):
+                    ui.button("추천 상품 자동 구성", on_click=select_featured_products, icon="auto_awesome").props("color=primary")
+                    ui.button("상품 4개 보기", on_click=lambda: render_featured(), icon="view_list").props("outline")
+                    ui.button("다시 선택", on_click=select_featured_products, icon="refresh").props("outline")
+                    ui.button("추천 상품 미리보기", on_click=featured_preview, icon="preview").props("outline")
+                    ui.button("Shopify 적용", on_click=featured_apply_gate, icon="publish").props("outline")
+                    ui.button("과제 제출용 확인", on_click=lambda: ui.notify("원격 section 검증 후 ASSIGNMENT_READY가 됩니다.", type="info"), icon="checklist").props("outline")
+                render_featured()
+
             async def save_hero_upload(event):
                 try:
                     plan = state.get("plan")
@@ -2107,7 +2153,8 @@ class OperatorUI:
                     state["assignment_preview"] = HomepageAssignmentService().build(
                         homepage={"hero": plan["hero"], "unrelated_sections": (snapshot.get("template") or {}).get("sections", {})},
                         collection_plan=collection_plan, mappings=assignment_mappings,
-                        approved_images=images, theme=theme_assignment, hero_asset=hero_asset)
+                        approved_images=images, theme=theme_assignment, hero_asset=hero_asset,
+                        featured_products=state.get("featured_products_plan"))
                     HomepageAutomationService().export_report(plan, preview=state["preview"])
                     update_homepage_prerequisite_status(True)
                     summary.set_text(f"Hero: NEEDS IMAGE · Categories: {plan['category_summary']['ready_count']} READY / {plan['category_summary']['skipped_count']} SKIPPED · Theme: {snapshot.get('status', 'MANUAL ACTION')}")

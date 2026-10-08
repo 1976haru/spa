@@ -20,7 +20,7 @@ from .security import redact_value
 
 DOMAINS = (
     "PRODUCTS", "COLLECTIONS", "PRICING", "INVENTORY_POLICY", "BRAND",
-    "NAVIGATION", "HOMEPAGE", "PRODUCT_TEMPLATE", "COLLECTION_TEMPLATE",
+    "NAVIGATION", "HOMEPAGE", "FEATURED_PRODUCTS", "PRODUCT_TEMPLATE", "COLLECTION_TEMPLATE",
     "SEARCH", "CART", "FOOTER", "STATIC_PAGES", "POLICIES", "CONTACT_SUPPORT",
     "SEO", "ACCESSIBILITY", "MOBILE", "BROKEN_LINKS", "MEDIA_QUALITY",
     "MARKETS_CURRENCY", "DOMAIN_SSL", "SHIPPING", "TAX", "PAYMENT", "CHECKOUT",
@@ -35,7 +35,7 @@ REQUIRED_BLOCKERS = {"PRODUCTS", "NAVIGATION", "SEARCH", "CART", "POLICIES", "SH
 AUTO_SAFE_AREAS = {"FOOTER", "STATIC_PAGES", "SEO", "ACCESSIBILITY", "MOBILE", "BROKEN_LINKS", "MEDIA_QUALITY"}
 WEIGHTS = {
     "PRODUCTS": 8, "COLLECTIONS": 4, "PRICING": 4, "INVENTORY_POLICY": 3, "BRAND": 6,
-    "NAVIGATION": 6, "HOMEPAGE": 5, "PRODUCT_TEMPLATE": 5, "COLLECTION_TEMPLATE": 4,
+    "NAVIGATION": 6, "HOMEPAGE": 5, "FEATURED_PRODUCTS": 5, "PRODUCT_TEMPLATE": 5, "COLLECTION_TEMPLATE": 4,
     "SEARCH": 3, "CART": 4, "FOOTER": 2, "STATIC_PAGES": 3, "POLICIES": 5,
     "CONTACT_SUPPORT": 2, "SEO": 4, "ACCESSIBILITY": 3, "MOBILE": 3,
     "BROKEN_LINKS": 4, "MEDIA_QUALITY": 3, "MARKETS_CURRENCY": 3, "DOMAIN_SSL": 2,
@@ -448,6 +448,9 @@ class StoreCompletionService:
             "BRAND": final(bool(self._references(store_id).get("brand_profile_id") or snapshot.get("brand")), manual=True, details=consistency),
             "NAVIGATION": final(bool(snapshot.get("navigation_ready")) and links["status"] == "VERIFIED", reason="Broken or unverified main navigation", details=links),
             "HOMEPAGE": final(bool(snapshot.get("homepage_ready")), manual=True),
+            "FEATURED_PRODUCTS": final(bool((snapshot.get("featured_products") or {}).get("remote_verified"))
+                                       if "featured_products" in snapshot else True, manual=True,
+                                       details=snapshot.get("featured_products") or {"status": "LEGACY_NOT_REPORTED"}),
             "PRODUCT_TEMPLATE": final(product_template["status"] == "PRESENT", manual=True, details=product_template),
             "COLLECTION_TEMPLATE": final(collection_template["status"] == "PRESENT", manual=True, details=collection_template),
             "SEARCH": final(search["status"] == "VERIFIED", reason="Basic storefront search is incomplete", details=search),
