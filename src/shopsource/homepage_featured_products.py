@@ -9,12 +9,13 @@ import hashlib
 import json
 import re
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .db import connect, init_db
 from .paths import EXPORT_DIR
 from .shopify_products import _install_schema as install_product_schema
+from .shopify_collections import ShopifyGraphQLClient, get_connection, get_shopify_token
 
 MODES = {"NEW_ARRIVALS", "BALANCED_CATEGORIES", "MANUAL_SELECTION"}
 ELIGIBLE_DECISIONS = {"PRIMARY", "RESERVE_A", "RESERVE_B", "PRODUCTION_CANDIDATE"}
@@ -38,12 +39,125 @@ def _install(db=None):
         CREATE INDEX IF NOT EXISTS idx_featured_product_plan_store
           ON homepage_featured_product_plans(store_id,created_at DESC);
         CREATE TABLE IF NOT EXISTS homepage_featured_product_items(
-          plan_id TEXT NOT NULL,position INTEGER NOT NULL,master_product_id INTEGER NOT NULL,
+          plan_id TEXT NOT NULL,position INTEGER NOT NULL,source_kind TEXT NOT NULL DEFAULT 'SHOPSOURCE_MANAGED',
+          source_key TEXT NOT NULL DEFAULT '',master_product_id INTEGER,
           shopify_product_id TEXT NOT NULL,shopify_handle TEXT NOT NULL,title TEXT NOT NULL,
           category_key TEXT,image_url TEXT,price REAL,remote_status TEXT NOT NULL,
-          selection_reason TEXT NOT NULL,verification_status TEXT NOT NULL,
+          selection_reason TEXT NOT NULL,verification_status TEXT NOT NULL,created_at TEXT,updated_at TEXT,
           PRIMARY KEY(plan_id,position),UNIQUE(plan_id,shopify_product_id),UNIQUE(plan_id,shopify_handle));
+        CREATE TABLE IF NOT EXISTS homepage_featured_product_remote_cache(
+          store_id TEXT PRIMARY KEY,fetched_at TEXT NOT NULL,product_count INTEGER NOT NULL,
+          source_hash TEXT NOT NULL,candidates_json TEXT NOT NULL);
         """)
+        columns = {row["name"] for row in con.execute("PRAGMA table_info(homepage_featured_product_items)")}
+        if "source_kind" not in columns:
+            con.executescript("""
+            ALTER TABLE homepage_featured_product_items RENAME TO homepage_featured_product_items_phase43;
+            CREATE TABLE homepage_featured_product_items(
+              plan_id TEXT NOT NULL,position INTEGER NOT NULL,source_kind TEXT NOT NULL DEFAULT 'SHOPSOURCE_MANAGED',
+              source_key TEXT NOT NULL DEFAULT '',master_product_id INTEGER,shopify_product_id TEXT NOT NULL,
+              shopify_handle TEXT NOT NULL,title TEXT NOT NULL,category_key TEXT,image_url TEXT,price REAL,
+              remote_status TEXT NOT NULL,selection_reason TEXT NOT NULL,verification_status TEXT NOT NULL,
+              created_at TEXT,updated_at TEXT,PRIMARY KEY(plan_id,position),
+              UNIQUE(plan_id,shopify_product_id),UNIQUE(plan_id,shopify_handle));
+            INSERT INTO homepage_featured_product_items(
+              plan_id,position,source_kind,source_key,master_product_id,shopify_product_id,shopify_handle,title,
+              category_key,image_url,price,remote_status,selection_reason,verification_status,created_at,updated_at)
+            SELECT plan_id,position,'SHOPSOURCE_MANAGED','master:' || master_product_id,master_product_id,
+              shopify_product_id,shopify_handle,title,category_key,image_url,price,remote_status,
+              selection_reason,verification_status,NULL,NULL FROM homepage_featured_product_items_phase43;
+            DROP TABLE homepage_featured_product_items_phase43;
+            """)
+
+
+EXISTING_PRODUCTS_QUERY = """query ShopSourceExistingProducts($first:Int!,$after:String) {
+  currentAppInstallation { accessScopes { handle } }
+  products(first:$first,after:$after,sortKey:UPDATED_AT,reverse:true) {
+    nodes { id handle title status createdAt updatedAt productType tags onlineStoreUrl
+      featuredMedia { ... on MediaImage { image { url altText } } }
+      variants(first:20) { nodes { price compareAtPrice } }
+      variantsCount { count } }
+    pageInfo { hasNextPage endCursor }
+  }
+}"""
+
+
+class ShopifyExistingProductReader:
+    """Bounded, cached Admin GraphQL catalog read with no remote-write method."""
+    def __init__(self, *, db=None, client_factory=ShopifyGraphQLClient, cache_minutes=5, page_size=100, max_pages=5):
+        self.db, self.client_factory = db, client_factory
+        self.cache_minutes, self.page_size, self.max_pages = int(cache_minutes), min(100, int(page_size)), min(20, int(max_pages))
+        _install(db)
+
+    @staticmethod
+    def _normalize(row: dict) -> dict:
+        product_id, handle = str(row.get("id") or ""), str(row.get("handle") or "").strip()
+        variants = ((row.get("variants") or {}).get("nodes") or [])
+        prices = []
+        for variant in variants:
+            try:
+                value = float(variant.get("price"))
+                if value > 0: prices.append(value)
+            except (TypeError, ValueError): pass
+        media = row.get("featuredMedia") or {}; image = media.get("image") or {}
+        image_url = image.get("url")
+        status = str(row.get("status") or "").upper(); reasons = []
+        if not product_id.startswith("gid://shopify/Product/"): reasons.append("MISSING_SHOPIFY_PRODUCT_ID")
+        if not handle: reasons.append("MISSING_REAL_HANDLE")
+        if status != "ACTIVE": reasons.append("NOT_STOREFRONT_ELIGIBLE")
+        if not prices: reasons.append("MISSING_VALID_RETAIL_PRICE")
+        if not image_url: reasons.append("NEEDS_IMAGE")
+        if row.get("publishedOnCurrentPublication") is False: reasons.append("NOT_PUBLISHED_ON_CURRENT_PUBLICATION")
+        tags = list(row.get("tags") or []); product_type = str(row.get("productType") or "").strip()
+        category = product_type or (tags[0] if tags else _title_group(row.get("title")))
+        return {"source_kind": "EXISTING_SHOPIFY", "source_key": product_id, "master_product_id": None,
+                "shopify_product_id": product_id, "shopify_handle": handle, "title": str(row.get("title") or ""),
+                "remote_status": status, "price": min(prices) if prices else None, "image_url": image_url,
+                "image_alt": image.get("altText"), "product_type": product_type, "tags": tags,
+                "created_at": row.get("createdAt"), "updated_at": row.get("updatedAt"),
+                "synced_at": None, "category_key": category or "uncategorized",
+                "product_link": row.get("onlineStoreUrl") or (f"/products/{handle}" if handle else None),
+                "storefront_eligible": not reasons, "eligible": not reasons, "eligibility_reasons": reasons,
+                "verification_status": "REMOTE_READ_VERIFIED"}
+
+    def read(self, store_id: str, *, force=False) -> dict:
+        now = datetime.now(timezone.utc)
+        with connect(self.db) as con:
+            cached = con.execute("SELECT * FROM homepage_featured_product_remote_cache WHERE store_id=?", (store_id,)).fetchone()
+        if cached and not force:
+            fetched = datetime.fromisoformat(cached["fetched_at"])
+            if now - fetched <= timedelta(minutes=self.cache_minutes):
+                return {"status": "READ_PRODUCTS_READY", "store_id": store_id, "products": json.loads(cached["candidates_json"]),
+                        "product_count": cached["product_count"], "fetched_at": cached["fetched_at"], "cache_used": True, "write_performed": False}
+        config = get_connection(store_id, db=self.db); token, _ = get_shopify_token(store_id, db=self.db)
+        if not config or not token:
+            return {"status": "MISSING_READ_PRODUCTS_SCOPE", "reason": "Shopify connection or credential missing", "products": [], "write_performed": False}
+        client = self.client_factory(config["shop_domain"], token, config["api_version"])
+        products, after = [], None
+        for _ in range(self.max_pages):
+            data = client.execute(EXISTING_PRODUCTS_QUERY, {"first": self.page_size, "after": after})
+            scopes = {x.get("handle") for x in (data.get("currentAppInstallation") or {}).get("accessScopes", [])}
+            if "read_products" not in scopes:
+                return {"status": "MISSING_READ_PRODUCTS_SCOPE", "reason": "Shopify 기존 상품을 읽으려면 read_products 권한이 필요합니다.",
+                        "products": [], "write_performed": False}
+            connection = data.get("products") or {}; products.extend(self._normalize(x) for x in connection.get("nodes", []))
+            page = connection.get("pageInfo") or {}
+            if not page.get("hasNextPage"): break
+            after = page.get("endCursor")
+            if not after: break
+        fetched_at, source_hash = now.isoformat(timespec="seconds"), _hash(products)
+        with connect(self.db) as con:
+            con.execute("""INSERT INTO homepage_featured_product_remote_cache VALUES(?,?,?,?,?)
+              ON CONFLICT(store_id) DO UPDATE SET fetched_at=excluded.fetched_at,product_count=excluded.product_count,
+              source_hash=excluded.source_hash,candidates_json=excluded.candidates_json""",
+              (store_id, fetched_at, len(products), source_hash, _json(products)))
+        return {"status": "READ_PRODUCTS_READY", "store_id": store_id, "products": products,
+                "product_count": len(products), "fetched_at": fetched_at, "cache_used": False, "write_performed": False}
+
+
+def _title_group(title) -> str:
+    words = re.findall(r"[a-z0-9]+", str(title or "").casefold())
+    return " ".join(words[:2]) or "uncategorized"
 
 
 def discover_featured_product_schema(section_files: dict[str, str]) -> dict:
@@ -111,25 +225,53 @@ class FeaturedProductAssignmentService:
             storefront = str(raw.get("shopify_status") or raw.get("storefront_status") or "DRAFT").upper()
             if storefront != "ACTIVE": reasons.append("NOT_STOREFRONT_ELIGIBLE")
             row.update(price=float(price) if valid_price else None, image_url=image,
+                       source_kind="SHOPSOURCE_MANAGED", source_key=f"master:{row['master_product_id']}",
                        category_key=row.get("category") or (tags[0] if tags else "uncategorized"),
                        storefront_status=storefront, eligibility_reasons=reasons, eligible=not reasons,
+                       remote_status=storefront, created_at=raw.get("shopify_created_at"),
+                       updated_at=raw.get("shopify_updated_at"),
                        product_link=f"/products/{row['shopify_handle']}" if row.get("shopify_handle") else None)
             result.append(row)
         return result
 
+    def candidate_union(self, store_id: str, *, force_remote=False, reader=None) -> dict:
+        managed = self.eligible_products(store_id)
+        remote_result = (reader or ShopifyExistingProductReader(db=self.db)).read(store_id, force=force_remote)
+        remote = remote_result.get("products", []) if remote_result.get("status") == "READ_PRODUCTS_READY" else []
+        combined, seen_ids, seen_handles, duplicates = [], set(), set(), 0
+        for row in [*managed, *remote]:
+            product_id = str(row.get("shopify_product_id") or "")
+            handle = str(row.get("shopify_handle") or "").strip().casefold()
+            if product_id in seen_ids or (handle and handle in seen_handles): duplicates += 1; continue
+            seen_ids.add(product_id)
+            if handle: seen_handles.add(handle)
+            combined.append(row)
+        reason_counts = {}
+        for row in combined:
+            for reason in row.get("eligibility_reasons", []): reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        eligible = [x for x in combined if x.get("eligible")]
+        return {"status": remote_result.get("status"), "managed_count": len([x for x in managed if x.get('eligible')]),
+                "remote_product_count": len(remote), "remote_eligible_count": len([x for x in remote if x.get('eligible')]),
+                "eligible_count": len(eligible), "duplicate_count": duplicates, "reason_counts": reason_counts,
+                "candidates": combined, "eligible": eligible, "cache_used": remote_result.get("cache_used", False),
+                "scope_reason": remote_result.get("reason"), "write_performed": False}
+
     def create_plan(self, store_id: str, *, mode="BALANCED_CATEGORIES", requested_count=4,
                     heading="New Arrivals", subheading="", manual_product_ids=None,
-                    collection_key=None, collection_handle=None) -> dict:
+                    collection_key=None, collection_handle=None, include_existing=False,
+                    force_remote=False, reader=None) -> dict:
         mode = str(mode).upper()
         if mode not in MODES: raise ValueError(f"Unsupported featured-product mode: {mode}")
-        requested_count = max(1, int(requested_count)); candidates = self.eligible_products(store_id)
+        requested_count = max(1, int(requested_count))
+        union = self.candidate_union(store_id, force_remote=force_remote, reader=reader) if include_existing else None
+        candidates = union["candidates"] if union else self.eligible_products(store_id)
         eligible = [x for x in candidates if x["eligible"]]
         if mode == "MANUAL_SELECTION":
-            wanted = [int(x) for x in (manual_product_ids or [])]
-            by_id = {x["master_product_id"]: x for x in eligible}
+            wanted = list(manual_product_ids or [])
+            by_id = {(x["master_product_id"] if x.get("master_product_id") is not None else x["source_key"]): x for x in eligible}
             selected = [by_id[x] for x in wanted if x in by_id][:requested_count]
         elif mode == "NEW_ARRIVALS":
-            selected = sorted(eligible, key=lambda x: (x.get("synced_at") or "", x["master_product_id"]), reverse=True)[:requested_count]
+            selected = sorted(eligible, key=lambda x: (x.get("created_at") or x.get("synced_at") or "", x["source_key"]), reverse=True)[:requested_count]
         else:
             selected, seen = [], set()
             for row in eligible:
@@ -147,18 +289,22 @@ class FeaturedProductAssignmentService:
         status = "READY" if not reasons else "MANUAL_ACTION_REQUIRED"
         plan_id, now = "HFP_" + secrets.token_hex(10), _now()
         fingerprint = {"store_id": store_id, "mode": mode, "requested_count": requested_count,
-                       "selected": [(x["master_product_id"], x["shopify_product_id"], x["shopify_handle"], x["synced_at"]) for x in selected]}
+                       "selected": [(x.get("source_kind"), x.get("source_key"), x["shopify_product_id"], x["shopify_handle"], x.get("created_at") or x.get("synced_at")) for x in selected]}
         with connect(self.db) as con:
             con.execute("INSERT INTO homepage_featured_product_plans VALUES(?,?,?,?,?,?,?,?,?,?,?,0,?,?)",
                         (plan_id, store_id, mode, heading, subheading, requested_count, collection_key,
                          collection_handle, status, _hash(fingerprint), None, now, now))
             for position, row in enumerate(selected, 1):
-                why = "manual order" if mode == "MANUAL_SELECTION" else "recently synced" if mode == "NEW_ARRIVALS" else f"category diversity: {row['category_key']}"
-                con.execute("INSERT INTO homepage_featured_product_items VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (plan_id, position, row["master_product_id"], row["shopify_product_id"], row["shopify_handle"],
-                             row["title"], row["category_key"], row["image_url"], row["price"], row["storefront_status"],
-                             why, "LOCAL_ELIGIBILITY_VERIFIED"))
-        return self.get_plan(plan_id, reasons=reasons)
+                why = "manual order" if mode == "MANUAL_SELECTION" else ("newly created" if row.get("source_kind") == "EXISTING_SHOPIFY" else "recently synced") if mode == "NEW_ARRIVALS" else f"category diversity: {row['category_key']}"
+                con.execute("INSERT INTO homepage_featured_product_items VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (plan_id, position, row.get("source_kind", "SHOPSOURCE_MANAGED"), row.get("source_key", ""),
+                             row.get("master_product_id"), row["shopify_product_id"], row["shopify_handle"], row["title"],
+                             row["category_key"], row["image_url"], row["price"], row.get("remote_status") or row.get("storefront_status"),
+                             why, row.get("verification_status", "LOCAL_ELIGIBILITY_VERIFIED"), now, now))
+        plan = self.get_plan(plan_id, reasons=reasons)
+        plan["diagnostics"] = union or {"managed_count": len(eligible), "remote_product_count": 0, "remote_eligible_count": 0,
+                                        "eligible_count": len(eligible), "reason_counts": {}, "duplicate_count": 0}
+        return plan
 
     def get_plan(self, plan_id: str, *, reasons=None) -> dict:
         with connect(self.db) as con:
@@ -229,6 +375,9 @@ class FeaturedProductAssignmentService:
         lines = ["# Featured Products assignment", "", f"- Store: {plan['store_id']}", f"- Heading: {plan['heading']}",
                  f"- Section status: {plan['status']}", "", "## Selected products", ""]
         for item in plan["items"]: lines.append(f"- {item['position']}. {item['title']} — {item['selection_reason']} — /products/{item['shopify_handle']}")
+        lines = lines[:8] + [f"- {item['position']}. [{item.get('source_kind')}] {item['title']} — {item['category_key']} — "
+                            f"${item['price']:.2f} — {item['remote_status']} — /products/{item['shopify_handle']} — {item['selection_reason']}"
+                            for item in plan["items"]]
         lines += ["", "## Screenshot checklist", "", "- Desktop section and product links", "- Mobile crop and cards", "- Price and image visibility", "",
                   "## 제출 메모", "", "실제 검증된 상품만 사용해 추천 상품 영역을 구성했습니다. 선택된 카테고리와 링크는 위 목록을 기준으로 확인합니다."]
         (folder / "assignment_featured_products.md").write_text("\n".join(lines) + "\n", encoding="utf-8")

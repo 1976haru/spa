@@ -1982,6 +1982,7 @@ class OperatorUI:
             with ui.card().classes("w-full border border-indigo-200 bg-white"):
                 ui.label("추천 상품(신상품)").classes("text-lg font-semibold")
                 featured_status = ui.label("선택된 상품: 0 / 4 · 상태: REVIEW REQUIRED")
+                featured_diagnostics = ui.label("로컬 관리 상품 후보: 0 · Shopify 기존 상품 후보: 0 · 최종 사용 가능: 0").classes("ss-help")
                 featured_table = ui.column().classes("w-full gap-1")
 
                 def render_featured(plan=None):
@@ -1989,20 +1990,30 @@ class OperatorUI:
                     featured_table.clear()
                     count = len((plan or {}).get("items", []))
                     featured_status.set_text(f"선택된 상품: {count} / 4 · 상태: {(plan or {}).get('status', 'REVIEW REQUIRED')}")
+                    diagnostics = (plan or {}).get("diagnostics") or {}
+                    excluded = diagnostics.get("reason_counts") or {}
+                    featured_diagnostics.set_text(
+                        f"로컬 관리 상품 후보: {diagnostics.get('managed_count', 0)} · Shopify 기존 상품 후보: {diagnostics.get('remote_eligible_count', 0)} · "
+                        f"최종 사용 가능: {diagnostics.get('eligible_count', 0)} · 제외: ACTIVE 아님 {excluded.get('NOT_STOREFRONT_ELIGIBLE', 0)} / "
+                        f"이미지 없음 {excluded.get('NEEDS_IMAGE', 0)} / 가격 없음 {excluded.get('MISSING_VALID_RETAIL_PRICE', 0)} / 기타 {sum(v for k, v in excluded.items() if k not in {'NOT_STOREFRONT_ELIGIBLE','NEEDS_IMAGE','MISSING_VALID_RETAIL_PRICE'})}")
                     with featured_table:
                         for item in (plan or {}).get("items", []):
                             ui.label(f"{item['position']}. {item['title']} · {item.get('category_key') or '-'} · ${item.get('price') or 0:.2f} · {item['remote_status']} · /products/{item['shopify_handle']} · {item['selection_reason']} · {item['verification_status']}")
                         if not count:
                             ui.label("실제 Shopify mapping, 판매가, 이미지, ACTIVE 상태가 검증된 상품이 필요합니다.").classes("ss-help")
 
-                def select_featured_products():
+                def select_featured_products(force_remote=False):
                     try:
                         service = FeaturedProductAssignmentService()
                         plan = service.create_plan(self.current_store, mode="BALANCED_CATEGORIES", requested_count=4,
-                            heading="New Arrivals", subheading="Fresh picks to keep your car clean, organized, and ready to go." if self.current_store == "001" else "")
+                            heading="New Arrivals", subheading="Fresh picks to keep your car clean, organized, and ready to go." if self.current_store == "001" else "",
+                            include_existing=True, force_remote=bool(force_remote))
                         state["featured_products_plan"] = plan
                         render_featured(plan)
-                        ui.notify("추천 상품 계획을 로컬에 저장했습니다. Shopify write는 실행하지 않았습니다.", type="positive" if plan["status"] == "READY" else "warning")
+                        if plan.get("diagnostics", {}).get("status") == "MISSING_READ_PRODUCTS_SCOPE":
+                            ui.notify("Shopify 기존 상품을 읽으려면 read_products 권한이 필요합니다. 설정 > Shopify 연결에서 권한을 새로 확인하세요.", type="warning")
+                        else:
+                            ui.notify("추천 상품 계획을 로컬에 저장했습니다. Shopify write는 실행하지 않았습니다.", type="positive" if plan["status"] == "READY" else "warning")
                     except Exception as exc: ui.notify(_safe_error(exc), type="negative")
 
                 def featured_preview():
@@ -2019,6 +2030,7 @@ class OperatorUI:
                     ui.button("추천 상품 자동 구성", on_click=select_featured_products, icon="auto_awesome").props("color=primary")
                     ui.button("상품 4개 보기", on_click=lambda: render_featured(), icon="view_list").props("outline")
                     ui.button("다시 선택", on_click=select_featured_products, icon="refresh").props("outline")
+                    ui.button("Shopify 상품 다시 읽기", on_click=lambda: select_featured_products(True), icon="cloud_download").props("outline")
                     ui.button("추천 상품 미리보기", on_click=featured_preview, icon="preview").props("outline")
                     ui.button("Shopify 적용", on_click=featured_apply_gate, icon="publish").props("outline")
                     ui.button("과제 제출용 확인", on_click=lambda: ui.notify("원격 section 검증 후 ASSIGNMENT_READY가 됩니다.", type="info"), icon="checklist").props("outline")

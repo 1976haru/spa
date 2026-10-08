@@ -4,7 +4,7 @@ from pathlib import Path
 from shopsource.db import connect, init_db
 from shopsource.homepage_assignment import HomepageAssignmentService, homepage_assignment_workflow
 from shopsource.homepage_featured_products import (
-    FeaturedProductAssignmentService, discover_featured_product_schema,
+    FeaturedProductAssignmentService, ShopifyExistingProductReader, discover_featured_product_schema,
 )
 from shopsource.store_build import STAGES
 from shopsource.store_completion import DOMAINS, StoreCompletionService
@@ -147,8 +147,122 @@ def test_ui_ready_labels_and_no_network_or_write_path():
     for label in ("추천 상품 자동 구성", "상품 4개 보기", "다시 선택", "추천 상품 미리보기", "Shopify 적용", "과제 제출용 확인"):
         assert label in source
     module = (Path(__file__).parents[1] / "src/shopsource/homepage_featured_products.py").read_text(encoding="utf-8")
-    assert "ShopifyGraphQLClient" not in module and "mutation " not in module
+    assert "class ShopifyExistingProductReader" in module and "mutation " not in module
 
 
 def test_protected_store_file_untouched():
     assert (Path(__file__).parents[1] / "stores/001_cabin_tidy.json").exists()
+
+
+def remote_product(number, *, status="ACTIVE", handle=None, price="59.00", image=True, product_type=""):
+    return {"id": f"gid://shopify/Product/{number}", "handle": handle if handle is not None else f"remote-{number}",
+            "title": f"Remote product {number}", "status": status, "createdAt": f"2026-02-{number:02d}T00:00:00Z",
+            "updatedAt": f"2026-03-{number:02d}T00:00:00Z", "productType": product_type, "tags": [f"tag-{number}"],
+            "onlineStoreUrl": None, "featuredMedia": {"image": {"url": f"https://cdn/{number}.jpg", "altText": "item"}} if image else None,
+            "variants": {"nodes": [{"price": price}] if price is not None else []}, "variantsCount": {"count": 1},
+            "publishedOnCurrentPublication": True}
+
+
+class FakeCatalogClient:
+    calls = 0
+    products = []
+    scopes = ["read_products"]
+    def __init__(self, *args): pass
+    def execute(self, query, variables=None):
+        type(self).calls += 1
+        assert "mutation" not in query.casefold()
+        return {"currentAppInstallation": {"accessScopes": [{"handle": x} for x in self.scopes]},
+                "products": {"nodes": list(self.products), "pageInfo": {"hasNextPage": False, "endCursor": None}}}
+
+
+def reader(tmp_path, monkeypatch, products=None, scopes=None):
+    db = tmp_path / "reader.sqlite3"; init_db(db)
+    FakeCatalogClient.calls = 0; FakeCatalogClient.products = list(products or []); FakeCatalogClient.scopes = list(scopes or ["read_products"])
+    monkeypatch.setattr("shopsource.homepage_featured_products.get_connection", lambda *a, **k: {"shop_domain": "fixture.myshopify.com", "api_version": "2026-07"})
+    monkeypatch.setattr("shopsource.homepage_featured_products.get_shopify_token", lambda *a, **k: ("fixture-token", "test"))
+    return db, ShopifyExistingProductReader(db=db, client_factory=FakeCatalogClient)
+
+
+def test_existing_shopify_reader_requires_read_products(tmp_path, monkeypatch):
+    _, value = reader(tmp_path, monkeypatch, [remote_product(1)], scopes=["read_themes"])
+    result = value.read("s1")
+    assert result["status"] == "MISSING_READ_PRODUCTS_SCOPE" and "read_products" in result["reason"]
+
+
+def test_existing_shopify_reader_is_read_only(tmp_path, monkeypatch):
+    _, value = reader(tmp_path, monkeypatch, [remote_product(1)])
+    result = value.read("s1")
+    assert result["write_performed"] is False and FakeCatalogClient.calls == 1
+
+
+def test_existing_shopify_eligibility_reasons(tmp_path, monkeypatch):
+    products = [remote_product(1), remote_product(2, status="DRAFT"), remote_product(3, handle=""),
+                remote_product(4, price=None), remote_product(5, image=False)]
+    _, value = reader(tmp_path, monkeypatch, products)
+    rows = value.read("s1")["products"]
+    assert rows[0]["eligible"] and rows[0]["source_kind"] == "EXISTING_SHOPIFY"
+    assert "NOT_STOREFRONT_ELIGIBLE" in rows[1]["eligibility_reasons"]
+    assert "MISSING_REAL_HANDLE" in rows[2]["eligibility_reasons"]
+    assert "MISSING_VALID_RETAIL_PRICE" in rows[3]["eligibility_reasons"]
+    assert "NEEDS_IMAGE" in rows[4]["eligibility_reasons"]
+
+
+def test_existing_shopify_dedupes_against_managed_mapping(tmp_path, monkeypatch):
+    db, remote_reader = reader(tmp_path, monkeypatch, [remote_product(1, handle="product-1")])
+    svc = FeaturedProductAssignmentService(db=db); add_product(db, 1, "trunk", remote_id="gid://shopify/Product/1")
+    union = svc.candidate_union("s1", reader=remote_reader)
+    assert len(union["candidates"]) == 1 and union["candidates"][0]["source_kind"] == "SHOPSOURCE_MANAGED"
+    assert union["duplicate_count"] == 1
+
+
+def test_existing_shopify_preexisting_store_can_reach_four_without_master(tmp_path, monkeypatch):
+    db, remote_reader = reader(tmp_path, monkeypatch, [remote_product(i, product_type=f"Type {i}") for i in range(1, 5)])
+    svc = FeaturedProductAssignmentService(db=db)
+    plan = svc.create_plan("s1", include_existing=True, reader=remote_reader)
+    assert plan["status"] == "READY" and len(plan["items"]) == 4
+    assert all(x["source_kind"] == "EXISTING_SHOPIFY" and x["master_product_id"] is None for x in plan["items"])
+    with connect(db) as con: assert con.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0
+
+
+def test_balanced_remote_all_same_category_still_selects_four(tmp_path, monkeypatch):
+    db, remote_reader = reader(tmp_path, monkeypatch, [remote_product(i, product_type="Organizer") for i in range(1, 5)])
+    plan = FeaturedProductAssignmentService(db=db).create_plan("s1", include_existing=True, reader=remote_reader)
+    assert len(plan["items"]) == 4 and {x["category_key"] for x in plan["items"]} == {"Organizer"}
+
+
+def test_new_arrivals_uses_shopify_created_at_for_remote(tmp_path, monkeypatch):
+    db, remote_reader = reader(tmp_path, monkeypatch, [remote_product(i) for i in range(1, 5)])
+    plan = FeaturedProductAssignmentService(db=db).create_plan("s1", mode="NEW_ARRIVALS", include_existing=True, reader=remote_reader)
+    assert [x["shopify_product_id"].rsplit("/", 1)[-1] for x in plan["items"]] == ["4", "3", "2", "1"]
+    assert all(x["selection_reason"] == "newly created" for x in plan["items"])
+
+
+def test_featured_item_migration_preserves_old_rows(tmp_path):
+    db = tmp_path / "migration.sqlite3"; init_db(db)
+    with connect(db) as con:
+        con.execute("""CREATE TABLE homepage_featured_product_items(plan_id TEXT,position INTEGER,master_product_id INTEGER NOT NULL,
+          shopify_product_id TEXT,shopify_handle TEXT,title TEXT,category_key TEXT,image_url TEXT,price REAL,remote_status TEXT,
+          selection_reason TEXT,verification_status TEXT,PRIMARY KEY(plan_id,position))""")
+        con.execute("INSERT INTO homepage_featured_product_items VALUES('old',1,7,'gid://shopify/Product/7','old','Old','cat','img',9,'ACTIVE','old','OK')")
+    FeaturedProductAssignmentService(db=db)
+    with connect(db) as con: row = con.execute("SELECT * FROM homepage_featured_product_items").fetchone()
+    assert row["master_product_id"] == 7 and row["source_kind"] == "SHOPSOURCE_MANAGED"
+
+
+def test_featured_remote_cache_and_force_refresh(tmp_path, monkeypatch):
+    _, value = reader(tmp_path, monkeypatch, [remote_product(1)])
+    assert value.read("s1")["cache_used"] is False
+    assert value.read("s1")["cache_used"] is True and FakeCatalogClient.calls == 1
+    assert value.read("s1", force=True)["cache_used"] is False and FakeCatalogClient.calls == 2
+
+
+def test_assignment_check_accepts_existing_shopify_source(tmp_path, monkeypatch):
+    db, remote_reader = reader(tmp_path, monkeypatch, [remote_product(i) for i in range(1, 5)])
+    svc = FeaturedProductAssignmentService(db=db); plan = svc.create_plan("s1", include_existing=True, reader=remote_reader)
+    assert svc.checklist(plan, section_visible=True, remote_verified=True)["status"] == "ASSIGNMENT_READY"
+
+
+def test_featured_ui_auto_refresh_scope_message_and_diagnostics():
+    source = (Path(__file__).parents[1] / "src/shopsource/ui/v2.py").read_text(encoding="utf-8")
+    assert "include_existing=True" in source and "Shopify 상품 다시 읽기" in source
+    assert "read_products 권한이 필요합니다" in source and "최종 사용 가능" in source

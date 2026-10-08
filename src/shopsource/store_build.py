@@ -575,7 +575,8 @@ class StoreBuildOrchestrator:
                 subheading=options.get("featured_products_subheading", ""),
                 manual_product_ids=options.get("featured_products_manual_ids"),
                 collection_key=options.get("featured_products_collection_key"),
-                collection_handle=options.get("featured_products_collection_handle"))
+                collection_handle=options.get("featured_products_collection_handle"), include_existing=True,
+                force_remote=bool(options.get("featured_products_force_refresh")))
             data["featured_products_plan_id"] = plan["plan_id"]
             if plan["status"] != "READY":
                 return {"status": "MANUAL_ACTION_REQUIRED", "manual_gate": "FEATURED_PRODUCTS_SELECTION",
