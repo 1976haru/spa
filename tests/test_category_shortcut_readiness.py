@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -10,36 +9,43 @@ import pytest
 
 from shopsource.category_shortcut_readiness import (
     CategoryShortcutReadinessService,
-    _category_match,
-    _catalog_counts,
+    _eligible_products,
+    category_image_prompt,
     readiness_summary,
 )
-from shopsource.db import connect, init_db
-from shopsource.homepage_featured_products import _install
+from shopsource.db import connect, init_db, upsert_store
 
 
 @pytest.fixture
-def db():
-    handle = tempfile.NamedTemporaryFile(prefix="shopsource-category-", suffix=".sqlite3", delete=False)
-    handle.close()
-    path = Path(handle.name)
-    try:
-        yield path
-    finally:
-        for target in (path, Path(str(path) + "-shm"), Path(str(path) + "-wal"), Path(str(path) + ".png"), Path(str(path) + ".invalid.png")):
-            target.unlink(missing_ok=True)
+def db(tmp_path):
+    return tmp_path / "category-readiness.sqlite3"
 
 
 def _product(product_id, title, product_type, **extra):
-    return {"shopify_product_id": f"gid://shopify/Product/{product_id}",
-            "shopify_handle": f"item-{product_id}", "title": title, "product_type": product_type,
-            "tags": [], "remote_status": "ACTIVE", "eligible": True,
-            "storefront_eligible": True, "verification_status": "REMOTE_READ_VERIFIED", **extra}
+    return {
+        "shopify_product_id": f"gid://shopify/Product/{product_id}",
+        "shopify_handle": f"item-{product_id}",
+        "title": title,
+        "product_type": product_type,
+        "tags": [],
+        "remote_status": "ACTIVE",
+        "eligible": True,
+        "storefront_eligible": True,
+        "verification_status": "REMOTE_READ_VERIFIED",
+        **extra,
+    }
 
 
-def _seed(db, products):
+def _seed(db, store_id, store_name, products, *, profile=None):
     init_db(db)
-    _install(db)
+    store = {
+        "store_id": store_id,
+        "store_name": store_name,
+        "category": "General merchandise",
+        **(profile or {}),
+    }
+    upsert_store(store, db)
+    CategoryShortcutReadinessService(db)
     with connect(db) as con:
         con.execute("""CREATE TABLE IF NOT EXISTS shopify_collection_mappings(
             store_id TEXT,collection_key TEXT,handle TEXT,shopify_collection_id TEXT,
@@ -48,251 +54,309 @@ def _seed(db, products):
         con.execute("""CREATE TABLE IF NOT EXISTS collection_image_assets(
             store_id TEXT,collection_key TEXT,path TEXT,provider TEXT,model TEXT,alt_text TEXT,
             metadata_json TEXT,created_at TEXT,approval_status TEXT,PRIMARY KEY(store_id,collection_key))""")
-        con.execute("""CREATE TABLE IF NOT EXISTS shopify_collection_mappings(
-            store_id TEXT,collection_key TEXT,handle TEXT,shopify_collection_id TEXT,
-            last_synced_hash TEXT,last_synced_at TEXT,published_ids_json TEXT,image_url TEXT,
-            PRIMARY KEY(store_id,collection_key))""")
-        con.execute("""CREATE TABLE IF NOT EXISTS homepage_category_collection_remote_cache(
-            store_id TEXT PRIMARY KEY,fetched_at TEXT,source_hash TEXT,collections_json TEXT)""")
-        con.execute("INSERT INTO homepage_featured_product_remote_cache VALUES(?,?,?,?,?)",
-                    ("001", datetime.now(timezone.utc).isoformat(), len(products), "source-hash",
-                     json.dumps(products)))
+        con.execute(
+            "INSERT OR REPLACE INTO homepage_featured_product_remote_cache VALUES(?,?,?,?,?)",
+            (store_id, datetime.now(timezone.utc).isoformat(), len(products),
+             f"source-{store_id}", json.dumps(products)),
+        )
+    return store
 
 
-def test_counts_use_active_eligible_and_exclude_repair_parts():
-    products = [
-        _product(1, "Cargo trunk organizer", "Automotive Cargo"),
-        _product(2, "Seat back storage organizer", "Automotive Interior"),
-        _product(3, "Silicone car trash can", "Garbage Cans"),
-        _product(4, "Center console organizer", "Automotive Interior"),
-        _product(5, "Center console replacement trim panel", "Console Accessories"),
-        _product(6, "Cup holder insert", "Convenience", eligible=False),
-        _product(1, "Duplicate record", "Trunk"),
-    ]
-    counts, excluded = _catalog_counts(products)
-    assert counts["trunk-cargo"] == 1
-    assert counts["seat-backseat"] == 1
-    assert counts["trash-cleanup"] == 1
-    assert counts["console-small-storage"] == 1
-    assert excluded["repair_or_fitment_part"] == 1
-    assert excluded["not_active_or_ineligible"] == 1
-
-
-def test_existing_shopsource_collection_mapping_signal_precedes_product_text():
-    assert _category_match({"collection_key": "console-storage", "product_type": "Seat organizer"}) == "console-small-storage"
-
-
-def test_build_selects_four_nonempty_deterministically_and_never_fakes_mapping(db):
-    products = [
-        _product(1, "Cargo trunk organizer", "Automotive Cargo"),
-        _product(2, "Seat back storage organizer", "Automotive Interior"),
-        _product(3, "Silicone car trash can", "Garbage Cans"),
-        _product(4, "Center console organizer", "Automotive Interior"),
-        _product(5, "Cup holder insert", "Cup Holder"),
-    ]
-    _seed(db, products)
-    service = CategoryShortcutReadinessService(db)
-    package = service.build("001")
-    assert package["status"] == "CATEGORIES_SELECTED_PREREQUISITES_BLOCKED"
-    assert len(package["items"]) == 4
-    assert all(item["product_count"] > 0 for item in package["items"])
-    assert all(item["mapping_status"] == "NOT_MAPPED" for item in package["items"])
-    assert all(item["shopify_collection_id"] is None and item["handle"] is None for item in package["items"])
-    assert all(item["storefront_url"] is None for item in package["items"])
-    assert all(item["image_status"] == "NEEDS_ASSET" for item in package["items"])
-    assert package["summary"]["mapping_ready"] == package["summary"]["image_ready"] == 0
-    assert package["summary"]["preview_enabled"] is False
-    assert service.latest("001")["plan_id"] == package["plan_id"]
-    assert service.build("001", persist=False)["items"] == package["items"]
-
-
-def _seed_trunk_mapping(db, *, publication_ids=None, remote_id="gid://shopify/Collection/77",
-                        remote_handle="trunk-organizers", remote_count=None):
+def _add_collection_plan(db, store_id, definitions, *, plan_id="plan-1", version=1):
+    now = datetime.now(timezone.utc).isoformat()
     with connect(db) as con:
-        con.execute("INSERT INTO shopify_collection_mappings VALUES(?,?,?,?,?,?,?,?)",
-                    ("001", "trunk-storage", "trunk-organizers", "gid://shopify/Collection/77", "h", "2026-10-09",
-                     json.dumps(publication_ids if publication_ids is not None else ["gid://shopify/Publication/123"]), None))
-        if remote_count is not None:
-            con.execute("INSERT OR REPLACE INTO homepage_category_collection_remote_cache VALUES(?,?,?,?)",
-                        ("001", datetime.now(timezone.utc).isoformat(), "remote-hash", json.dumps([{
-                            "id": remote_id, "handle": remote_handle, "title": "Trunk Organizers",
-                            "products_count": remote_count, "products_count_precision": "EXACT"
-                        }])) )
+        con.execute("""INSERT INTO store_collection_plans
+            (plan_id,store_id,version,planner_version,status,created_at,updated_at)
+            VALUES(?,?,?,'test','DRAFT',?,?)""", (plan_id, store_id, version, now, now))
+        for priority, definition in enumerate(definitions):
+            cursor = con.execute("""INSERT INTO store_collection_definitions
+                (plan_id,collection_key,title,handle,priority,enabled,match_mode,created_at,updated_at)
+                VALUES(?,?,?,?,?,1,?,?,?)""",
+                (plan_id, definition["key"], definition["title"], definition.get("handle", ""),
+                 priority, definition.get("match_mode", "ANY"), now, now))
+            for condition in definition.get("conditions", []):
+                con.execute("""INSERT INTO store_collection_conditions
+                    (collection_definition_id,field,relation,value,group_operator,priority)
+                    VALUES(?,?,?,?,?,?)""",
+                    (cursor.lastrowid, condition["field"], condition.get("relation", "CONTAINS"),
+                     condition["value"], "OR", 0))
 
 
-def _category_package(db):
-    _seed(db, [_product(i, title, kind) for i, title, kind in [
-        (1, "Cargo trunk organizer", "Cargo"), (2, "Seat back organizer", "Seat"),
-        (3, "Car trash can", "Garbage"), (4, "Center console organizer", "Console"),
-    ]])
-    return CategoryShortcutReadinessService(db)
-
-
-def test_publication_ids_are_not_product_count(db):
-    service = _category_package(db)
-    _seed_trunk_mapping(db, remote_count=9)
-    package = service.build("001", persist=False)
-    trunk = next(item for item in package["items"] if item["collection_key"] == "trunk-storage")
-    assert trunk["publication_ids"] == ["gid://shopify/Publication/123"]
-    assert trunk["remote_product_count"] == 9
-    assert trunk["remote_product_count"] != len(trunk["publication_ids"])
-    assert trunk["remote_count_status"] == "VERIFIED"
-    assert trunk["publication_status"] == "KNOWN_PUBLISHED"
-
-
-def test_mapping_with_publication_id_but_no_remote_count_not_ready(db):
-    service = _category_package(db)
-    _seed_trunk_mapping(db)
-    trunk = next(item for item in service.build("001", persist=False)["items"] if item["collection_key"] == "trunk-storage")
-    assert trunk["mapping_status"] == "REMOTE_NOT_VERIFIED"
-    assert trunk["mapping_identity_status"] == "REMOTE_NOT_VERIFIED"
-    assert trunk["remote_product_count"] is None
-
-
-def test_mapping_with_remote_zero_products_not_ready(db):
-    service = _category_package(db)
-    _seed_trunk_mapping(db, remote_count=0)
-    trunk = next(item for item in service.build("001", persist=False)["items"] if item["collection_key"] == "trunk-storage")
-    assert trunk["mapping_status"] == "REMOTE_EMPTY"
-    assert trunk["mapping_identity_status"] == "VERIFIED"
-    assert trunk["remote_count_status"] == "VERIFIED"
-
-
-def test_mapping_with_verified_remote_positive_count_ready_for_identity_count(db):
-    service = _category_package(db)
-    _seed_trunk_mapping(db, remote_count=9)
-    trunk = next(item for item in service.build("001", persist=False)["items"] if item["collection_key"] == "trunk-storage")
-    assert trunk["mapping_status"] == "READY"
-    assert trunk["mapping_identity_status"] == "VERIFIED"
-    assert trunk["remote_product_count"] == 9
-    assert trunk["shopify_collection_id"] == "gid://shopify/Collection/77"
-    assert trunk["handle"] == "trunk-organizers"
-    assert trunk["storefront_url"] == "/collections/trunk-organizers"
-
-
-def test_remote_collection_identity_mismatch_blocks_ready(db):
-    service = _category_package(db)
-    _seed_trunk_mapping(db, remote_id="gid://shopify/Collection/77", remote_handle="different-handle", remote_count=9)
-    trunk = next(item for item in service.build("001", persist=False)["items"] if item["collection_key"] == "trunk-storage")
-    assert trunk["mapping_status"] == "IDENTITY_MISMATCH"
-    assert trunk["mapping_identity_status"] == "IDENTITY_MISMATCH"
-    assert trunk["remote_product_count"] is None
-
-
-def test_missing_publication_evidence_does_not_make_mapping_ready(db):
-    service = _category_package(db)
-    _seed_trunk_mapping(db, publication_ids=[], remote_count=9)
-    trunk = next(item for item in service.build("001", persist=False)["items"] if item["collection_key"] == "trunk-storage")
-    assert trunk["mapping_identity_status"] == "VERIFIED"
-    assert trunk["remote_count_status"] == "VERIFIED"
-    assert trunk["publication_status"] == "UNKNOWN"
-    assert trunk["mapping_status"] == "NOT_READY"
-
-
-def test_remote_snapshot_cache_reused(db, monkeypatch):
-    service = _category_package(db)
-    _seed_trunk_mapping(db)
-    calls = []
-    class FakeClient:
-        def __init__(self, *args): pass
-        def execute(self, query):
-            calls.append(query)
-            return {"collections": {"nodes": [{"id": "gid://shopify/Collection/77", "handle": "trunk-organizers",
-                "title": "Trunk", "productsCount": {"count": 9, "precision": "EXACT"}}]}}
-    monkeypatch.setattr("shopsource.shopify_collections.get_connection", lambda *a, **k: {"shop_domain": "test.myshopify.com", "api_version": "2026-07"})
-    monkeypatch.setattr("shopsource.shopify_collections.get_shopify_token", lambda *a, **k: ("fake-token", "test"))
-    monkeypatch.setattr("shopsource.shopify_collections.ShopifyGraphQLClient", FakeClient)
-    assert service.refresh_collection_snapshot("001")["status"] == "READ_ONLY_REFRESHED"
-    assert service.collection_snapshot("001")["collections"][0]["products_count"] == 9
-    trunk = next(item for item in service.build("001", persist=False)["items"] if item["collection_key"] == "trunk-storage")
-    assert trunk["remote_product_count"] == 9 and trunk["mapping_identity_status"] == "VERIFIED"
-    assert len(calls) == 1
-
-
-def test_remote_snapshot_force_refresh_read_only(db, monkeypatch):
-    service = _category_package(db)
-    calls = []
-    class FakeClient:
-        def __init__(self, *args): pass
-        def execute(self, query):
-            calls.append(query)
-            return {"collections": {"nodes": []}}
-    monkeypatch.setattr("shopsource.shopify_collections.get_connection", lambda *a, **k: {"shop_domain": "test.myshopify.com", "api_version": "2026-07"})
-    monkeypatch.setattr("shopsource.shopify_collections.get_shopify_token", lambda *a, **k: ("fake-token", "test"))
-    monkeypatch.setattr("shopsource.shopify_collections.ShopifyGraphQLClient", FakeClient)
-    assert service.refresh_collection_snapshot("001")["status"] == "READ_ONLY_REFRESHED"
-    assert len(calls) == 1 and "productsCount" in calls[0] and "mutation" not in calls[0].casefold()
-
-
-def test_no_collection_mutation(db, monkeypatch):
-    service = _category_package(db)
-    queries = []
-    class FakeClient:
-        def __init__(self, *args): pass
-        def execute(self, query):
-            queries.append(query)
-            assert "mutation" not in query.casefold()
-            return {"collections": {"nodes": []}}
-    monkeypatch.setattr("shopsource.shopify_collections.get_connection", lambda *a, **k: {"shop_domain": "test.myshopify.com", "api_version": "2026-07"})
-    monkeypatch.setattr("shopsource.shopify_collections.get_shopify_token", lambda *a, **k: ("fake-token", "test"))
-    monkeypatch.setattr("shopsource.shopify_collections.ShopifyGraphQLClient", FakeClient)
-    service.refresh_collection_snapshot("001")
-    assert len(queries) == 1
-
-
-def test_no_theme_mutation():
-    from shopsource.category_shortcut_readiness import readiness_summary
-    package = {"items": [], "theme_schema_status": "WAITING_FOR_LIVE_READ"}
-    assert readiness_summary(package)["preview_enabled"] is False
-
-
-def test_only_approved_valid_reviewed_unique_image_is_ready(db):
-    products = [_product(i, title, kind) for i, title, kind in [
-        (1, "Cargo trunk organizer", "Cargo"), (2, "Seat back organizer", "Seat"),
-        (3, "Car trash can", "Garbage"), (4, "Center console organizer", "Console"),
-    ]]
-    _seed(db, products)
-    image = Path(str(db) + ".png")
-    Image.new("RGB", (900, 900), "white").save(image)
+def _add_mapping(db, store_id, key, *, collection_id="gid://shopify/Collection/77",
+                 handle="example-collection", publication_ids=None):
     with connect(db) as con:
-        con.execute("INSERT INTO collection_image_assets VALUES(?,?,?,?,?,?,?,?,?)",
-                    ("001", "trunk-storage", str(image), "MANUAL", "", "Trunk storage",
-                     json.dumps({"content_review": {"no_text": True, "no_logo": True, "no_watermark": True}}),
-                     datetime.now(timezone.utc).isoformat(), "APPROVED"))
-        con.execute("INSERT INTO collection_image_assets VALUES(?,?,?,?,?,?,?,?,?)",
-                    ("001", "seat-organization", str(image), "MANUAL", "", "Seat storage",
-                     json.dumps({"content_review": {"no_text": True, "no_logo": True, "no_watermark": True}}),
-                     datetime.now(timezone.utc).isoformat(), "APPROVED"))
+        con.execute("""INSERT INTO shopify_collection_mappings
+            (store_id,collection_key,handle,shopify_collection_id,last_synced_hash,last_synced_at,published_ids_json,image_url)
+            VALUES(?,?,?,?,?,?,?,NULL)""",
+            (store_id, key, handle, collection_id, "hash", datetime.now(timezone.utc).isoformat(),
+             json.dumps(publication_ids if publication_ids is not None else ["gid://shopify/Publication/123"])))
+
+
+def _add_remote_snapshot(db, store_id, *, collection_id="gid://shopify/Collection/77",
+                         handle="example-collection", count=8):
+    now = datetime.now(timezone.utc).isoformat()
+    collections = [{"id": collection_id, "handle": handle, "title": "Example",
+                    "products_count": count, "products_count_precision": "EXACT"}]
+    with connect(db) as con:
+        con.execute("""INSERT OR REPLACE INTO homepage_category_collection_remote_cache
+            VALUES(?,?,?,?)""", (store_id, now, "remote-hash", json.dumps(collections)))
+
+
+def test_collection_plan_drives_cabin_tidy_categories_and_profile_exclusions(db):
+    products = [
+        _product(1, "Car trunk cargo organizer", "Automotive storage"),
+        _product(2, "Backseat organizer", "Automotive storage"),
+        _product(3, "Center console organizer", "Automotive storage"),
+        _product(4, "Car trash bin", "Automotive storage"),
+        _product(5, "Center console replacement fitment panel", "Automotive part"),
+    ]
+    store = _seed(db, "001", "Cabin Tidy", products, profile={
+        "primary_category": "Automotive Interior",
+        "exclude_keywords": ["replacement", "fitment"],
+    })
+    _add_collection_plan(db, "001", [
+        {"key": "trunk-storage", "title": "Trunk & Cargo",
+         "conditions": [{"field": "TITLE", "value": "trunk"}]},
+        {"key": "seat-organization", "title": "Seat & Backseat",
+         "conditions": [{"field": "TITLE", "value": "backseat"}]},
+        {"key": "console-storage", "title": "Console & Small Storage",
+         "conditions": [{"field": "TITLE", "value": "console"}]},
+        {"key": "trash-cleanup", "title": "Trash & Cleanup",
+         "conditions": [{"field": "TITLE", "value": "trash"}]},
+    ])
     package = CategoryShortcutReadinessService(db).build("001", persist=False)
-    ready = [item for item in package["items"] if item["image_status"] == "READY"]
-    assert len(ready) == 1
-    assert ready[0]["image_asset_path"] == str(image.resolve())
+    assert package["candidate_source"] == "COLLECTION_PLAN"
+    assert {item["title"] for item in package["items"]} == {
+        "Trunk & Cargo", "Seat & Backseat", "Console & Small Storage", "Trash & Cleanup"
+    }
+    console = next(item for item in package["items"] if item["collection_key"] == "console-storage")
+    assert console["product_count"] == 1
+    assert all(item["candidate_source"] == "COLLECTION_PLAN" for item in package["items"])
+    assert "Automotive Interior" in package["items"][0]["image_prompt"]
+    assert package["items"][0]["proposed_handle"].startswith("cabin-tidy-")
+    assert store["store_name"] == "Cabin Tidy"
+
+
+def test_non_automotive_collection_plan_and_visual_context_are_portable(db):
+    products = [
+        _product(11, "Pantry containers for dry goods", "Pantry storage"),
+        _product(12, "Under-sink organizer basket", "Under-sink storage"),
+        _product(13, "Kitchen drawer divider set", "Drawer organization"),
+        _product(14, "Cabinet rack shelf organizer", "Cabinet storage"),
+        _product(15, "Refrigerator bins for produce", "Refrigerator organization"),
+    ]
+    _seed(db, "002", "Hearth & Order", products, profile={
+        "primary_category": "Home & Kitchen Organization",
+        "brand_personality": ["practical", "calm"],
+        "visual_direction": "warm natural wood, bright neutral background",
+    })
+    _add_collection_plan(db, "002", [
+        {"key": "pantry-containers", "title": "Pantry Containers",
+         "conditions": [{"field": "TITLE", "value": "pantry"}]},
+        {"key": "under-sink", "title": "Under-Sink Organizers",
+         "conditions": [{"field": "TITLE", "value": "under-sink"}]},
+        {"key": "drawer-dividers", "title": "Drawer Dividers",
+         "conditions": [{"field": "TITLE", "value": "drawer"}]},
+        {"key": "cabinet-racks", "title": "Cabinet Racks",
+         "conditions": [{"field": "TITLE", "value": "cabinet"}]},
+        {"key": "refrigerator-bins", "title": "Refrigerator Bins",
+         "conditions": [{"field": "TITLE", "value": "refrigerator"}]},
+    ])
+    package = CategoryShortcutReadinessService(db).build("002", persist=False)
+    titles = {item["title"] for item in package["items"]}
+    assert package["candidate_source"] == "COLLECTION_PLAN"
+    assert len(titles) == 4
+    assert titles.issubset({"Pantry Containers", "Under-Sink Organizers", "Drawer Dividers",
+                           "Cabinet Racks", "Refrigerator Bins"})
+    assert not any(word in " ".join(titles).casefold() for word in ("automotive", "car", "vehicle", "trunk", "seat"))
+    prompt = package["items"][0]["image_prompt"].casefold()
+    assert "home & kitchen organization" in prompt
+    assert not any(word in prompt for word in ("automotive", "car interior", "vehicle"))
+    assert all(item["proposed_handle"].startswith("hearth-order-") for item in package["items"])
+
+
+def test_product_derived_fallback_is_review_required_and_store_handles_are_isolated(db):
+    labels = ("Pantry Containers", "Under-Sink Baskets", "Drawer Dividers", "Cabinet Racks")
+    products = [_product(i, f"{title} {i}", title) for i, title in enumerate(labels, start=20)]
+    _seed(db, "hearth", "Hearth & Order", products, profile={"primary_category": "Home Organization"})
+    _seed(db, "loom", "Loom & Leaf", products, profile={"primary_category": "Home Organization"})
+    service = CategoryShortcutReadinessService(db)
+    hearth = service.build("hearth", persist=False)
+    loom = service.build("loom", persist=False)
+    assert hearth["candidate_source"] == loom["candidate_source"] == "PRODUCT_DERIVED_FALLBACK"
+    assert len(hearth["items"]) == len(loom["items"]) == 4
+    assert all(item["candidate_status"] == "REVIEW_REQUIRED" for item in hearth["items"] + loom["items"])
+    hearth_handles = {item["proposed_handle"] for item in hearth["items"]}
+    loom_handles = {item["proposed_handle"] for item in loom["items"]}
+    assert all(handle.startswith("hearth-order-") for handle in hearth_handles)
+    assert all(handle.startswith("loom-leaf-") for handle in loom_handles)
+    assert hearth_handles.isdisjoint(loom_handles)
+    assert hearth["store_id"] == "hearth"
+    assert loom["store_id"] == "loom"
+
+
+def test_explicit_store_profile_strategy_precedes_product_fallback(db):
+    products = [_product(28, "Pantry container bins", "Pantry")]
+    _seed(db, "profile-store", "Hearth & Order", products, profile={
+        "category_shortcut_strategy": {"categories": [{
+            "category_key": "pantry-storage", "title": "Pantry Storage",
+            "collection_key": "pantry-storage", "match_signals": ["pantry"],
+        }]},
+    })
+    package = CategoryShortcutReadinessService(db).build("profile-store", persist=False)
+    assert package["candidate_source"].startswith("STORE_PROFILE")
+    assert len(package["items"]) == 4
+    assert package["items"][0]["candidate_source"] == "STORE_PROFILE"
+    assert package["items"][0]["candidate_status"] == "STORE_DATA"
+    assert all(item["candidate_status"] == "REVIEW_REQUIRED" for item in package["items"][1:])
+
+
+def test_latest_plan_without_product_evidence_is_skipped_for_older_usable_plan(db):
+    _seed(db, "plans", "Plan Store", [_product(29, "Pantry container", "Pantry")])
+    service = CategoryShortcutReadinessService(db)
+    _add_collection_plan(db, "plans", [{"key": "pantry", "title": "Pantry Containers",
+        "conditions": [{"field": "TITLE", "value": "pantry"}]}], plan_id="usable-plan", version=1)
+    _add_collection_plan(db, "plans", [{"key": "bath", "title": "Bath Accessories",
+        "conditions": [{"field": "TITLE", "value": "bath"}]}], plan_id="empty-plan", version=2)
+    package = service.build("plans", persist=False)
+    assert package["candidate_source"].startswith("COLLECTION_PLAN")
+    assert package["items"][0]["collection_key"] == "pantry"
+    assert package["items"][0]["local_collection_definition"]["plan_id"] == "usable-plan"
+    assert all(item["candidate_status"] == "REVIEW_REQUIRED" for item in package["items"][1:])
+
+
+def test_store_profile_exclusions_and_existing_product_decisions_are_respected():
+    products = [
+        _product(31, "Pantry container set", "Pantry"),
+        _product(32, "Restricted pantry item", "Pantry", final_status="RESTRICTED"),
+        _product(33, "Disallowed pantry item", "Pantry"),
+    ]
+    eligible, excluded = _eligible_products(products, {"exclude_keywords": ["disallowed"]})
+    assert [item["shopify_product_id"] for item in eligible] == ["gid://shopify/Product/31"]
+    assert excluded["decision_or_risk_exclusion"] == 1
+    assert excluded["store_profile_exclusion"] == 1
+
+
+def test_remote_collection_evidence_semantics_remain_separate(db):
+    products = [_product(40, "Pantry container", "Pantry")]
+    _seed(db, "hearth", "Hearth & Order", products, profile={"primary_category": "Home Organization"})
+    _add_collection_plan(db, "hearth", [{"key": "pantry", "title": "Pantry Containers",
+        "conditions": [{"field": "TITLE", "value": "pantry"}]}])
+    _add_mapping(db, "hearth", "pantry", handle="pantry-containers")
+    service = CategoryShortcutReadinessService(db)
+    without_snapshot = service.build("hearth", persist=False)["items"][0]
+    assert without_snapshot["publication_ids"] == ["gid://shopify/Publication/123"]
+    assert without_snapshot["remote_product_count"] is None
+    assert without_snapshot["mapping_status"] == "REMOTE_NOT_VERIFIED"
+    _add_remote_snapshot(db, "hearth", handle="pantry-containers", count=0)
+    empty = service.build("hearth", persist=False)["items"][0]
+    assert empty["remote_count_status"] == "VERIFIED"
+    assert empty["remote_product_count"] == 0
+    assert empty["mapping_status"] == "REMOTE_EMPTY"
+    _add_remote_snapshot(db, "hearth", handle="pantry-containers", count=8)
+    nonempty = service.build("hearth", persist=False)["items"][0]
+    assert nonempty["mapping_identity_status"] == "VERIFIED"
+    assert nonempty["remote_product_count"] == 8
+    assert nonempty["remote_count_status"] == "VERIFIED"
+    assert nonempty["publication_status"] == "KNOWN_PUBLISHED"
+    assert nonempty["mapping_status"] == "READY"
+
+
+def test_remote_identity_mismatch_blocks_readiness(db):
+    _seed(db, "hearth", "Hearth & Order", [_product(41, "Pantry container", "Pantry")])
+    _add_collection_plan(db, "hearth", [{"key": "pantry", "title": "Pantry Containers",
+        "conditions": [{"field": "TITLE", "value": "pantry"}]}])
+    _add_mapping(db, "hearth", "pantry", handle="pantry-containers")
+    _add_remote_snapshot(db, "hearth", handle="different-handle", count=8)
+    item = CategoryShortcutReadinessService(db).build("hearth", persist=False)["items"][0]
+    assert item["mapping_identity_status"] == "IDENTITY_MISMATCH"
+    assert item["remote_product_count"] is None
+    assert item["mapping_status"] == "IDENTITY_MISMATCH"
+
+
+def test_remote_snapshot_refresh_is_read_only_and_cached(db, monkeypatch):
+    _seed(db, "hearth", "Hearth & Order", [_product(42, "Pantry container", "Pantry")])
+    service = CategoryShortcutReadinessService(db)
+    calls = []
+
+    class FakeClient:
+        def __init__(self, *args):
+            pass
+
+        def execute(self, query):
+            calls.append(query)
+            return {"collections": {"nodes": [{
+                "id": "gid://shopify/Collection/77", "handle": "pantry-containers",
+                "title": "Pantry Containers", "productsCount": {"count": 5, "precision": "EXACT"},
+            }]}}
+
+    monkeypatch.setattr("shopsource.shopify_collections.get_connection",
+                        lambda *a, **k: {"shop_domain": "test.myshopify.com", "api_version": "2026-07"})
+    monkeypatch.setattr("shopsource.shopify_collections.get_shopify_token", lambda *a, **k: ("fake-token", "test"))
+    monkeypatch.setattr("shopsource.shopify_collections.ShopifyGraphQLClient", FakeClient)
+    result = service.refresh_collection_snapshot("hearth")
+    assert result["status"] == "READ_ONLY_REFRESHED"
+    assert service.collection_snapshot("hearth")["collections"][0]["products_count"] == 5
+    assert len(calls) == 1
+    assert "productsCount" in calls[0] and "mutation" not in calls[0].casefold()
+
+
+def test_approved_unique_image_validation_is_preserved(db):
+    products = [_product(i, title, category) for i, (title, category) in enumerate([
+        ("Pantry container", "Pantry"), ("Under-sink basket", "Under Sink"),
+        ("Drawer divider", "Drawer"), ("Cabinet rack", "Cabinet"),
+    ], start=50)]
+    _seed(db, "hearth", "Hearth & Order", products, profile={"primary_category": "Home Organization"})
+    definitions = [
+        ("pantry", "Pantry Containers", "pantry"),
+        ("under-sink", "Under-Sink Baskets", "under-sink"),
+        ("drawer", "Drawer Dividers", "drawer"),
+        ("cabinet", "Cabinet Racks", "cabinet"),
+    ]
+    _add_collection_plan(db, "hearth", [
+        {"key": key, "title": title, "conditions": [{"field": "TITLE", "value": signal}]}
+        for key, title, signal in definitions
+    ])
+    image_path = Path(db).with_suffix(".png")
+    Image.new("RGB", (900, 900), "white").save(image_path)
+    with connect(db) as con:
+        con.execute("""INSERT INTO collection_image_assets
+            (store_id,collection_key,path,provider,model,alt_text,metadata_json,created_at,approval_status)
+            VALUES(?,?,?,?,?,?,?,?,?)""",
+            ("hearth", "pantry", str(image_path), "MANUAL", "", "Pantry",
+             json.dumps({"content_review": {"no_text": True, "no_logo": True, "no_watermark": True}}),
+             datetime.now(timezone.utc).isoformat(), "APPROVED"))
+    package = CategoryShortcutReadinessService(db).build("hearth", persist=False)
+    assert sum(item["image_status"] == "READY" for item in package["items"]) == 1
     assert sum(item["image_status"] == "NEEDS_ASSET" for item in package["items"]) == 3
 
 
-def test_invalid_or_unapproved_category_artwork_never_becomes_ready(db):
-    products = [_product(i, title, kind) for i, title, kind in [
-        (1, "Cargo trunk organizer", "Cargo"), (2, "Seat back organizer", "Seat"),
-        (3, "Car trash can", "Garbage"), (4, "Center console organizer", "Console"),
-    ]]
-    _seed(db, products)
-    invalid = Path(str(db) + ".invalid.png")
-    invalid.write_bytes(b"not an image")
-    valid_unapproved = Path(str(db) + ".png")
-    Image.new("RGB", (900, 900), "white").save(valid_unapproved)
-    with connect(db) as con:
-        for key, path, status in (("trunk-storage", invalid, "APPROVED"),
-                                  ("seat-organization", valid_unapproved, "NEEDS_REVIEW")):
-            con.execute("INSERT INTO collection_image_assets VALUES(?,?,?,?,?,?,?,?,?)",
-                        ("001", key, str(path), "MANUAL", "", "category image", "{}",
-                         datetime.now(timezone.utc).isoformat(), status))
-    package = CategoryShortcutReadinessService(db).build("001", persist=False)
-    assert all(item["image_status"] == "NEEDS_ASSET" for item in package["items"])
+def test_generic_image_prompt_uses_store_and_brand_context():
+    prompt = category_image_prompt("Pantry Containers", {
+        "primary_category": "Home & Kitchen Organization",
+        "visual_direction": "warm natural wood",
+        "brand_personality": ["calm", "practical"],
+    })
+    assert "Home & Kitchen Organization" in prompt
+    assert "warm natural wood" in prompt
+    assert not any(word in prompt.casefold() for word in ("automotive", "car interior", "vehicle"))
 
 
-def test_prompt_only_and_readiness_summary_keep_preview_blocked():
-    from shopsource.category_shortcut_readiness import category_image_prompt
-    prompt = category_image_prompt("Trunk & Cargo")
-    assert "no text" in prompt and "no logos" in prompt and "no watermark" in prompt
-    assert readiness_summary({"items": [{"mapping_status": "READY", "image_status": "READY"} for _ in range(4)],
-                              "theme_schema_status": "WAITING_FOR_LIVE_READ"})["preview_enabled"] is False
+def test_readiness_summary_keeps_preview_blocked_without_prerequisites():
+    package = {"items": [{"mapping_status": "READY", "image_status": "READY"} for _ in range(4)],
+               "theme_schema_status": "WAITING_FOR_LIVE_READ"}
+    assert readiness_summary(package)["preview_enabled"] is False
+    assert readiness_summary(package)["theme_write_status"] == "NOT_RUN"
+    fallback_package = {"items": [{"mapping_status": "READY", "image_status": "READY",
+                                    "candidate_status": "REVIEW_REQUIRED"} for _ in range(4)],
+                        "theme_schema_status": "READY"}
+    assert readiness_summary(fallback_package)["preview_enabled"] is False
+
+
+def test_core_module_has_no_store_or_automotive_taxonomy_hardcoding():
+    source = Path(__import__("shopsource.category_shortcut_readiness", fromlist=["__file__"]).__file__).read_text(encoding="utf-8").casefold()
+    assert "cabin-tidy-" not in source
+    assert "cabin tidy" not in source
+    assert "automotive" not in source
+    assert "_repair_part" not in source
+    assert "category_definitions" not in source

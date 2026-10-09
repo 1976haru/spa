@@ -11,37 +11,20 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .db import connect, init_db
+from .db import connect, get_store, init_db
 from .image_validation import inspect_image
 from .homepage_featured_products import _install as install_featured_schema
 
 CATALOG_MAX_AGE_DAYS = 7
-CATEGORY_DEFINITIONS = (
-    {"key": "trunk-cargo", "title": "Trunk & Cargo", "collection_key": "trunk-storage", "usefulness": 90,
-     "patterns": (r"\btrunk\b", r"\bcargo\b", r"boot organizer", r"car boot")},
-    {"key": "seat-backseat", "title": "Seat & Backseat", "collection_key": "seat-organization", "usefulness": 92,
-     "patterns": (r"back ?seat", r"seat ?back", r"seatback", r"seat organizer")},
-    {"key": "console-small-storage", "title": "Console & Small Storage", "collection_key": "console-storage", "usefulness": 84,
-     "patterns": (r"center console", r"\bconsole\b", r"small storage")},
-    {"key": "trash-cleanup", "title": "Trash & Cleanup", "collection_key": "trash-cleanup", "usefulness": 88,
-     "patterns": (r"\btrash\b", r"\bgarbage\b", r"\bwaste\b", r"\blitter\b", r"clean.?up")},
-    {"key": "cup-holder", "title": "Cup Holder & Convenience", "collection_key": "cup-holder", "usefulness": 82,
-     "patterns": (r"cup.?holders?", r"cupholder")},
-    {"key": "document-visor", "title": "Document & Visor", "collection_key": "document-visor", "usefulness": 65,
-     "patterns": (r"\bvisor\b", r"registration holder", r"document holder")},
-    {"key": "travel-organization", "title": "Travel Organization", "collection_key": "travel-storage", "usefulness": 68,
-     "patterns": (r"travel organizer", r"travel storage", r"travel organization")},
-    {"key": "general-organization", "title": "General Organization", "collection_key": "general-organization", "usefulness": 60,
-     "patterns": (r"organizer", r"organization", r"storage")},
-)
-_REPAIR_PART = re.compile(
-    r"\b(replacement|repair|oem|direct[ -]?fit|fitment|trim|panel|interior part|replacement part)\b|"
-    r"\b(?:19|20)\d{2}\s*(?:-|to)\s*(?:19|20)\d{2}\b|\bfits?\s+(?:19|20)\d{2}\b",
-    re.I,
-)
 _SAFE_HANDLE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 _COLLECTION_GID = re.compile(r"gid://shopify/Collection/\d+\Z")
 _PUBLICATION_GID = re.compile(r"gid://shopify/Publication/\d+\Z")
+_GENERIC_SIGNAL_WORDS = frozenset({
+    "a", "an", "and", "for", "with", "the", "to", "of", "in", "on", "by", "from",
+    "new", "best", "premium", "quality", "product", "products", "item", "items", "set", "pack",
+    "organizer", "organizers", "organization", "organizing", "storage", "accessory", "accessories",
+    "collection", "shopify", "uncategorized",
+})
 
 
 def _json(value, fallback):
@@ -52,31 +35,41 @@ def _json(value, fallback):
         return fallback
 
 
-def _category_match(product: dict) -> str | None:
-    """ShopSource collection mapping, taxonomy/productType, tags, then title."""
-    mapped = product.get("shopsource_collection_keys") or product.get("collection_keys") or product.get("collection_key")
-    mapped_values = mapped if isinstance(mapped, (list, tuple, set)) else [mapped]
-    mapped_values = {str(value).casefold() for value in mapped_values if value}
-    for definition in CATEGORY_DEFINITIONS:
-        if definition["collection_key"].casefold() in mapped_values or definition["key"].casefold() in mapped_values:
-            return definition["key"]
-    ordered = (
-        " ".join(str(product.get(key) or "") for key in ("category_key", "product_type")),
-        " ".join(map(str, product.get("tags") or [])),
-        str(product.get("title") or ""),
-    )
-    for source in ordered:
-        folded = source.casefold()
-        for definition in CATEGORY_DEFINITIONS[:-1]:
-            if any(re.search(pattern, folded, re.I) for pattern in definition["patterns"]):
-                return definition["key"]
-    combined = " ".join(ordered).casefold()
-    if any(re.search(pattern, combined, re.I) for pattern in CATEGORY_DEFINITIONS[-1]["patterns"]):
-        return "general-organization"
-    return None
+def _slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(value or "").casefold()).strip("-")[:80] or "category"
 
 
-def _is_eligible(product: dict) -> bool:
+def _product_text(product: dict) -> str:
+    tags = product.get("tags") or []
+    if not isinstance(tags, (list, tuple, set)):
+        tags = [tags]
+    return " ".join(str(value or "") for value in (
+        product.get("title"), product.get("product_type"), product.get("category"),
+        product.get("category_key"), product.get("collection_key"), *tags,
+    )).casefold()
+
+
+def _profile_exclusions(profile: dict) -> list[tuple[str, str]]:
+    def values(value):
+        if isinstance(value, str):
+            return [value]
+        return list(value) if isinstance(value, (list, tuple, set)) else []
+
+    exclusions = [(str(value).casefold(), "STORE_PROFILE_EXCLUDE_KEYWORD")
+                  for value in values(profile.get("exclude_keywords")) if str(value).strip()]
+    exclusions.extend((str(value).casefold(), "STORE_PROFILE_MERCHANDISING_EXCLUSION")
+                      for value in values(profile.get("category_shortcut_exclude_keywords")) if str(value).strip())
+    exclusions.extend((str(value).casefold(), "STORE_PROFILE_MERCHANDISING_EXCLUSION")
+                      for value in profile.get("merchandising_exclusions", []) if isinstance(value, str) and value.strip())
+    for rule in profile.get("risk_rules", []) or []:
+        if not isinstance(rule, dict) or str(rule.get("status") or "").upper() not in {"REVIEW", "RESTRICTED"}:
+            continue
+        exclusions.extend((str(term).casefold(), f"STORE_PROFILE_RISK_{str(rule.get('status')).upper()}")
+                          for term in values(rule.get("terms")) if str(term).strip())
+    return exclusions
+
+
+def _is_eligible(product: dict, profile: dict | None = None) -> bool:
     if str(product.get("remote_status") or "").upper() != "ACTIVE":
         return False
     if product.get("eligible") is False or product.get("storefront_eligible") is False:
@@ -85,41 +78,132 @@ def _is_eligible(product: dict) -> bool:
         return False
     if not (product.get("shopify_product_id") or product.get("source_key")):
         return False
-    evidence = " ".join(str(product.get(key) or "") for key in ("title", "product_type", "tags"))
-    return not bool(_REPAIR_PART.search(evidence))
+    if any(str(product.get(key) or "").upper() in {"REVIEW", "REVIEW_REQUIRED", "RESTRICTED", "EXCLUDED"}
+           for key in ("final_status", "decision_status", "risk_status")):
+        return False
+    text = _product_text(product)
+    return not any(term and term in text for term, _reason in _profile_exclusions(profile or {}))
 
 
-def _catalog_counts(products: list[dict]) -> tuple[dict[str, int], dict[str, int]]:
-    counts = {item["key"]: 0 for item in CATEGORY_DEFINITIONS}
+def _eligible_products(products: list[dict], profile: dict | None = None) -> tuple[list[dict], dict[str, int]]:
     excluded = {"not_active_or_ineligible": 0, "unverified_or_missing_identity": 0,
-                "repair_or_fitment_part": 0, "uncategorized": 0}
-    seen: set[str] = set()
+                "store_profile_exclusion": 0, "decision_or_risk_exclusion": 0}
+    eligible, seen = [], set()
+    exclusions = _profile_exclusions(profile or {})
     for product in products:
         identity = str(product.get("shopify_product_id") or product.get("source_key") or "")
         if not identity or identity in seen:
             continue
         seen.add(identity)
-        if str(product.get("remote_status") or "").upper() != "ACTIVE" or product.get("eligible") is False or product.get("storefront_eligible") is False:
+        if (str(product.get("remote_status") or "").upper() != "ACTIVE" or
+                product.get("eligible") is False or product.get("storefront_eligible") is False):
             excluded["not_active_or_ineligible"] += 1
             continue
-        if product.get("verification_status") != "REMOTE_READ_VERIFIED" or not identity:
+        if product.get("verification_status") != "REMOTE_READ_VERIFIED":
             excluded["unverified_or_missing_identity"] += 1
             continue
-        if not _is_eligible(product):
-            excluded["repair_or_fitment_part"] += 1
+        text = _product_text(product)
+        if any(str(product.get(key) or "").upper() in {"REVIEW", "REVIEW_REQUIRED", "RESTRICTED", "EXCLUDED"}
+               for key in ("final_status", "decision_status", "risk_status")):
+            excluded["decision_or_risk_exclusion"] += 1
             continue
-        category = _category_match(product)
-        if category:
-            counts[category] += 1
-        else:
-            excluded["uncategorized"] += 1
-    return counts, excluded
+        if any(term and term in text for term, _reason in exclusions):
+            excluded["store_profile_exclusion"] += 1
+            continue
+        eligible.append(product)
+    return eligible, excluded
 
 
-def category_image_prompt(title: str) -> str:
-    return (f"Premium automotive organization category-card photograph for {title}; clean modern car interior, "
-            "realistic useful product in context, neutral natural light, consistent square composition, "
-            "no text, no logos, no watermark, no vehicle-specific replacement parts.")
+def _candidate_matches(product: dict, candidate: dict) -> bool:
+    conditions = candidate.get("conditions") or []
+    if conditions:
+        from .collection_planner import condition_matches
+        normalized = {**product, "category": product.get("category") or product.get("product_type") or ""}
+        checks = [condition_matches(normalized, condition) for condition in conditions]
+        return all(checks) if str(candidate.get("match_mode") or "ANY").upper() == "ALL" else any(checks)
+    mapped = product.get("shopsource_collection_keys") or product.get("collection_keys") or product.get("collection_key")
+    mapped_values = mapped if isinstance(mapped, (list, tuple, set)) else [mapped]
+    mapped_values = {_slug(value) for value in mapped_values if value}
+    if _slug(candidate.get("collection_key") or "") in mapped_values or _slug(candidate.get("category_key") or "") in mapped_values:
+        return True
+    text = _product_text(product)
+    return any(str(signal).strip() and str(signal).casefold() in text
+               for signal in candidate.get("match_signals", []))
+
+
+def _title_from_signal(value: str) -> str:
+    return " ".join(word.capitalize() for word in re.sub(r"[_-]+", " ", str(value or "")).split())
+
+
+def _product_derived_candidates(products: list[dict]) -> list[dict]:
+    """Conservative categories from repeated actual product taxonomy, tags, and title phrases."""
+    buckets: dict[str, dict] = {}
+
+    def add(value: str, source_field: str, product_identity: str):
+        value = " ".join(str(value or "").strip().split())
+        words = re.findall(r"[a-z0-9]+", value.casefold())
+        if not words or all(word in _GENERIC_SIGNAL_WORDS for word in words):
+            return
+        # Taxonomy paths can be whole navigation trees, not useful card labels.
+        if source_field == "PRODUCT_CATEGORY_KEY" and len(words) > 5:
+            return
+        key = _slug(value)
+        if not key:
+            return
+        row = buckets.setdefault(key, {"category_key": key, "collection_key": key,
+            "title": _title_from_signal(value), "candidate_source": "PRODUCT_DERIVED_FALLBACK",
+            "source_field": source_field, "match_signals": [value], "conditions": [],
+            "match_mode": "ANY", "_product_identities": set()})
+        row["_product_identities"].add(product_identity)
+        if value.casefold() not in {signal.casefold() for signal in row["match_signals"]}:
+            row["match_signals"].append(value)
+
+    for product in products:
+        identity = str(product.get("shopify_product_id") or product.get("source_key") or "")
+        for value in (product.get("category_key"), product.get("collection_key")):
+            if value and str(value).casefold() != "uncategorized":
+                add(value, "PRODUCT_CATEGORY_KEY", identity)
+        add(product.get("product_type") or product.get("category"), "PRODUCT_TYPE", identity)
+        tags = product.get("tags") or []
+        if not isinstance(tags, (list, tuple, set)):
+            tags = [tags]
+        for value in tags:
+            add(value, "MERCHANT_TAG", identity)
+        words = [word for word in re.findall(r"[a-z0-9]+", str(product.get("title") or "").casefold())
+                 if word not in _GENERIC_SIGNAL_WORDS]
+        for size in (2, 3):
+            for start in range(max(0, len(words) - size + 1)):
+                add(" ".join(words[start:start + size]), "PRODUCT_TITLE_PHRASE", identity)
+    candidates = list(buckets.values())
+    for candidate in candidates:
+        candidate["product_count"] = len(candidate.pop("_product_identities"))
+        candidate["usefulness"] = 0
+    candidates = [candidate for candidate in candidates if candidate["product_count"] > 0]
+    candidates.sort(key=lambda row: (-row["product_count"], len(row["match_signals"][0]), row["title"].casefold()))
+    return candidates
+
+
+def category_image_prompt(title: str, store_profile: dict | None = None,
+                          brand_profile: dict | None = None) -> str:
+    store_profile = store_profile or {}
+    brand = (brand_profile or {}).get("profile", brand_profile or {})
+    primary_category = (brand.get("primary_category") or store_profile.get("primary_category") or
+                        store_profile.get("category") or "the store's products")
+    personality = brand.get("personality") or store_profile.get("brand_personality") or store_profile.get("brand_voice") or []
+    keywords = brand.get("brand_keywords") or store_profile.get("brand_keywords") or []
+    direction = (brand.get("visual_direction") or store_profile.get("visual_direction") or
+                 store_profile.get("visual_identity") or "clean, practical, modern")
+    palette = brand.get("colors") or store_profile.get("brand_colors")
+    def compact(value):
+        if isinstance(value, dict):
+            return ", ".join(str(item) for item in value.values() if item)
+        if isinstance(value, (list, tuple, set)):
+            return ", ".join(str(item) for item in value if item)
+        return str(value or "")
+    context = ", ".join(part for part in (compact(personality), compact(keywords), compact(direction), compact(palette)) if part)
+    return (f"Premium ecommerce category-card photograph for {title} in the context of {primary_category}; "
+            f"show relevant products in realistic use, consistent with this store's visual direction: {context}. "
+            "Square composition, natural light, clear subject, balanced negative space; no text, logos, or watermark.")
 
 
 def readiness_summary(package: dict) -> dict:
@@ -132,13 +216,16 @@ def readiness_summary(package: dict) -> dict:
     mapping_ready = sum(item.get("mapping_status") == "READY" for item in items)
     image_ready = sum(item.get("image_status") == "READY" for item in items)
     theme_status = package.get("theme_schema_status", "WAITING_FOR_LIVE_READ")
-    sufficient = len(items) == 4 and mapping_ready == 4 and image_ready == 4 and theme_status == "READY"
+    fallback_reviews = sum(item.get("candidate_status") == "REVIEW_REQUIRED" for item in items)
+    sufficient = (len(items) == 4 and mapping_ready == 4 and image_ready == 4 and
+                  fallback_reviews == 0 and theme_status == "READY")
     return {
-        "selected_count": len(items), "mapping_ready": mapping_ready,
-        "identity_ready": identity_ready, "nonempty_remote_ready": nonempty_remote_ready,
+        "selected_count": len(items), "candidates_selected": len(items), "mapping_ready": mapping_ready,
+        "identity_ready": identity_ready, "collection_identity_verified": identity_ready,
+        "nonempty_remote_ready": nonempty_remote_ready, "remote_nonempty_verified": nonempty_remote_ready,
         "publication_ready": publication_ready,
         "publication_unknown": sum(item.get("publication_status") == "UNKNOWN" for item in items),
-        "image_ready": image_ready,
+        "image_ready": image_ready, "candidate_review_required": fallback_reviews,
         "theme_schema_status": theme_status, "theme_write_status": "NOT_RUN",
         "preview_enabled": sufficient,
     }
@@ -158,6 +245,89 @@ class CategoryShortcutReadinessService:
             con.execute("""CREATE TABLE IF NOT EXISTS homepage_category_collection_remote_cache (
                 store_id TEXT PRIMARY KEY, fetched_at TEXT NOT NULL, source_hash TEXT NOT NULL,
                 collections_json TEXT NOT NULL)""")
+
+    def _store_context(self, store_id: str) -> tuple[dict, dict]:
+        try:
+            store_profile = get_store(str(store_id), self.db)
+        except (KeyError, ValueError):
+            store_profile = {"store_id": str(store_id), "store_name": str(store_id)}
+        brand_profile = {}
+        with connect(self.db) as con:
+            exists = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='brand_profiles'").fetchone()
+            row = con.execute("SELECT profile_json FROM brand_profiles WHERE store_id=?", (str(store_id),)).fetchone() if exists else None
+        if row:
+            brand_profile = _json(row["profile_json"], {})
+        return store_profile, brand_profile
+
+    def _plan_candidates(self, store_id: str, products: list[dict]) -> tuple[list[dict], bool]:
+        with connect(self.db) as con:
+            plan_rows = con.execute("SELECT plan_id,status FROM store_collection_plans WHERE store_id=? ORDER BY version DESC,created_at DESC",
+                                    (str(store_id),)).fetchall()
+            for plan in plan_rows:
+                if str(plan["status"] or "").upper() in {"CANCELLED", "ARCHIVED", "DELETED"}:
+                    continue
+                definitions = con.execute("""SELECT * FROM store_collection_definitions
+                    WHERE plan_id=? AND enabled=1 ORDER BY priority,id""", (plan["plan_id"],)).fetchall()
+                if not definitions:
+                    continue
+                candidates = []
+                for definition in definitions:
+                    row = dict(definition)
+                    conditions = [dict(condition) for condition in con.execute("""SELECT field,relation,value,group_operator
+                        FROM store_collection_conditions WHERE collection_definition_id=? ORDER BY priority,id""",
+                        (row["id"],)).fetchall()]
+                    signals = [row.get("title", ""), row.get("collection_key", "")]
+                    signals.extend(condition.get("value", "") for condition in conditions)
+                    candidate = {
+                        "category_key": row["collection_key"], "collection_key": row["collection_key"],
+                        "title": row["title"], "proposed_handle": row.get("handle") or "",
+                        "usefulness": max(0, 100 - int(row.get("priority") or 0)),
+                        "candidate_source": "COLLECTION_PLAN", "source_plan_id": plan["plan_id"],
+                        "conditions": conditions, "match_mode": row.get("match_mode") or "ANY",
+                        "match_signals": [str(value) for value in signals if value],
+                        "local_collection_definition": row,
+                    }
+                    candidate["product_count"] = sum(_candidate_matches(product, candidate) for product in products)
+                    if candidate["product_count"] > 0:
+                        candidates.append(candidate)
+                if candidates:
+                    return candidates, True
+        return [], False
+
+    @staticmethod
+    def _profile_candidates(profile: dict, brand_profile: dict, products: list[dict]) -> tuple[list[dict], bool]:
+        source = profile.get("category_shortcut_strategy") or profile.get("category_shortcuts")
+        if isinstance(source, dict):
+            source = source.get("categories") or source.get("candidates")
+        if not isinstance(source, list):
+            brand = (brand_profile or {}).get("profile", brand_profile or {})
+            source = brand.get("category_shortcut_strategy") or brand.get("category_shortcuts")
+        if isinstance(source, dict):
+            source = source.get("categories") or source.get("candidates")
+        if not isinstance(source, list):
+            return [], False
+        candidates, has_strategy = [], False
+        for spec in source:
+            if not isinstance(spec, dict):
+                continue
+            title = str(spec.get("title") or spec.get("name") or "").strip()
+            collection_key = str(spec.get("collection_key") or spec.get("category_key") or _slug(title))
+            if not title or not collection_key or spec.get("enabled") is False:
+                continue
+            has_strategy = True
+            signals = spec.get("match_signals") or spec.get("signals") or spec.get("keywords") or []
+            if isinstance(signals, str):
+                signals = [signals]
+            signals = [str(value) for value in [*signals, title] if value]
+            candidate = {**spec, "category_key": str(spec.get("category_key") or collection_key),
+                         "collection_key": collection_key, "title": title,
+                         "candidate_source": "STORE_PROFILE", "conditions": spec.get("conditions") or [],
+                         "match_signals": signals, "match_mode": spec.get("match_mode") or "ANY",
+                         "usefulness": float(spec.get("usefulness") or 0)}
+            candidate["product_count"] = sum(_candidate_matches(product, candidate) for product in products)
+            if candidate["product_count"] > 0:
+                candidates.append(candidate)
+        return candidates, has_strategy
 
     def collection_snapshot(self, store_id: str) -> dict | None:
         """Return the last bounded read-only Shopify collection snapshot, if any."""
@@ -213,15 +383,13 @@ class CategoryShortcutReadinessService:
             image_rows = con.execute("SELECT collection_key,path,approval_status,alt_text,metadata_json FROM collection_image_assets WHERE store_id=?", (str(store_id),)).fetchall() if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='collection_image_assets'").fetchone() else []
             homepage_image_rows = con.execute("SELECT asset_id,asset_type,local_path,approval_status,shopify_file_id,shopify_url FROM store_homepage_assets WHERE store_id=?", (str(store_id),)).fetchall() if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='store_homepage_assets'").fetchone() else []
             brand_image_rows = con.execute("SELECT asset_id,asset_type,local_path,approval_status,shopify_file_id,shopify_url,metadata_json FROM brand_assets WHERE store_id=?", (str(store_id),)).fetchall() if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='brand_assets'").fetchone() else []
-            definition_rows = con.execute("""SELECT d.collection_key,d.title,d.handle,d.estimated_product_count,d.warning_json
-                FROM store_collection_plans p JOIN store_collection_definitions d ON d.plan_id=p.plan_id
-                WHERE p.store_id=? ORDER BY p.created_at DESC,d.priority,d.id""", (str(store_id),)).fetchall() if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='store_collection_plans'").fetchone() else []
         if not cache:
             return {"status": "WAITING_FOR_CATALOG", "store_id": str(store_id), "catalog_fetched_at": None,
                     "distribution": {}, "items": [], "summary": readiness_summary({"items": []}),
                     "blockers": ["No cached ACTIVE Shopify product catalog is available; refresh with read_products only."]}
         products = _json(cache["candidates_json"], [])
-        counts, excluded = _catalog_counts(products)
+        store_profile, brand_profile = self._store_context(store_id)
+        eligible_products, excluded = _eligible_products(products, store_profile)
         now = datetime.now(timezone.utc)
         try:
             age_days = max(0, (now - datetime.fromisoformat(cache["fetched_at"].replace("Z", "+00:00"))).total_seconds() / 86400)
@@ -229,16 +397,13 @@ class CategoryShortcutReadinessService:
             age_days = None
         if age_days is None or age_days > CATALOG_MAX_AGE_DAYS:
             return {"status": "STALE_CATALOG", "store_id": str(store_id), "catalog_fetched_at": cache["fetched_at"],
-                    "catalog_age_days": age_days, "distribution": counts, "items": [],
+                    "catalog_age_days": age_days, "distribution": {}, "items": [],
                     "summary": readiness_summary({"items": []}),
                     "blockers": ["Cached catalog is stale; a read_products refresh is needed before selecting categories."]}
 
         mappings = {row["collection_key"]: dict(row) for row in collection_rows}
         remote_snapshot = self.collection_snapshot(store_id)
         remote_collections = (remote_snapshot or {}).get("collections", [])
-        definitions = {}
-        for row in definition_rows:
-            definitions.setdefault(row["collection_key"], dict(row))
         images = {row["collection_key"]: dict(row) for row in image_rows}
         for row in [*homepage_image_rows, *brand_image_rows]:
             candidate = dict(row)
@@ -248,12 +413,39 @@ class CategoryShortcutReadinessService:
                 images[str(key)] = {"path": candidate.get("local_path"), "approval_status": candidate.get("approval_status"),
                                     "alt_text": metadata.get("alt_text", "") if isinstance(metadata, dict) else "",
                                     "metadata_json": candidate.get("metadata_json"), "asset_id": candidate.get("asset_id")}
-        # Broad usefulness and use-case diversity break similar counts; count is the primary rank.
-        ranked = [item for item in CATEGORY_DEFINITIONS if counts[item["key"]] > 0]
-        ranked.sort(key=lambda item: (-counts[item["key"]], -item["usefulness"], item["key"]))
-        selected = ranked[:4]
+        plan_candidates, _has_collection_plan = self._plan_candidates(store_id, eligible_products)
+        candidate_pools = [plan_candidates]
+        known_candidate_keys = {str(item.get("collection_key") or "") for item in plan_candidates}
+        if len(known_candidate_keys) < 4:
+            profile_candidates, _has_profile_strategy = self._profile_candidates(
+                store_profile, brand_profile, eligible_products)
+            candidate_pools.append(profile_candidates)
+            known_candidate_keys.update(str(item.get("collection_key") or "") for item in profile_candidates)
+        if len(known_candidate_keys) < 4:
+            candidate_pools.append(_product_derived_candidates(eligible_products))
+        selected, selected_keys, sources_used = [], set(), []
+        for pool in candidate_pools:
+            pool.sort(key=lambda item: (-item.get("product_count", 0),
+                                        -float(item.get("usefulness") or 0),
+                                        int((item.get("local_collection_definition") or {}).get("priority") or 0),
+                                        str(item.get("title") or "").casefold(),
+                                        str(item.get("collection_key") or "")))
+            for candidate in pool:
+                candidate_key = str(candidate.get("collection_key") or "")
+                if not candidate_key or candidate_key in selected_keys:
+                    continue
+                selected.append(candidate)
+                selected_keys.add(candidate_key)
+                if candidate.get("candidate_source") not in sources_used:
+                    sources_used.append(candidate["candidate_source"])
+                if len(selected) == 4:
+                    break
+            if len(selected) == 4:
+                break
+        candidate_source = "+".join(sources_used) if sources_used else "NO_CANDIDATES"
         items = []
         used_asset_paths: set[str] = set()
+        store_name = str(store_profile.get("store_name") or store_profile.get("name") or store_id)
         for position, item in enumerate(selected, 1):
             key = item["collection_key"]
             mapping = mappings.get(key) or {}
@@ -293,11 +485,18 @@ class CategoryShortcutReadinessService:
                         and .75 <= inspection.get("aspect_ratio", 0) <= 1.25 and content_ok):
                     image_status = "READY"
                     used_asset_paths.add(asset_path)
-            plan_definition = definitions.get(key) or {}
-            proposed_handle = plan_definition.get("handle") or re.sub(r"[^a-z0-9]+", "-", f"cabin-tidy-{item['title']}").strip("-")
+            plan_definition = item.get("local_collection_definition") or {}
+            proposed_handle = item.get("proposed_handle") or re.sub(
+                r"[^a-z0-9]+", "-", f"{store_name} {item['title']}".casefold()).strip("-")[:80]
+            if not _SAFE_HANDLE.fullmatch(proposed_handle):
+                proposed_handle = re.sub(r"[^a-z0-9]+", "-", f"{store_name} {item['title']}".casefold()).strip("-")[:80]
+            item_candidate_source = item.get("candidate_source", candidate_source)
+            selection_reason = (f"{item.get('product_count', 0)} eligible products matched {item_candidate_source} evidence")
             items.append({
-                "shortcut_key": item["key"], "title": item["title"], "merchandising_group": item["title"],
-                "product_count": counts[item["key"]], "collection_key": key,
+                "shortcut_key": item.get("category_key") or key, "category_key": item.get("category_key") or key,
+                "title": item["title"], "merchandising_group": item["title"],
+                "candidate_source": item_candidate_source,
+                "product_count": item["product_count"], "selection_reason": selection_reason, "collection_key": key,
                 "shopify_collection_id": collection_id if identity_status == "VERIFIED" else None,
                 "handle": handle if identity_status == "VERIFIED" else None, "storefront_url": target_url,
                 "mapping_status": mapping_status, "mapping_identity_status": identity_status,
@@ -306,13 +505,15 @@ class CategoryShortcutReadinessService:
                 "remote_count_status": remote_count_status,
                 "local_collection_definition": plan_definition or None,
                 "proposed_collection_definition": {"collection_key": key, "title": item["title"],
-                    "estimated_active_product_count": counts[item["key"]], "proposed_handle": proposed_handle,
-                    "remote_id": None, "status": "LOCAL_PROPOSAL_ONLY"}, "proposed_handle": proposed_handle,
+                    "estimated_active_product_count": item["product_count"], "proposed_handle": proposed_handle,
+                    "remote_id": None, "status": "LOCAL_PROPOSAL_ONLY"},
+                "proposed_handle": proposed_handle,
+                "candidate_status": "REVIEW_REQUIRED" if item_candidate_source == "PRODUCT_DERIVED_FALLBACK" else "STORE_DATA",
                 "image_asset_id": asset.get("asset_id") if image_status == "READY" else None,
                 "image_asset_path": asset_path if image_status == "READY" else None,
                 "image_status": image_status, "image_inspection": inspection,
-                "alt_text": asset.get("alt_text") if image_status == "READY" else f"{item['title']} organization in a clean car interior",
-                "image_prompt": category_image_prompt(item["title"]), "position": position,
+                "alt_text": asset.get("alt_text") if image_status == "READY" else f"{item['title']} products in realistic use",
+                "image_prompt": category_image_prompt(item["title"], store_profile, brand_profile), "position": position,
                 "readiness_reasons": (["Remote collection identity and productsCount evidence are required; publication IDs are not product counts."] if mapping_status != "READY" else []) +
                     (["Approved square image with verified no-text/no-logo/no-watermark content review is missing."] if image_status != "READY" else []),
             })
@@ -327,10 +528,16 @@ class CategoryShortcutReadinessService:
             theme_info = {"status": theme_status, "filename": category_schema.get("filename"),
                           "type": category_schema.get("type"), "mode": category_schema.get("mode"),
                           "discovery_status": found.get("category_status")}
-        package = {"plan_id": package_id, "store_id": str(store_id), "status": "CATEGORIES_SELECTED_PREREQUISITES_BLOCKED" if len(items) == 4 else "INSUFFICIENT_CATEGORIES",
+        distribution = {item["collection_key"]: {"title": item["title"], "product_count": item["product_count"],
+                         "candidate_source": item.get("candidate_source", candidate_source),
+                         "status": "REVIEW_REQUIRED" if item.get("candidate_source") == "PRODUCT_DERIVED_FALLBACK" else "STORE_DATA"}
+                       for item in selected}
+        package = {"plan_id": package_id, "store_id": str(store_id), "store_name": store_name,
+                   "candidate_source": candidate_source,
+                   "status": "CATEGORIES_SELECTED_PREREQUISITES_BLOCKED" if len(items) == 4 else "INSUFFICIENT_CATEGORIES",
                    "catalog_fetched_at": cache["fetched_at"], "catalog_age_days": round(age_days, 3),
-                   "catalog_product_count": len(products), "excluded_counts": excluded,
-                   "distribution": {item["key"]: {"title": item["title"], "product_count": counts[item["key"]]} for item in CATEGORY_DEFINITIONS},
+                   "catalog_product_count": len(products), "eligible_product_count": len(eligible_products),
+                   "excluded_counts": excluded, "distribution": distribution,
                    "items": items, "theme_schema_status": theme_status, "theme_schema": theme_info, "theme_write_status": "NOT_RUN",
                    "mapping_refresh_status": "READ_ONLY_SNAPSHOT" if remote_snapshot else "REMOTE_EVIDENCE_UNAVAILABLE",
                    "collection_snapshot_fetched_at": (remote_snapshot or {}).get("fetched_at"), "summary": {},
