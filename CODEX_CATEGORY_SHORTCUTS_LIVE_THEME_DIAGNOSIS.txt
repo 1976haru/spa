@@ -1,0 +1,240 @@
+ShopSource Studio — CATEGORY SHORTCUTS LIVE THEME DIAGNOSIS
+SPAMY CATEGORY NAVIGATION ASSIGNMENT — READ ONLY
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+
+Assignment
+"스토어 메인 화면에서 고객이 원하는 카테고리로 바로 이동하게 해 주는 영역을 만듭니다."
+
+Context
+- This is the Spamy category-shortcut assignment.
+- Cabin Tidy already has local category shortcut planning code and prepared category concepts/images.
+- Current real theme discovery previously reported:
+  category capability = MANUAL
+  CATEGORY_NOT_FOUND
+- Do NOT implement or patch yet.
+- Shopify Asset API/themeFilesUpsert exemption is still pending.
+- This task is diagnosis only and must not write Shopify.
+
+Goal
+Determine exactly how Cabin Tidy's current MAIN theme can represent a homepage category shortcut area and whether ShopSource can safely automate it after exemption approval.
+
+======================================================================
+1. CURRENT THEME / TEMPLATE
+======================================================================
+
+Read the current MAIN theme READ-ONLY.
+
+Report:
+- theme name/id/role
+- templates/index.json readable
+- current homepage section ids in order
+- for each current section: id, type, schema name if available
+
+No write.
+
+======================================================================
+2. AUDIT ALL SECTION SCHEMAS
+======================================================================
+
+Read all sections/*.liquid schemas that could plausibly implement category shortcuts.
+
+Look for:
+- collection_list
+- collection
+- image_picker
+- url/link
+- heading/title/text
+- multicolumn
+- grid
+- cards
+- featured collections
+- image with text blocks
+- blocks containing image + link + heading
+- blocks containing collection picker
+
+Do not rely only on filename keywords.
+
+For each plausible schema, report:
+- filename
+- type
+- schema name
+- settings
+- blocks
+- max_blocks
+- presets
+- enabled_on/disabled_on
+- whether it can safely render 4 category cards
+- whether each card can link to /collections/<handle>
+- whether image is merchant/theme controlled
+- confidence HIGH/MEDIUM/LOW
+
+======================================================================
+3. CURRENT HOMEPAGE EVIDENCE
+======================================================================
+
+Inspect current templates/index.json and identify whether Cabin Tidy already has a section visually similar to category shortcuts:
+- four benefit cards
+- image cards
+- collection grid
+- multicolumn
+- featured collections
+- icon rows
+
+Determine whether an existing section could be reused safely or whether a new managed section should be created.
+
+Do not mutate merchant-owned existing sections in diagnosis.
+
+======================================================================
+4. COLLECTION TARGETS
+======================================================================
+
+Read ShopSource local collection plan + Shopify collection mappings READ-ONLY.
+
+For the intended Cabin Tidy category shortcuts, report:
+- collection key
+- title
+- Shopify collection id
+- handle
+- storefront URL
+- product count if available
+- mapping status
+
+Prefer the already discussed 4-category concept if those collections truly exist:
+- Trunk Organizers
+- Seat Organizers / Seat & Backseat
+- Console Storage / Console & Small Storage
+- Trash & Cleanup
+
+Do not invent mappings.
+If actual collection titles differ, report the real ones.
+
+======================================================================
+5. CATEGORY IMAGES
+======================================================================
+
+Inspect current ShopSource collection/homepage image assets READ-ONLY.
+
+For each target category report:
+- approved asset exists YES/NO
+- local path
+- Shopify file/image reference if already available
+- aspect ratio
+- whether current theme schema expects image_picker/resource image/url
+
+Do not generate paid images.
+Do not upload files.
+
+======================================================================
+6. AUTOMATION OPTIONS
+======================================================================
+
+Rank the viable implementation strategies:
+
+A. native collection_list setting
+B. collection blocks
+C. multicolumn/image-card blocks with image + heading + link
+D. reuse an existing merchant section
+E. custom ShopSource-owned section requiring creation of a new .liquid file
+F. manual only
+
+For each:
+- safe?
+- needs themeFilesUpsert exemption?
+- changes templates/index.json only?
+- requires creating sections/*.liquid?
+- preserves merchant content?
+- supports 4 cards + links + images?
+- rollback complexity
+
+Prefer the least invasive option.
+
+======================================================================
+7. SHOPIFY INSTANCE IDS
+======================================================================
+
+Any proposed managed section/block IDs must use the new central alphanumeric generator.
+Confirm:
+- generated section id sample
+- generated block id samples
+- all valid [A-Za-z0-9]+
+
+Do not reuse old underscore IDs.
+
+======================================================================
+8. STORE FRONT / PASSWORD CONSTRAINT
+======================================================================
+
+If public homepage HTML is password-protected, note that automated storefront verification may be unavailable.
+Define what human confirmation will be required:
+- Desktop title/4 cards/links
+- Mobile 4 cards/layout
+
+No write.
+
+======================================================================
+9. EXISTING CODE GAP
+======================================================================
+
+Compare diagnosis against current ShopSource code:
+- homepage_automation.discover_homepage_sections()
+- category_shortcuts()
+- category preview/build path
+- homepage session resolver
+- UI button "카테고리 바로가기 자동 만들기"
+
+Explain why current real theme produced CATEGORY_NOT_FOUND:
+- detector too narrow?
+- theme lacks suitable schema?
+- suitable schema exists but fields not recognized?
+- collection mappings missing?
+- images missing?
+- another reason?
+
+Do not edit yet.
+
+======================================================================
+10. OUTPUT FORMAT
+======================================================================
+
+Report exactly:
+
+THEME =
+INDEX_JSON = YES/NO
+
+CURRENT_HOMEPAGE_SECTIONS =
+PLAUSIBLE_CATEGORY_SCHEMAS =
+
+BEST_CATEGORY_SECTION_STRATEGY =
+BEST_SECTION_FILE =
+BEST_SECTION_TYPE =
+BEST_MODE = COLLECTION_LIST / COLLECTION_BLOCKS / MULTICOLUMN / EXISTING_SECTION / CUSTOM_SECTION / MANUAL
+
+TARGET_COLLECTIONS =
+TARGET_COLLECTION_MAPPING_READY = YES/NO/PARTIAL
+
+CATEGORY_IMAGES_READY = YES/NO/PARTIAL
+
+CURRENT_CATEGORY_NOT_FOUND_ROOT_CAUSE =
+
+TEMPLATE_ONLY_CHANGE_POSSIBLE = YES/NO
+NEW_LIQUID_SECTION_REQUIRED = YES/NO
+THEMEFILES_EXEMPTION_REQUIRED = YES/NO
+
+ALPHANUMERIC_SECTION_ID_SAMPLE =
+ALPHANUMERIC_BLOCK_ID_SAMPLES =
+
+HUMAN_STOREFRONT_CHECKS =
+
+RECOMMENDED_IMPLEMENTATION =
+MINIMAL_FILES_TO_CHANGE =
+REGRESSION_TESTS_NEEDED =
+
+SHOPIFY_WRITE_COUNT = 0
+CODE_CHANGE_COUNT = 0
+
+No code changes.
+No Shopify writes.
+No commit/push.
