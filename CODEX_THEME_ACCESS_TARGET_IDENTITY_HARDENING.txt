@@ -1,0 +1,302 @@
+ShopSource Studio — THEME ACCESS CLI TARGET IDENTITY / LIVE-ROLE HARDENING
+DO THIS BEFORE MERGING FALLBACK BACKEND
+
+Repository
+- Local worktree: D:\shop\001_so_amazon_theme_fallback_v2
+- Remote: https://github.com/1976haru/spa.git
+- Branch: phase/theme-write-fallback-backend-v2
+- Expected current implementation HEAD before this prompt commit: c4d65c36d0fe0e9ebabc344dce77dcea5a65d197
+- Main base: cc2a1fd70e7c01df263786d5acaa3615f5b56e11
+
+Why this hardening is required
+Independent review of the Phase A implementation found one remaining safety gap:
+
+ShopifyThemeCLI.capability_status() runs:
+  shopify theme list --store <domain> --json
+
+but currently:
+- does not prove that the requested theme_id actually exists in that store,
+- does not parse and persist the target theme's actual role/status,
+- can report READY even if the requested theme ID is wrong,
+- write_file() relies on caller-supplied request.target_is_live to decide whether --allow-live is required.
+
+For a production safety boundary, the backend itself must know whether the exact target theme is the MAIN/live theme.
+A caller must not be able to accidentally label a live theme as non-live and weaken the gate.
+
+Shopify CLI officially supports theme list filtering by ID and reports theme IDs/statuses.
+Use that capability or equivalent robust JSON parsing.
+No live write in this task.
+
+Mission
+Harden target theme identity and actual role detection before this backend is merged to main.
+
+======================================================================
+1. TARGET THEME IDENTITY MUST BE VERIFIED
+======================================================================
+
+Refactor capability_status(store_id, theme_id=...) to verify the exact target theme.
+
+Preferred command shape:
+shopify theme list
+  --store <domain>
+  --id <numeric-theme-id>
+  --json
+
+If --id is not supported by the detected CLI version, fall back to:
+theme list --store <domain> --json
+and filter JSON locally.
+
+Requirements:
+- parse JSON only
+- exact numeric theme ID match
+- no fuzzy theme-name matching
+- no assumption that an authenticated store implies the theme ID exists
+
+New statuses/reason codes as appropriate:
+THEME_ID_NOT_FOUND
+THEME_ID_AMBIGUOUS
+THEME_ROLE_UNKNOWN
+THEME_LIST_INVALID_JSON
+
+READY requires:
+- CLI supported
+- Theme Access credential present
+- configured store matches
+- exact theme ID found
+- role/status reliably known
+
+======================================================================
+2. NORMALIZE SHOPIFY CLI THEME LIST JSON SAFELY
+======================================================================
+
+The CLI JSON shape can vary by CLI release.
+Create a bounded parser helper that accepts plausible shapes such as:
+- top-level list
+- {"themes": [...]}
+- other explicitly observed wrapper object
+
+Do NOT recursively scan arbitrary nested data with fuzzy matching.
+
+Normalize each theme to:
+{
+  "id": "<numeric>",
+  "name": "...",
+  "role": "main|unpublished|development|demo|unknown"
+}
+
+Accept common role/status field names only if explicitly mapped.
+Normalize:
+main/live/published => MAIN
+unpublished => UNPUBLISHED
+development => DEVELOPMENT
+demo => DEMO
+
+Unknown role => THEME_ROLE_UNKNOWN, not READY.
+
+Do not include credential/token in parser diagnostics.
+
+======================================================================
+3. BACKEND-DERIVED LIVE STATUS
+======================================================================
+
+ThemeBackendCapabilities.details must include:
+- verified_theme_id
+- verified_theme_name when available
+- verified_theme_role
+- target_is_live = true/false
+- identity_verified = true
+
+The write backend must derive live status from this verified capability.
+Do not trust request.target_is_live by itself.
+
+Rules:
+- actual role MAIN => actual_live = True
+- all other verified roles => actual_live = False
+
+If request.target_is_live disagrees with actual role:
+return PRECONDITION_FAILED
+reason_code = TARGET_ROLE_MISMATCH
+
+======================================================================
+4. LIVE WRITE GATE MUST USE VERIFIED ROLE
+======================================================================
+
+For actual MAIN/live target:
+write_file() must require BOTH:
+- confirmed=True
+- allow_live=True
+
+Only then add:
+--allow-live
+
+Even if request.target_is_live=False, if verified role is MAIN:
+- reject as TARGET_ROLE_MISMATCH or ALLOW_LIVE_REQUIRED
+- never push
+
+For actual non-live target:
+- do not append --allow-live
+- if request.target_is_live=True, reject TARGET_ROLE_MISMATCH rather than silently accepting inconsistent state
+
+Apply same verified-role logic to rollback_file().
+
+======================================================================
+5. READ / VERIFY SHOULD ALSO BIND TO VERIFIED TARGET
+======================================================================
+
+read_file() / _pull() must ensure:
+- requested shop_domain equals configured store
+- theme_id is the verified exact theme ID
+
+Avoid capability probe + later different theme ID race inside one call.
+If capability object can be passed internally, use it.
+Otherwise re-check exact identity before pull.
+
+No write.
+
+======================================================================
+6. ROUTER CAPABILITY DETAILS
+======================================================================
+
+ThemeWriteBackendRouter behavior remains:
+- GraphQL primary when active
+- Theme Access CLI fallback when READY
+
+But CLI must not be READY unless target identity + role are verified.
+
+No UI changes in this hardening task.
+
+======================================================================
+7. SECRET SAFETY
+======================================================================
+
+Keep existing guarantees:
+- password only in SHOPIFY_CLI_THEME_TOKEN env
+- never argv
+- never exception/log text
+- do not return raw stdout/stderr to callers
+- do not persist secret
+
+When parsing theme list JSON, parse stdout in-memory and discard it.
+Do not include entire raw JSON in error metadata.
+
+======================================================================
+8. TESTS
+======================================================================
+
+Add/update tests at minimum:
+
+test_capability_requires_exact_theme_id_match
+test_capability_theme_id_not_found
+test_capability_rejects_ambiguous_theme_id
+test_capability_parses_top_level_theme_list_json
+test_capability_parses_wrapped_themes_json
+test_capability_rejects_invalid_json
+test_capability_requires_known_theme_role
+test_capability_marks_main_theme_live
+test_capability_marks_unpublished_theme_not_live
+test_write_live_role_cannot_be_bypassed_by_false_request_flag
+test_write_nonlive_role_rejects_true_request_flag
+test_write_main_requires_allow_live
+test_write_main_adds_allow_live_only_after_verified_role
+test_rollback_main_requires_verified_live_gate
+test_secret_not_leaked_in_theme_list_parse_errors
+test_wrong_theme_id_never_pushes
+test_router_cli_not_ready_when_theme_identity_unverified
+test_no_shopify_live_write
+
+Preserve previous fallback tests.
+
+======================================================================
+9. OFFICIAL CLI COMPATIBILITY
+======================================================================
+
+Use current Shopify CLI capabilities defensively:
+- theme list supports --id and --json in current docs
+- theme list provides theme IDs and statuses
+- do not hardcode undocumented raw JSON shape more than necessary
+
+If installed CLI does not support --id:
+- fallback to full --json list and exact local ID filter
+- capability may still be READY if exact identity and role are proven
+
+======================================================================
+10. PROTECTED / OVERLAP FILES
+======================================================================
+
+Do not modify:
+- src/shopsource/ui/v2.py
+- src/shopsource/category_strategy.py
+- src/shopsource/category_shortcut_readiness.py
+- tools/shopify_app/safe_shopify_cli.ps1
+- stores/001_cabin_tidy.json
+- data/*.sqlite3
+- .env
+- credentials
+- backups
+- user assets
+
+Preferred changed files:
+- src/shopsource/shopify_theme_cli.py
+- tests/test_shopify_theme_cli.py
+- perhaps docs/THEME_DELIVERY_BACKENDS.md only if needed
+
+======================================================================
+11. QUALITY GATES
+======================================================================
+
+Run:
+python -m compileall -q src tests
+focused fallback tests
+python -m pytest -q --basetemp=<worktree-local-temp>
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Required:
+FULL SUITE PASS
+SHOPIFY LIVE WRITE COUNT = 0
+
+======================================================================
+12. COMMIT / PUSH
+======================================================================
+
+Stay on:
+phase/theme-write-fallback-backend-v2
+
+Suggested commit:
+git commit -m "Harden Theme Access target identity and live role"
+
+Push same branch.
+Do not merge main.
+
+======================================================================
+13. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] target identity verification
+[5] CLI JSON normalization
+[6] verified live-role detection
+[7] write gate behavior
+[8] rollback gate behavior
+[9] secret safety
+[10] router effect
+[11] focused tests
+[12] full-suite result
+[13] protected files
+[14] Shopify live write count
+[15] merge readiness
+[16] exact next action
+
+Final:
+TARGET_THEME_IDENTITY_VERIFIED = YES/NO
+TARGET_THEME_ROLE_VERIFIED = YES/NO
+LIVE_ROLE_CALLER_BYPASS_BLOCKED = YES/NO
+SECRET_SAFE = YES/NO
+FULL_SUITE = PASS/FAIL
+SHOPIFY_LIVE_WRITE_COUNT = 0
+CODE_MERGE_READY = YES/NO
