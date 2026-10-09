@@ -482,6 +482,12 @@ class CategoryShortcutReadinessService:
         store_name = str(store_profile.get("store_name") or store_profile.get("name") or store_id)
         for position, item in enumerate(selected, 1):
             key = item["collection_key"]
+            matched_products = [product for product in eligible_products if _candidate_matches(product, item)]
+            expected_product_ids = sorted({str(product.get("shopify_product_id") or product.get("source_key"))
+                                           for product in matched_products
+                                           if product.get("shopify_product_id") or product.get("source_key")})
+            expected_product_handles = sorted({str(product.get("shopify_handle") or "").casefold()
+                                               for product in matched_products if product.get("shopify_handle")})
             mapping = mappings.get(key) or {}
             handle = mapping.get("handle")
             collection_id = mapping.get("shopify_collection_id")
@@ -532,6 +538,10 @@ class CategoryShortcutReadinessService:
                 "candidate_source": item_candidate_source,
                 "product_count": item["product_count"], "selection_reason": selection_reason, "collection_key": key,
                 "conditions": item.get("conditions") or [], "match_signals": item.get("match_signals") or [],
+                "expected_product_count": len(matched_products), "expected_product_ids": expected_product_ids,
+                "expected_product_handles": expected_product_handles,
+                "source_strategy_id": item.get("source_strategy_id"),
+                "source_strategy_version": item.get("source_strategy_version"),
                 "shopify_collection_id": collection_id if identity_status == "VERIFIED" else None,
                 "handle": handle if identity_status == "VERIFIED" else None, "storefront_url": target_url,
                 "mapping_status": mapping_status, "mapping_identity_status": identity_status,
@@ -541,6 +551,11 @@ class CategoryShortcutReadinessService:
                 "local_collection_definition": plan_definition or None,
                 "proposed_collection_definition": {"collection_key": key, "title": item["title"],
                     "estimated_active_product_count": item["product_count"], "proposed_handle": proposed_handle,
+                    "expected_product_count": len(matched_products),
+                    "expected_product_ids": expected_product_ids,
+                    "expected_product_handles": expected_product_handles,
+                    "source_strategy_id": item.get("source_strategy_id"),
+                    "source_strategy_version": item.get("source_strategy_version"),
                     "remote_id": None, "status": "LOCAL_PROPOSAL_ONLY"},
                 "proposed_handle": proposed_handle,
                 "candidate_status": "REVIEW_REQUIRED" if item_candidate_source == "PRODUCT_DERIVED_FALLBACK" else "STORE_DATA",

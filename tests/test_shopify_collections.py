@@ -43,6 +43,12 @@ def definition(key="trunk", *, strategy="TITLE_FALLBACK", value="trunk organizer
             "rule_strategy":strategy,"estimated_product_count":12,"image_alt_text":"Trunk organizers"}
 
 
+def evidenced_definition(count=2):
+    return {**definition(), "expected_product_count": count,
+            "expected_product_ids": [f"gid://shopify/Product/{i}" for i in range(1, count + 1)],
+            "expected_product_handles": [f"p-{i}" for i in range(1, count + 1)]}
+
+
 def plan(*definitions):
     return {"plan_id":"plan-test","store_id":"001","collections":list(definitions)}
 
@@ -280,6 +286,61 @@ def test_no_real_shopify_write_in_tests(setup_shopify):
     assert result["counts"]["CREATE"] == 1
     assert not fake.writes
     assert all(not ("collectionCreate" in query or "collectionUpdate" in query or "publishablePublish" in query) for query,_ in fake.calls)
+
+
+class ReconciliationReadClient(FakeShopify):
+    def __init__(self, rows, members):
+        super().__init__(rows)
+        self.members = members
+
+    def execute(self, query, variables=None):
+        if "ShopSourceCollectionMembership" in query:
+            variables = variables or {}; self.calls.append((query, variables))
+            start = 0 if variables.get("after") is None else int(variables["after"])
+            end = min(start + variables["first"], len(self.members))
+            rows = self.members[start:end]
+            remote = self.rows[0]
+            return {"collection": {"id": remote["id"], "title": remote["title"], "handle": remote["handle"],
+                    "productsCount": remote["productsCount"], "products": {"nodes": rows,
+                    "pageInfo": {"hasNextPage": end < len(self.members), "endCursor": str(end)}}}}
+        return super().execute(query, variables)
+
+
+def _reconciliation_publisher(tmp_path, monkeypatch, count, members):
+    db = tmp_path / "reconcile.sqlite3"
+    monkeypatch.setenv("SHOPIFY_ACCESS_TOKEN", "never-log-this-token")
+    save_connection("001", "cabin-tidy.myshopify.com", db=db)
+    remote = {"id": "gid://shopify/Collection/9", "title": "Trunk Organizers",
+              "handle": "trunk-organizers", "descriptionHtml": "", "image": None,
+              "productsCount": {"count": count, "precision": "EXACT"}, "sources": []}
+    fake = ReconciliationReadClient([remote], members)
+    return fake, ShopifyCollectionPublisher(db=db, client_factory=fake)
+
+
+def test_dry_run_uses_create_when_reuse_candidate_is_content_unsafe(tmp_path, monkeypatch):
+    members = [{"id": f"gid://shopify/Product/{i}", "handle": f"p-{i}"} for i in range(1, 373)]
+    fake, publisher = _reconciliation_publisher(tmp_path, monkeypatch, 372, members)
+    result = publisher.dry_run(plan(evidenced_definition(84)))
+    assert result["items"][0]["action"] == "CREATE"
+    assert result["items"][0]["reconciliation"]["content_status"] == "VERIFIED_OVERBROAD"
+    assert fake.writes == []
+
+
+def test_cabin_tidy_like_84_vs_372_blocks_reuse(tmp_path, monkeypatch):
+    members = [{"id": f"gid://shopify/Product/{i}", "handle": f"p-{i}"} for i in range(1, 373)]
+    _, publisher = _reconciliation_publisher(tmp_path, monkeypatch, 372, members)
+    item = publisher.dry_run(plan(evidenced_definition(84)))["items"][0]
+    assert item["action"] == "CREATE"
+    assert item["reconciliation"]["content_metrics"]["count_ratio"] == 4.4286
+
+
+def test_second_store_compatible_existing_collection_can_reuse(tmp_path, monkeypatch):
+    members = [{"id": f"gid://shopify/Product/{i}", "handle": f"p-{i}"} for i in range(1, 3)]
+    fake, publisher = _reconciliation_publisher(tmp_path, monkeypatch, 2, members)
+    result = publisher.dry_run(plan(evidenced_definition(2)))
+    assert result["items"][0]["action"] == "REUSE_CANDIDATE"
+    assert result["items"][0]["reconciliation"]["content_status"] == "VERIFIED_COMPATIBLE"
+    assert fake.writes == []
 
 
 def test_secret_token_only_credential_store(tmp_path,monkeypatch):

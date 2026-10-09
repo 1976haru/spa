@@ -118,40 +118,52 @@ def test_strategy_store_isolation(tmp_path):
 
 def test_reconciliation_mapping_is_store_isolated(tmp_path):
     db = tmp_path / "s.sqlite3"; service = ExistingCollectionReconciliationService(db)
-    proposal = service.propose("a", {"collection_key": "trunk", "title": "Trunk Organizers", "handle": "trunk-organizers"}, [_remote()])
+    proposal = service.propose("a", _local(), [_remote()])
     service.adopt(proposal, confirmed=True)
     with connect(db) as con:
         assert con.execute("SELECT COUNT(*) FROM shopify_collection_mappings WHERE store_id='a'").fetchone()[0] == 1
         assert con.execute("SELECT COUNT(*) FROM shopify_collection_mappings WHERE store_id='b'").fetchone()[0] == 0
 
 
-def _remote(identifier="1", handle="trunk-organizers", title="Trunk Organizers", count=372):
+def _local(handle="trunk-organizers", count=2):
+    return {"collection_key": "trunk", "title": "Trunk Organizers", "handle": handle,
+            "expected_product_count": count,
+            "expected_product_ids": [f"gid://shopify/Product/{i}" for i in range(1, count + 1)],
+            "expected_product_handles": [f"p-{i}" for i in range(1, count + 1)]}
+
+
+def _remote(identifier="1", handle="trunk-organizers", title="Trunk Organizers", count=2,
+            product_numbers=None, complete=True):
+    product_numbers = list(range(1, count + 1)) if product_numbers is None else product_numbers
     return {"id": f"gid://shopify/Collection/{identifier}", "handle": handle, "title": title,
-            "products_count": count, "products_count_precision": "EXACT"}
+            "products_count": count, "products_count_precision": "EXACT",
+            "product_ids": [f"gid://shopify/Product/{i}" for i in product_numbers],
+            "product_handles": [f"p-{i}" for i in product_numbers],
+            "membership_status": "FULL" if complete else "PARTIAL", "membership_complete": complete}
 
 
 def test_reconciliation_exact_match(tmp_path):
     service = ExistingCollectionReconciliationService(tmp_path / "s.sqlite3")
-    assert service.propose("a", {"collection_key": "trunk", "title": "Trunk Organizers", "handle": "trunk-organizers"}, [_remote()])["status"] == "EXACT_MATCH"
+    assert service.propose("a", _local(), [_remote()])["status"] == "EXACT_MATCH"
 
 
 def test_reconciliation_high_confidence_requires_user_confirmation(tmp_path):
     service = ExistingCollectionReconciliationService(tmp_path / "s.sqlite3")
-    proposal = service.propose("a", {"collection_key": "trunk", "title": "Trunk Organizers", "handle": "store-trunk-organizers"}, [_remote()])
+    proposal = service.propose("a", _local("store-trunk-organizers"), [_remote()])
     assert proposal["status"] == "HIGH_CONFIDENCE_CANDIDATE"
     with pytest.raises(PermissionError): service.adopt(proposal)
 
 
 def test_reconciliation_ambiguous_blocks_adoption(tmp_path):
     service = ExistingCollectionReconciliationService(tmp_path / "s.sqlite3")
-    proposal = service.propose("a", {"collection_key": "trunk", "title": "Trunk Organizers"}, [_remote("1"), _remote("2", "trunk-2")])
+    proposal = service.propose("a", _local(""), [_remote("1"), _remote("2", "trunk-2")])
     assert proposal["status"] == "AMBIGUOUS"
     with pytest.raises(ValueError): service.adopt(proposal, confirmed=True)
 
 
 def test_existing_collection_adoption_writes_local_mapping_only(tmp_path):
     db = tmp_path / "s.sqlite3"; service = ExistingCollectionReconciliationService(db)
-    proposal = service.propose("a", {"collection_key": "trunk", "title": "Trunk Organizers", "handle": "trunk-organizers"}, [_remote()])
+    proposal = service.propose("a", _local(), [_remote()])
     result = service.adopt(proposal, confirmed=True)
     assert result["shopify_write_performed"] is False
     with connect(db) as con:
@@ -160,7 +172,7 @@ def test_existing_collection_adoption_writes_local_mapping_only(tmp_path):
 
 def test_adoption_does_not_invent_publication_ids(tmp_path):
     db = tmp_path / "s.sqlite3"; service = ExistingCollectionReconciliationService(db)
-    proposal = service.propose("a", {"collection_key": "trunk", "title": "Trunk Organizers", "handle": "trunk-organizers"}, [_remote()])
+    proposal = service.propose("a", _local(), [_remote()])
     service.adopt(proposal, confirmed=True)
     with connect(db) as con:
         assert json.loads(con.execute("SELECT published_ids_json FROM shopify_collection_mappings").fetchone()[0]) == []
@@ -198,3 +210,109 @@ def test_no_shopify_write(tmp_path):
     service = ExistingCollectionReconciliationService(tmp_path / "s.sqlite3")
     proposal = service.propose("a", {"collection_key": "trunk", "title": "Trunk Organizers"}, [_remote()])
     assert proposal["remote_write_performed"] is False
+
+
+def test_reconciliation_large_count_mismatch_not_high_confidence(tmp_path):
+    service = ExistingCollectionReconciliationService(tmp_path / "s.sqlite3")
+    remote = {**_remote(count=372, complete=False), "product_ids": [], "product_handles": []}
+    proposal = service.propose("a", _local(count=84), [remote])
+    assert proposal["identity_status"] == "EXACT_HANDLE"
+    assert proposal["content_status"] == "COUNT_MISMATCH"
+    assert proposal["status"] == "CONFLICT"
+    assert proposal["user_confirmation_required"] is False
+
+
+def test_reconciliation_membership_metrics_compatible(tmp_path):
+    proposal = ExistingCollectionReconciliationService(tmp_path / "s.sqlite3").propose(
+        "a", _local(count=10), [_remote(count=12, product_numbers=range(1, 13))])
+    assert proposal["content_status"] == "VERIFIED_COMPATIBLE"
+    assert proposal["content_metrics"] == {**proposal["content_metrics"], "intersection_count": 10,
+                                             "precision": 0.8333, "recall": 1.0, "jaccard": 0.8333}
+
+
+def _assert_incompatible_membership_blocks_adoption(tmp_path, remote_count, numbers, content_status):
+    service = ExistingCollectionReconciliationService(tmp_path / "s.sqlite3")
+    proposal = service.propose("a", _local(count=10), [_remote(count=remote_count, product_numbers=numbers)])
+    assert proposal["content_status"] == content_status
+    with pytest.raises(ValueError, match="verified compatible"):
+        service.adopt(proposal, confirmed=True)
+
+
+def test_reconciliation_overbroad_blocks_adoption(tmp_path):
+    _assert_incompatible_membership_blocks_adoption(tmp_path, 16, range(1, 17), "VERIFIED_OVERBROAD")
+
+
+def test_reconciliation_undercovered_blocks_adoption(tmp_path):
+    _assert_incompatible_membership_blocks_adoption(tmp_path, 5, range(1, 6), "VERIFIED_UNDERCOVERED")
+
+
+def test_reconciliation_unknown_content_blocks_adoption(tmp_path):
+    service = ExistingCollectionReconciliationService(tmp_path / "s.sqlite3")
+    remote = {**_remote(count=2, complete=False), "product_ids": [], "product_handles": []}
+    proposal = service.propose("a", _local(), [remote])
+    assert proposal["content_status"] == "UNKNOWN"
+    with pytest.raises(ValueError):
+        service.adopt(proposal, confirmed=True)
+
+
+def test_adopt_requires_verified_compatible_content(tmp_path):
+    service = ExistingCollectionReconciliationService(tmp_path / "s.sqlite3")
+    unsafe = service.propose("a", _local(), [{"id": "gid://shopify/Collection/1", "handle": "trunk-organizers",
+                                               "title": "Trunk Organizers", "products_count": 2}])
+    with pytest.raises(ValueError):
+        service.adopt(unsafe, confirmed=True)
+
+
+def test_exact_handle_does_not_bypass_content_mismatch(tmp_path):
+    proposal = ExistingCollectionReconciliationService(tmp_path / "s.sqlite3").propose(
+        "a", _local(count=84), [{"id": "gid://shopify/Collection/1", "handle": "trunk-organizers",
+                                  "title": "Other", "products_count": 372}])
+    assert proposal["identity_status"] == "EXACT_HANDLE"
+    assert proposal["status"] == "CONFLICT"
+
+
+def test_membership_snapshot_pagination_read_only(tmp_path):
+    class Client:
+        calls = []
+        def execute(self, query, variables):
+            self.calls.append((query, variables))
+            start = 0 if variables["after"] is None else int(variables["after"])
+            end = min(start + variables["first"], 205)
+            return {"collection": {"id": variables["id"], "title": "Trunk Organizers",
+                    "handle": "trunk-organizers", "productsCount": {"count": 205, "precision": "EXACT"},
+                    "products": {"nodes": [{"id": f"gid://shopify/Product/{i}", "handle": f"p-{i}"}
+                                            for i in range(start, end)],
+                                 "pageInfo": {"hasNextPage": end < 205, "endCursor": str(end)}}}}
+    client = Client()
+    result = ExistingCollectionReconciliationService(tmp_path / "s.sqlite3").fetch_membership(
+        "a", "gid://shopify/Collection/1", client=client)
+    assert result["membership_status"] == "FULL" and result["membership_fetched_count"] == 205
+    assert len(client.calls) == 3
+    assert all("mutation" not in query.casefold() for query, _ in client.calls)
+    assert result["shopify_write_performed"] is False
+
+
+def test_membership_snapshot_over_cap_is_partial(tmp_path):
+    class Client:
+        def execute(self, query, variables):
+            start = 0 if variables["after"] is None else int(variables["after"])
+            end = start + variables["first"]
+            return {"collection": {"id": variables["id"], "title": "Large", "handle": "large",
+                    "productsCount": {"count": 501, "precision": "EXACT"},
+                    "products": {"nodes": [{"id": f"gid://shopify/Product/{i}", "handle": f"p-{i}"}
+                                            for i in range(start, end)],
+                                 "pageInfo": {"hasNextPage": True, "endCursor": str(end)}}}}
+    result = ExistingCollectionReconciliationService(tmp_path / "s.sqlite3").fetch_membership(
+        "a", "gid://shopify/Collection/1", client=Client())
+    assert result["membership_status"] == "PARTIAL"
+    assert result["membership_complete"] is False
+    assert result["membership_fetched_count"] == 500
+
+
+def test_store_isolation_membership_evidence(tmp_path):
+    service = ExistingCollectionReconciliationService(tmp_path / "s.sqlite3")
+    safe = service.propose("second-store", _local(), [_remote()])
+    unsafe = service.propose("a", _local(count=84), [{"id": "gid://shopify/Collection/1",
+        "handle": "trunk-organizers", "title": "Trunk Organizers", "products_count": 372}])
+    assert safe["store_id"] == "second-store" and safe["status"] == "EXACT_MATCH"
+    assert unsafe["store_id"] == "a" and unsafe["status"] == "CONFLICT"

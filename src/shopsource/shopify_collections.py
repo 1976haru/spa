@@ -364,12 +364,26 @@ class ShopifyCollectionPublisher:
                     for row in remote_data]
                 reconciliation = ExistingCollectionReconciliationService(self.db).propose(
                     store_id, definition, normalized_remote)
+                candidate_remote = (reconciliation.get("candidate") or {}).get("remote") or {}
+                if candidate_remote.get("id"):
+                    try:
+                        membership = ExistingCollectionReconciliationService(self.db).fetch_membership(
+                            store_id, candidate_remote["id"], client=client)
+                        normalized_remote = [membership if row.get("id") == membership.get("id") else row
+                                             for row in normalized_remote]
+                        reconciliation = ExistingCollectionReconciliationService(self.db).propose(
+                            store_id, definition, normalized_remote)
+                    except Exception:
+                        # Count-only evidence remains conservative; never promote on a failed read.
+                        pass
                 if reconciliation["status"] in {"EXACT_MATCH", "HIGH_CONFIDENCE_CANDIDATE"}:
                     item["action"] = "REUSE_CANDIDATE"
                     item["reason"] = "Existing collection requires explicit local mapping approval"
                     item["reconciliation"] = reconciliation
                 else:
                     item["action"] = "CREATE"
+                    item["reason"] = "No adoption-safe existing collection; create the curated strategy collection"
+                    item["reconciliation"] = reconciliation
             elif _normalized_hash(remote) == _condition_hash(definition):
                 item["action"] = "NO CHANGE"
             elif not mapping:

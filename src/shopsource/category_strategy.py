@@ -10,6 +10,22 @@ from difflib import SequenceMatcher
 
 from .db import connect, init_db
 
+MEMBERSHIP_PAGE_SIZE = 100
+MEMBERSHIP_SAFE_CAP = 500
+COMPATIBLE_RECALL = 0.80
+COMPATIBLE_PRECISION = 0.70
+COUNT_RATIO_MAX = 1.75
+COUNT_RATIO_MIN = 0.57
+COLLECTION_MEMBERSHIP_QUERY = """query ShopSourceCollectionMembership($id: ID!, $first: Int!, $after: String) {
+  collection(id: $id) {
+    id title handle productsCount { count precision }
+    products(first: $first, after: $after) {
+      nodes { id handle }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}"""
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -149,7 +165,8 @@ class HomepageCategoryStrategyService:
         for source in record["strategy"]["items"]:
             item = dict(source)
             item.update(candidate_source="CATEGORY_STRATEGY", source_strategy_id=record["strategy_id"],
-                        strategy_status=record["status"], proposed_handle=source.get("preferred_handle") or "")
+                        source_strategy_version=record["version"], strategy_status=record["status"],
+                        proposed_handle=source.get("preferred_handle") or "")
             item["product_count"] = sum(_candidate_matches(product, item) for product in products)
             result.append(item)
         return result, record
@@ -160,11 +177,16 @@ class HomepageCategoryStrategyService:
             raise RuntimeError("An approved category strategy is required")
         collections = []
         for item in record["strategy"]["items"]:
+            evidence = item.get("evidence") or {}
             collections.append({
                 "collection_key": item["collection_key"], "title": item["title"],
                 "handle": item.get("preferred_handle") or _slug(item["title"]),
                 "match_mode": item.get("match_mode", "ANY"), "conditions": item.get("conditions") or [],
-                "estimated_product_count": (item.get("evidence") or {}).get("matched_count", 0),
+                "estimated_product_count": evidence.get("matched_count", 0),
+                "expected_product_count": evidence.get("matched_count"),
+                "expected_product_ids": evidence.get("expected_product_ids") or [],
+                "expected_product_handles": evidence.get("expected_product_handles") or [],
+                "source_strategy_id": record["strategy_id"], "source_strategy_version": record["version"],
                 "image_prompt": item.get("image_prompt", ""),
             })
         return {"plan_id": record["strategy_id"], "store_id": str(store_id),
@@ -201,6 +223,9 @@ class HomepageCategoryStrategyService:
                 "image_prompt": source.get("image_prompt") or category_image_prompt(source.get("title"), profile),
                 "notes": source.get("notes") or "Suggested from current eligible cached product evidence; review before approval.",
                 "evidence": {"matched_count": len(matches),
+                    "expected_product_ids": sorted(identity for identity in identities if identity.startswith("gid://shopify/Product/")),
+                    "expected_product_handles": sorted({str(product.get("shopify_handle") or "").casefold()
+                                                        for product in matches if product.get("shopify_handle")}),
                     "sample_titles": [str(product.get("title") or "")[:240] for product in matches[:10]],
                     "selection_reason": source.get("selection_reason") or "Nonzero verified products and explicit customer intent.",
                     "not_fallback_reason": "Customer-facing title and deterministic rules were explicitly supplied and evidenced."}})
@@ -232,6 +257,103 @@ class ExistingCollectionReconciliationService:
               evidence_json TEXT NOT NULL)
             """)
 
+    @staticmethod
+    def _expected(local: dict) -> tuple[int | None, set[str], set[str]]:
+        evidence = local.get("evidence") if isinstance(local.get("evidence"), dict) else {}
+        count = local.get("expected_product_count", local.get("estimated_product_count",
+                    evidence.get("matched_count")))
+        count = count if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else None
+        ids = {str(value) for value in (local.get("expected_product_ids") or
+               evidence.get("expected_product_ids") or []) if str(value)}
+        handles = {str(value).casefold() for value in (local.get("expected_product_handles") or
+                   evidence.get("expected_product_handles") or []) if str(value)}
+        return count, ids, handles
+
+    @staticmethod
+    def _content_evidence(local: dict, remote: dict) -> dict:
+        expected_count, expected_ids, expected_handles = ExistingCollectionReconciliationService._expected(local)
+        remote_count = remote.get("products_count")
+        remote_count = remote_count if isinstance(remote_count, int) and not isinstance(remote_count, bool) else None
+        count_ratio = (remote_count / expected_count) if remote_count is not None and expected_count else None
+        complete = remote.get("membership_complete") is True or remote.get("membership_status") == "FULL"
+        remote_ids = {str(value) for value in (remote.get("product_ids") or []) if str(value)}
+        remote_handles = {str(value).casefold() for value in (remote.get("product_handles") or []) if str(value)}
+        expected_set, remote_set, basis = set(), set(), None
+        if complete and expected_ids and remote_ids:
+            expected_set, remote_set, basis = expected_ids, remote_ids, "PRODUCT_ID"
+        elif complete and expected_handles and remote_handles:
+            expected_set, remote_set, basis = expected_handles, remote_handles, "PRODUCT_HANDLE"
+        metrics = {"expected_count": expected_count, "remote_count": remote_count,
+                   "count_ratio": round(count_ratio, 4) if count_ratio is not None else None,
+                   "intersection_count": None, "precision": None, "recall": None, "jaccard": None,
+                   "membership_basis": basis, "membership_complete": complete,
+                   "membership_status": remote.get("membership_status") or ("FULL" if complete else "UNKNOWN")}
+        if basis:
+            intersection = len(expected_set & remote_set)
+            union = len(expected_set | remote_set)
+            precision = intersection / len(remote_set) if remote_set else 0.0
+            recall = intersection / len(expected_set) if expected_set else 0.0
+            jaccard = intersection / union if union else 0.0
+            metrics.update(intersection_count=intersection, precision=round(precision, 4),
+                           recall=round(recall, 4), jaccard=round(jaccard, 4))
+            if recall >= COMPATIBLE_RECALL and precision >= COMPATIBLE_PRECISION and (
+                    count_ratio is None or COUNT_RATIO_MIN <= count_ratio <= COUNT_RATIO_MAX):
+                status = "VERIFIED_COMPATIBLE"
+            elif recall >= COMPATIBLE_RECALL and precision < COMPATIBLE_PRECISION:
+                status = "VERIFIED_OVERBROAD"
+            elif precision >= COMPATIBLE_PRECISION and recall < COMPATIBLE_RECALL:
+                status = "VERIFIED_UNDERCOVERED"
+            else:
+                status = "COUNT_MISMATCH"
+        elif count_ratio is not None and (count_ratio > COUNT_RATIO_MAX or count_ratio < COUNT_RATIO_MIN):
+            status = "COUNT_MISMATCH"
+        else:
+            status = "UNKNOWN"
+        return {"content_status": status, "metrics": metrics}
+
+    def fetch_membership(self, store_id: str, collection_id: str, *, cap: int = MEMBERSHIP_SAFE_CAP,
+                         page_size: int = MEMBERSHIP_PAGE_SIZE, client=None) -> dict:
+        """Fetch bounded Shopify collection membership using queries only."""
+        if not re.fullmatch(r"gid://shopify/Collection/\d+", str(collection_id or "")):
+            raise ValueError("A valid Shopify collection GID is required")
+        cap = max(1, min(int(cap), MEMBERSHIP_SAFE_CAP))
+        page_size = max(1, min(int(page_size), MEMBERSHIP_PAGE_SIZE, cap))
+        if client is None:
+            from .shopify_collections import ShopifyGraphQLClient, get_connection, get_shopify_token
+            config = get_connection(str(store_id), db=self.db)
+            token, _source = get_shopify_token(str(store_id), db=self.db)
+            if not config or not token:
+                raise RuntimeError("Shopify read connection is required")
+            client = ShopifyGraphQLClient(config["shop_domain"], token, config["api_version"])
+        nodes, after, identity, remote_count, precision = [], None, {}, None, None
+        while len(nodes) < cap:
+            first = min(page_size, cap - len(nodes))
+            payload = client.execute(COLLECTION_MEMBERSHIP_QUERY,
+                                     {"id": collection_id, "first": first, "after": after})
+            collection = payload.get("collection") or {}
+            if not collection or collection.get("id") != collection_id:
+                raise RuntimeError("Shopify collection identity was not returned")
+            identity = {"id": collection.get("id"), "title": collection.get("title"),
+                        "handle": collection.get("handle")}
+            products_count = collection.get("productsCount") or {}
+            remote_count, precision = products_count.get("count"), products_count.get("precision")
+            connection = collection.get("products") or {}
+            nodes.extend(row for row in (connection.get("nodes") or []) if row.get("id") and row.get("handle"))
+            page_info = connection.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            after = page_info.get("endCursor")
+            if not after:
+                break
+        complete = isinstance(remote_count, int) and len(nodes) >= remote_count
+        status = "FULL" if complete else "PARTIAL" if nodes else "UNKNOWN"
+        return {**identity, "products_count": remote_count, "products_count_precision": precision,
+                "product_ids": [row["id"] for row in nodes],
+                "product_handles": [row["handle"] for row in nodes],
+                "membership_status": status, "membership_complete": complete,
+                "membership_fetched_count": len(nodes), "membership_cap": cap,
+                "shopify_write_performed": False}
+
     def propose(self, store_id: str, local: dict, remote_collections: list[dict]) -> dict:
         key = str(local.get("collection_key") or "")
         title = str(local.get("title") or "")
@@ -255,25 +377,36 @@ class ExistingCollectionReconciliationService:
         top = candidates[0] if candidates else None
         tied = bool(top and len(candidates) > 1 and candidates[1]["score"] == top["score"])
         if not top:
-            status = "NO_MATCH"
+            identity_status, content_status, metrics, status = "NO_MATCH", "UNKNOWN", {}, "NO_MATCH"
         elif tied:
-            status = "AMBIGUOUS"
-        elif top["exact_id"] or top["exact_handle"]:
-            status = "EXACT_MATCH"
-        elif top["score"] >= 80:
-            status = "HIGH_CONFIDENCE_CANDIDATE"
+            identity_status, content_status, metrics, status = "AMBIGUOUS", "UNKNOWN", {}, "AMBIGUOUS"
         else:
-            status = "CONFLICT"
+            identity_status = ("EXACT_ID" if top["exact_id"] else "EXACT_HANDLE" if top["exact_handle"] else
+                               "TITLE_MATCH" if top["normalized_title_match"] else "SIMILAR_HANDLE")
+            content = self._content_evidence(local, top["remote"])
+            content_status, metrics = content["content_status"], content["metrics"]
+            if content_status != "VERIFIED_COMPATIBLE":
+                status = "CONFLICT"
+            elif top["exact_id"] or top["exact_handle"]:
+                status = "EXACT_MATCH"
+            elif top["score"] >= 80:
+                status = "HIGH_CONFIDENCE_CANDIDATE"
+            else:
+                status = "CONFLICT"
         return {"store_id": str(store_id), "collection_key": key, "local": local,
                 "status": status, "candidate": top, "candidates": candidates,
+                "identity_status": identity_status, "content_status": content_status,
+                "content_metrics": metrics,
                 "user_confirmation_required": status in {"EXACT_MATCH", "HIGH_CONFIDENCE_CANDIDATE"},
                 "remote_write_performed": False}
 
     def adopt(self, proposal: dict, *, confirmed: bool = False) -> dict:
         if confirmed is not True:
             raise PermissionError("Explicit confirmation is required to link an existing collection")
-        if proposal.get("status") not in {"EXACT_MATCH", "HIGH_CONFIDENCE_CANDIDATE"}:
-            raise ValueError("Only an unambiguous reconciliation proposal can be adopted")
+        if (proposal.get("status") not in {"EXACT_MATCH", "HIGH_CONFIDENCE_CANDIDATE"} or
+                proposal.get("content_status") != "VERIFIED_COMPATIBLE" or
+                proposal.get("identity_status") in {"AMBIGUOUS", "NO_MATCH", None}):
+            raise ValueError("Adoption requires unambiguous identity and verified compatible content")
         candidate = (proposal.get("candidate") or {}).get("remote") or {}
         store_id, key = str(proposal.get("store_id") or ""), str(proposal.get("collection_key") or "")
         if not store_id or not key or not candidate.get("id") or not candidate.get("handle"):

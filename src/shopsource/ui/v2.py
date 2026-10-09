@@ -2226,7 +2226,21 @@ class OperatorUI:
                     proposals = [service.propose(self.current_store, row, snapshot.get("collections", []))
                                  for row in (package or {}).get("items", [])]
                     state["category_reconciliation"] = proposals
-                    ui.notify(" · ".join(f"{p['local']['title']}: {p['status']}" for p in proposals), type="info")
+                    category_strategy_rows.clear()
+                    with category_strategy_rows:
+                        for proposal in proposals:
+                            metrics = proposal.get("content_metrics") or {}
+                            with ui.card().classes("w-full"):
+                                ui.label(f"{proposal['local']['title']} · {proposal['status']}").classes("font-semibold")
+                                ui.label(f"Identity: {proposal.get('identity_status')} · Content: {proposal.get('content_status')}")
+                                ui.label(f"Expected/remote: {metrics.get('expected_count')} / {metrics.get('remote_count')} · ratio {metrics.get('count_ratio')}")
+                                if metrics.get("precision") is not None:
+                                    ui.label(f"Precision {metrics['precision']} · Recall {metrics['recall']} · Jaccard {metrics['jaccard']}")
+                                if not proposal.get("user_confirmation_required"):
+                                    ui.label("Existing collection content is not compatible with the current strategy; automatic linking is unavailable.").classes("text-amber-800")
+                    adoption_confirm.value = False
+                    adoption_button.set_enabled(any(p.get("user_confirmation_required") for p in proposals))
+                    category_strategy_dialog.open()
 
                 def adopt_reconciliation_candidate():
                     from ..category_strategy import ExistingCollectionReconciliationService
@@ -2245,7 +2259,7 @@ class OperatorUI:
                     ui.button("View strategy 4", on_click=show_category_strategy, icon="view_list").props("outline")
                     ui.button("Approve strategy", on_click=approve_category_strategy, icon="check_circle").props("outline")
                     ui.button("View existing collection candidates", on_click=show_reconciliation_candidates, icon="link").props("outline")
-                    ui.button("Link existing collection", on_click=adopt_reconciliation_candidate, icon="link").props("outline")
+                    adoption_button = ui.button("Link existing collection", on_click=adopt_reconciliation_candidate, icon="link").props("outline disable")
                     ui.button("View 4 categories", on_click=show_category_readiness, icon="category").props("outline")
                     ui.button("Recheck collection mappings (read-only)", on_click=recheck_category_mappings, icon="sync").props("outline")
                     ui.button("Image readiness", on_click=show_category_images, icon="image").props("outline")
