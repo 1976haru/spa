@@ -1,0 +1,450 @@
+ShopSource Studio — CATEGORY SHORTCUT FINALIZATION BEFORE SHOPIFY THEME APPROVAL
+FIX GENERIC SCHEMA DISCOVERY + ADD STORE-SPECIFIC STRATEGY DRAFT + EXISTING COLLECTION RECONCILIATION
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: phase/shopify-exemption-homepage-gate
+- Expected current branch HEAD: 31db0e66c48b0248424b34b68c83d925d3e791b9
+- main handoff base: 86a31edc56dfd6411c88f829e5a102f3c7e48dd3
+
+Current verified operational state
+- Shopify auth VERIFIED
+- App = ShopSource Production
+- read_products/read_publications/read_themes/write_products/write_publications granted
+- write_themes NOT granted yet
+- MAIN theme read PASS
+- Collections read PASS
+- Products read PASS
+- Featured Products READY TO APPLY AFTER APPROVAL
+- Category schema audit found native sections/collection-list.liquid, 4-card support, template-only, no new Liquid required
+- Yet generic discover_homepage_sections() still returns CATEGORY_NOT_FOUND because its label matching fails on hyphen/underscore/translatable schema names
+- Current category readiness selected:
+  1. Trunk Organizers — COLLECTION_PLAN
+  2. Cup Holders — COLLECTION_PLAN
+  3. a long PRODUCT_DERIVED_FALLBACK seat-back label
+  4. Car Seat — PRODUCT_DERIVED_FALLBACK
+- This is not acceptable for a production homepage.
+- Remote collections currently include:
+  - frontpage
+  - trunk-organizers with 372 products
+- Existing local proposed handle for Trunk Organizers is cabin-tidy-trunk-organizers, so the remote trunk-organizers collection was not auto-adopted.
+- Category mappings = 0/4
+- Category images = 0/4
+- Merchandising draft exists but excludes 0 products; do not auto-approve.
+- Theme write must remain 0 while exemption is pending.
+
+MISSION
+Finish the reusable PROGRAM architecture needed for a clean category-shortcut workflow before Shopify theme approval, while performing NO Shopify writes.
+
+The result should make both Cabin Tidy and the future second store safe:
+1. generic theme section discovery must correctly recognize native collection-list schemas,
+2. homepage category choices must have a versioned, explicit, store-specific strategy layer instead of ugly fallback labels,
+3. existing remote collections must be safely reconciled/adopted instead of duplicated,
+4. user approval remains required before strategy activation or local mapping adoption,
+5. no theme/collection/product/image writes in this task.
+
+Do NOT merge to main in this task.
+
+======================================================================
+1. FIX GENERIC CATEGORY THEME SCHEMA DISCOVERY
+======================================================================
+
+Confirmed defect:
+discover_homepage_sections() currently gates category discovery on label substring matching:
+"collection list", "multicolumn", etc.
+
+Actual theme:
+sections/collection-list.liquid
+schema name:
+t:names.collection_list
+
+This can fail because hyphens/underscores/translatable names are not normalized before the gate.
+
+Refactor discovery to be semantic-first.
+
+Category evidence should include:
+A. section settings with type:
+   - collection_list
+   - collection_list_picker
+B. blocks containing settings type:
+   - collection
+C. normalized label evidence:
+   replace "-", "_", "/", ".", ":" with spaces before keyword matching
+D. image/link block semantics for multicolumn/card fallback where appropriate
+
+Do not require English display labels if strong schema field evidence exists.
+
+Return richer evidence:
+- filename
+- type
+- name
+- mode
+- status
+- matched_semantics
+- collection_list_field ids
+- collection_block types
+- supports_4_cards
+- supports_collection_link
+- supports_image
+
+For the real Design by klarjoy schema:
+CATEGORY_THEME_SCHEMA must become READY through the generic detector, not a one-off audit.
+
+No theme-name hardcoding.
+
+======================================================================
+2. VERSIONED STORE-SPECIFIC CATEGORY SHORTCUT STRATEGY
+======================================================================
+
+Add a durable local data layer, similar in spirit to merchandising policy but separate in purpose.
+
+Suggested table:
+homepage_category_strategies(
+  strategy_id TEXT PRIMARY KEY,
+  store_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  status TEXT NOT NULL,          -- DRAFT / APPROVED / SUPERSEDED
+  source TEXT NOT NULL,          -- MANUAL / SUGGESTED / COLLECTION_PLAN
+  strategy_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  approved_at TEXT,
+  updated_at TEXT NOT NULL,
+  UNIQUE(store_id,version)
+)
+
+Each strategy contains exactly 4 homepage shortcut entries when approvable:
+- category_key
+- collection_key
+- title
+- match_mode
+- conditions and/or match_signals
+- usefulness/priority
+- preferred_handle nullable
+- image_prompt
+- notes
+- evidence summary
+
+Rules:
+- DRAFT does not become authoritative automatically
+- APPROVED strategy outranks Collection Plan / Store Profile / product-derived fallback
+- latest APPROVED active
+- approving new version supersedes previous
+- explicit confirmed=True gate
+- no domain hardcoding in service
+- strategy is store-isolated
+- do not modify stores/001_cabin_tidy.json
+
+Readiness candidate priority should become:
+1. latest APPROVED homepage category strategy
+2. latest usable Collection Plan
+3. explicit Store/Brand profile category shortcut strategy
+4. PRODUCT_DERIVED_FALLBACK (REVIEW_REQUIRED)
+
+If a DRAFT exists, surface it in UI but do not use it as final readiness unless preview mode explicitly asks for draft simulation.
+
+======================================================================
+3. CABIN TIDY STRATEGY DRAFT — EVIDENCE-BASED ONLY
+======================================================================
+
+Create a SUGGESTED DRAFT for Store 001 using live/cached product evidence.
+
+Do NOT approve it.
+
+Goal: produce four clean customer-facing categories, not long fallback labels.
+
+Strong historical/business candidates:
+- Trunk Organizers
+- Seat & Backseat Organizers
+- Trash & Cleanup
+- Cup Holders
+
+But do not blindly force them.
+For each candidate, verify:
+- nonzero ACTIVE REMOTE_READ_VERIFIED product count
+- useful customer intent
+- low ambiguity
+- supported inclusion conditions/signals
+- not a repair/fitment-only cluster
+- no obvious category overlap > acceptable threshold
+
+If current data supports a better fourth category, report it instead.
+
+For each draft item include:
+- title
+- collection_key
+- proposed handle
+- matched count
+- sample 10 product titles
+- conditions/signals
+- overlap with other 3
+- why selected
+- why not a fallback garbage label
+
+The draft must be inspectable in UI and user-approvable later.
+
+======================================================================
+4. DO NOT USE PRODUCT_DERIVED FALLBACK AS PRODUCTION LABEL WITHOUT REVIEW
+======================================================================
+
+Current bad examples:
+- "Automotive Interior Accessories Consoles Organizers Seat Back Organizers"
+- "Car Seat"
+
+These may be useful evidence clusters but should not silently become production homepage labels.
+
+Change readiness semantics:
+- PRODUCT_DERIVED_FALLBACK remains diagnostic candidate source
+- candidate_status = REVIEW_REQUIRED
+- preview_enabled = false if any final selected category is fallback
+- UI clearly marks fallback labels as "검토 필요"
+- no category theme apply if any selected category is fallback
+
+Do not remove fallback functionality entirely.
+
+======================================================================
+5. EXISTING REMOTE COLLECTION RECONCILIATION / ADOPTION
+======================================================================
+
+Add a safe read-only reconciliation service for local collection definitions vs existing remote Shopify collections.
+
+It must NEVER auto-bind by fuzzy title alone.
+
+For each local candidate, compute a reconciliation proposal using:
+- exact collection ID if known
+- exact handle
+- normalized title match
+- normalized handle similarity
+- product count sanity
+- collection rule/identity evidence where available
+
+Statuses:
+- EXACT_MATCH
+- HIGH_CONFIDENCE_CANDIDATE
+- AMBIGUOUS
+- NO_MATCH
+- CONFLICT
+
+For Trunk Organizers:
+remote:
+  handle = trunk-organizers
+  productsCount = 372
+local:
+  title = Trunk Organizers
+  proposed handle = cabin-tidy-trunk-organizers
+
+This should likely become HIGH_CONFIDENCE_CANDIDATE, NOT auto-adopted.
+
+Add explicit local-only approval action:
+"기존 Shopify 컬렉션 연결"
+
+On approval:
+- write ONLY local shopify_collection_mappings
+- do not mutate remote collection
+- record:
+  store_id
+  collection_key
+  remote ID
+  remote handle
+  remote productsCount evidence
+  adoption timestamp
+  adoption source = USER_CONFIRMED_EXISTING_COLLECTION
+- do not invent publication IDs
+- publication status remains independently verified/read
+
+If no user approval, mapping stays NOT_MAPPED.
+
+======================================================================
+6. COLLECTION CREATION PLAN MUST USE APPROVED STRATEGY
+======================================================================
+
+Collection publisher dry-run for homepage category creation should use:
+- approved category strategy conditions
+- or Collection Plan definitions
+
+It must NOT create a remote collection from a PRODUCT_DERIVED_FALLBACK that lacks supported conditions.
+
+After an approved strategy exists:
+- all 4 chosen categories should have supported deterministic conditions
+- dry-run should be CREATE / UPDATE / NO_CHANGE / REUSE_CANDIDATE, not unexplained SKIP due missing conditions
+
+No Shopify write in this task.
+
+======================================================================
+7. IMAGE PROMPTS FOLLOW FINAL STRATEGY TITLES
+======================================================================
+
+Category image readiness must bind to the approved/draft strategy item collection_key/title.
+
+When strategy changes:
+- old non-approved category-image plan is stale
+- approved reusable asset may be retained only if semantic category identity still matches
+
+No paid generation.
+No upload.
+
+For the Cabin Tidy draft, prepare prompt-only images for the 4 clean draft categories.
+
+======================================================================
+8. MERCHANDISING POLICY — DO NOT APPROVE EMPTY-EFFECT DRAFT
+======================================================================
+
+Current draft:
+MP_de7d3c7b58b04d6ea92d7e59cf933f05
+currently excludes 0 products.
+
+Do not auto-approve it.
+
+UI should indicate:
+"현재 미리보기에서 추가 제외 0개 — 승인 효과 없음"
+
+A policy with zero incremental effect may still be approved manually, but the UI should not imply it is required to make categories safe.
+
+Do not couple category strategy approval to merchandising-policy approval if current upstream/store-profile rules already make the selected category sample safe.
+
+======================================================================
+9. UI
+======================================================================
+
+Homepage > Category Shortcuts area should show:
+
+카테고리 전략
+- APPROVED vN / DRAFT vN / NONE
+- source
+- 4 category cards preview
+- matched product counts
+- fallback review warnings
+
+Buttons:
+[전략 초안 만들기]
+[전략 4개 보기]
+[전략 승인]
+[기존 Shopify 컬렉션 후보 보기]
+[기존 컬렉션 연결]
+[매핑 다시 확인]
+[이미지 준비 상태]
+[테마 다시 읽기]
+
+Approval actions require explicit checkbox/confirmation.
+
+No Shopify mutation buttons in this task.
+
+======================================================================
+10. SECOND-STORE PORTABILITY
+======================================================================
+
+Add a non-automotive fixture proving:
+- strategy titles come from that store's own data
+- no Cabin Tidy categories leak
+- collection reconciliation is store-isolated
+- existing remote collection for store A cannot bind to store B
+- schema discovery works with:
+  collection-list.liquid
+  collection_list.liquid
+  translatable schema name
+  semantic collection_list setting without useful English name
+
+======================================================================
+11. TESTS
+======================================================================
+
+Add at minimum:
+
+test_category_schema_detection_hyphenated_filename
+test_category_schema_detection_translatable_name
+test_category_schema_detection_semantic_collection_list_setting
+test_approved_strategy_precedes_collection_plan
+test_draft_strategy_does_not_override
+test_fallback_category_blocks_preview
+test_strategy_approval_supersedes_previous
+test_strategy_store_isolation
+test_reconciliation_exact_match
+test_reconciliation_high_confidence_requires_user_confirmation
+test_reconciliation_ambiguous_blocks_adoption
+test_existing_collection_adoption_writes_local_mapping_only
+test_adoption_does_not_invent_publication_ids
+test_collection_dry_run_uses_approved_strategy_conditions
+test_non_automotive_strategy_portability
+test_zero_effect_merch_policy_not_auto_approved
+test_no_shopify_write
+
+Run:
+python -m compileall -q src tests
+focused category/homepage/reconciliation tests
+full pytest with writable repo-local --basetemp
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Required:
+FULL SUITE PASS
+SHOPIFY WRITE COUNT = 0
+
+======================================================================
+12. PROTECTED FILES
+======================================================================
+
+Do not edit/stage/commit:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env / credentials
+- .phase*
+- backups
+- user assets
+- test temp dirs
+
+======================================================================
+13. COMMIT / PUSH
+======================================================================
+
+Stay on:
+phase/shopify-exemption-homepage-gate
+
+Commit code/tests only after green tests.
+
+Suggested commit:
+git commit -m "Finalize reusable category shortcut strategy and reconciliation"
+
+Push same branch.
+
+Do NOT merge main.
+
+======================================================================
+14. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] generic schema discovery fix
+[5] strategy DB/service model
+[6] Cabin Tidy suggested draft four categories
+[7] counts/samples/overlap per category
+[8] fallback blocking behavior
+[9] existing remote collection reconciliation
+[10] Trunk Organizers reconciliation result
+[11] collection dry-run using draft simulation
+[12] image prompt-only plan
+[13] merchandising policy zero-effect status
+[14] second-store portability
+[15] focused tests
+[16] full-suite result
+[17] protected files
+[18] Shopify write count
+[19] user approvals still required
+[20] exact next action
+
+Final flags:
+GENERIC_CATEGORY_SCHEMA_DISCOVERY = PASS/FAIL
+CATEGORY_STRATEGY_LAYER = READY/NOT_READY
+CABIN_TIDY_DRAFT_4 = READY/NOT_READY
+FALLBACK_PRODUCTION_BLOCK = PASS/FAIL
+EXISTING_COLLECTION_RECONCILIATION = READY/NOT_READY
+TRUNK_REUSE_CANDIDATE = YES/NO
+CATEGORY_THEME_SCHEMA = READY/NOT_READY
+FULL_SUITE = PASS/FAIL
+SHOPIFY_WRITE_COUNT = 0
+CODE_MERGE_READY = YES/NO
