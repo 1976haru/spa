@@ -210,25 +210,60 @@ def discover_homepage_sections(theme_files: dict[str, str]) -> dict:
         schema = _section_schema(raw)
         if not schema:
             continue
-        label = f"{filename} {schema.get('name', '')}".casefold()
+        label = re.sub(r"[-_/.:]+", " ", f"{filename} {schema.get('name', '')}".casefold())
         fields = _field_semantics(schema)
         if any(term in label for term in ("hero", "banner", "slideshow", "image with text")):
             required = {"image", "heading", "body", "button_label", "button_link"}
             found = sorted(required.intersection(fields))
             status = "HERO_SUPPORTED_HIGH_CONFIDENCE" if {"image", "heading", "button_link"}.issubset(fields) else "HERO_SUPPORTED_REVIEW_REQUIRED"
             heroes.append({"filename": filename, "type": filename.split("/")[-1].removesuffix(".liquid"), "name": schema.get("name", filename), "schema": schema, "fields": fields, "supported_fields": found, "status": status})
-        if any(term in label for term in ("collection list", "multicolumn", "collection cards", "collection grid", "featured collection list")):
-            list_fields = [f for f in schema.get("settings", []) if f.get("type") in {"collection_list", "collection_list_picker"}]
-            blocks = schema.get("blocks", [])
-            block_collection = any(any(f.get("type") == "collection" for f in block.get("settings", [])) for block in blocks)
-            mode = "COLLECTION_LIST" if list_fields else "COLLECTION_BLOCKS" if block_collection else "MULTICOLUMN"
-            status = "CATEGORY_SUPPORTED_HIGH_CONFIDENCE" if list_fields or block_collection else "CATEGORY_SUPPORTED_REVIEW_REQUIRED"
-            categories.append({"filename": filename, "type": filename.split("/")[-1].removesuffix(".liquid"), "name": schema.get("name", filename), "schema": schema, "mode": mode, "status": status})
+        list_fields = [f for f in schema.get("settings", []) if f.get("type") in {"collection_list", "collection_list_picker"}]
+        blocks = schema.get("blocks", []) or []
+        collection_blocks = [block for block in blocks if any(
+            field.get("type") == "collection" for field in (block.get("settings") or []))]
+        block_fields = [field for block in blocks for field in (block.get("settings") or [])]
+        has_link = bool(list_fields or collection_blocks or any(
+            field.get("type") in {"url", "link"} for field in block_fields))
+        has_image = bool(list_fields or collection_blocks or any(
+            field.get("type") == "image_picker" for field in block_fields))
+        label_match = any(term in label for term in (
+            "collection list", "multicolumn", "collection cards", "collection grid",
+            "featured collection list"))
+        multicolumn_semantics = label_match and has_link and has_image
+        if list_fields or collection_blocks or multicolumn_semantics:
+            mode = "COLLECTION_LIST" if list_fields else "COLLECTION_BLOCKS" if collection_blocks else "MULTICOLUMN"
+            strong = bool(list_fields or collection_blocks)
+            matched = []
+            if list_fields: matched.append("COLLECTION_LIST_SETTING")
+            if collection_blocks: matched.append("COLLECTION_BLOCK_SETTING")
+            if label_match: matched.append("NORMALIZED_LABEL")
+            if has_link: matched.append("COLLECTION_LINK")
+            if has_image: matched.append("IMAGE")
+            max_blocks = schema.get("max_blocks")
+            supports_four = max_blocks is None or int(max_blocks) >= 4
+            categories.append({
+                "filename": filename,
+                "type": filename.split("/")[-1].removesuffix(".liquid"),
+                "name": schema.get("name", filename), "schema": schema, "mode": mode,
+                "status": "CATEGORY_SUPPORTED_HIGH_CONFIDENCE" if strong else "CATEGORY_SUPPORTED_REVIEW_REQUIRED",
+                "matched_semantics": matched,
+                "collection_list_field_ids": [field.get("id") for field in list_fields if field.get("id")],
+                "collection_block_types": [block.get("type") for block in collection_blocks if block.get("type")],
+                "supports_4_cards": supports_four,
+                "supports_collection_link": has_link,
+                "supports_image": has_image,
+            })
     heroes.sort(key=lambda x: (x["status"] != "HERO_SUPPORTED_HIGH_CONFIDENCE", x["filename"]))
-    categories.sort(key=lambda x: (x["mode"] != "COLLECTION_LIST", x["status"] != "CATEGORY_SUPPORTED_HIGH_CONFIDENCE", x["filename"]))
+    categories.sort(key=lambda x: (x["mode"] != "COLLECTION_LIST",
+                                   _words_for_schema_rank(x["type"]) != "collection list",
+                                   x["status"] != "CATEGORY_SUPPORTED_HIGH_CONFIDENCE", x["filename"]))
     return {"hero": heroes[0] if heroes else None, "category": categories[0] if categories else None,
             "hero_status": heroes[0]["status"] if heroes else "HERO_NOT_FOUND",
             "category_status": categories[0]["status"] if categories else "CATEGORY_NOT_FOUND"}
+
+
+def _words_for_schema_rank(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", str(value or "").casefold()))
 
 
 def hero_copy(brand: dict, collections: list[dict], collection_handles: dict[str, str] | None = None) -> dict:

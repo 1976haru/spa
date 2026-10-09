@@ -1984,11 +1984,18 @@ class OperatorUI:
                 category_readiness_summary = ui.label("Not checked · Shopify theme write: NOT RUN").classes("ss-help")
                 category_readiness_detail = ui.label("Product distribution and actual mappings have not been checked.").classes("ss-help")
                 merchandising_policy_status = ui.label("Merchandising policy: REVIEW REQUIRED").classes("ss-help")
+                category_strategy_status = ui.label("Category strategy: NONE").classes("ss-help")
                 category_buttons = ui.row().classes("flex-wrap gap-2")
                 with ui.dialog() as category_review_dialog, ui.card().classes("w-[min(900px,95vw)] max-h-[85vh] overflow-auto"):
                     ui.label("Selected category shortcuts (local evidence)").classes("text-xl font-bold")
                     category_review_rows = ui.column().classes("w-full gap-2")
                     ui.button("Close", on_click=category_review_dialog.close).props("outline")
+                with ui.dialog() as category_strategy_dialog, ui.card().classes("w-[min(950px,95vw)] max-h-[85vh] overflow-auto"):
+                    ui.label("Category strategy (local approval only)").classes("text-xl font-bold")
+                    category_strategy_rows = ui.column().classes("w-full gap-2")
+                    strategy_approval_confirm = ui.checkbox("I reviewed all four categories and approve this strategy version.")
+                    adoption_confirm = ui.checkbox("I reviewed the unambiguous existing collection candidate and approve the local link.")
+                    ui.button("Close", on_click=category_strategy_dialog.close).props("outline")
                 with ui.dialog() as merchandising_policy_dialog, ui.card().classes("w-[min(850px,95vw)] max-h-[85vh] overflow-auto"):
                     ui.label("Store merchandising policy review (local only)").classes("text-xl font-bold")
                     ui.label(f"Purpose: CATEGORY_SHORTCUTS · Store: {self.current_store}").classes("ss-help")
@@ -2031,8 +2038,10 @@ class OperatorUI:
                             policy_preview_label.set_text(f"Policy preview unavailable: {exc}")
                             policy_samples.clear()
                             return
-                        policy_preview_label.set_text(
-                            f"If applied, {result['excluded_count']} of {result['eligible_product_count']} eligible cached products would be excluded.")
+                        effect = ("No additional exclusions in the current preview; approval has no current safety effect."
+                                  if result["excluded_count"] == 0 else
+                                  f"If applied, {result['excluded_count']} of {result['eligible_product_count']} eligible cached products would be excluded.")
+                        policy_preview_label.set_text(effect)
                         policy_samples.clear()
                         with policy_samples:
                             for sample in result["sample_excluded"]:
@@ -2110,6 +2119,13 @@ class OperatorUI:
                             policy_label = "REVIEW REQUIRED · NONE"
                         merchandising_policy_status.set_text(
                             f"Merchandising policy: {policy_label} · excluded products: {package.get('excluded_by_policy_count', 0)}")
+                        strategy_label = package.get("strategy_status", "NONE")
+                        if package.get("active_strategy_version"):
+                            strategy_label += f" v{package.get('active_strategy_version')}"
+                        if package.get("latest_strategy_status") == "DRAFT" and package.get("strategy_status") != "DRAFT":
+                            strategy_label += f" · DRAFT v{package.get('latest_strategy_version')} pending"
+                        category_strategy_status.set_text(
+                            f"Category strategy: {strategy_label} · source {package.get('strategy_source') or 'none'}")
                         category_readiness_summary.set_text(
                             f"{summary.get('selected_count', 0)}/4 selected · Identity {summary.get('identity_ready', 0)}/4 · "
                             f"nonempty remote {summary.get('nonempty_remote_ready', 0)}/4 · publication evidence "
@@ -2154,7 +2170,82 @@ class OperatorUI:
                     ui.notify(f"Read-only Shopify collection check: {result.get('status')}",
                               type="positive" if result.get("status") == "READ_ONLY_REFRESHED" else "warning")
 
+                def show_category_strategy():
+                    from ..category_strategy import HomepageCategoryStrategyService
+                    record = HomepageCategoryStrategyService().latest(self.current_store, include_draft=True)
+                    category_strategy_rows.clear()
+                    with category_strategy_rows:
+                        if not record:
+                            ui.label("No strategy draft exists for this store.").classes("text-amber-800")
+                        else:
+                            ui.label(f"{record['status']} v{record['version']} · {record['source']}").classes("font-semibold")
+                            for item in record["strategy"]["items"]:
+                                count = (item.get("evidence") or {}).get("matched_count", "not measured")
+                                ui.label(f"{item['priority']}. {item['title']} · {count} matched · {item['collection_key']}")
+                                ui.label("Prompt only: " + (item.get("image_prompt") or "not prepared")).classes("ss-help")
+                    strategy_approval_confirm.value = False
+                    category_strategy_dialog.open()
+
+                def approve_category_strategy():
+                    from ..category_strategy import HomepageCategoryStrategyService
+                    service = HomepageCategoryStrategyService()
+                    draft = service.latest(self.current_store, include_draft=True)
+                    try:
+                        if not draft or draft.get("status") != "DRAFT": raise ValueError("No draft selected")
+                        service.approve(draft["strategy_id"], confirmed=strategy_approval_confirm.value is True)
+                        refresh_category_readiness(); ui.notify("Category strategy approved locally.", type="positive")
+                    except (PermissionError, ValueError, KeyError) as exc:
+                        ui.notify(f"Strategy not approved: {exc}", type="warning")
+
+                def create_category_strategy_draft():
+                    from ..category_strategy import HomepageCategoryStrategyService
+                    package = state.get("category_shortcut_package") or refresh_category_readiness()
+                    items = []
+                    for row in (package or {}).get("items", []):
+                        conditions = row.get("conditions") or []
+                        if row.get("candidate_status") == "REVIEW_REQUIRED" or not conditions:
+                            ui.notify("Review fallback labels and add supported conditions before creating a strategy draft.", type="warning")
+                            return
+                        items.append({"category_key": row["category_key"], "collection_key": row["collection_key"],
+                            "title": row["title"], "conditions": conditions, "priority": row["position"],
+                            "preferred_handle": row["proposed_handle"], "image_prompt": row["image_prompt"],
+                            "evidence": {"matched_count": row["product_count"]}})
+                    try:
+                        draft = HomepageCategoryStrategyService().create_draft(
+                            self.current_store, {"items": items}, source="COLLECTION_PLAN")
+                        refresh_category_readiness(); ui.notify(f"Strategy DRAFT v{draft['version']} created; not active.", type="positive")
+                    except ValueError as exc:
+                        ui.notify(f"Strategy draft not created: {exc}", type="warning")
+
+                def show_reconciliation_candidates():
+                    from ..category_strategy import ExistingCollectionReconciliationService
+                    from ..category_shortcut_readiness import CategoryShortcutReadinessService
+                    package = state.get("category_shortcut_package") or refresh_category_readiness()
+                    snapshot = CategoryShortcutReadinessService().collection_snapshot(self.current_store) or {}
+                    service = ExistingCollectionReconciliationService()
+                    proposals = [service.propose(self.current_store, row, snapshot.get("collections", []))
+                                 for row in (package or {}).get("items", [])]
+                    state["category_reconciliation"] = proposals
+                    ui.notify(" · ".join(f"{p['local']['title']}: {p['status']}" for p in proposals), type="info")
+
+                def adopt_reconciliation_candidate():
+                    from ..category_strategy import ExistingCollectionReconciliationService
+                    proposal = next((row for row in state.get("category_reconciliation", [])
+                                     if row.get("status") in {"EXACT_MATCH", "HIGH_CONFIDENCE_CANDIDATE"}), None)
+                    try:
+                        if not proposal: raise ValueError("No unambiguous candidate has been reviewed")
+                        ExistingCollectionReconciliationService().adopt(
+                            proposal, confirmed=adoption_confirm.value is True)
+                        refresh_category_readiness(); ui.notify("Existing collection linked locally; Shopify was not changed.", type="positive")
+                    except (PermissionError, ValueError) as exc:
+                        ui.notify(f"Collection not linked: {exc}", type="warning")
+
                 with category_buttons:
+                    ui.button("Create strategy draft", on_click=create_category_strategy_draft, icon="edit").props("outline")
+                    ui.button("View strategy 4", on_click=show_category_strategy, icon="view_list").props("outline")
+                    ui.button("Approve strategy", on_click=approve_category_strategy, icon="check_circle").props("outline")
+                    ui.button("View existing collection candidates", on_click=show_reconciliation_candidates, icon="link").props("outline")
+                    ui.button("Link existing collection", on_click=adopt_reconciliation_candidate, icon="link").props("outline")
                     ui.button("View 4 categories", on_click=show_category_readiness, icon="category").props("outline")
                     ui.button("Recheck collection mappings (read-only)", on_click=recheck_category_mappings, icon="sync").props("outline")
                     ui.button("Image readiness", on_click=show_category_images, icon="image").props("outline")

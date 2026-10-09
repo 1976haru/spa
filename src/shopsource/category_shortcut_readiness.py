@@ -385,7 +385,8 @@ class CategoryShortcutReadinessService:
             return {"status": "READ_ONLY_REFRESH_FAILED", "error_type": type(exc).__name__,
                     "snapshot": self.collection_snapshot(store_id)}
 
-    def build(self, store_id: str, *, persist: bool = True, theme_snapshot: dict | None = None) -> dict:
+    def build(self, store_id: str, *, persist: bool = True, theme_snapshot: dict | None = None,
+              simulate_draft: bool = False) -> dict:
         with connect(self.db) as con:
             cache = con.execute("SELECT fetched_at,source_hash,candidates_json FROM homepage_featured_product_remote_cache WHERE store_id=?", (str(store_id),)).fetchone()
             collection_rows = con.execute("SELECT collection_key,handle,shopify_collection_id,published_ids_json,last_synced_at FROM shopify_collection_mappings WHERE store_id=?", (str(store_id),)).fetchall() if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='shopify_collection_mappings'").fetchone() else []
@@ -435,9 +436,17 @@ class CategoryShortcutReadinessService:
                 images[str(key)] = {"path": candidate.get("local_path"), "approval_status": candidate.get("approval_status"),
                                     "alt_text": metadata.get("alt_text", "") if isinstance(metadata, dict) else "",
                                     "metadata_json": candidate.get("metadata_json"), "asset_id": candidate.get("asset_id")}
+        from .category_strategy import HomepageCategoryStrategyService
+        strategy_service = HomepageCategoryStrategyService(self.db)
+        strategy_candidates, selected_strategy = strategy_service.candidates(
+            str(store_id), eligible_products, simulate_draft=simulate_draft)
+        latest_strategy = strategy_service.latest(str(store_id), include_draft=True)
         plan_candidates, _has_collection_plan = self._plan_candidates(store_id, eligible_products)
-        candidate_pools = [plan_candidates]
-        known_candidate_keys = {str(item.get("collection_key") or "") for item in plan_candidates}
+        candidate_pools = [strategy_candidates] if strategy_candidates else [plan_candidates]
+        known_candidate_keys = {str(item.get("collection_key") or "") for item in candidate_pools[0]}
+        if strategy_candidates:
+            # An approved strategy has exactly four reviewed entries and is authoritative.
+            plan_candidates = []
         if len(known_candidate_keys) < 4:
             profile_candidates, _has_profile_strategy = self._profile_candidates(
                 store_profile, brand_profile, eligible_products)
@@ -447,11 +456,14 @@ class CategoryShortcutReadinessService:
             candidate_pools.append(_product_derived_candidates(eligible_products))
         selected, selected_keys, sources_used = [], set(), []
         for pool in candidate_pools:
-            pool.sort(key=lambda item: (-item.get("product_count", 0),
-                                        -float(item.get("usefulness") or 0),
-                                        int((item.get("local_collection_definition") or {}).get("priority") or 0),
-                                        str(item.get("title") or "").casefold(),
-                                        str(item.get("collection_key") or "")))
+            if pool and all(item.get("candidate_source") == "CATEGORY_STRATEGY" for item in pool):
+                pool.sort(key=lambda item: (int(item.get("priority") or 999), str(item.get("collection_key") or "")))
+            else:
+                pool.sort(key=lambda item: (-item.get("product_count", 0),
+                                            -float(item.get("usefulness") or 0),
+                                            int((item.get("local_collection_definition") or {}).get("priority") or 0),
+                                            str(item.get("title") or "").casefold(),
+                                            str(item.get("collection_key") or "")))
             for candidate in pool:
                 candidate_key = str(candidate.get("collection_key") or "")
                 if not candidate_key or candidate_key in selected_keys:
@@ -519,6 +531,7 @@ class CategoryShortcutReadinessService:
                 "title": item["title"], "merchandising_group": item["title"],
                 "candidate_source": item_candidate_source,
                 "product_count": item["product_count"], "selection_reason": selection_reason, "collection_key": key,
+                "conditions": item.get("conditions") or [], "match_signals": item.get("match_signals") or [],
                 "shopify_collection_id": collection_id if identity_status == "VERIFIED" else None,
                 "handle": handle if identity_status == "VERIFIED" else None, "storefront_url": target_url,
                 "mapping_status": mapping_status, "mapping_identity_status": identity_status,
@@ -535,7 +548,7 @@ class CategoryShortcutReadinessService:
                 "image_asset_path": asset_path if image_status == "READY" else None,
                 "image_status": image_status, "image_inspection": inspection,
                 "alt_text": asset.get("alt_text") if image_status == "READY" else f"{item['title']} products in realistic use",
-                "image_prompt": category_image_prompt(item["title"], store_profile, brand_profile), "position": position,
+                "image_prompt": item.get("image_prompt") or category_image_prompt(item["title"], store_profile, brand_profile), "position": position,
                 "readiness_reasons": (["Remote collection identity and productsCount evidence are required; publication IDs are not product counts."] if mapping_status != "READY" else []) +
                     (["Approved square image with verified no-text/no-logo/no-watermark content review is missing."] if image_status != "READY" else []),
             })
@@ -556,6 +569,14 @@ class CategoryShortcutReadinessService:
                        for item in selected}
         package = {"plan_id": package_id, "store_id": str(store_id), "store_name": store_name,
                    "candidate_source": candidate_source,
+                   "active_strategy_id": selected_strategy.get("strategy_id") if selected_strategy else None,
+                   "active_strategy_version": selected_strategy.get("version") if selected_strategy else None,
+                   "strategy_status": selected_strategy.get("status") if selected_strategy else "NONE",
+                   "strategy_source": selected_strategy.get("source") if selected_strategy else None,
+                   "latest_strategy_id": latest_strategy.get("strategy_id") if latest_strategy else None,
+                   "latest_strategy_version": latest_strategy.get("version") if latest_strategy else None,
+                   "latest_strategy_status": latest_strategy.get("status") if latest_strategy else "NONE",
+                   "draft_simulation": bool(simulate_draft and selected_strategy and selected_strategy.get("status") == "DRAFT"),
                    "active_policy_id": active_policy.get("policy_id") if active_policy else None,
                    "active_policy_version": active_policy.get("version") if active_policy else None,
                    "policy_source": active_policy.get("source") if active_policy else None,

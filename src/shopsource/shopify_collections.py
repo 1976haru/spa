@@ -357,7 +357,19 @@ class ShopifyCollectionPublisher:
             elif not remote and mapping:
                 item["action"] = "CONFLICT"; item["reason"] = "Previously mapped collection is missing remotely; no duplicate will be created"
             elif not remote:
-                item["action"] = "CREATE"
+                from .category_strategy import ExistingCollectionReconciliationService
+                normalized_remote = [{**row,
+                    "products_count": (row.get("productsCount") or {}).get("count"),
+                    "products_count_precision": (row.get("productsCount") or {}).get("precision")}
+                    for row in remote_data]
+                reconciliation = ExistingCollectionReconciliationService(self.db).propose(
+                    store_id, definition, normalized_remote)
+                if reconciliation["status"] in {"EXACT_MATCH", "HIGH_CONFIDENCE_CANDIDATE"}:
+                    item["action"] = "REUSE_CANDIDATE"
+                    item["reason"] = "Existing collection requires explicit local mapping approval"
+                    item["reconciliation"] = reconciliation
+                else:
+                    item["action"] = "CREATE"
             elif _normalized_hash(remote) == _condition_hash(definition):
                 item["action"] = "NO CHANGE"
             elif not mapping:
@@ -369,7 +381,8 @@ class ShopifyCollectionPublisher:
             rows.append(item)
         return {"store_id": store_id, "shop_domain": config["shop_domain"], "api_version": config["api_version"],
                 "plan_id": plan["plan_id"], "publish_online_store": bool(publish_online_store), "items": rows,
-                "counts": {action: sum(row["action"] == action for row in rows) for action in ("CREATE", "UPDATE", "NO CHANGE", "CONFLICT", "SKIP")}}
+                "counts": {action: sum(row["action"] == action for row in rows) for action in
+                           ("CREATE", "UPDATE", "NO CHANGE", "REUSE_CANDIDATE", "CONFLICT", "SKIP")}}
 
     def sync(self, plan: dict, *, confirmed: bool = False, publish_online_store: bool = False,
              retry_failed_only: bool = False, expected_preview: dict | None = None) -> dict:
