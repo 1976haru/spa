@@ -1,0 +1,378 @@
+ShopSource Studio — CATEGORY SHORTCUT PORTABILITY HARDENING
+SECOND-STORE REUSE GATE BEFORE MERGE
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: phase/category-shortcuts-prerequisite-readiness
+- Expected baseline: 8690dc3261968c272211e9591d4cef34a87281d7
+
+WHY THIS TASK EXISTS
+The current branch now has correct remote collection count semantics and a clean full suite, but it is NOT yet safe to merge for a multi-store product.
+
+A real code review found store/domain hard-coding in the reusable category shortcut module:
+
+1. CATEGORY_DEFINITIONS is automotive-specific:
+   Trunk & Cargo, Seat & Backseat, Console & Small Storage, Trash & Cleanup, Cup Holder, etc.
+
+2. category_image_prompt() hard-codes:
+   "automotive organization", "car interior", "vehicle-specific replacement parts"
+
+3. proposed_handle fallback hard-codes:
+   f"cabin-tidy-{item['title']}"
+
+4. _REPAIR_PART is automotive-specific policy embedded in generic category readiness.
+
+This is acceptable only as Cabin Tidy data, not as reusable ShopSource core.
+
+The project goal is to build 100–200 stores and use the same program for a second real shop.
+Do not merge this branch until the category-shortcut readiness logic is store-agnostic.
+
+MISSION
+Refactor category shortcut readiness into a reusable, data-driven engine that:
+- preserves Cabin Tidy behavior,
+- works for a non-automotive second store without code changes,
+- does not hard-code Cabin Tidy, car, automotive, trunk, seat, console, cup holder, etc. in generic selection logic,
+- consumes store/collection strategy data rather than inventing a domain in code,
+- keeps all current safety/read-only guarantees.
+
+Do NOT write Shopify.
+Do NOT change stores/001_cabin_tidy.json.
+Do NOT use paid image generation.
+Do NOT merge to main in this task.
+
+======================================================================
+1. ARCHITECTURAL RULE — READINESS DOES NOT OWN TAXONOMY
+======================================================================
+
+CategoryShortcutReadinessService must NOT define the merchant's domain taxonomy in core code.
+
+Its responsibility is:
+- take candidate categories from an upstream/store-specific source,
+- measure actual product evidence,
+- rank/select four,
+- verify remote collection identity/count/publication,
+- verify image readiness,
+- expose readiness.
+
+Candidate category source priority:
+
+1. Latest usable Store Collection Plan definitions for this store.
+2. Explicit persisted category-shortcut strategy/profile for this store, if one exists.
+3. Generic product-derived fallback from actual product_type/tags/title signals, with no domain-specific vocabulary in code.
+
+Do NOT maintain an automotive CATEGORY_DEFINITIONS constant in the generic module.
+
+If a small reusable data class is useful, introduce something like:
+CategoryShortcutCandidate(
+    key,
+    title,
+    collection_key,
+    match_signals,
+    usefulness,
+    source
+)
+
+But candidate data must come from store-specific plan/profile/evidence.
+
+======================================================================
+2. PRESERVE CABIN TIDY WITHOUT CABIN-TIDY CORE HARD-CODING
+======================================================================
+
+Cabin Tidy must still produce sensible categories when its current evidence is available.
+
+Use existing data sources such as:
+- store_collection_plans / store_collection_definitions
+- store profile
+- product_type
+- merchant tags
+- ShopSource collection mappings
+- cached Shopify product catalog
+
+Do NOT add:
+if store_id == "001"
+or
+if store_name == "Cabin Tidy"
+
+Do NOT move the automotive constant into another Python file and call that generic.
+
+If a Cabin-Tidy-specific strategy needs to be persisted, it must be data, not core branching.
+Prefer deriving from existing collection plan/store profile so no protected store JSON edit is required.
+
+======================================================================
+3. HANDLE GENERATION MUST BE STORE-GENERIC
+======================================================================
+
+Remove:
+"cabin-tidy-..."
+
+Fallback proposed handle must use actual store identity from get_store()/Store Profile:
+
+slug(f"{store_name} {category_title}")
+
+Requirements:
+- deterministic
+- safe Shopify handle
+- no store-001 hardcode
+- no fake remote handle: proposed_handle remains LOCAL_PROPOSAL_ONLY until remote mapping exists
+
+Add tests with two different store names proving different correct proposed handles.
+
+======================================================================
+4. IMAGE PROMPT MUST BE STORE-GENERIC
+======================================================================
+
+Refactor category_image_prompt() to accept store/brand context.
+
+Use:
+- category title
+- Brand Profile primary_category if available
+- brand personality/keywords
+- palette if useful
+- store visual direction
+
+Generic structure:
+"Premium ecommerce category-card photograph for <category> in the context of <primary category> ..."
+
+Do NOT hard-code:
+- automotive
+- car interior
+- vehicle-specific parts
+
+Cabin Tidy may still get automotive language because its Brand/Store Profile says auto interior.
+
+A non-automotive fixture must produce a non-automotive prompt.
+
+======================================================================
+5. ELIGIBILITY / EXCLUSION POLICY MUST BE STORE-AWARE
+======================================================================
+
+Remove generic dependence on the automotive-only _REPAIR_PART rule.
+
+Preferred evidence priority:
+- existing remote eligibility/storefront eligibility
+- existing ShopSource decision/risk status if present
+- Store Profile exclude_keywords / risk_rules
+- optional store-specific merchandising exclusions from data
+
+Category shortcut readiness should not create a second hidden product-safety policy.
+
+If existing cached products are already filtered/eligible by upstream logic, reuse that status.
+Any extra exclusion must come from store data.
+
+For Cabin Tidy, repair/fitment parts should remain excluded using existing store/profile evidence or an explicit data-driven rule.
+
+Add a non-automotive fixture proving normal products are not rejected by automotive vocabulary assumptions.
+
+======================================================================
+6. GENERIC PRODUCT-DERIVED FALLBACK
+======================================================================
+
+Only if there is no usable collection plan/profile, support a conservative generic fallback.
+
+It may:
+- aggregate normalized product_type values,
+- use high-frequency merchant tags,
+- use existing category_key/collection_key evidence,
+- derive readable titles,
+- require minimum non-zero counts,
+- avoid generic stop words.
+
+It must NOT contain domain vocabulary such as trunk/seat/console/kitchen/pet/etc.
+
+Fallback categories must be marked:
+source = PRODUCT_DERIVED_FALLBACK
+status = REVIEW_REQUIRED
+
+Do not automatically treat them as approved remote collections.
+
+======================================================================
+7. CANONICAL CANDIDATE / READINESS MODEL
+======================================================================
+
+Each item should expose:
+- candidate_source
+- category_key
+- title
+- collection_key
+- product_count
+- selection_reason
+- mapping_identity_status
+- remote_product_count
+- remote_count_status
+- publication_status
+- mapping_status
+- image_status
+- proposed_handle
+- readiness_reasons
+
+Summary should distinguish:
+- candidates selected 4/4
+- collection identity verified x/4
+- remote nonempty x/4
+- publication known x/4
+- image ready x/4
+- theme schema
+- theme write NOT_RUN
+
+======================================================================
+8. SECOND-STORE PORTABILITY TEST
+======================================================================
+
+Add a realistic NON-AUTOMOTIVE store fixture.
+
+Use a neutral example such as:
+Store name: "Hearth & Order"
+Primary category: "Home & Kitchen Organization"
+Products:
+- pantry containers
+- under-sink organizers
+- drawer dividers
+- cabinet racks
+- refrigerator bins
+etc.
+
+The test is NOT claiming this is the actual second shop.
+It is only a portability proof.
+
+Assert:
+- no automotive categories appear
+- no "cabin-tidy" handle prefix
+- image prompts do not mention car/automotive/vehicle
+- four categories can be selected from that store's own plan/product evidence
+- mapping/readiness rules remain identical
+
+Also retain Cabin-Tidy-like fixture tests.
+
+======================================================================
+9. STATIC PORTABILITY GUARD TEST
+======================================================================
+
+Add a narrow regression test that prevents known forbidden store/domain literals from returning to the generic module.
+
+At minimum inspect category_shortcut_readiness.py source or exported defaults and fail if core logic contains:
+- "cabin-tidy-"
+- "Cabin Tidy"
+- hard-coded automotive category tuple as the generic candidate source
+
+Do not ban legitimate words in tests/fixtures/docs.
+The goal is to protect reusable core, not perform brittle global grep across the repo.
+
+======================================================================
+10. UI
+======================================================================
+
+UI labels must be generic:
+- "카테고리 4개"
+- mapping/image/theme readiness
+
+Do not display Cabin Tidy-specific labels unless they came from the selected store's actual package.
+
+Switching store selector must rebuild/read that store's own package.
+No state leakage between store 001 and another store.
+
+Add a test for store switch isolation if practical.
+
+======================================================================
+11. KEEP CURRENT CORRECTNESS FIXES
+======================================================================
+
+Preserve from 8690dc3:
+- publication IDs are not product counts
+- productsCount read-only evidence
+- remote identity verification
+- remote count UNKNOWN vs VERIFIED
+- publication readiness separation
+- 7-day product catalog freshness
+- no fake remote IDs/handles
+- approved image validation
+- prompt-only fallback
+- no Shopify write
+- repo-local TEMP full suite strategy
+
+======================================================================
+12. TEST / QUALITY GATES
+======================================================================
+
+Run:
+python -m compileall -q src tests
+
+Focused:
+- category readiness tests
+- non-automotive portability tests
+- homepage golden path tests
+
+Full suite using writable repo-local TEMP/TMP/TMPDIR:
+python -m pytest -q
+
+git diff --check
+
+$env:PYTHONPATH=(Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Required:
+FULL SUITE PASS
+SECOND-STORE PORTABILITY PASS
+NO REAL SHOPIFY WRITE
+
+======================================================================
+13. PROTECTED FILES
+======================================================================
+
+Do not stage/commit:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env / credentials
+- .phase*
+- theme backups
+- user assets
+- .test_tmp
+
+======================================================================
+14. COMMIT / PUSH
+======================================================================
+
+Stay on:
+phase/category-shortcuts-prerequisite-readiness
+
+Suggested commit:
+git commit -m "Generalize category shortcut readiness across stores"
+
+Push same branch.
+
+Do NOT merge to main.
+
+======================================================================
+15. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] hard-coded store/domain findings removed
+[5] category candidate source architecture
+[6] Cabin Tidy behavior preservation
+[7] generic handle generation
+[8] generic image prompt generation
+[9] store-aware eligibility/exclusion
+[10] non-automotive second-store portability fixture/result
+[11] mapping/readiness evidence preserved
+[12] UI store isolation
+[13] focused tests
+[14] full-suite pass count
+[15] protected files
+[16] Shopify write count
+[17] branch/push
+[18] exact next action before merge
+
+Final:
+CABIN TIDY CORE HARDCODING REMOVED = YES/NO
+CATEGORY READINESS STORE-AGNOSTIC = YES/NO
+NON-AUTOMOTIVE PORTABILITY = PASS/FAIL
+FULL SUITE = PASS/FAIL
+SHOPIFY WRITE COUNT = 0
+CATEGORY BRANCH MERGE READY = YES/NO
