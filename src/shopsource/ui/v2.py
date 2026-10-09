@@ -1997,8 +1997,10 @@ class OperatorUI:
                         state["category_shortcut_package"] = package
                         summary = package.get("summary", {})
                         category_readiness_summary.set_text(
-                            f"{summary.get('selected_count', 0)}/4 selected · Collection mapping (local cache): "
-                            f"{summary.get('mapping_ready', 0)}/4 READY · Images: {summary.get('image_ready', 0)}/4 READY · "
+                            f"{summary.get('selected_count', 0)}/4 selected · Identity {summary.get('identity_ready', 0)}/4 · "
+                            f"nonempty remote {summary.get('nonempty_remote_ready', 0)}/4 · publication evidence "
+                            f"{summary.get('publication_ready', 0)}/4 (unknown {summary.get('publication_unknown', 0)}) · "
+                            f"mapping READY {summary.get('mapping_ready', 0)}/4 · images {summary.get('image_ready', 0)}/4 · "
                             f"Theme schema: {summary.get('theme_schema_status', 'WAITING_FOR_LIVE_READ')} · Shopify theme write: NOT RUN")
                         category_readiness_detail.set_text(
                             f"Catalog: {package.get('catalog_product_count', 0)} products · fetched {package.get('catalog_fetched_at') or 'not available'} · "
@@ -2031,9 +2033,16 @@ class OperatorUI:
                     if not package: return
                     ui.notify(" · ".join(f"{row['title']}: {row['image_status']}" for row in package.get("items", [])) or "No categories ready", type="info")
 
+                def recheck_category_mappings():
+                    from ..category_shortcut_readiness import CategoryShortcutReadinessService
+                    result = CategoryShortcutReadinessService().refresh_collection_snapshot(self.current_store)
+                    refresh_category_readiness()
+                    ui.notify(f"Read-only Shopify collection check: {result.get('status')}",
+                              type="positive" if result.get("status") == "READ_ONLY_REFRESHED" else "warning")
+
                 with category_buttons:
                     ui.button("View 4 categories", on_click=show_category_readiness, icon="category").props("outline")
-                    ui.button("Recheck collection mappings", on_click=refresh_category_readiness, icon="sync").props("outline")
+                    ui.button("Recheck collection mappings (read-only)", on_click=recheck_category_mappings, icon="sync").props("outline")
                     ui.button("Image readiness", on_click=show_category_images, icon="image").props("outline")
                     ui.button("Read theme again", on_click=lambda: design(discover_theme=True), icon="refresh").props("outline")
                     ui.button("Category preview", on_click=lambda: None, icon="preview").props("outline disable")

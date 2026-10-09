@@ -41,6 +41,7 @@ _REPAIR_PART = re.compile(
 )
 _SAFE_HANDLE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 _COLLECTION_GID = re.compile(r"gid://shopify/Collection/\d+\Z")
+_PUBLICATION_GID = re.compile(r"gid://shopify/Publication/\d+\Z")
 
 
 def _json(value, fallback):
@@ -123,12 +124,21 @@ def category_image_prompt(title: str) -> str:
 
 def readiness_summary(package: dict) -> dict:
     items = package.get("items") or []
+    identity_ready = sum(item.get("mapping_identity_status") == "VERIFIED" for item in items)
+    nonempty_remote_ready = sum(item.get("remote_count_status") == "VERIFIED" and
+                                isinstance(item.get("remote_product_count"), int) and
+                                item["remote_product_count"] > 0 for item in items)
+    publication_ready = sum(item.get("publication_status") == "KNOWN_PUBLISHED" for item in items)
     mapping_ready = sum(item.get("mapping_status") == "READY" for item in items)
     image_ready = sum(item.get("image_status") == "READY" for item in items)
     theme_status = package.get("theme_schema_status", "WAITING_FOR_LIVE_READ")
     sufficient = len(items) == 4 and mapping_ready == 4 and image_ready == 4 and theme_status == "READY"
     return {
-        "selected_count": len(items), "mapping_ready": mapping_ready, "image_ready": image_ready,
+        "selected_count": len(items), "mapping_ready": mapping_ready,
+        "identity_ready": identity_ready, "nonempty_remote_ready": nonempty_remote_ready,
+        "publication_ready": publication_ready,
+        "publication_unknown": sum(item.get("publication_status") == "UNKNOWN" for item in items),
+        "image_ready": image_ready,
         "theme_schema_status": theme_status, "theme_write_status": "NOT_RUN",
         "preview_enabled": sufficient,
     }
@@ -145,6 +155,56 @@ class CategoryShortcutReadinessService:
             con.execute("""CREATE TABLE IF NOT EXISTS homepage_category_shortcut_plans (
                 plan_id TEXT PRIMARY KEY, store_id TEXT NOT NULL, source_hash TEXT NOT NULL,
                 catalog_fetched_at TEXT, plan_json TEXT NOT NULL, created_at TEXT NOT NULL)""")
+            con.execute("""CREATE TABLE IF NOT EXISTS homepage_category_collection_remote_cache (
+                store_id TEXT PRIMARY KEY, fetched_at TEXT NOT NULL, source_hash TEXT NOT NULL,
+                collections_json TEXT NOT NULL)""")
+
+    def collection_snapshot(self, store_id: str) -> dict | None:
+        """Return the last bounded read-only Shopify collection snapshot, if any."""
+        with connect(self.db) as con:
+            row = con.execute("SELECT fetched_at,source_hash,collections_json FROM homepage_category_collection_remote_cache WHERE store_id=?",
+                              (str(store_id),)).fetchone()
+        if not row:
+            return None
+        collections = _json(row["collections_json"], [])
+        if not isinstance(collections, list):
+            return None
+        return {"fetched_at": row["fetched_at"], "source_hash": row["source_hash"], "collections": collections}
+
+    def refresh_collection_snapshot(self, store_id: str) -> dict:
+        """Refresh collection evidence using Shopify's read-only collections query only."""
+        from .shopify_collections import COLLECTIONS_QUERY, ShopifyGraphQLClient, get_connection, get_shopify_token
+
+        try:
+            config = get_connection(str(store_id), db=self.db)
+            token, _source = get_shopify_token(str(store_id), db=self.db)
+            if not config or not token:
+                return {"status": "WAITING_FOR_SHOPIFY_CONNECTION", "snapshot": self.collection_snapshot(store_id)}
+            client = ShopifyGraphQLClient(config["shop_domain"], token, config.get("api_version"))
+            result = client.execute(COLLECTIONS_QUERY)
+            collections = result.get("collections", {}).get("nodes", [])
+            normalized = []
+            for row in collections if isinstance(collections, list) else []:
+                products_count = row.get("productsCount") or {}
+                count = products_count.get("count")
+                normalized.append({
+                    "id": row.get("id"), "handle": row.get("handle"), "title": row.get("title"),
+                    "products_count": count if isinstance(count, int) and not isinstance(count, bool) else None,
+                    "products_count_precision": products_count.get("precision"),
+                })
+            normalized.sort(key=lambda item: (str(item.get("id") or ""), str(item.get("handle") or "")))
+            payload = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+            source_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            with connect(self.db) as con:
+                con.execute("INSERT OR REPLACE INTO homepage_category_collection_remote_cache(store_id,fetched_at,source_hash,collections_json) VALUES(?,?,?,?)",
+                            (str(store_id), fetched_at, source_hash, payload))
+            return {"status": "READ_ONLY_REFRESHED", "snapshot": {"fetched_at": fetched_at,
+                    "source_hash": source_hash, "collections": normalized}}
+        except Exception as exc:
+            # Never expose exception messages: HTTP/library errors can contain request details.
+            return {"status": "READ_ONLY_REFRESH_FAILED", "error_type": type(exc).__name__,
+                    "snapshot": self.collection_snapshot(store_id)}
 
     def build(self, store_id: str, *, persist: bool = True, theme_snapshot: dict | None = None) -> dict:
         with connect(self.db) as con:
@@ -174,6 +234,8 @@ class CategoryShortcutReadinessService:
                     "blockers": ["Cached catalog is stale; a read_products refresh is needed before selecting categories."]}
 
         mappings = {row["collection_key"]: dict(row) for row in collection_rows}
+        remote_snapshot = self.collection_snapshot(store_id)
+        remote_collections = (remote_snapshot or {}).get("collections", [])
         definitions = {}
         for row in definition_rows:
             definitions.setdefault(row["collection_key"], dict(row))
@@ -197,11 +259,27 @@ class CategoryShortcutReadinessService:
             mapping = mappings.get(key) or {}
             handle = mapping.get("handle")
             collection_id = mapping.get("shopify_collection_id")
-            published_ids = _json(mapping.get("published_ids_json"), [])
-            remote_count = len(published_ids) if isinstance(published_ids, list) else 0
-            mapping_valid = bool(_SAFE_HANDLE.fullmatch(str(handle or "")) and _COLLECTION_GID.fullmatch(str(collection_id or "")) and remote_count > 0)
-            mapping_status = "READY" if mapping_valid else "NOT_MAPPED"
-            target_url = f"/collections/{handle}" if mapping_valid else None
+            publication_ids = _json(mapping.get("published_ids_json"), [])
+            publication_ids = [value for value in publication_ids if isinstance(value, str) and _PUBLICATION_GID.fullmatch(value)] if isinstance(publication_ids, list) else []
+            publication_status = "KNOWN_PUBLISHED" if publication_ids else "UNKNOWN"
+            has_local_identity = bool(handle or collection_id)
+            valid_local_identity = bool(_SAFE_HANDLE.fullmatch(str(handle or "")) and _COLLECTION_GID.fullmatch(str(collection_id or "")))
+            remote_collection = next((row for row in remote_collections
+                                      if row.get("id") == collection_id), None) if valid_local_identity else None
+            identity_status = "VERIFIED" if remote_collection and remote_collection.get("handle") == handle else (
+                "IDENTITY_MISMATCH" if remote_collection else ("REMOTE_NOT_VERIFIED" if valid_local_identity else
+                "INVALID_LOCAL_IDENTITY" if has_local_identity else "NOT_MAPPED"))
+            remote_count = remote_collection.get("products_count") if identity_status == "VERIFIED" else None
+            remote_precision = remote_collection.get("products_count_precision") if identity_status == "VERIFIED" else None
+            remote_count_status = "VERIFIED" if isinstance(remote_count, int) and not isinstance(remote_count, bool) else "UNKNOWN"
+            mapping_valid = (identity_status == "VERIFIED" and remote_count_status == "VERIFIED" and
+                             remote_count > 0 and publication_status == "KNOWN_PUBLISHED")
+            mapping_status = "READY" if mapping_valid else ("REMOTE_EMPTY" if remote_count_status == "VERIFIED" and remote_count == 0 else
+                "REMOTE_COUNT_UNKNOWN" if identity_status == "VERIFIED" and remote_count_status == "UNKNOWN" else
+                "IDENTITY_MISMATCH" if identity_status == "IDENTITY_MISMATCH" else
+                "REMOTE_NOT_VERIFIED" if identity_status == "REMOTE_NOT_VERIFIED" else
+                "NOT_MAPPED" if identity_status == "NOT_MAPPED" else "NOT_READY")
+            target_url = f"/collections/{handle}" if identity_status == "VERIFIED" else None
             asset = images.get(key) or {}
             path = asset.get("path")
             image_status, inspection = "NEEDS_ASSET", None
@@ -220,9 +298,12 @@ class CategoryShortcutReadinessService:
             items.append({
                 "shortcut_key": item["key"], "title": item["title"], "merchandising_group": item["title"],
                 "product_count": counts[item["key"]], "collection_key": key,
-                "shopify_collection_id": collection_id if mapping_valid else None,
-                "handle": handle if mapping_valid else None, "storefront_url": target_url,
-                "mapping_status": mapping_status, "remote_collection_product_count": remote_count,
+                "shopify_collection_id": collection_id if identity_status == "VERIFIED" else None,
+                "handle": handle if identity_status == "VERIFIED" else None, "storefront_url": target_url,
+                "mapping_status": mapping_status, "mapping_identity_status": identity_status,
+                "publication_ids": publication_ids, "publication_status": publication_status,
+                "remote_product_count": remote_count, "remote_product_count_precision": remote_precision,
+                "remote_count_status": remote_count_status,
                 "local_collection_definition": plan_definition or None,
                 "proposed_collection_definition": {"collection_key": key, "title": item["title"],
                     "estimated_active_product_count": counts[item["key"]], "proposed_handle": proposed_handle,
@@ -232,7 +313,7 @@ class CategoryShortcutReadinessService:
                 "image_status": image_status, "image_inspection": inspection,
                 "alt_text": asset.get("alt_text") if image_status == "READY" else f"{item['title']} organization in a clean car interior",
                 "image_prompt": category_image_prompt(item["title"]), "position": position,
-                "readiness_reasons": (["Actual Shopify collection mapping with ID, handle, and nonzero member count is missing."] if mapping_status != "READY" else []) +
+                "readiness_reasons": (["Remote collection identity and productsCount evidence are required; publication IDs are not product counts."] if mapping_status != "READY" else []) +
                     (["Approved square image with verified no-text/no-logo/no-watermark content review is missing."] if image_status != "READY" else []),
             })
         package_id = "CSP_" + hashlib.sha256(f"{store_id}:{cache['source_hash']}:{json.dumps(items,sort_keys=True)}".encode()).hexdigest()[:20]
@@ -251,7 +332,8 @@ class CategoryShortcutReadinessService:
                    "catalog_product_count": len(products), "excluded_counts": excluded,
                    "distribution": {item["key"]: {"title": item["title"], "product_count": counts[item["key"]]} for item in CATEGORY_DEFINITIONS},
                    "items": items, "theme_schema_status": theme_status, "theme_schema": theme_info, "theme_write_status": "NOT_RUN",
-                   "mapping_refresh_status": "LOCAL_CACHE_ONLY", "summary": {},
+                   "mapping_refresh_status": "READ_ONLY_SNAPSHOT" if remote_snapshot else "REMOTE_EVIDENCE_UNAVAILABLE",
+                   "collection_snapshot_fetched_at": (remote_snapshot or {}).get("fetched_at"), "summary": {},
                    "blockers": ["Shopify theme schema live read pending.", "Theme apply remains blocked pending themeFilesUpsert exemption."]}
         package["summary"] = readiness_summary(package)
         if persist:

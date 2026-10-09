@@ -48,6 +48,12 @@ def _seed(db, products):
         con.execute("""CREATE TABLE IF NOT EXISTS collection_image_assets(
             store_id TEXT,collection_key TEXT,path TEXT,provider TEXT,model TEXT,alt_text TEXT,
             metadata_json TEXT,created_at TEXT,approval_status TEXT,PRIMARY KEY(store_id,collection_key))""")
+        con.execute("""CREATE TABLE IF NOT EXISTS shopify_collection_mappings(
+            store_id TEXT,collection_key TEXT,handle TEXT,shopify_collection_id TEXT,
+            last_synced_hash TEXT,last_synced_at TEXT,published_ids_json TEXT,image_url TEXT,
+            PRIMARY KEY(store_id,collection_key))""")
+        con.execute("""CREATE TABLE IF NOT EXISTS homepage_category_collection_remote_cache(
+            store_id TEXT PRIMARY KEY,fetched_at TEXT,source_hash TEXT,collections_json TEXT)""")
         con.execute("INSERT INTO homepage_featured_product_remote_cache VALUES(?,?,?,?,?)",
                     ("001", datetime.now(timezone.utc).isoformat(), len(products), "source-hash",
                      json.dumps(products)))
@@ -100,26 +106,144 @@ def test_build_selects_four_nonempty_deterministically_and_never_fakes_mapping(d
     assert service.build("001", persist=False)["items"] == package["items"]
 
 
-def test_real_mapping_requires_collection_gid_handle_and_nonempty_remote_members(db):
+def _seed_trunk_mapping(db, *, publication_ids=None, remote_id="gid://shopify/Collection/77",
+                        remote_handle="trunk-organizers", remote_count=None):
+    with connect(db) as con:
+        con.execute("INSERT INTO shopify_collection_mappings VALUES(?,?,?,?,?,?,?,?)",
+                    ("001", "trunk-storage", "trunk-organizers", "gid://shopify/Collection/77", "h", "2026-10-09",
+                     json.dumps(publication_ids if publication_ids is not None else ["gid://shopify/Publication/123"]), None))
+        if remote_count is not None:
+            con.execute("INSERT OR REPLACE INTO homepage_category_collection_remote_cache VALUES(?,?,?,?)",
+                        ("001", datetime.now(timezone.utc).isoformat(), "remote-hash", json.dumps([{
+                            "id": remote_id, "handle": remote_handle, "title": "Trunk Organizers",
+                            "products_count": remote_count, "products_count_precision": "EXACT"
+                        }])) )
+
+
+def _category_package(db):
     _seed(db, [_product(i, title, kind) for i, title, kind in [
         (1, "Cargo trunk organizer", "Cargo"), (2, "Seat back organizer", "Seat"),
         (3, "Car trash can", "Garbage"), (4, "Center console organizer", "Console"),
     ]])
-    with connect(db) as con:
-        con.execute("INSERT INTO shopify_collection_mappings VALUES(?,?,?,?,?,?,?,?)",
-                    ("001", "trunk-storage", "trunk-organizers", "gid://shopify/Collection/77", "h", "2026-10-09", json.dumps(["gid://shopify/Product/1"]), None))
-    package = CategoryShortcutReadinessService(db).build("001", persist=False)
+    return CategoryShortcutReadinessService(db)
+
+
+def test_publication_ids_are_not_product_count(db):
+    service = _category_package(db)
+    _seed_trunk_mapping(db, remote_count=9)
+    package = service.build("001", persist=False)
     trunk = next(item for item in package["items"] if item["collection_key"] == "trunk-storage")
+    assert trunk["publication_ids"] == ["gid://shopify/Publication/123"]
+    assert trunk["remote_product_count"] == 9
+    assert trunk["remote_product_count"] != len(trunk["publication_ids"])
+    assert trunk["remote_count_status"] == "VERIFIED"
+    assert trunk["publication_status"] == "KNOWN_PUBLISHED"
+
+
+def test_mapping_with_publication_id_but_no_remote_count_not_ready(db):
+    service = _category_package(db)
+    _seed_trunk_mapping(db)
+    trunk = next(item for item in service.build("001", persist=False)["items"] if item["collection_key"] == "trunk-storage")
+    assert trunk["mapping_status"] == "REMOTE_NOT_VERIFIED"
+    assert trunk["mapping_identity_status"] == "REMOTE_NOT_VERIFIED"
+    assert trunk["remote_product_count"] is None
+
+
+def test_mapping_with_remote_zero_products_not_ready(db):
+    service = _category_package(db)
+    _seed_trunk_mapping(db, remote_count=0)
+    trunk = next(item for item in service.build("001", persist=False)["items"] if item["collection_key"] == "trunk-storage")
+    assert trunk["mapping_status"] == "REMOTE_EMPTY"
+    assert trunk["mapping_identity_status"] == "VERIFIED"
+    assert trunk["remote_count_status"] == "VERIFIED"
+
+
+def test_mapping_with_verified_remote_positive_count_ready_for_identity_count(db):
+    service = _category_package(db)
+    _seed_trunk_mapping(db, remote_count=9)
+    trunk = next(item for item in service.build("001", persist=False)["items"] if item["collection_key"] == "trunk-storage")
     assert trunk["mapping_status"] == "READY"
+    assert trunk["mapping_identity_status"] == "VERIFIED"
+    assert trunk["remote_product_count"] == 9
     assert trunk["shopify_collection_id"] == "gid://shopify/Collection/77"
     assert trunk["handle"] == "trunk-organizers"
     assert trunk["storefront_url"] == "/collections/trunk-organizers"
-    with connect(db) as con:
-        con.execute("UPDATE shopify_collection_mappings SET shopify_collection_id='fake-77',published_ids_json='[]' WHERE store_id='001'")
-    invalid = CategoryShortcutReadinessService(db).build("001", persist=False)
-    trunk = next(item for item in invalid["items"] if item["collection_key"] == "trunk-storage")
-    assert trunk["mapping_status"] == "NOT_MAPPED"
-    assert trunk["shopify_collection_id"] is None and trunk["handle"] is None
+
+
+def test_remote_collection_identity_mismatch_blocks_ready(db):
+    service = _category_package(db)
+    _seed_trunk_mapping(db, remote_id="gid://shopify/Collection/77", remote_handle="different-handle", remote_count=9)
+    trunk = next(item for item in service.build("001", persist=False)["items"] if item["collection_key"] == "trunk-storage")
+    assert trunk["mapping_status"] == "IDENTITY_MISMATCH"
+    assert trunk["mapping_identity_status"] == "IDENTITY_MISMATCH"
+    assert trunk["remote_product_count"] is None
+
+
+def test_missing_publication_evidence_does_not_make_mapping_ready(db):
+    service = _category_package(db)
+    _seed_trunk_mapping(db, publication_ids=[], remote_count=9)
+    trunk = next(item for item in service.build("001", persist=False)["items"] if item["collection_key"] == "trunk-storage")
+    assert trunk["mapping_identity_status"] == "VERIFIED"
+    assert trunk["remote_count_status"] == "VERIFIED"
+    assert trunk["publication_status"] == "UNKNOWN"
+    assert trunk["mapping_status"] == "NOT_READY"
+
+
+def test_remote_snapshot_cache_reused(db, monkeypatch):
+    service = _category_package(db)
+    _seed_trunk_mapping(db)
+    calls = []
+    class FakeClient:
+        def __init__(self, *args): pass
+        def execute(self, query):
+            calls.append(query)
+            return {"collections": {"nodes": [{"id": "gid://shopify/Collection/77", "handle": "trunk-organizers",
+                "title": "Trunk", "productsCount": {"count": 9, "precision": "EXACT"}}]}}
+    monkeypatch.setattr("shopsource.shopify_collections.get_connection", lambda *a, **k: {"shop_domain": "test.myshopify.com", "api_version": "2026-07"})
+    monkeypatch.setattr("shopsource.shopify_collections.get_shopify_token", lambda *a, **k: ("fake-token", "test"))
+    monkeypatch.setattr("shopsource.shopify_collections.ShopifyGraphQLClient", FakeClient)
+    assert service.refresh_collection_snapshot("001")["status"] == "READ_ONLY_REFRESHED"
+    assert service.collection_snapshot("001")["collections"][0]["products_count"] == 9
+    trunk = next(item for item in service.build("001", persist=False)["items"] if item["collection_key"] == "trunk-storage")
+    assert trunk["remote_product_count"] == 9 and trunk["mapping_identity_status"] == "VERIFIED"
+    assert len(calls) == 1
+
+
+def test_remote_snapshot_force_refresh_read_only(db, monkeypatch):
+    service = _category_package(db)
+    calls = []
+    class FakeClient:
+        def __init__(self, *args): pass
+        def execute(self, query):
+            calls.append(query)
+            return {"collections": {"nodes": []}}
+    monkeypatch.setattr("shopsource.shopify_collections.get_connection", lambda *a, **k: {"shop_domain": "test.myshopify.com", "api_version": "2026-07"})
+    monkeypatch.setattr("shopsource.shopify_collections.get_shopify_token", lambda *a, **k: ("fake-token", "test"))
+    monkeypatch.setattr("shopsource.shopify_collections.ShopifyGraphQLClient", FakeClient)
+    assert service.refresh_collection_snapshot("001")["status"] == "READ_ONLY_REFRESHED"
+    assert len(calls) == 1 and "productsCount" in calls[0] and "mutation" not in calls[0].casefold()
+
+
+def test_no_collection_mutation(db, monkeypatch):
+    service = _category_package(db)
+    queries = []
+    class FakeClient:
+        def __init__(self, *args): pass
+        def execute(self, query):
+            queries.append(query)
+            assert "mutation" not in query.casefold()
+            return {"collections": {"nodes": []}}
+    monkeypatch.setattr("shopsource.shopify_collections.get_connection", lambda *a, **k: {"shop_domain": "test.myshopify.com", "api_version": "2026-07"})
+    monkeypatch.setattr("shopsource.shopify_collections.get_shopify_token", lambda *a, **k: ("fake-token", "test"))
+    monkeypatch.setattr("shopsource.shopify_collections.ShopifyGraphQLClient", FakeClient)
+    service.refresh_collection_snapshot("001")
+    assert len(queries) == 1
+
+
+def test_no_theme_mutation():
+    from shopsource.category_shortcut_readiness import readiness_summary
+    package = {"items": [], "theme_schema_status": "WAITING_FOR_LIVE_READ"}
+    assert readiness_summary(package)["preview_enabled"] is False
 
 
 def test_only_approved_valid_reviewed_unique_image_is_ready(db):
