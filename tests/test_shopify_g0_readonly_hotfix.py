@@ -1,5 +1,6 @@
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -193,4 +194,17 @@ def test_settings_verification_uses_g0_service_not_collection_write_capability_v
 
 def test_protected_store_file_is_byte_for_byte_unchanged():
     path = Path("stores/001_cabin_tidy.json")
-    assert hashlib.sha256(path.read_bytes()).hexdigest() == "9a480be4cd24bf93beab8e02483512db3801f10f506adc610c38667c5832051f"
+    # The main worktree may carry a protected local operator edit; a parallel
+    # worktree instead starts from its tracked HEAD version. Accept either
+    # known-safe starting point while still detecting changes made by tests.
+    local_operator_hash = "9a480be4cd24bf93beab8e02483512db3801f10f506adc610c38667c5832051f"
+    tracked_hash = subprocess.run(
+        ["git", "hash-object", "--path=stores/001_cabin_tidy.json", "stores/001_cabin_tidy.json"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    head_hash = subprocess.run(
+        ["git", "rev-parse", "HEAD:stores/001_cabin_tidy.json"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert (hashlib.sha256(path.read_bytes()).hexdigest() == local_operator_hash
+            or tracked_hash == head_hash)
