@@ -1967,7 +1967,8 @@ class OperatorUI:
                  "collection_plan": None, "brand": None, "prompt_set": None, "backup_id": None,
                  "local_candidates": [], "store_id": self.current_store, "session_context": None,
                  "snapshot_store_id": None, "snapshot_read_at": None, "current_stage": "STORE_SELECTED",
-                 "featured_apply_status": "NOT RUN", "featured_human_checks": {"desktop_title": False, "four_cards": False, "product_links": False, "mobile_section": False}}
+                 "featured_apply_status": "NOT RUN", "featured_human_checks": {"desktop_title": False, "four_cards": False, "product_links": False, "mobile_section": False},
+                 "category_shortcut_package": None}
         homepage_prerequisites = HomepagePrerequisiteService()
         with ui.card().classes("w-full border-2 border-sky-200 bg-sky-50"):
             brand_name = next((row["store_name"] for row in self.stores if row["store_id"] == self.current_store), self.current_store)
@@ -1978,6 +1979,65 @@ class OperatorUI:
                 ui.label("현재 진행 상태").classes("font-semibold")
                 homepage_session_status = ui.label("Brand: WAITING · Collections: WAITING · Theme read: WAITING · Featured: WAITING · Homepage preview: NOT READY · Shopify write: NOT RUN").classes("ss-help")
                 homepage_next_action = ui.label("다음: 홈페이지 자동 설계").classes("font-medium text-primary")
+            with ui.card().classes("w-full border border-emerald-300 bg-white"):
+                ui.label("Category shortcuts · local readiness only").classes("font-semibold")
+                category_readiness_summary = ui.label("Not checked · Shopify theme write: NOT RUN").classes("ss-help")
+                category_readiness_detail = ui.label("Product distribution and actual mappings have not been checked.").classes("ss-help")
+                category_buttons = ui.row().classes("flex-wrap gap-2")
+                with ui.dialog() as category_review_dialog, ui.card().classes("w-[min(900px,95vw)] max-h-[85vh] overflow-auto"):
+                    ui.label("Selected category shortcuts (local evidence)").classes("text-xl font-bold")
+                    category_review_rows = ui.column().classes("w-full gap-2")
+                    ui.button("Close", on_click=category_review_dialog.close).props("outline")
+
+                def refresh_category_readiness():
+                    from ..category_shortcut_readiness import CategoryShortcutReadinessService
+                    try:
+                        package = CategoryShortcutReadinessService().build(
+                            self.current_store, theme_snapshot=state.get("snapshot"))
+                        state["category_shortcut_package"] = package
+                        summary = package.get("summary", {})
+                        category_readiness_summary.set_text(
+                            f"{summary.get('selected_count', 0)}/4 selected · Collection mapping (local cache): "
+                            f"{summary.get('mapping_ready', 0)}/4 READY · Images: {summary.get('image_ready', 0)}/4 READY · "
+                            f"Theme schema: {summary.get('theme_schema_status', 'WAITING_FOR_LIVE_READ')} · Shopify theme write: NOT RUN")
+                        category_readiness_detail.set_text(
+                            f"Catalog: {package.get('catalog_product_count', 0)} products · fetched {package.get('catalog_fetched_at') or 'not available'} · "
+                            f"mapping source {package.get('mapping_refresh_status', 'LOCAL_CACHE_ONLY')} · "
+                            f"status {package.get('status')} · preview {'enabled' if summary.get('preview_enabled') else 'disabled until prerequisites are ready'}")
+                        return package
+                    except Exception as exc:
+                        category_readiness_summary.set_text(f"Readiness unavailable · {type(exc).__name__} · Shopify theme write: NOT RUN")
+                        return None
+
+                def show_category_readiness():
+                    package = state.get("category_shortcut_package") or refresh_category_readiness()
+                    category_review_rows.clear()
+                    if not package:
+                        ui.notify("Local category readiness could not be loaded.", type="warning"); return
+                    with category_review_rows:
+                        for group in package.get("distribution", {}).values():
+                            ui.label(f"Catalog · {group.get('title')}: {group.get('product_count', 0)} eligible ACTIVE products")
+                        for item in package.get("items", []):
+                            with ui.card().classes("w-full"):
+                                ui.label(f"{item['position']}. {item['title']} · {item['product_count']} eligible ACTIVE products").classes("font-semibold")
+                                ui.label(f"Collection: {item['mapping_status']} · ID={item.get('shopify_collection_id') or 'not verified'} · handle={item.get('handle') or 'not verified'}")
+                                ui.label(f"Local proposal only: key={item['collection_key']} · candidate handle={item['proposed_handle']} · image={item['image_status']}")
+                                ui.label("Prompt only: " + item["image_prompt"]).classes("ss-help")
+                                for reason in item.get("readiness_reasons", []): ui.label(reason).classes("text-amber-800")
+                    category_review_dialog.open()
+
+                def show_category_images():
+                    package = state.get("category_shortcut_package") or refresh_category_readiness()
+                    if not package: return
+                    ui.notify(" · ".join(f"{row['title']}: {row['image_status']}" for row in package.get("items", [])) or "No categories ready", type="info")
+
+                with category_buttons:
+                    ui.button("View 4 categories", on_click=show_category_readiness, icon="category").props("outline")
+                    ui.button("Recheck collection mappings", on_click=refresh_category_readiness, icon="sync").props("outline")
+                    ui.button("Image readiness", on_click=show_category_images, icon="image").props("outline")
+                    ui.button("Read theme again", on_click=lambda: design(discover_theme=True), icon="refresh").props("outline")
+                    ui.button("Category preview", on_click=lambda: None, icon="preview").props("outline disable")
+                refresh_category_readiness()
             actions = ui.column().classes("w-full gap-2")
             preview_area = ui.column().classes("w-full gap-2")
             hero_url = ui.input("Shopify Files hero image URL (optional)").classes("w-full")
@@ -2297,6 +2357,7 @@ class OperatorUI:
             def design(discover_theme=True):
                 try:
                     context = resolve_homepage_context("DESIGN", force_theme=bool(discover_theme))
+                    refresh_category_readiness()
                     if context.homepage_plan:
                         plan = context.homepage_plan
                         plan["hero"]["image_url"] = normalize_text_value(hero_url.value) or None
