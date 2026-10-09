@@ -11,23 +11,37 @@ import pytest
 
 from shopsource.shopify_collections import save_connection
 from shopsource.shopify_theme_cli import ShopifyThemeCLI, TARGET_FILE
-from shopsource.theme_write_backend import ThemeFileWriteRequest, raw_sha256
+from shopsource.theme_write_backend import (ThemeBackendCapabilities, ThemeFileWriteRequest,
+                                            ThemeWriteBackendRouter, raw_sha256)
 
 
 class Runner:
-    def __init__(self, root: Path, *, remote=None, version="3.80.0"):
+    def __init__(self, root: Path, *, remote=None, version="3.80.0", role="unpublished", themes=None):
         self.root = root
         self.remote = remote or "/* Shopify header comment */\n{\"sections\":{},\"order\":[]}\n"
         self.version = version
         self.calls = []
         self.fail_push = False
+        self.themes = themes if themes is not None else [{"id": "123", "name": "Mock theme", "role": role}]
+        self.theme_list_json_override = None
+        self.unsupported_id_filter = False
 
     def __call__(self, command, **kwargs):
         self.calls.append((list(command), dict(kwargs)))
         if command[1:] == ["version"]:
             return subprocess.CompletedProcess(command, 0, stdout=f"{self.version}\n", stderr="")
         if command[1:3] == ["theme", "list"]:
-            return subprocess.CompletedProcess(command, 0, stdout="[]", stderr="")
+            if "--id" in command and self.unsupported_id_filter:
+                return subprocess.CompletedProcess(command, 1, stdout="", stderr="unknown option --id")
+            if self.theme_list_json_override is not None:
+                payload = self.theme_list_json_override
+            elif "--id" in command:
+                requested_id = command[command.index("--id") + 1]
+                payload = [theme for theme in self.themes if str(theme.get("id")) == requested_id]
+            else:
+                payload = self.themes
+            output = payload if isinstance(payload, str) else json.dumps(payload)
+            return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
         if "theme" not in command:
             return subprocess.CompletedProcess(command, 1, stdout="", stderr="")
         path = Path(command[command.index("--path") + 1])
@@ -42,12 +56,12 @@ class Runner:
         return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
 
 
-def setup(tmp_path, monkeypatch, *, runner=None, password="merchant-password"):
+def setup(tmp_path, monkeypatch, *, runner=None, password="merchant-password", role="unpublished"):
     db = tmp_path / "test.sqlite3"
     save_connection("store-a", "example.myshopify.com", db=db)
     root = tmp_path / "cli-tmp"
     root.mkdir()
-    runner = runner or Runner(root)
+    runner = runner or Runner(root, role=role)
     cli = ShopifyThemeCLI(db=db, runner=runner, which=lambda _name: "shopify.exe", temp_dir=root,
                           credential_getter=lambda _store: password)
     return cli, runner, db, root
@@ -91,7 +105,7 @@ def test_cli_read_uses_isolated_temp_theme(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("request_overrides,reason", [
-    ({"target_is_live": True}, "ALLOW_LIVE_REQUIRED"),
+    ({"target_is_live": True}, "TARGET_ROLE_MISMATCH"),
     ({"confirmed": False}, "CONFIRMATION_REQUIRED"),
     ({"expected_remote_raw_hash": ""}, "EXPECTED_REMOTE_HASH_REQUIRED"),
 ])
@@ -135,7 +149,7 @@ def test_cli_write_uses_nodelete_strict_json(tmp_path, monkeypatch):
 
 
 def test_cli_live_requires_allow_live(tmp_path, monkeypatch):
-    cli, runner, _, _ = setup(tmp_path, monkeypatch)
+    cli, runner, _, _ = setup(tmp_path, monkeypatch, role="main")
     before = runner.remote
     blocked = ThemeFileWriteRequest("store-a", "example.myshopify.com", "123", TARGET_FILE,
                                     "{}", raw_sha256(before), confirmed=True, target_is_live=True)
@@ -202,6 +216,142 @@ def test_cli_rollback_restores_exact_raw_only_after_current_hash_check(tmp_path,
                                expected_current_raw_hash=raw_sha256(proposed))
     assert result.status == "ROLLBACK_VERIFIED"
     assert runner.remote == original
+
+
+def test_capability_requires_exact_theme_id_match(tmp_path, monkeypatch):
+    cli, runner, _, _ = setup(tmp_path, monkeypatch)
+    runner.themes = [{"id": "1234", "name": "Lookalike", "role": "unpublished"}]
+    assert cli.capability_status("store-a", theme_id="123").status == "THEME_ID_NOT_FOUND"
+
+
+def test_capability_theme_id_not_found(tmp_path, monkeypatch):
+    cli, _, _, _ = setup(tmp_path, monkeypatch)
+    assert cli.capability_status("store-a", theme_id="999").reason_code == "THEME_ID_NOT_FOUND"
+
+
+def test_capability_rejects_ambiguous_theme_id(tmp_path, monkeypatch):
+    cli, runner, _, _ = setup(tmp_path, monkeypatch)
+    runner.themes = [{"id": "123", "name": "One", "role": "main"},
+                     {"id": 123, "name": "Two", "role": "unpublished"}]
+    assert cli.capability_status("store-a", theme_id="123").status == "THEME_ID_AMBIGUOUS"
+
+
+def test_capability_parses_top_level_theme_list_json(tmp_path, monkeypatch):
+    cli, runner, _, _ = setup(tmp_path, monkeypatch)
+    runner.theme_list_json_override = '[{"id":123,"name":"Top level","status":"live"}]'
+    capability = cli.capability_status("store-a", theme_id="123")
+    assert capability.ready and capability.details["verified_theme_name"] == "Top level"
+
+
+def test_capability_parses_wrapped_themes_json(tmp_path, monkeypatch):
+    cli, runner, _, _ = setup(tmp_path, monkeypatch)
+    runner.theme_list_json_override = {"data": {"themes": [
+        {"theme_id": "gid://shopify/OnlineStoreTheme/123", "themeName": "Wrapped", "themeRole": "development"}]}}
+    capability = cli.capability_status("store-a", theme_id="123")
+    assert capability.ready and capability.details["verified_theme_role"] == "DEVELOPMENT"
+
+
+def test_capability_rejects_invalid_json(tmp_path, monkeypatch):
+    cli, runner, _, _ = setup(tmp_path, monkeypatch)
+    runner.theme_list_json_override = "not json"
+    assert cli.capability_status("store-a", theme_id="123").status == "THEME_LIST_INVALID_JSON"
+
+
+def test_capability_requires_known_theme_role(tmp_path, monkeypatch):
+    cli, runner, _, _ = setup(tmp_path, monkeypatch)
+    runner.themes = [{"id": "123", "name": "Roleless"}]
+    assert cli.capability_status("store-a", theme_id="123").status == "THEME_ROLE_UNKNOWN"
+
+
+def test_capability_marks_main_theme_live(tmp_path, monkeypatch):
+    cli, _, _, _ = setup(tmp_path, monkeypatch, role="published")
+    details = cli.capability_status("store-a", theme_id="123").details
+    assert details["verified_theme_role"] == "MAIN"
+    assert details["target_is_live"] is True and details["identity_verified"] is True
+
+
+def test_capability_marks_unpublished_theme_not_live(tmp_path, monkeypatch):
+    cli, _, _, _ = setup(tmp_path, monkeypatch, role="unpublished")
+    details = cli.capability_status("store-a", theme_id="123").details
+    assert details["verified_theme_role"] == "UNPUBLISHED"
+    assert details["target_is_live"] is False
+
+
+def test_write_live_role_cannot_be_bypassed_by_false_request_flag(tmp_path, monkeypatch):
+    cli, runner, _, _ = setup(tmp_path, monkeypatch, role="main")
+    result = cli.write_file(ThemeFileWriteRequest("store-a", "example.myshopify.com", "123", TARGET_FILE,
+        "{}", raw_sha256(runner.remote), confirmed=True, allow_live=True, target_is_live=False))
+    assert result.reason_code == "TARGET_ROLE_MISMATCH"
+    assert not any(command[1:3] == ["theme", "push"] for command, _ in runner.calls)
+
+
+def test_write_nonlive_role_rejects_true_request_flag(tmp_path, monkeypatch):
+    cli, runner, _, _ = setup(tmp_path, monkeypatch, role="development")
+    result = cli.write_file(ThemeFileWriteRequest("store-a", "example.myshopify.com", "123", TARGET_FILE,
+        "{}", raw_sha256(runner.remote), confirmed=True, allow_live=True, target_is_live=True))
+    assert result.reason_code == "TARGET_ROLE_MISMATCH"
+    assert not any(command[1:3] == ["theme", "push"] for command, _ in runner.calls)
+
+
+def test_write_main_requires_allow_live(tmp_path, monkeypatch):
+    cli, runner, _, _ = setup(tmp_path, monkeypatch, role="main")
+    result = cli.write_file(ThemeFileWriteRequest("store-a", "example.myshopify.com", "123", TARGET_FILE,
+        "{}", raw_sha256(runner.remote), confirmed=True, target_is_live=True))
+    assert result.reason_code == "ALLOW_LIVE_REQUIRED"
+    assert not any(command[1:3] == ["theme", "push"] for command, _ in runner.calls)
+
+
+def test_write_main_adds_allow_live_only_after_verified_role(tmp_path, monkeypatch):
+    cli, runner, _, _ = setup(tmp_path, monkeypatch, role="main")
+    request = ThemeFileWriteRequest("store-a", "example.myshopify.com", "123", TARGET_FILE,
+        "{}", raw_sha256(runner.remote), confirmed=True, allow_live=True, target_is_live=True)
+    assert cli.write_file(request).status == "REMOTE_JSON_VERIFIED"
+    command, _ = next((command, kwargs) for command, kwargs in runner.calls if command[1:3] == ["theme", "push"])
+    assert "--allow-live" in command
+
+
+def test_rollback_main_requires_verified_live_gate(tmp_path, monkeypatch):
+    cli, runner, _, _ = setup(tmp_path, monkeypatch, role="main")
+    request = ThemeFileWriteRequest("store-a", "example.myshopify.com", "123", TARGET_FILE,
+        "{}", raw_sha256(runner.remote), confirmed=True, target_is_live=True)
+    result = cli.rollback_file(request, original_content="{}", expected_current_raw_hash="0" * 64)
+    assert result.reason_code == "ALLOW_LIVE_REQUIRED"
+    assert not any(command[1:3] == ["theme", "push"] for command, _ in runner.calls)
+
+
+def test_secret_not_leaked_in_theme_list_parse_errors(tmp_path, monkeypatch):
+    cli, runner, _, _ = setup(tmp_path, monkeypatch)
+    runner.theme_list_json_override = "merchant-password { malformed json"
+    capability = cli.capability_status("store-a", theme_id="123")
+    assert capability.status == "THEME_LIST_INVALID_JSON"
+    assert "merchant-password" not in repr(capability.details)
+
+
+def test_wrong_theme_id_never_pushes(tmp_path, monkeypatch):
+    cli, runner, _, _ = setup(tmp_path, monkeypatch)
+    request = ThemeFileWriteRequest("store-a", "example.myshopify.com", "999", TARGET_FILE,
+        "{}", raw_sha256(runner.remote), confirmed=True)
+    result = cli.write_file(request)
+    assert result.reason_code == "THEME_ID_NOT_FOUND"
+    assert not any(command[1:3] == ["theme", "push"] for command, _ in runner.calls)
+
+
+def test_cli_id_filter_fallback_uses_exact_local_filter(tmp_path, monkeypatch):
+    cli, runner, _, _ = setup(tmp_path, monkeypatch)
+    runner.unsupported_id_filter = True
+    capability = cli.capability_status("store-a", theme_id="123")
+    assert capability.ready is True
+    assert any("--id" not in command for command, _ in runner.calls if command[1:3] == ["theme", "list"])
+
+
+def test_router_cli_not_ready_when_theme_identity_unverified(tmp_path, monkeypatch):
+    cli, _, _, _ = setup(tmp_path, monkeypatch)
+    graph = type("NoGraphQL", (), {"backend_name": "ADMIN_GRAPHQL",
+        "capability_status": lambda self, store_id, *, theme_id=None:
+        ThemeBackendCapabilities("ADMIN_GRAPHQL", "UNAVAILABLE", "SCOPE_MISSING")})()
+    selected = ThemeWriteBackendRouter(graph, cli).select("store-a", theme_id="999")
+    assert selected["backend_name"] is None
+    assert selected["capabilities"]["THEME_ACCESS_CLI"].reason_code == "THEME_ID_NOT_FOUND"
 
 
 @pytest.mark.parametrize("diagnostic,expected", [
