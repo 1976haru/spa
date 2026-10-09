@@ -1,0 +1,362 @@
+ShopSource Studio — APPROVAL-WAIT PARALLEL HOMEPAGE READINESS
+FINISH EVERYTHING EXCEPT THEME WRITE
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: phase/shopify-exemption-homepage-gate
+- Expected branch base/main handoff: 86a31edc56dfd6411c88f829e5a102f3c7e48dd3
+
+Current confirmed state
+- Shopify auth is restored and VERIFIED in UI.
+- Credential = YES
+- Authenticated App = ShopSource Production
+- App binding = VERIFIED
+- MAIN theme read = PASS
+- Publications read = PASS
+- Granted scopes currently DO NOT include write_themes.
+- Therefore protected Asset API/themeFilesUpsert exemption is still pending.
+- Shopify theme write is forbidden in this task.
+- User wants all remaining NON-WRITE work completed now so only final theme apply remains after approval.
+
+User intent
+"승인은 몇 시간 뒤 다시 확인할 테니, 그동안 나머지 부분을 진행한다."
+
+This is an operational readiness run, not a code-development run.
+
+ABSOLUTE RULES
+- CODE CHANGE COUNT = 0
+- SHOPIFY THEME WRITE = 0
+- SHOPIFY PRODUCT WRITE = 0
+- SHOPIFY COLLECTION WRITE = 0
+- SHOPIFY FILE UPLOAD = 0
+- PAID IMAGE GENERATION = 0
+- no main merge
+- no force push
+- do not edit protected files
+- do not approve merchandising policy automatically
+
+======================================================================
+STAGE 0 — REPO SAFETY
+======================================================================
+
+Fetch origin and verify:
+- branch = phase/shopify-exemption-homepage-gate
+- origin/main still compatible with branch base
+- no unexpected code changes
+- protected dirty files remain untouched:
+  stores/001_cabin_tidy.json
+  tools/shopify_app/safe_shopify_cli.ps1
+  data/*.sqlite3
+  .env / credentials
+  .phase*
+  backups
+
+If concurrent main movement would invalidate assumptions, report it but continue read-only/local readiness work if safe.
+Do not merge.
+
+======================================================================
+STAGE 1 — READ-ONLY SHOPIFY RECHECK
+======================================================================
+
+Now that credentials are restored, run existing read-only verification.
+
+Confirm:
+- app identity = ShopSource Production
+- store identity = Cabin Tidy store 001
+- granted scopes
+- MAIN theme read
+- publications read
+- collections read
+- product read
+
+Do NOT require write_themes for this run.
+Do NOT attempt themeFilesUpsert.
+
+Report:
+AUTH_VERIFIED
+WRITE_THEMES_GRANTED
+THEME_READ
+COLLECTION_READ
+PRODUCT_READ
+PUBLICATION_READ
+
+======================================================================
+STAGE 2 — FEATURED PRODUCTS FINAL READINESS PREVIEW
+======================================================================
+
+Build a FRESH Featured Products / New Arrivals preview for Cabin Tidy.
+
+Revalidate the currently selected four real Shopify products.
+Historical target set was:
+- gid://shopify/Product/15276412207353
+- gid://shopify/Product/15276420759801
+- gid://shopify/Product/15276419776761
+- gid://shopify/Product/15276418662649
+
+Do not force them if current live data invalidates any item.
+
+Verify:
+- ACTIVE
+- storefront eligible
+- product handles
+- product titles
+- 4/4 selected
+- preview title "New Arrivals"
+- intended order
+- target section ID uses central alphanumeric generator
+- legacy invalid section ss_featured_products_e193a01e recognized if still present
+- intended migration diff is isolated
+- leading Shopify JSON comment/prefix preserved
+
+Output:
+FEATURED_PLAN_ID
+FEATURED_4_OF_4
+FEATURED_PREVIEW_STATUS
+LEGACY_ID_PRESENT
+TARGET_SECTION_ID
+FEATURED_DIFF_SCOPE
+UNRELATED_DIFF_COUNT
+
+DO NOT APPLY.
+
+======================================================================
+STAGE 3 — CATEGORY REMOTE SNAPSHOT REFRESH
+======================================================================
+
+Use read-only Shopify collection query.
+
+Refresh and persist the bounded local snapshot using the implemented
+CategoryShortcutReadinessService.refresh_collection_snapshot() path.
+
+Then rebuild Cabin Tidy category readiness from current live/cache evidence.
+
+Report selected 4 categories and per item:
+- title
+- candidate_source
+- product_count
+- collection_key
+- local proposed handle
+- current mapped Shopify collection ID
+- current mapped handle
+- remote identity status
+- remote productsCount
+- productsCount precision
+- publication status
+- mapping status
+- image status
+
+Do not assume old 4 if current evidence chooses differently.
+
+Report:
+CATEGORY_SELECTED = 4/4 or x/4
+CATEGORY_IDENTITY_READY = x/4
+CATEGORY_REMOTE_NONEMPTY = x/4
+CATEGORY_PUBLICATION_READY = x/4
+CATEGORY_MAPPING_READY = x/4
+
+======================================================================
+STAGE 4 — LIVE THEME CATEGORY SCHEMA DISCOVERY
+======================================================================
+
+Use read_themes only.
+
+Read:
+- MAIN theme identity
+- templates/index.json
+- all relevant sections/*.liquid schemas
+
+Use the generalized discovery path and ALSO perform an evidence audit so a narrow detector does not hide a suitable schema.
+
+Look for existing native options supporting 4 category cards via:
+- collection list
+- collection blocks
+- multicolumn
+- image + heading + link blocks
+- featured collection lists
+- grid/card blocks
+
+Report:
+- actual section file
+- section type
+- schema name
+- mode
+- required settings/blocks
+- max blocks
+- whether 4 cards supported
+- whether per-card collection link supported
+- whether image supported
+- whether template-only change is possible
+- whether new Liquid section would be required
+
+Rank:
+1. native existing section, template-only
+2. reusable existing section with blocks
+3. custom managed section
+4. manual
+
+Set:
+CATEGORY_THEME_SCHEMA = READY / NOT_READY
+CATEGORY_BEST_MODE = ...
+CATEGORY_TEMPLATE_ONLY = YES/NO
+CATEGORY_NEW_LIQUID_REQUIRED = YES/NO
+
+NO WRITE.
+
+======================================================================
+STAGE 5 — MERCHANDISING POLICY DRAFT/PREVIEW
+======================================================================
+
+Read the current CATEGORY_SHORTCUTS merchandising policy status.
+
+If APPROVED:
+- report policy ID/version/source
+- do not change it
+
+If no approved policy:
+- create or reuse a DRAFT only
+- suggestion must use explicit Store Profile data and existing evidence
+- do not silently restore old automotive hardcoding
+- if a historical behavior review draft is useful, label it:
+  HISTORICAL_BEHAVIOR_REVIEW
+- never auto-approve
+
+Generate bounded preview:
+- proposed exclude keywords
+- proposed phrases
+- proposed title patterns
+- proposed decision statuses
+- excluded product count
+- up to 15 sample excluded product titles
+- category counts before/after
+
+Report:
+MERCH_POLICY_STATUS
+MERCH_POLICY_ID
+MERCH_POLICY_VERSION
+MERCH_POLICY_SOURCE
+MERCH_POLICY_EXCLUDED_COUNT
+MERCH_POLICY_APPROVAL_REQUIRED = YES/NO
+
+======================================================================
+STAGE 6 — COLLECTION SYNC DRY-RUN
+======================================================================
+
+Use existing collection publisher DRY-RUN only.
+
+For each selected category, determine:
+- CREATE
+- UPDATE
+- NO_CHANGE
+- CONFLICT
+- SKIP
+
+Report:
+- title
+- collection_key
+- proposed/actual handle
+- current Shopify collection ID if any
+- local estimated matched product count
+- live remote productsCount if any
+- intended conditions
+- publication target
+- dry-run action
+- reason
+
+No collection create/update/publish.
+
+If any CREATE/UPDATE/CONFLICT exists:
+COLLECTION_USER_APPROVAL_REQUIRED = YES
+
+======================================================================
+STAGE 7 — CATEGORY IMAGE READINESS / REUSE AUDIT
+======================================================================
+
+For each selected category, search:
+1. approved collection_image_assets
+2. approved store_homepage_assets
+3. approved brand_assets tagged for category shortcut reuse
+4. existing safe Shopify collection/product image references only if architecture supports reuse without mutation
+
+Validate:
+- actual image file/reference exists
+- valid format
+- minimum useful dimensions
+- square/near-square suitability
+- no text/logo/watermark per current policy
+- no duplicate asset reused across categories unless explicitly allowed
+
+If no approved image:
+- prepare prompt-only plan
+- NO image API call
+- NO upload
+
+Report exact next action per category:
+REUSE_APPROVED_ASSET / REVIEW_EXISTING_ASSET / GENERATE_LATER / MANUAL_ASSET_NEEDED
+
+Set:
+CATEGORY_IMAGES_READY = x/4
+
+======================================================================
+STAGE 8 — BUILD THE “ONE CLICK AFTER APPROVAL” CHECKLIST
+======================================================================
+
+Prepare a concise operational checklist for the moment write_themes appears:
+
+A. Click Shopify connection/permission check
+B. Confirm write_themes in Granted scopes
+C. Run fresh Featured preview
+D. Isolated Featured apply only
+E. Verify REMOTE_JSON_VERIFIED
+F. Human desktop/mobile storefront check
+G. Mark Spamy Featured/New Arrivals assignment ready
+H. Then separately complete category prerequisites and apply only when 4/4 mappings + 4/4 images + schema ready
+
+Do NOT execute any step requiring write_themes.
+
+======================================================================
+STAGE 9 — LOCAL READINESS SNAPSHOT
+======================================================================
+
+Persist only normal local runtime readiness/package/draft records through existing services.
+Do not commit SQLite/runtime files.
+
+No source code edits.
+
+======================================================================
+STAGE 10 — FINAL REPORT
+======================================================================
+
+Report exactly:
+
+[1] repo/branch safety
+[2] Shopify auth + granted scopes
+[3] featured 4-product readiness
+[4] featured legacy ID / target ID / isolated diff
+[5] category selected four
+[6] category mapping readiness per item
+[7] category live theme schema audit
+[8] merchandising policy draft/preview
+[9] collection dry-run per item
+[10] category image readiness per item
+[11] one-click-after-approval checklist
+[12] local runtime records created/updated
+[13] protected file status
+[14] Shopify write count
+[15] code change count
+[16] exact next USER action now
+[17] exact next action when write_themes appears
+
+Final flags:
+AUTH_VERIFIED = YES/NO
+WRITE_THEMES_GRANTED = YES/NO
+FEATURED_READY_TO_APPLY_AFTER_APPROVAL = YES/NO
+CATEGORY_SELECTED = x/4
+CATEGORY_MAPPING_READY = x/4
+CATEGORY_IMAGES_READY = x/4
+CATEGORY_THEME_SCHEMA = READY/NOT_READY/WAITING
+MERCH_POLICY_APPROVAL_REQUIRED = YES/NO
+COLLECTION_USER_APPROVAL_REQUIRED = YES/NO
+SHOPIFY_WRITE_COUNT = 0
+CODE_CHANGE_COUNT = 0
+SAFE_TO_WAIT_FOR_EXEMPTION = YES/NO
