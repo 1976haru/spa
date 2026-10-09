@@ -1,0 +1,504 @@
+ShopSource Studio — THEME WRITE FALLBACK BACKEND PHASE A
+GRAPHQL PRIMARY + THEME ACCESS CLI FALLBACK
+PARALLEL-SAFE BACKEND-ONLY IMPLEMENTATION
+
+Repository
+- Main working repo: D:\shop\001_so_amazon
+- Recommended parallel worktree: D:\shop\001_so_amazon_theme_fallback
+- Remote: https://github.com/1976haru/spa.git
+- Branch: phase/theme-write-fallback-backend
+- Branch base: 994da9b99c9666b16665035440e67d30e9330684
+
+Critical coordination context
+- Another phase is currently hardening category collection reconciliation.
+- This phase must minimize overlap.
+- BACKEND ONLY.
+- Do NOT edit src/shopsource/ui/v2.py in this phase.
+- Do NOT edit category_strategy.py or category_shortcut_readiness.py.
+- Do NOT edit the protected local tools/shopify_app/safe_shopify_cli.ps1.
+- Do NOT merge main.
+- No live Shopify theme write.
+
+Current production reality
+- ShopSource Production auth is VERIFIED.
+- read_themes works.
+- write_themes is REQUESTED but NOT GRANTED.
+- Shopify's themeFilesUpsert path remains blocked by protected-scope/exemption approval.
+- Need a robust alternative if approval is delayed or denied.
+
+Officially supported fallback target
+Theme Access app + Shopify CLI.
+
+Shopify CLI supports:
+- Theme Access password via SHOPIFY_CLI_THEME_TOKEN
+- theme pull --only
+- theme push --only
+- --theme / --live / --unpublished
+- --json
+- --strict
+- --allow-live required for non-interactive live pushes
+
+Mission
+Build a reusable transport/backend layer so ShopSource can support:
+1. PRIMARY: existing Admin GraphQL themeFilesUpsert path when exemption is active.
+2. FALLBACK: Shopify CLI authenticated through Theme Access password.
+3. LATER: Theme App Extension path can coexist as a third delivery model.
+
+This phase builds and tests the Theme Access CLI backend plus transport abstraction.
+It does NOT wire live UI buttons or execute live writes.
+
+======================================================================
+1. REPO / WORKTREE SAFETY
+======================================================================
+
+Before code:
+- verify branch/base
+- record git status
+- detect whether running in dedicated worktree
+- ensure no unexpected main movement invalidates baseline assumptions
+
+If using the main working tree while another branch has dirty code changes:
+STOP and report WORKTREE_REQUIRED.
+
+Recommended:
+git worktree add D:\shop\001_so_amazon_theme_fallback phase/theme-write-fallback-backend
+
+Operate only in the fallback worktree.
+
+======================================================================
+2. INSPECT EXISTING THEME APPLY ARCHITECTURE
+======================================================================
+
+Locate and document:
+- FeaturedProductThemeApplyService
+- existing themeFilesUpsert GraphQL transport
+- exact backup logic
+- comment-aware templates/index.json parser
+- semantic/raw hash verification
+- rollback path
+- Shopify connection/auth services
+- any current CLI helper usage
+
+Do not rewrite stable business logic.
+
+Architectural rule:
+Existing preview / semantic diff / backup / verification logic remains ABOVE the transport layer.
+Transport backend only moves exact theme file bytes/text to/from Shopify.
+
+======================================================================
+3. ADD GENERIC THEME TRANSPORT CONTRACT
+======================================================================
+
+Add a new isolated module, preferred:
+src/shopsource/theme_write_backend.py
+
+Define stable structures such as:
+ThemeFileReadResult
+ThemeFileWriteRequest
+ThemeFileWriteResult
+ThemeBackendCapabilities
+
+Define backend protocol/interface:
+- capability_status(...)
+- read_file(...)
+- write_file(...)
+- verify_file(...)
+- backend_name
+
+Important:
+The transport must accept an exact filename such as templates/index.json and exact text/raw bytes.
+It must not decide homepage semantics.
+
+Expected backend names:
+ADMIN_GRAPHQL
+THEME_ACCESS_CLI
+
+Do not integrate call sites yet unless needed only through a backwards-compatible adapter test.
+
+======================================================================
+4. THEME ACCESS CREDENTIAL STORAGE
+======================================================================
+
+Add a dedicated secure credential helper, e.g.:
+src/shopsource/theme_access_credentials.py
+
+Windows Credential Manager / keyring only.
+
+Suggested service:
+ShopSourceStudio.ShopifyThemeAccess
+
+Key:
+<store_id>:theme-access-password
+
+Functions:
+- save_theme_access_password
+- get_theme_access_password
+- delete_theme_access_password
+- credential_present
+
+Rules:
+- no SQLite secret
+- no .env write
+- no logs
+- no exception messages containing token
+- no CLI argument containing password
+
+Password must be passed to subprocess ONLY through:
+SHOPIFY_CLI_THEME_TOKEN
+
+Never use:
+--password <secret>
+because process command lines can be inspected.
+
+======================================================================
+5. SHOPIFY CLI CAPABILITY DETECTION
+======================================================================
+
+Add:
+src/shopsource/shopify_theme_cli.py
+
+Detect safely:
+- executable exists
+- version
+- expected minimum capability, without over-hardcoding exact version if feature detection is better
+- Theme Access credential present
+- store domain configured
+- theme ID known
+
+Capability statuses:
+READY
+CLI_NOT_INSTALLED
+CREDENTIAL_MISSING
+STORE_NOT_CONFIGURED
+THEME_ID_MISSING
+AUTH_FAILED
+UNSUPPORTED_CLI
+NETWORK_ERROR
+
+Do not expose token.
+
+For testability, inject subprocess runner.
+
+======================================================================
+6. READ-ONLY FILE PULL
+======================================================================
+
+Implement CLI backend read_file using an isolated temporary Shopify theme directory.
+
+For:
+templates/index.json
+
+Use equivalent behavior to:
+shopify theme pull
+  --store <domain>
+  --theme <theme-id>
+  --only templates/index.json
+  --path <isolated-temp-theme-root>
+
+Credentials:
+SHOPIFY_CLI_THEME_TOKEN in subprocess environment only.
+
+The temp folder must satisfy Shopify theme folder expectations.
+Do not point CLI directly at the source repository.
+
+Return:
+- exact raw content
+- raw SHA256
+- command-safe metadata
+- backend name
+- store/theme identity metadata
+
+Always remove temp folder unless diagnostic retention is explicitly enabled.
+
+======================================================================
+7. WRITE IMPLEMENTATION — CODED BUT LIVE-DISABLED
+======================================================================
+
+Implement write_file for test/mock use and future activation.
+
+Expected CLI behavior:
+shopify theme push
+  --store <domain>
+  --theme <theme-id>
+  --only templates/index.json
+  --path <isolated-temp-theme-root>
+  --nodelete
+  --strict
+  --json
+
+LIVE theme extra gate:
+- require explicit allow_live=True
+- only then append --allow-live
+- require confirmed=True
+- require expected remote precondition hash
+- require exact target file allowlist
+
+Default allowlist:
+templates/index.json only
+
+The method must refuse:
+- sections/*.liquid
+- snippets/*
+- assets/*
+- config/*
+- layout/*
+during Phase A.
+
+This keeps fallback limited to the same safe homepage JSON use case.
+
+Do NOT run write_file against real Shopify in this task.
+Tests must mock subprocess.
+
+======================================================================
+8. PRECONDITION / RACE SAFETY
+======================================================================
+
+CLI backend write must use the same safety model as GraphQL:
+
+Before write:
+1. read_file current remote
+2. compare raw SHA256 against expected_remote_raw_hash
+3. if mismatch -> REMOTE_CHANGED_ABORT
+
+Then:
+4. create isolated temp theme root
+5. write only target file locally
+6. execute push
+7. pull/read target file again
+8. compare exact/semantic expected result
+
+Results:
+PRECONDITION_FAILED
+WRITE_ATTEMPTED
+REMOTE_JSON_VERIFIED
+VERIFY_FAILED
+ROLLBACK_REQUIRED
+ROLLBACK_VERIFIED
+
+Phase A can implement rollback mechanics but must test only with mocks.
+
+======================================================================
+9. EXACT BACKUP CONTRACT
+======================================================================
+
+Transport backend should expose data needed by existing backup layer.
+Do not create a second competing backup system.
+
+If no generic backup structure currently exists:
+create a transport-neutral backup record dataclass only.
+Do not persist production backups in tests.
+
+Important:
+Leading Shopify /* ... */ JSON comments must remain exact through the transport.
+
+======================================================================
+10. BACKEND ROUTER / POLICY
+======================================================================
+
+Add a router, e.g. ThemeWriteBackendRouter.
+
+Selection rules:
+
+AUTO:
+1. If ADMIN_GRAPHQL reports exemption/write_themes active -> ADMIN_GRAPHQL
+2. Else if THEME_ACCESS_CLI is READY -> THEME_ACCESS_CLI
+3. Else -> NO_WRITE_BACKEND
+
+Explicit selections:
+ADMIN_GRAPHQL
+THEME_ACCESS_CLI
+
+Never silently switch AFTER a write failure.
+Backend selection occurs before mutation and is included in preview/confirmation data.
+
+Return reason codes:
+GRAPHQL_EXEMPTION_ACTIVE
+GRAPHQL_SCOPE_MISSING_CLI_READY
+GRAPHQL_DENIED_CLI_READY
+NO_APPROVED_WRITE_PATH
+USER_SELECTED_GRAPHQL
+USER_SELECTED_CLI
+
+No runtime UI integration in Phase A.
+
+======================================================================
+11. DO NOT BYPASS SHOPIFY APPROVAL SEMANTICS
+======================================================================
+
+Important wording / product behavior:
+Theme Access CLI is a merchant/store-owner controlled alternative transport.
+It is NOT described as bypassing Shopify security.
+
+It requires:
+- Theme Access app installed on that store
+- merchant-generated password
+- Themes permission
+- explicit local credential configuration
+
+Keep this distinction in code/docstrings/status messages.
+
+======================================================================
+12. FUTURE THEME APP EXTENSION COMPATIBILITY
+======================================================================
+
+Add a short architecture note:
+docs/THEME_DELIVERY_BACKENDS.md
+
+Describe three lanes:
+
+A. ADMIN_GRAPHQL
+- direct templates/index.json update
+- needs write_themes + exemption
+
+B. THEME_ACCESS_CLI
+- owner-controlled operational fallback
+- good for user's own stores
+- exact single-file push possible
+- requires Theme Access credential
+
+C. THEME_APP_EXTENSION
+- long-term scalable delivery
+- blocks exposed in Theme Editor
+- no direct theme code editing
+- merchant adds/activates app block
+- suitable for Featured Products / Category Shortcuts componentization
+
+Do not implement the Theme App Extension in Phase A.
+
+======================================================================
+13. TESTS
+======================================================================
+
+Add dedicated tests, preferred:
+tests/test_theme_write_backend.py
+tests/test_shopify_theme_cli.py
+tests/test_theme_access_credentials.py
+
+At minimum:
+
+test_cli_backend_password_only_in_env
+test_cli_backend_secret_not_in_command
+test_cli_backend_secret_not_in_logs
+test_cli_read_uses_only_target_file
+test_cli_read_uses_isolated_temp_theme
+test_cli_write_default_refuses_live
+test_cli_write_requires_confirmed
+test_cli_write_requires_expected_remote_hash
+test_cli_write_allows_only_index_json
+test_cli_write_uses_nodelete_strict_json
+test_cli_live_requires_allow_live
+test_cli_precondition_remote_changed_aborts
+test_cli_verify_refetch
+test_cli_comment_prefix_exact_preservation
+test_cli_temp_cleanup
+test_router_prefers_graphql_when_active
+test_router_uses_cli_when_graphql_unavailable_and_cli_ready
+test_router_no_backend_when_both_unavailable
+test_router_does_not_switch_after_write_failure
+test_credentials_keyring_only
+test_no_shopify_live_write
+
+Mock subprocess/network.
+Do not use live Theme Access credential.
+
+======================================================================
+14. PARALLEL MERGE SAFETY
+======================================================================
+
+Because another branch is active:
+Do not modify:
+- src/shopsource/ui/v2.py
+- src/shopsource/category_strategy.py
+- src/shopsource/category_shortcut_readiness.py
+- tests/test_category_strategy.py
+unless absolutely unavoidable.
+
+If unavoidable:
+STOP and report OVERLAP_WITH_ACTIVE_PHASE.
+
+Preferred new files only, plus perhaps a small transport-neutral existing module if truly necessary.
+
+======================================================================
+15. PROTECTED FILES
+======================================================================
+
+Never edit/stage/commit:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env
+- credentials
+- .phase*
+- backups
+- user assets
+
+======================================================================
+16. QUALITY GATES
+======================================================================
+
+python -m compileall -q src tests
+focused fallback backend tests
+python -m pytest -q --basetemp=<worktree-local-writable-temp>
+git diff --check
+python -m shopsource.cli --help
+
+UI help only if imports remain unaffected:
+python -m shopsource.ui.v2 --help
+
+Required:
+FULL SUITE PASS
+SHOPIFY LIVE WRITE COUNT = 0
+
+======================================================================
+17. COMMIT / PUSH
+======================================================================
+
+Stay on:
+phase/theme-write-fallback-backend
+
+Suggested commit:
+git commit -m "Add Theme Access CLI fallback backend"
+
+Push same branch.
+
+Do NOT merge main.
+
+======================================================================
+18. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] baseline SHA
+[2] final SHA
+[3] worktree path
+[4] files changed
+[5] existing architecture found
+[6] backend transport contract
+[7] Theme Access credential storage
+[8] CLI capability detection
+[9] CLI read-file command shape
+[10] CLI write-file safety gates
+[11] precondition verification
+[12] router behavior
+[13] Theme App Extension future lane
+[14] secret-safety tests
+[15] focused tests
+[16] full-suite tests
+[17] protected files
+[18] Shopify live write count
+[19] overlap with reconciliation phase
+[20] merge readiness
+[21] exact next step after reconciliation main merge
+
+Final:
+THEME_BACKEND_ABSTRACTION = READY/NOT_READY
+THEME_ACCESS_CLI_BACKEND = READY/NOT_READY
+SECRET_SAFE = YES/NO
+LIVE_WRITE_DISABLED_BY_DEFAULT = YES/NO
+GRAPHQL_PRIMARY_PRESERVED = YES/NO
+THEME_APP_EXTENSION_PATH_DOCUMENTED = YES/NO
+FULL_SUITE = PASS/FAIL
+SHOPIFY_LIVE_WRITE_COUNT = 0
+PARALLEL_MERGE_SAFE = YES/NO
+CODE_MERGE_READY = YES/NO
