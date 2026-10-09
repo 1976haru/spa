@@ -1,0 +1,355 @@
+ShopSource Studio — STORE MERCHANDISING POLICY LAYER
+CATEGORY SHORTCUTS — FINAL MULTI-STORE MERGE GATE
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: phase/category-shortcuts-prerequisite-readiness
+- Expected baseline: e3c20d0822504f80fa19a25bd41eafed61563da5
+
+WHY THIS TASK EXISTS
+The category-shortcut readiness engine is now store-agnostic and the full suite passes.
+However Cabin Tidy previously excluded replacement/repair/fitment parts through hidden core logic.
+That hidden hardcoding was correctly removed.
+
+The remaining requirement is NOT to re-hardcode automotive logic.
+Instead, ShopSource needs a reusable STORE-SPECIFIC MERCHANDISING POLICY layer that can be explicitly reviewed and approved per store.
+
+This is important for the second real shop and future 100–200 store operation:
+- core engine stays generic,
+- each store can have approved merchandising exclusions,
+- policies survive restarts and are not mixed into protected store JSON,
+- no store-specific rules are silently inferred as final truth.
+
+MISSION
+Add a durable, versioned, approval-gated merchandising policy layer and make category shortcut readiness consume it.
+
+Do NOT edit stores/001_cabin_tidy.json.
+Do NOT hard-code Cabin Tidy, automotive, replacement, fitment, kitchen, pet, etc. in reusable core defaults.
+Do NOT write Shopify.
+Do NOT merge to main in this task.
+
+======================================================================
+1. PERSISTENT POLICY MODEL
+======================================================================
+
+Create an additive local DB model, e.g.:
+
+store_merchandising_policies(
+  policy_id TEXT PRIMARY KEY,
+  store_id TEXT NOT NULL,
+  purpose TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  status TEXT NOT NULL,          -- DRAFT / APPROVED / SUPERSEDED
+  policy_json TEXT NOT NULL,
+  source TEXT NOT NULL,          -- MANUAL / IMPORTED_PROFILE / SUGGESTED
+  created_at TEXT NOT NULL,
+  approved_at TEXT,
+  updated_at TEXT NOT NULL
+)
+
+Recommended purpose:
+CATEGORY_SHORTCUTS
+
+policy_json may contain:
+{
+  "exclude_keywords": [...],
+  "exclude_phrases": [...],
+  "exclude_title_patterns": [...],
+  "exclude_decision_statuses": [...],
+  "notes": "..."
+}
+
+Requirements:
+- additive/idempotent migration
+- latest APPROVED policy is active
+- draft never changes eligibility
+- explicit approval required
+- immutable history: approving a new version supersedes prior approved version
+- no credentials/secrets
+- no sentinel IDs
+
+======================================================================
+2. POLICY SERVICE
+======================================================================
+
+Add a focused service, e.g.:
+StoreMerchandisingPolicyService
+
+Methods:
+- latest(store_id, purpose, include_draft=False)
+- create_draft(store_id, purpose, policy, source)
+- approve(policy_id, confirmed=True)
+- supersede(...)
+- effective_policy(store_id, purpose)
+
+Validation:
+- normalize strings
+- dedupe case-insensitively
+- reject empty patterns
+- cap list sizes reasonably
+- compile/validate regex patterns safely
+- reject pathological/invalid regex
+- never execute arbitrary code
+
+No store-specific default rules in the service.
+
+======================================================================
+3. CATEGORY READINESS POLICY PRECEDENCE
+======================================================================
+
+CategoryShortcutReadinessService eligibility should use:
+
+A. upstream product evidence:
+- ACTIVE
+- storefront eligible
+- remotely verified
+- existing ShopSource decision/risk state
+
+B. existing Store Profile exclusions:
+- exclude_keywords
+- merchandising_exclusions
+- category_shortcut_exclude_keywords
+- risk rules according to existing conservative logic
+
+C. latest APPROVED CATEGORY_SHORTCUTS merchandising policy
+
+DRAFT policy must not affect counts.
+
+Expose:
+- active_policy_id
+- active_policy_version
+- policy_source
+- excluded_by_policy_count
+
+Do not duplicate hidden domain rules in code.
+
+======================================================================
+4. POLICY MATCHING SEMANTICS
+======================================================================
+
+Support:
+- exclude_keywords: token/substring semantics documented
+- exclude_phrases: normalized phrase containment
+- exclude_title_patterns: title-only validated regex
+- exclude_decision_statuses: explicit statuses
+
+Matching must be deterministic.
+
+Return exclusion reasons for diagnostics, e.g.:
+MERCH_POLICY_KEYWORD:<term>
+MERCH_POLICY_PHRASE:<phrase>
+MERCH_POLICY_PATTERN:<index>
+MERCH_POLICY_DECISION_STATUS:<status>
+
+Do not expose raw regex errors to beginner UI.
+
+======================================================================
+5. CABIN TIDY — NO AUTO-APPROVAL
+======================================================================
+
+Do NOT hard-code Cabin Tidy policy values in production code.
+
+For Cabin Tidy runtime:
+- if no approved CATEGORY_SHORTCUTS policy exists, UI should show:
+  "Merchandising policy: REVIEW REQUIRED"
+- allow the user to create/review a draft policy
+- do not automatically infer/approve prior repair/fitment behavior
+
+For tests ONLY, a Cabin-Tidy-like fixture may use example approved rules such as replacement/repair/fitment to prove that store-specific policy restores intended exclusion behavior.
+
+Actual user approval will happen after this code is merged/reviewed.
+
+======================================================================
+6. UI — REUSABLE POLICY REVIEW
+======================================================================
+
+On Homepage Automation category readiness panel add:
+
+Merchandising policy:
+- NONE / DRAFT / APPROVED vN
+- excluded products count
+
+Buttons:
+[머천다이징 정책 보기]
+[정책 초안 만들기]
+[정책 승인]
+
+Policy dialog:
+- purpose
+- current store
+- exclude keywords
+- exclude phrases
+- optional advanced title patterns
+- decision statuses
+- preview: "이 정책을 적용하면 N개 상품이 제외됩니다."
+- sample excluded products (bounded list, title only)
+- confirmation checkbox before approve
+
+No Shopify write.
+
+The UI must work for any selected store.
+
+======================================================================
+7. POLICY DRAFT SUGGESTION — CONSERVATIVE
+======================================================================
+
+Optional but useful:
+Provide a "suggest draft" function based only on existing store data:
+- current Store Profile explicit exclusions/risk terms
+- prior manual product decision reasons/statuses if present
+- existing collection plan warnings/exclusions
+
+It may PRE-FILL a DRAFT.
+It must NOT invent a domain-specific policy from model/code constants.
+It must never auto-approve.
+
+If evidence is insufficient, create an empty draft and require user input.
+
+======================================================================
+8. CABIN TIDY READINESS REGRESSION TEST
+======================================================================
+
+Use fixtures, not production hardcoding.
+
+Test:
+- Cabin-Tidy-like store + approved policy with replacement/fitment terms
+- affected products excluded
+- category counts match intended curated behavior
+- DRAFT version alone does not exclude
+- superseded approved policy no longer active
+- active approved policy ID/version is reported
+
+Do not assert exact real-production counts unless fixture data supports them.
+
+======================================================================
+9. SECOND-STORE PORTABILITY TEST
+======================================================================
+
+Use a non-automotive fixture:
+- separate store
+- different policy or no policy
+- no automotive exclusions leak across stores
+- policy for store A never affects store B
+- same category readiness engine works unchanged
+
+Add store-switch isolation tests.
+
+======================================================================
+10. MERGE-READINESS DISTINCTION
+======================================================================
+
+After this task distinguish:
+
+CODE MERGE READY
+- architecture generic
+- tests pass
+- policy layer exists
+
+CABIN TIDY DATA READY
+- actual store has an APPROVED merchandising policy if needed
+- live collection mappings/images/theme schema may still be pending
+
+Do NOT block code merge merely because Cabin Tidy runtime data is incomplete.
+Do block merge for architecture/test regressions.
+
+This distinction is important.
+
+======================================================================
+11. TESTS
+======================================================================
+
+Add at minimum:
+
+test_policy_draft_does_not_affect_readiness
+test_approved_policy_affects_only_its_store
+test_policy_version_supersedes_previous
+test_policy_keywords_phrases_patterns_normalized
+test_invalid_regex_rejected
+test_policy_exclusion_reasons_reported
+test_policy_preview_count_and_samples
+test_cabin_tidy_like_fixture_policy_restores_repair_exclusion
+test_non_automotive_store_not_affected
+test_store_switch_policy_isolation
+test_no_shopify_write
+
+Run existing category readiness, homepage Golden Path, collection planner, second-store portability tests.
+
+Full suite with repo-local writable TEMP/TMP/TMPDIR.
+
+======================================================================
+12. PROTECTED FILES
+======================================================================
+
+Do not edit/stage/commit:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env / credentials
+- .phase*
+- theme backups
+- user assets
+- .test_tmp
+
+======================================================================
+13. QUALITY GATES
+======================================================================
+
+python -m compileall -q src tests
+focused policy/category tests
+homepage Golden Path tests
+python -m pytest -q  (with writable repo-local TEMP/TMP/TMPDIR)
+git diff --check
+$env:PYTHONPATH=(Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Required:
+FULL SUITE PASS
+NO REAL SHOPIFY WRITE
+
+======================================================================
+14. COMMIT / PUSH
+======================================================================
+
+Stay on:
+phase/category-shortcuts-prerequisite-readiness
+
+Suggested commit:
+git commit -m "Add per-store merchandising policy layer"
+
+Push same branch.
+Do NOT merge to main.
+
+======================================================================
+15. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] policy DB/version model
+[5] policy service/validation
+[6] category readiness integration
+[7] UI review/approval flow
+[8] draft suggestion behavior
+[9] Cabin-Tidy-like regression fixture
+[10] non-automotive/store isolation result
+[11] full-suite pass count
+[12] protected files
+[13] Shopify write count
+[14] code merge readiness
+[15] Cabin Tidy data readiness
+[16] branch/push
+[17] exact next action
+
+Final:
+MERCHANDISING POLICY LAYER = READY/NOT_READY
+CORE STORE-AGNOSTIC = YES/NO
+SECOND-STORE POLICY ISOLATION = PASS/FAIL
+FULL SUITE = PASS/FAIL
+SHOPIFY WRITE COUNT = 0
+CODE MERGE READY = YES/NO
+CABIN TIDY DATA READY = YES/NO
