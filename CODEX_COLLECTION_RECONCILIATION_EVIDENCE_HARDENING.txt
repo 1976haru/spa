@@ -1,0 +1,300 @@
+ShopSource Studio — EXISTING COLLECTION RECONCILIATION EVIDENCE HARDENING
+COUNT / MEMBERSHIP SAFETY BEFORE ADOPTION
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: phase/collection-reconciliation-evidence-hardening
+- Branch base: 994da9b99c9666b16665035440e67d30e9330684
+
+Why this task exists
+After the category strategy feature was merged, Cabin Tidy produced:
+- intended Trunk Organizers strategy match count: 84
+- existing remote Shopify collection "trunk-organizers": 372 products
+- reconciliation status: HIGH_CONFIDENCE_CANDIDATE
+
+Review of the merged implementation found a concrete safety defect:
+ExistingCollectionReconciliationService.propose() currently treats product-count evidence as merely:
+  sane_count = isinstance(count, int) and count > 0
+It does NOT compare the remote collection count/content with the intended local category membership.
+
+Therefore a semantically over-broad remote collection can be classified HIGH_CONFIDENCE based mostly on normalized title equality, even when its membership differs drastically from the intended category.
+
+This is a reusable multi-store safety issue and must be fixed before any existing collection adoption.
+
+Mission
+Make collection reconciliation evidence-based enough that an existing remote collection is never recommended for adoption solely because its title/handle looks right while its contents are materially wrong.
+
+No Shopify writes.
+No category strategy approval.
+No collection adoption.
+No main merge in this task.
+
+======================================================================
+1. SEPARATE IDENTITY CONFIDENCE FROM CONTENT COMPATIBILITY
+======================================================================
+
+Refactor reconciliation output so it reports two separate dimensions:
+
+identity_status:
+- EXACT_ID
+- EXACT_HANDLE
+- TITLE_MATCH
+- SIMILAR_HANDLE
+- AMBIGUOUS
+- NO_MATCH
+
+content_status:
+- VERIFIED_COMPATIBLE
+- VERIFIED_OVERBROAD
+- VERIFIED_UNDERCOVERED
+- COUNT_MISMATCH
+- UNKNOWN
+
+Keep existing top-level statuses for compatibility where practical:
+- EXACT_MATCH
+- HIGH_CONFIDENCE_CANDIDATE
+- AMBIGUOUS
+- NO_MATCH
+- CONFLICT
+
+But top-level HIGH_CONFIDENCE_CANDIDATE must require BOTH:
+- strong enough identity evidence
+- compatible content evidence
+
+A large count/content mismatch must NOT remain HIGH_CONFIDENCE.
+
+======================================================================
+2. EXPECTED LOCAL MEMBERSHIP EVIDENCE
+======================================================================
+
+Reconciliation local input should accept:
+- expected_product_count
+- expected_product_ids and/or expected_product_handles when available
+- source strategy ID/version
+- collection_key/title/handle
+
+Wire this from Category Strategy / readiness so the reconciler can use the actual matched eligible product identities.
+
+Do not expose secret data.
+
+======================================================================
+3. READ-ONLY REMOTE COLLECTION MEMBERSHIP AUDIT
+======================================================================
+
+Add a bounded read-only Shopify collection membership fetch path.
+
+Use Shopify GraphQL read only.
+No writes.
+
+For a specific candidate collection ID:
+- fetch collection identity
+- productsCount
+- product IDs + handles, paginated as needed within a safe cap
+- if collection has > safe cap, make status PARTIAL/UNKNOWN rather than pretending complete
+
+Prefer enough evidence to evaluate Cabin Tidy's 372-product collection against the 84 intended products.
+A cap of 500 is acceptable for this store, with pagination.
+
+Persist only normal local read-only snapshot/evidence if useful.
+
+No Shopify mutation.
+
+======================================================================
+4. CONTENT COMPATIBILITY METRICS
+======================================================================
+
+When full membership is known, compute:
+- expected_count
+- remote_count
+- count_ratio
+- intersection_count
+- precision = intersection / remote
+- recall = intersection / expected
+- jaccard = intersection / union
+
+Return metrics in proposal.
+
+Suggested conservative defaults:
+- VERIFIED_COMPATIBLE only when:
+  recall >= 0.80
+  AND precision >= 0.70
+  AND count ratio is not extreme
+- VERIFIED_OVERBROAD when recall is acceptable but precision < 0.70
+- VERIFIED_UNDERCOVERED when precision is acceptable but recall < 0.80
+- COUNT_MISMATCH when full membership unavailable but remote/expected ratio is materially large, e.g. > 1.75x or < 0.57x
+- UNKNOWN when evidence insufficient
+
+Do not hardcode domain-specific thresholds by store.
+Constants may be generic and documented.
+
+======================================================================
+5. ADOPTION SAFETY GATE
+======================================================================
+
+ExistingCollectionReconciliationService.adopt() may proceed only when:
+- identity is unambiguous
+- content_status == VERIFIED_COMPATIBLE
+- confirmed=True
+
+If content_status is:
+- VERIFIED_OVERBROAD
+- VERIFIED_UNDERCOVERED
+- COUNT_MISMATCH
+- UNKNOWN
+
+then normal adopt() must reject.
+
+If a future explicit override is ever supported, it must be a separate method/flag with an additional stronger confirmation and reason; DO NOT add override in this task.
+
+This prevents accidental linking of a wrong collection.
+
+======================================================================
+6. CABIN TIDY EXPECTED RESULT
+======================================================================
+
+Re-evaluate:
+- local Trunk Organizers expected = 84
+- remote trunk-organizers = 372
+
+Do NOT force expected outcome, but likely:
+- identity_status = TITLE_MATCH or similar
+- content_status = COUNT_MISMATCH / VERIFIED_OVERBROAD
+- top-level status = CONFLICT
+- user_confirmation_required = false for normal adoption
+- adoption blocked
+
+If membership overlap proves surprisingly compatible, report the actual metrics and classify accordingly.
+
+The program must prefer creating the curated new collection rather than reusing a materially over-broad existing one.
+
+======================================================================
+7. UI
+======================================================================
+
+In existing collection candidate UI show:
+- identity status
+- content status
+- expected vs remote counts
+- precision/recall/Jaccard when available
+- warning for over-broad/under-covered/count mismatch
+
+"기존 컬렉션 연결" button must be disabled unless proposal is adoption-safe.
+
+For Cabin Tidy, if unsafe:
+show:
+"기존 trunk-organizers는 이름은 유사하지만 현재 카테고리 전략과 상품 구성이 일치하지 않아 자동 연결할 수 없습니다."
+
+======================================================================
+8. COLLECTION DRY-RUN INTERACTION
+======================================================================
+
+If existing remote collection is not adoption-safe:
+- dry-run should show CREATE for the curated strategy collection
+  instead of REUSE_CANDIDATE
+
+Do not write it.
+
+For Cabin Tidy expected likely:
+- Trunk Organizers: CREATE
+- Seat & Backseat Organizers: CREATE
+- Trash & Cleanup: CREATE
+- Cup Holders: CREATE
+
+Actual result must follow evidence.
+
+======================================================================
+9. TESTS
+======================================================================
+
+Add at minimum:
+
+test_reconciliation_large_count_mismatch_not_high_confidence
+test_reconciliation_membership_metrics_compatible
+test_reconciliation_overbroad_blocks_adoption
+test_reconciliation_undercovered_blocks_adoption
+test_reconciliation_unknown_content_blocks_adoption
+test_adopt_requires_verified_compatible_content
+test_exact_handle_does_not_bypass_content_mismatch
+test_membership_snapshot_pagination_read_only
+test_store_isolation_membership_evidence
+test_dry_run_uses_create_when_reuse_candidate_is_content_unsafe
+test_cabin_tidy_like_84_vs_372_blocks_reuse
+test_second_store_compatible_existing_collection_can_reuse
+test_no_shopify_write
+
+Update older tests that assumed title equality + positive count was enough for HIGH_CONFIDENCE.
+
+======================================================================
+10. PROTECTED FILES
+======================================================================
+
+Do not edit/stage/commit:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env / credentials
+- .phase*
+- backups
+- user assets
+- temp dirs
+
+======================================================================
+11. QUALITY GATES
+======================================================================
+
+python -m compileall -q src tests
+focused reconciliation/category tests
+python -m pytest -q --basetemp=<repo-local-writable-temp>
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Required:
+FULL SUITE PASS
+SHOPIFY WRITE COUNT = 0
+
+======================================================================
+12. COMMIT / PUSH
+======================================================================
+
+Stay on:
+phase/collection-reconciliation-evidence-hardening
+
+Suggested commit:
+git commit -m "Harden existing collection reconciliation evidence"
+
+Push same branch.
+Do not merge main.
+
+======================================================================
+13. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] root cause fixed
+[5] identity vs content model
+[6] remote membership read path
+[7] compatibility metrics
+[8] adoption safety gate
+[9] Cabin Tidy Trunk result
+[10] category dry-run result
+[11] second-store portability
+[12] focused tests
+[13] full-suite result
+[14] protected files
+[15] Shopify write count
+[16] branch/push
+[17] exact next action
+
+Final:
+RECONCILIATION_CONTENT_EVIDENCE = READY/NOT_READY
+CABIN_TIDY_TRUNK_REUSE_SAFE = YES/NO
+ADOPTION_GATE = SAFE/UNSAFE
+FULL_SUITE = PASS/FAIL
+SHOPIFY_WRITE_COUNT = 0
+CODE_MERGE_READY = YES/NO
