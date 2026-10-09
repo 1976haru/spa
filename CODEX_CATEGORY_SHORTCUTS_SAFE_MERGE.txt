@@ -1,0 +1,213 @@
+ShopSource Studio — CATEGORY SHORTCUTS SAFE FAST-FORWARD MERGE
+MULTI-WINDOW / MULTI-BRANCH SAFETY GATE
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Feature branch: phase/category-shortcuts-prerequisite-readiness
+- Expected feature HEAD before this prompt: 2e0777bfa9404790c0c7f33945080fd37ae1f1f9
+- Current verified main base: 3d0634d3427ef522cfc5d0692a7bd9a63874a279
+
+Context
+This repository is being worked on from TWO active ChatGPT/Codex workflows.
+Therefore the merge must be lease-like and must never overwrite concurrent work.
+
+The category-shortcut branch has:
+- store-agnostic category readiness
+- correct remote collection productsCount semantics
+- publication IDs separated from product counts
+- per-store merchandising policy layer
+- second-store isolation tests
+- full suite PASS
+- no Shopify/theme writes
+
+Goal
+Merge ONLY this feature branch into main, preferably by fast-forward, while preserving local protected dirty files and detecting any concurrent movement of main.
+
+DO NOT modify Shopify.
+DO NOT approve any Cabin Tidy merchandising policy in this task.
+DO NOT clean/reset protected local files.
+
+======================================================================
+1. PRE-MERGE SAFETY
+======================================================================
+
+Fetch origin.
+
+Record:
+- local main SHA
+- origin/main SHA
+- local feature SHA
+- origin/feature SHA
+- merge-base main feature
+- ahead/behind main...feature
+- git status --short
+
+Expected relationship at the time this prompt was prepared:
+main should be an ancestor of the feature branch and feature should be ahead only.
+
+If origin/main has moved from the expected base or the feature branch has diverged:
+STOP.
+Do NOT merge.
+Report CONCURRENT_MAIN_MOVEMENT or BRANCH_DIVERGED.
+
+Do not attempt automatic conflict resolution in that case.
+
+======================================================================
+2. PROTECTED DIRTY FILES
+======================================================================
+
+Before merge, record status and SHA256 where present for:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+
+Also preserve:
+- data/*.sqlite3
+- .env / credentials
+- .phase*
+- user assets
+- backups
+
+Do NOT stage, stash, reset, checkout, restore, or edit these protected files.
+
+The merge must not require touching them.
+
+======================================================================
+3. REVIEW DIFF SCOPE
+======================================================================
+
+Confirm feature branch changes are limited to the intended code/tests/prompt files.
+
+Expected implementation scope includes:
+- src/shopsource/category_shortcut_readiness.py
+- src/shopsource/merchandising_policy.py
+- src/shopsource/ui/v2.py
+- tests/test_category_shortcut_readiness.py
+- tests/test_merchandising_policy.py
+- diagnostic/prompt txt files from this phase
+
+If unexpected production/store/credential files appear:
+STOP.
+
+======================================================================
+4. PRE-MERGE TEST GATE
+======================================================================
+
+On the feature branch, using repo-local writable TEMP/TMP/TMPDIR:
+
+python -m compileall -q src tests
+focused category/policy/homepage tests
+python -m pytest -q
+git diff --check
+$env:PYTHONPATH=(Resolve-Path src).Path
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Required:
+FULL SUITE PASS
+
+No Shopify calls are needed.
+
+======================================================================
+5. FAST-FORWARD MERGE ONLY
+======================================================================
+
+Switch to main without disturbing protected dirty files.
+
+Update local main to origin/main only if this is a safe fast-forward and origin/main still equals the preflight expected remote head.
+
+Then merge:
+git merge --ff-only phase/category-shortcuts-prerequisite-readiness
+
+If --ff-only fails:
+STOP.
+Do not create a merge commit.
+Do not resolve conflicts.
+
+======================================================================
+6. POST-MERGE TEST
+======================================================================
+
+On main after fast-forward:
+- rerun focused policy/category/homepage tests
+- run full suite with repo-local TEMP/TMP/TMPDIR
+- compileall
+- git diff --check
+- CLI/UI help
+
+Verify protected dirty file hashes/status are unchanged from pre-merge.
+
+======================================================================
+7. PUSH MAIN WITH CONCURRENCY CHECK
+======================================================================
+
+Immediately before pushing:
+git fetch origin
+verify origin/main is still the exact pre-merge remote main SHA.
+
+If origin/main moved:
+STOP BEFORE PUSH.
+Do not force push.
+Report REMOTE_MAIN_MOVED_AFTER_LOCAL_MERGE and leave local main ahead for manual reconciliation.
+
+If unchanged:
+git push origin main
+
+Never force push.
+
+======================================================================
+8. FINAL REMOTE VERIFICATION
+======================================================================
+
+After push:
+git fetch origin
+verify:
+- main SHA == origin/main SHA
+- git rev-list --left-right --count main...origin/main => 0 0
+- feature branch remains intact
+- protected dirty file status/hash unchanged
+- Shopify write count = 0
+
+======================================================================
+9. IMPORTANT MULTI-WINDOW HANDOFF
+======================================================================
+
+Because another active workflow is preparing the second real shop:
+Do not delete the feature branch.
+Do not rewrite main history.
+
+Final report must include:
+SECOND_WINDOW_HANDOFF_MAIN_SHA = <new main SHA>
+
+The other workflow must fetch/pull/rebase from this exact main SHA before its next merge to main.
+
+======================================================================
+10. COMPLETION REPORT
+======================================================================
+
+Report exactly:
+
+[1] pre-merge origin/main SHA
+[2] feature HEAD SHA
+[3] merge-base
+[4] ahead/behind
+[5] protected file pre-merge status/hashes
+[6] pre-merge tests
+[7] merge method
+[8] new local main SHA
+[9] post-merge tests
+[10] push result
+[11] final origin/main SHA
+[12] main...origin/main count
+[13] protected file post-merge status/hashes
+[14] Shopify write count
+[15] second-window handoff main SHA
+[16] exact next action
+
+Final flags:
+FAST_FORWARD_ONLY = PASS/FAIL
+FULL_SUITE_POST_MERGE = PASS/FAIL
+PROTECTED_FILES_UNCHANGED = YES/NO
+SHOPIFY_WRITE_COUNT = 0
+MAIN_REMOTE_SYNC = YES/NO
+SECOND_WINDOW_HANDOFF_REQUIRED = YES
