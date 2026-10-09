@@ -1,0 +1,380 @@
+ShopSource Studio — SHOPIFY EXEMPTION GATE + HOMEPAGE CONDITIONAL COMPLETION
+READ-FIRST, WRITE-ONLY-IF-ACTIVE
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Branch: phase/shopify-exemption-homepage-gate
+- Branch base / current main handoff SHA: 86a31edc56dfd6411c88f829e5a102f3c7e48dd3
+
+User intent
+- Check whether Shopify protected Asset/Theme file access is actually active for ShopSource Production.
+- If it IS active, continue the remaining homepage work safely.
+- If it is NOT active, stop without any Shopify writes.
+
+Critical context
+- App: ShopSource Production
+- Expected requested scopes include:
+  read_products
+  read_publications
+  read_themes
+  write_products
+  write_publications
+  write_themes
+- Previous granted scopes did NOT include write_themes.
+- Protected Asset API exemption request was submitted.
+- A prior legacy featured-products section ID exists in MAIN theme:
+  ss_featured_products_e193a01e
+- Correct managed featured ID must be alphanumeric only; previously computed:
+  ssfeaturedproductsb530645c3492
+- Use only the isolated featured-products apply path.
+- NEVER use full-homepage apply for this run.
+- Category shortcuts are NOT yet ready for theme apply.
+
+Protected local files
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env / credentials
+- .phase*
+- backups
+Do not stage/reset/restore/edit them unless runtime DB reads are needed by the app.
+
+======================================================================
+STAGE 0 — REPO / MAIN HANDOFF SAFETY
+======================================================================
+
+Fetch origin.
+
+Verify:
+- origin/main == 86a31edc56dfd6411c88f829e5a102f3c7e48dd3
+  OR, if main has legitimately moved, STOP and report CONCURRENT_MAIN_MOVEMENT.
+- this phase branch is based on that main SHA.
+- git status --short
+- protected dirty files remain untouched.
+
+Do not merge to main in this task.
+
+======================================================================
+STAGE 1 — SHOPIFY APPROVAL / ACCESS READ-ONLY CHECK
+======================================================================
+
+Use the existing ShopSource Shopify auth/verification code.
+Do not invent a new auth path.
+
+Read only:
+1. currentAppInstallation.accessScopes
+2. authenticated app identity
+3. shop identity/domain
+4. MAIN theme identity
+5. ability to READ templates/index.json
+6. collection read query
+
+Report:
+- APP_IDENTITY = expected ShopSource Production YES/NO
+- TOKEN_VALID = YES/NO
+- GRANTED_SCOPES = [...]
+- WRITE_THEMES_GRANTED = YES/NO
+- MAIN_THEME_READ = PASS/FAIL
+- COLLECTION_READ = PASS/FAIL
+
+Approval gate:
+
+If write_themes is NOT in granted scopes:
+  EXEMPTION_GATE = NOT_ACTIVE
+  SHOPIFY_WRITE_COUNT = 0
+  STOP ENTIRE TASK.
+  Do not attempt themeFilesUpsert.
+
+If write_themes IS granted:
+  EXEMPTION_GATE = SCOPE_GRANTED
+  continue.
+
+Important:
+write_themes being granted is necessary but the protected exemption may still fail on actual themeFilesUpsert.
+Therefore the final proof will be the intended isolated featured-products apply in Stage 3.
+
+======================================================================
+STAGE 2 — FRESH FEATURED-PRODUCT PREVIEW
+======================================================================
+
+For Store 001 Cabin Tidy only:
+
+Use the current main implementation.
+Do not patch code.
+
+Resolve fresh homepage prerequisites READ-ONLY and build a fresh Featured Products preview.
+
+Expected selected products are the existing four real ACTIVE products if still valid:
+- gid://shopify/Product/15276412207353
+- gid://shopify/Product/15276420759801
+- gid://shopify/Product/15276419776761
+- gid://shopify/Product/15276418662649
+
+Do not force those IDs if they are no longer valid.
+Revalidate:
+- ACTIVE
+- storefront eligible
+- current handle/title
+- 4/4 plan READY
+
+Read MAIN templates/index.json with the comment-aware parser.
+
+Verify:
+- leading Shopify comment is preserved
+- legacy ShopSource featured section recognition works
+- intended migration is ONLY:
+  delete known legacy invalid ID if present
+  insert/update new alphanumeric managed featured section
+  adjust order accordingly
+- no hero/category/unrelated merchant sections changed
+
+Produce semantic diff.
+
+Required:
+FEATURED_PREVIEW = PREVIEW
+FEATURED_DIFF_SCOPE = ISOLATED
+UNRELATED_SECTION_CHANGES = 0
+
+If any unrelated diff exists:
+STOP.
+Do not write.
+
+======================================================================
+STAGE 3 — ACTUAL EXEMPTION PROOF VIA INTENDED ISOLATED APPLY
+======================================================================
+
+The user has asked to proceed with the remaining process if approval is active.
+This stage is the one intended homepage write.
+
+Use ONLY:
+FeaturedProductThemeApplyService / existing isolated featured apply service.
+
+Do NOT:
+- call the bottom/full-homepage apply
+- use ad hoc raw GraphQL mutations outside the service
+- update hero
+- update category shortcuts
+- write other theme files
+
+Required safety:
+- exact raw backup of templates/index.json before write
+- precondition raw/semantic hash check
+- one-file mutation only
+- expected semantic diff guard
+- read-after-write verification
+- rollback on verification failure where a write actually occurred
+
+If themeFilesUpsert returns ACCESS_DENIED / protected scope error:
+- set EXEMPTION_GATE = NOT_ACTIVE_AT_API
+- confirm no verified mutation occurred
+- STOP further Shopify writes
+- report that the exemption is still not active even if write_themes appeared in scopes
+
+If apply succeeds:
+- result must be REMOTE_JSON_VERIFIED
+- verify legacy invalid managed section removed if it existed
+- verify new managed alphanumeric section present
+- verify 4 products in intended order
+- verify raw comment/prefix preservation
+- verify only templates/index.json changed
+- record backup ID/path
+
+Then:
+EXEMPTION_GATE = ACTIVE_CONFIRMED
+FEATURED_REMOTE_JSON = VERIFIED
+
+Do NOT claim storefront rendering is verified yet.
+
+======================================================================
+STAGE 4 — CATEGORY SHORTCUTS READ-ONLY READINESS REFRESH
+======================================================================
+
+After Stage 3 succeeds, continue with category work READ-ONLY only.
+
+Run:
+- collection remote snapshot refresh
+- MAIN theme schema read/discovery
+- category readiness package rebuild
+- merchandising policy status read
+
+Report the currently selected four categories from real store data.
+
+Expected historical candidates were:
+- Seat & Backseat
+- Trash & Cleanup
+- Trunk & Cargo
+- Cup Holder & Convenience
+
+But do not force them if current store data selects something else.
+
+Report per category:
+- title
+- candidate_source
+- eligible product_count
+- collection_key
+- verified remote collection ID
+- verified handle
+- remote productsCount
+- publication status
+- mapping status
+- image status
+
+Also report:
+- MERCH_POLICY_STATUS = REVIEW_REQUIRED / DRAFT / APPROVED
+- CATEGORY_MAPPING_READY = x/4
+- CATEGORY_IMAGES_READY = x/4
+- CATEGORY_THEME_SCHEMA = READY / CATEGORY_SCHEMA_NOT_FOUND / WAITING
+- CATEGORY_PREVIEW_ENABLED = YES/NO
+
+No category theme write.
+
+======================================================================
+STAGE 5 — MERCHANDISING POLICY DRAFT PREVIEW ONLY
+======================================================================
+
+If Cabin Tidy has no APPROVED CATEGORY_SHORTCUTS merchandising policy:
+
+Use the new reusable policy service.
+
+Create or reuse a DRAFT ONLY.
+Do not auto-approve.
+
+Draft suggestion must come from explicit existing store evidence where possible.
+Because prior hidden repair/fitment logic existed historically but is no longer a core default:
+- do not silently reintroduce it
+- if you prepare a suggested manual draft for review, label it clearly as HISTORICAL_BEHAVIOR_REVIEW, not approved truth
+
+Produce preview:
+- policy ID/version
+- proposed exclude keywords/phrases/patterns/statuses
+- excluded product count
+- up to 15 sample excluded product titles
+- before/after category counts
+
+If there is insufficient explicit evidence, an empty draft is acceptable.
+
+Set:
+MERCH_POLICY_USER_APPROVAL_REQUIRED = YES
+
+Do not approve in this task.
+
+======================================================================
+STAGE 6 — COLLECTION CREATION / UPDATE DRY-RUN ONLY
+======================================================================
+
+If any selected category has mapping_status != READY:
+
+Use existing collection publisher DRY-RUN only.
+
+For each category report:
+- CREATE / UPDATE / NO CHANGE / CONFLICT / SKIP
+- proposed handle
+- current remote collection if any
+- intended inclusion conditions
+- estimated local matched product count
+- actual remote productsCount if available
+
+Do NOT create/update/publish collections in this task.
+Do NOT upload images.
+
+Set:
+COLLECTION_WRITE_USER_APPROVAL_REQUIRED = YES if any CREATE/UPDATE is proposed.
+
+======================================================================
+STAGE 7 — CATEGORY IMAGE PLAN ONLY
+======================================================================
+
+For each selected category:
+- first look for approved reusable local/Shopify asset
+- then look for safe existing collection/product imagery that architecture allows to reuse
+- otherwise output prompt-only image plan
+
+Do NOT call paid image APIs.
+Do NOT upload files.
+Do NOT mark image READY unless actual approved/validated asset exists.
+
+Report exact next image action per category.
+
+======================================================================
+STAGE 8 — HUMAN STOREFRONT CHECK FOR FEATURED PRODUCTS
+======================================================================
+
+If Stage 3 succeeded:
+
+Because public storefront may be password-protected, do not fake automated storefront verification.
+
+Output the exact human checklist:
+1. Desktop homepage shows "New Arrivals"
+2. exactly 4 product cards
+3. each card opens the correct product detail page
+4. mobile homepage shows the section correctly
+5. no duplicate/blank/legacy broken section
+
+If the existing app supports "과제 제출용 확인", prepare that state but do not claim completion until human confirmation.
+
+Set:
+FEATURED_STOREFRONT_VERIFICATION = HUMAN_REQUIRED
+
+======================================================================
+STAGE 9 — NO CODE PATCHING UNLESS A NEW ROOT-CAUSE BUG IS PROVEN
+======================================================================
+
+This is an operational verification/completion run.
+
+Do NOT patch code merely because:
+- approval is pending
+- network is unavailable
+- collection mappings are missing
+- images are missing
+- user approval is needed
+
+Only propose a code patch if a new reproducible program defect is found.
+If a new defect is found:
+- stop before code changes
+- report root cause
+- propose a separate phase prompt
+
+======================================================================
+STAGE 10 — FINAL REPORT
+======================================================================
+
+Report exactly:
+
+[1] branch/base/main safety
+[2] Shopify app identity
+[3] granted scopes
+[4] WRITE_THEMES_GRANTED
+[5] EXEMPTION_GATE
+[6] MAIN theme read status
+[7] featured fresh preview status
+[8] featured isolated diff summary
+[9] featured apply result
+[10] backup / verification / rollback status
+[11] legacy featured ID migration result
+[12] category selected four
+[13] category remote mapping readiness
+[14] category image readiness
+[15] category theme schema result
+[16] merchandising policy status + draft preview
+[17] collection dry-run result
+[18] category image plan
+[19] human storefront checklist
+[20] Shopify write count
+[21] protected files
+[22] exact next USER action
+[23] exact next CODE action, if any
+
+Final flags:
+WRITE_THEMES_GRANTED = YES/NO
+EXEMPTION_GATE = NOT_ACTIVE / NOT_ACTIVE_AT_API / ACTIVE_CONFIRMED
+FEATURED_REMOTE_JSON_VERIFIED = YES/NO
+FEATURED_STOREFRONT_VERIFIED = NO
+CATEGORY_MAPPING_READY = x/4
+CATEGORY_IMAGES_READY = x/4
+CATEGORY_THEME_SCHEMA = READY/NOT_READY/WAITING
+MERCH_POLICY_USER_APPROVAL_REQUIRED = YES/NO
+COLLECTION_WRITE_USER_APPROVAL_REQUIRED = YES/NO
+SHOPIFY_WRITE_COUNT = <integer>
+CODE_CHANGE_COUNT = 0
+SAFE_TO_CONTINUE = YES/NO
