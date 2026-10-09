@@ -1983,11 +1983,111 @@ class OperatorUI:
                 ui.label("Category shortcuts · local readiness only").classes("font-semibold")
                 category_readiness_summary = ui.label("Not checked · Shopify theme write: NOT RUN").classes("ss-help")
                 category_readiness_detail = ui.label("Product distribution and actual mappings have not been checked.").classes("ss-help")
+                merchandising_policy_status = ui.label("Merchandising policy: REVIEW REQUIRED").classes("ss-help")
                 category_buttons = ui.row().classes("flex-wrap gap-2")
                 with ui.dialog() as category_review_dialog, ui.card().classes("w-[min(900px,95vw)] max-h-[85vh] overflow-auto"):
                     ui.label("Selected category shortcuts (local evidence)").classes("text-xl font-bold")
                     category_review_rows = ui.column().classes("w-full gap-2")
                     ui.button("Close", on_click=category_review_dialog.close).props("outline")
+                with ui.dialog() as merchandising_policy_dialog, ui.card().classes("w-[min(850px,95vw)] max-h-[85vh] overflow-auto"):
+                    ui.label("Store merchandising policy review (local only)").classes("text-xl font-bold")
+                    ui.label(f"Purpose: CATEGORY_SHORTCUTS · Store: {self.current_store}").classes("ss-help")
+                    policy_keywords_input = ui.textarea("Exclude keywords (one per line; case-insensitive substring)").classes("w-full")
+                    policy_phrases_input = ui.textarea("Exclude phrases (one per line; normalized phrase containment)").classes("w-full")
+                    policy_patterns_input = ui.textarea("Advanced title-only regex patterns (one per line)").classes("w-full")
+                    policy_statuses_input = ui.input("Decision statuses to exclude (comma-separated)").classes("w-full")
+                    policy_preview_label = ui.label("Draft preview: not evaluated").classes("ss-help")
+                    policy_samples = ui.column().classes("w-full gap-1")
+                    policy_approval_confirm = ui.checkbox("I reviewed this store-specific policy and approve this version.")
+                    policy_draft_id = {"value": None}
+
+                    def get_policy_service():
+                        from ..merchandising_policy import StoreMerchandisingPolicyService
+                        return StoreMerchandisingPolicyService()
+
+                    def policy_lines(text):
+                        return [value.strip() for value in str(text or "").splitlines() if value.strip()]
+
+                    def policy_form_value():
+                        return {
+                            "exclude_keywords": policy_lines(policy_keywords_input.value),
+                            "exclude_phrases": policy_lines(policy_phrases_input.value),
+                            "exclude_title_patterns": policy_lines(policy_patterns_input.value),
+                            "exclude_decision_statuses": [value.strip() for value in str(policy_statuses_input.value or "").split(",") if value.strip()],
+                        }
+
+                    def fill_policy_form(policy):
+                        policy = policy or {}
+                        policy_keywords_input.value = "\n".join(policy.get("exclude_keywords", []))
+                        policy_phrases_input.value = "\n".join(policy.get("exclude_phrases", []))
+                        policy_patterns_input.value = "\n".join(policy.get("exclude_title_patterns", []))
+                        policy_statuses_input.value = ", ".join(policy.get("exclude_decision_statuses", []))
+                        policy_approval_confirm.value = False
+
+                    def refresh_policy_preview():
+                        try:
+                            result = get_policy_service().preview(self.current_store, policy_form_value())
+                        except ValueError as exc:
+                            policy_preview_label.set_text(f"Policy preview unavailable: {exc}")
+                            policy_samples.clear()
+                            return
+                        policy_preview_label.set_text(
+                            f"If applied, {result['excluded_count']} of {result['eligible_product_count']} eligible cached products would be excluded.")
+                        policy_samples.clear()
+                        with policy_samples:
+                            for sample in result["sample_excluded"]:
+                                ui.label(f"Excluded sample: {sample['title']} · {sample['reason']}").classes("text-sm")
+
+                    def show_merchandising_policy():
+                        service = get_policy_service()
+                        active = service.effective_policy(self.current_store)
+                        latest = service.latest(self.current_store, include_draft=True)
+                        selected = latest or active
+                        policy_draft_id["value"] = selected.get("policy_id") if selected and selected.get("status") == "DRAFT" else None
+                        fill_policy_form(selected.get("policy") if selected else {})
+                        merchandising_policy_dialog.open()
+                        refresh_policy_preview()
+
+                    def suggest_merchandising_draft():
+                        try:
+                            draft = get_policy_service().suggest_draft(self.current_store)
+                            policy_draft_id["value"] = draft["policy_id"]
+                            fill_policy_form(draft["policy"])
+                            refresh_category_readiness()
+                            ui.notify(f"Suggested draft v{draft['version']} created; it is not active.", type="info")
+                            refresh_policy_preview()
+                        except (ValueError, KeyError) as exc:
+                            ui.notify(f"Could not create draft: {exc}", type="warning")
+
+                    def save_merchandising_draft():
+                        try:
+                            draft = get_policy_service().create_draft(
+                                self.current_store, "CATEGORY_SHORTCUTS", policy_form_value(), source="MANUAL")
+                            policy_draft_id["value"] = draft["policy_id"]
+                            policy_approval_confirm.value = False
+                            refresh_category_readiness()
+                            ui.notify(f"Draft v{draft['version']} saved; eligibility is unchanged until approval.", type="positive")
+                        except ValueError as exc:
+                            ui.notify(f"Draft was not saved: {exc}", type="warning")
+
+                    def approve_merchandising_policy():
+                        if not policy_draft_id["value"]:
+                            ui.notify("Create or select a draft before approval.", type="warning")
+                            return
+                        try:
+                            approved = get_policy_service().approve(
+                                policy_draft_id["value"], confirmed=policy_approval_confirm.value is True)
+                            refresh_category_readiness()
+                            ui.notify(f"Policy v{approved['version']} approved for this store.", type="positive")
+                        except (PermissionError, ValueError, KeyError) as exc:
+                            ui.notify(f"Policy not approved: {exc}", type="warning")
+
+                    with ui.row().classes("flex-wrap gap-2"):
+                        ui.button("Preview exclusions", on_click=refresh_policy_preview).props("outline")
+                        ui.button("Suggest draft from Store Profile", on_click=suggest_merchandising_draft).props("outline")
+                        ui.button("Save draft", on_click=save_merchandising_draft).props("color=primary")
+                        ui.button("Approve selected draft", on_click=approve_merchandising_policy).props("color=positive")
+                        ui.button("Close", on_click=merchandising_policy_dialog.close).props("outline")
 
                 def refresh_category_readiness():
                     from ..category_shortcut_readiness import CategoryShortcutReadinessService
@@ -1996,6 +2096,20 @@ class OperatorUI:
                             self.current_store, theme_snapshot=state.get("snapshot"))
                         state["category_shortcut_package"] = package
                         summary = package.get("summary", {})
+                        from ..merchandising_policy import StoreMerchandisingPolicyService
+                        policy_repository = StoreMerchandisingPolicyService()
+                        active_policy = policy_repository.effective_policy(self.current_store)
+                        latest_policy = policy_repository.latest(self.current_store, include_draft=True)
+                        if active_policy:
+                            policy_label = f"APPROVED v{active_policy['version']}"
+                            if latest_policy and latest_policy.get("status") == "DRAFT":
+                                policy_label += f" · DRAFT v{latest_policy['version']} pending"
+                        elif latest_policy and latest_policy.get("status") == "DRAFT":
+                            policy_label = f"DRAFT v{latest_policy['version']} · not active"
+                        else:
+                            policy_label = "REVIEW REQUIRED · NONE"
+                        merchandising_policy_status.set_text(
+                            f"Merchandising policy: {policy_label} · excluded products: {package.get('excluded_by_policy_count', 0)}")
                         category_readiness_summary.set_text(
                             f"{summary.get('selected_count', 0)}/4 selected · Identity {summary.get('identity_ready', 0)}/4 · "
                             f"nonempty remote {summary.get('nonempty_remote_ready', 0)}/4 · publication evidence "
@@ -2044,6 +2158,7 @@ class OperatorUI:
                     ui.button("View 4 categories", on_click=show_category_readiness, icon="category").props("outline")
                     ui.button("Recheck collection mappings (read-only)", on_click=recheck_category_mappings, icon="sync").props("outline")
                     ui.button("Image readiness", on_click=show_category_images, icon="image").props("outline")
+                    ui.button("Review merchandising policy", on_click=show_merchandising_policy, icon="policy").props("outline")
                     ui.button("Read theme again", on_click=lambda: design(discover_theme=True), icon="refresh").props("outline")
                     ui.button("Category preview", on_click=lambda: None, icon="preview").props("outline disable")
                 refresh_category_readiness()

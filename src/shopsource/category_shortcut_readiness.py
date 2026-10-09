@@ -14,6 +14,7 @@ from pathlib import Path
 from .db import connect, get_store, init_db
 from .image_validation import inspect_image
 from .homepage_featured_products import _install as install_featured_schema
+from .merchandising_policy import PURPOSE_CATEGORY_SHORTCUTS, StoreMerchandisingPolicyService, match_policy_exclusion
 
 CATALOG_MAX_AGE_DAYS = 7
 _SAFE_HANDLE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
@@ -85,9 +86,11 @@ def _is_eligible(product: dict, profile: dict | None = None) -> bool:
     return not any(term and term in text for term, _reason in _profile_exclusions(profile or {}))
 
 
-def _eligible_products(products: list[dict], profile: dict | None = None) -> tuple[list[dict], dict[str, int]]:
+def _eligible_products(products: list[dict], profile: dict | None = None,
+                       policy: dict | None = None) -> tuple[list[dict], dict[str, int]]:
     excluded = {"not_active_or_ineligible": 0, "unverified_or_missing_identity": 0,
-                "store_profile_exclusion": 0, "decision_or_risk_exclusion": 0}
+                "store_profile_exclusion": 0, "decision_or_risk_exclusion": 0,
+                "excluded_by_policy_count": 0, "policy_exclusion_reasons": {}}
     eligible, seen = [], set()
     exclusions = _profile_exclusions(profile or {})
     for product in products:
@@ -109,6 +112,12 @@ def _eligible_products(products: list[dict], profile: dict | None = None) -> tup
             continue
         if any(term and term in text for term, _reason in exclusions):
             excluded["store_profile_exclusion"] += 1
+            continue
+        policy_reason = match_policy_exclusion(product, policy) if policy else None
+        if policy_reason:
+            excluded["excluded_by_policy_count"] += 1
+            reasons = excluded["policy_exclusion_reasons"]
+            reasons[policy_reason] = reasons.get(policy_reason, 0) + 1
             continue
         eligible.append(product)
     return eligible, excluded
@@ -383,13 +392,25 @@ class CategoryShortcutReadinessService:
             image_rows = con.execute("SELECT collection_key,path,approval_status,alt_text,metadata_json FROM collection_image_assets WHERE store_id=?", (str(store_id),)).fetchall() if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='collection_image_assets'").fetchone() else []
             homepage_image_rows = con.execute("SELECT asset_id,asset_type,local_path,approval_status,shopify_file_id,shopify_url FROM store_homepage_assets WHERE store_id=?", (str(store_id),)).fetchall() if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='store_homepage_assets'").fetchone() else []
             brand_image_rows = con.execute("SELECT asset_id,asset_type,local_path,approval_status,shopify_file_id,shopify_url,metadata_json FROM brand_assets WHERE store_id=?", (str(store_id),)).fetchall() if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='brand_assets'").fetchone() else []
+        policy_service = StoreMerchandisingPolicyService(self.db)
+        active_policy = policy_service.effective_policy(str(store_id), PURPOSE_CATEGORY_SHORTCUTS)
+        policy_evidence = {
+            "active_policy_id": active_policy.get("policy_id") if active_policy else None,
+            "active_policy_version": active_policy.get("version") if active_policy else None,
+            "policy_source": active_policy.get("source") if active_policy else None,
+            "policy_status": "APPROVED" if active_policy else "REVIEW_REQUIRED",
+            "excluded_by_policy_count": 0,
+            "policy_exclusion_reasons": {},
+        }
         if not cache:
             return {"status": "WAITING_FOR_CATALOG", "store_id": str(store_id), "catalog_fetched_at": None,
+                    **policy_evidence,
                     "distribution": {}, "items": [], "summary": readiness_summary({"items": []}),
                     "blockers": ["No cached ACTIVE Shopify product catalog is available; refresh with read_products only."]}
         products = _json(cache["candidates_json"], [])
         store_profile, brand_profile = self._store_context(store_id)
-        eligible_products, excluded = _eligible_products(products, store_profile)
+        active_policy_data = active_policy.get("policy") if active_policy else None
+        eligible_products, excluded = _eligible_products(products, store_profile, active_policy_data)
         now = datetime.now(timezone.utc)
         try:
             age_days = max(0, (now - datetime.fromisoformat(cache["fetched_at"].replace("Z", "+00:00"))).total_seconds() / 86400)
@@ -397,6 +418,7 @@ class CategoryShortcutReadinessService:
             age_days = None
         if age_days is None or age_days > CATALOG_MAX_AGE_DAYS:
             return {"status": "STALE_CATALOG", "store_id": str(store_id), "catalog_fetched_at": cache["fetched_at"],
+                    **policy_evidence,
                     "catalog_age_days": age_days, "distribution": {}, "items": [],
                     "summary": readiness_summary({"items": []}),
                     "blockers": ["Cached catalog is stale; a read_products refresh is needed before selecting categories."]}
@@ -534,6 +556,12 @@ class CategoryShortcutReadinessService:
                        for item in selected}
         package = {"plan_id": package_id, "store_id": str(store_id), "store_name": store_name,
                    "candidate_source": candidate_source,
+                   "active_policy_id": active_policy.get("policy_id") if active_policy else None,
+                   "active_policy_version": active_policy.get("version") if active_policy else None,
+                   "policy_source": active_policy.get("source") if active_policy else None,
+                   "policy_status": "APPROVED" if active_policy else "REVIEW_REQUIRED",
+                   "excluded_by_policy_count": excluded["excluded_by_policy_count"],
+                   "policy_exclusion_reasons": excluded["policy_exclusion_reasons"],
                    "status": "CATEGORIES_SELECTED_PREREQUISITES_BLOCKED" if len(items) == 4 else "INSUFFICIENT_CATEGORIES",
                    "catalog_fetched_at": cache["fetched_at"], "catalog_age_days": round(age_days, 3),
                    "catalog_product_count": len(products), "eligible_product_count": len(eligible_products),
