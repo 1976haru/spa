@@ -1,0 +1,281 @@
+ShopSource Studio — THEME ACCESS FALLBACK BACKEND SAFE MERGE
+FAST-FORWARD ONLY + MULTI-WINDOW HANDOFF
+
+Repository
+- Main working repo: D:\shop\001_so_amazon
+- Fallback worktree: D:\shop\001_so_amazon_theme_fallback_v2
+- Remote: https://github.com/1976haru/spa.git
+- Feature branch: phase/theme-write-fallback-backend-v2
+- Expected implementation HEAD before this prompt commit: 52213e87b15bde3c69f8555cdc133603dfa742e9
+- Expected origin/main base: cc2a1fd70e7c01df263786d5acaa3615f5b56e11
+
+Feature contents
+- transport-neutral theme write backend contract
+- ADMIN_GRAPHQL adapter remains primary
+- Theme Access CLI fallback backend
+- Windows keyring Theme Access secret storage
+- password only via SHOPIFY_CLI_THEME_TOKEN
+- exact templates/index.json allowlist
+- raw-hash precondition
+- read-after-write verification
+- guarded rollback
+- exact theme ID verification
+- backend-derived MAIN/live role verification
+- caller live-role mismatch blocked
+- live write requires confirmed + allow_live
+- Theme App Extension architecture note
+- full suite: 954 passed, 1 skipped
+- Shopify live write count: 0
+
+No Shopify write in this merge task.
+Do not configure a real Theme Access password.
+Do not wire UI.
+Do not run live CLI push/pull as part of merge validation unless a read-only command is explicitly harmless and credential-free; default is local/mock tests only.
+
+======================================================================
+1. CONCURRENCY / FETCH GATE
+======================================================================
+
+In the MAIN working repo:
+
+git fetch origin --prune
+
+Record:
+- local main SHA
+- origin/main SHA
+- origin/phase/theme-write-fallback-backend-v2 SHA
+- merge-base main...feature
+- ahead/behind
+- git status --short
+
+Expected:
+origin/main = cc2a1fd70e7c01df263786d5acaa3615f5b56e11
+feature is ahead-only from main
+
+If origin/main differs:
+STOP and report CONCURRENT_MAIN_MOVEMENT.
+Do not auto-rebase or merge.
+
+The feature branch HEAD may be one commit ahead of 52213e... because this safe-merge prompt itself is committed. That is expected.
+
+======================================================================
+2. PROTECTED FILES
+======================================================================
+
+Before merge record status + SHA256 for:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+
+Preserve existing dirty state.
+
+Do not touch/stash/reset/restore:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env
+- credentials
+- .phase*
+- backups
+- user assets
+
+======================================================================
+3. DIFF SCOPE REVIEW
+======================================================================
+
+Expected code/docs/test files only:
+- src/shopsource/theme_write_backend.py
+- src/shopsource/theme_access_credentials.py
+- src/shopsource/shopify_theme_cli.py
+- docs/THEME_DELIVERY_BACKENDS.md
+- tests/test_theme_write_backend.py
+- tests/test_theme_access_credentials.py
+- tests/test_shopify_theme_cli.py
+- tests/test_shopify_g0_readonly_hotfix.py
+- phase prompt txt files
+
+Confirm specifically:
+- src/shopsource/ui/v2.py NOT changed
+- src/shopsource/category_strategy.py NOT changed
+- src/shopsource/category_shortcut_readiness.py NOT changed
+- protected files NOT staged/committed
+
+Review the test_shopify_g0_readonly_hotfix.py adjustment:
+- it must only accommodate tracked worktree vs protected local operator file
+- it must not weaken unrelated G0 safety assertions
+
+If unexpected overlap exists:
+STOP.
+
+======================================================================
+4. PRE-MERGE QUALITY GATE
+======================================================================
+
+On feature branch/worktree:
+- python -m compileall -q src tests
+- focused fallback tests
+- focused G0 readonly hotfix tests
+- full pytest with repo/worktree-local writable --basetemp
+- git diff --check
+- python -m shopsource.cli --help
+- python -m shopsource.ui.v2 --help
+
+Required:
+FULL SUITE PASS
+Expected current scale: at least 954 passed, 1 skipped.
+
+No live Shopify write.
+
+======================================================================
+5. SECURITY REVIEW GATE
+======================================================================
+
+Before merge explicitly confirm from code/tests:
+
+A. Secret
+- Theme Access password never in argv
+- only SHOPIFY_CLI_THEME_TOKEN env
+- never returned/logged/persisted
+
+B. Target identity
+- exact theme ID required
+- missing/ambiguous ID != READY
+- unknown role != READY
+
+C. Live role
+- MAIN/live derived by backend
+- caller flag mismatch rejected
+- MAIN requires confirmed=True + allow_live=True
+- --allow-live only added after verified MAIN role
+
+D. File scope
+- only templates/index.json allowed
+- no sections/snippets/assets/config/layout write
+
+E. Race safety
+- remote raw hash precondition before write
+- post-write refetch verification
+- rollback refuses remote drift
+
+If any one fails:
+STOP; do not merge.
+
+======================================================================
+6. FAST-FORWARD MERGE ONLY
+======================================================================
+
+Return to MAIN working repo.
+
+Refetch origin.
+
+Verify origin/main has NOT moved from the SHA recorded in step 1.
+
+Switch main if needed without touching protected dirty files.
+
+Run:
+git merge --ff-only phase/theme-write-fallback-backend-v2
+
+If --ff-only fails:
+STOP.
+No merge commit.
+No conflict auto-resolution.
+
+======================================================================
+7. POST-MERGE QUALITY GATE
+======================================================================
+
+On main:
+- compileall
+- focused fallback tests
+- focused G0 tests
+- full pytest
+- git diff --check
+- CLI help
+- UI help
+
+Verify:
+- no Theme Access credential created
+- no Shopify write executed
+- protected dirty file hashes/status unchanged
+
+======================================================================
+8. PUSH MAIN WITH LAST-SECOND REMOTE CHECK
+======================================================================
+
+Immediately before push:
+git fetch origin
+
+If origin/main moved:
+STOP BEFORE PUSH.
+Do not force push.
+Report REMOTE_MAIN_MOVED_AFTER_LOCAL_MERGE.
+
+Otherwise:
+git push origin main
+
+Never force push.
+
+Then:
+git fetch origin
+
+Verify:
+- main SHA == origin/main SHA
+- main...origin/main = 0 0
+
+======================================================================
+9. FEATURE / WORKTREE STATE
+======================================================================
+
+Do not delete:
+- phase/theme-write-fallback-backend-v2
+- D:\shop\001_so_amazon_theme_fallback_v2
+
+Keep them intact until the next Phase B integration is complete.
+
+======================================================================
+10. SECOND-WINDOW HANDOFF
+======================================================================
+
+Final report must include:
+
+SECOND_WINDOW_HANDOFF_MAIN_SHA = <new main SHA>
+
+Any other active workflow must fetch and rebase/refresh from this exact SHA before its next main merge.
+
+======================================================================
+11. COMPLETION REPORT
+======================================================================
+
+Report exactly:
+
+[1] pre-merge origin/main SHA
+[2] feature HEAD SHA
+[3] merge-base
+[4] ahead/behind
+[5] protected pre-merge hashes/status
+[6] diff scope review
+[7] pre-merge tests
+[8] security review gate
+[9] merge method
+[10] new local main SHA
+[11] post-merge tests
+[12] push result
+[13] final origin/main SHA
+[14] main...origin/main
+[15] protected post-merge hashes/status
+[16] Shopify live write count
+[17] Theme Access credential creation count
+[18] feature/worktree retained
+[19] SECOND_WINDOW_HANDOFF_MAIN_SHA
+[20] exact next action
+
+Final flags:
+FAST_FORWARD_ONLY = PASS/FAIL
+FULL_SUITE_POST_MERGE = PASS/FAIL
+SECRET_SAFE = YES/NO
+TARGET_THEME_IDENTITY_VERIFIED = YES/NO
+LIVE_ROLE_CALLER_BYPASS_BLOCKED = YES/NO
+PROTECTED_FILES_UNCHANGED = YES/NO
+SHOPIFY_LIVE_WRITE_COUNT = 0
+THEME_ACCESS_CREDENTIAL_CREATED = NO
+MAIN_REMOTE_SYNC = YES/NO
+SECOND_WINDOW_HANDOFF_REQUIRED = YES
