@@ -1,0 +1,206 @@
+ShopSource Studio — CATEGORY STRATEGY SAFE FAST-FORWARD MERGE
+MULTI-WINDOW SAFETY GATE
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Feature branch: phase/shopify-exemption-homepage-gate
+- Expected implementation HEAD before this merge-prompt commit: eb35d703a5304dfd45312ca33e1780ac558814da
+- Verified current main base: 86a31edc56dfd6411c88f829e5a102f3c7e48dd3
+
+Context
+Another active workflow is preparing the second real store.
+This merge must therefore be fast-forward only and must stop if main moved.
+
+Feature contents now include:
+- semantic-first category theme schema discovery
+- versioned per-store homepage category strategy layer
+- fallback production blocking
+- existing remote collection reconciliation/adoption (local-only)
+- store isolation / second-store portability
+- UI review/approval controls
+- tests: 888 passed, 1 skipped
+- Shopify writes: 0
+
+Do NOT perform any Shopify write.
+Do NOT approve Cabin Tidy category strategy in this task.
+Do NOT adopt the Trunk collection in this task.
+Do NOT merge if main moved.
+
+======================================================================
+1. PRE-MERGE SAFETY
+======================================================================
+
+Fetch origin.
+
+Record:
+- local main SHA
+- origin/main SHA
+- local feature SHA
+- origin/feature SHA
+- merge-base main feature
+- ahead/behind main...feature
+- git status --short
+
+Expected current relationship:
+- origin/main = 86a31edc56dfd6411c88f829e5a102f3c7e48dd3
+- main is ancestor of feature
+- feature ahead only
+
+If origin/main differs from expected base:
+STOP.
+Report CONCURRENT_MAIN_MOVEMENT.
+Do not rebase, merge, cherry-pick, or auto-resolve.
+
+======================================================================
+2. PROTECTED DIRTY FILES
+======================================================================
+
+Record status + SHA256 before merge for:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+
+Preserve and do not touch:
+- data/*.sqlite3
+- .env / credentials
+- .phase*
+- backups
+- user assets
+
+Do not stash/reset/restore these files.
+
+======================================================================
+3. DIFF SCOPE REVIEW
+======================================================================
+
+Confirm feature branch changes are only intended phase files, including:
+- src/shopsource/category_strategy.py
+- src/shopsource/category_shortcut_readiness.py
+- src/shopsource/homepage_automation.py
+- src/shopsource/shopify_collections.py
+- src/shopsource/ui/v2.py
+- tests/test_category_strategy.py
+- phase prompt txt files
+
+If unexpected store config, credential, runtime DB, backup, or user asset files appear:
+STOP.
+
+======================================================================
+4. PRE-MERGE TEST GATE
+======================================================================
+
+On feature branch:
+- create repo-local writable pytest basetemp
+- python -m compileall -q src tests
+- focused category strategy/readiness/homepage/reconciliation tests
+- python -m pytest -q --basetemp=<repo-local-temp>
+- git diff --check
+- python -m shopsource.cli --help
+- python -m shopsource.ui.v2 --help
+
+Required:
+FULL SUITE PASS
+
+Remove temp dir afterward if safe.
+
+======================================================================
+5. FAST-FORWARD MERGE ONLY
+======================================================================
+
+Switch to main without touching protected dirty files.
+
+Verify origin/main has not moved.
+
+Then:
+git merge --ff-only phase/shopify-exemption-homepage-gate
+
+If --ff-only fails:
+STOP.
+Do not create merge commit.
+Do not resolve conflicts.
+
+======================================================================
+6. POST-MERGE TEST
+======================================================================
+
+On main:
+- rerun focused category strategy/readiness/homepage/reconciliation tests
+- rerun full suite with repo-local basetemp
+- compileall
+- git diff --check
+- CLI/UI help
+
+Verify protected dirty file SHA256/status unchanged.
+
+======================================================================
+7. PUSH MAIN WITH CONCURRENCY CHECK
+======================================================================
+
+Immediately before push:
+git fetch origin
+verify origin/main is still the exact pre-merge remote main SHA.
+
+If origin/main moved:
+STOP BEFORE PUSH.
+Do not force push.
+Report REMOTE_MAIN_MOVED_AFTER_LOCAL_MERGE.
+
+If unchanged:
+git push origin main
+
+Never force push.
+
+======================================================================
+8. FINAL REMOTE VERIFICATION
+======================================================================
+
+After push:
+git fetch origin
+
+Verify:
+- main SHA == origin/main SHA
+- main...origin/main = 0 0
+- feature branch remains intact
+- protected dirty file status/hash unchanged
+- Shopify write count = 0
+
+======================================================================
+9. SECOND-WINDOW HANDOFF
+======================================================================
+
+Final report must include:
+
+SECOND_WINDOW_HANDOFF_MAIN_SHA = <new main SHA>
+
+The other active workflow must fetch/pull/rebase from this exact SHA before its next merge to main.
+
+======================================================================
+10. COMPLETION REPORT
+======================================================================
+
+Report exactly:
+
+[1] pre-merge origin/main SHA
+[2] feature HEAD SHA
+[3] merge-base
+[4] ahead/behind
+[5] protected file pre-merge hashes/status
+[6] pre-merge tests
+[7] merge method
+[8] new local main SHA
+[9] post-merge tests
+[10] push result
+[11] final origin/main SHA
+[12] main...origin/main
+[13] protected file post-merge hashes/status
+[14] Shopify write count
+[15] SECOND_WINDOW_HANDOFF_MAIN_SHA
+[16] exact next user action
+
+Final:
+FAST_FORWARD_ONLY = PASS/FAIL
+FULL_SUITE_POST_MERGE = PASS/FAIL
+PROTECTED_FILES_UNCHANGED = YES/NO
+SHOPIFY_WRITE_COUNT = 0
+MAIN_REMOTE_SYNC = YES/NO
+SECOND_WINDOW_HANDOFF_REQUIRED = YES
