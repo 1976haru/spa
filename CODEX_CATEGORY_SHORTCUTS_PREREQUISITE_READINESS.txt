@@ -1,0 +1,245 @@
+ShopSource Studio — CATEGORY SHORTCUTS PREREQUISITE READINESS
+SPAMY CATEGORY NAVIGATION ASSIGNMENT — NO THEME WRITE
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+
+Context
+The live-theme diagnosis could not re-read Shopify because of NETWORK_ERROR, so the actual section schema is still unknown.
+However two independent blockers are confirmed:
+- TARGET_COLLECTION_MAPPING_READY = NO
+- CATEGORY_IMAGES_READY = NO
+
+The Shopify themeFilesUpsert exemption is pending. Use this waiting period to make category-shortcut prerequisites ready WITHOUT editing the theme.
+
+Assignment
+"스토어 메인 화면에서 고객이 원하는 카테고리로 바로 이동하게 해 주는 영역을 만듭니다."
+
+Goal
+Prepare a reliable 4-category shortcut package for Cabin Tidy:
+- 4 non-empty categories
+- actual Shopify collection targets or clearly prepared mappings
+- approved/reusable category images where possible
+- no theme write
+- no fake handles
+- no empty collections
+- no paid image generation
+
+======================================================================
+1. AUDIT ACTUAL PRODUCT DISTRIBUTION
+======================================================================
+
+Use the existing Shopify product cache/read-only catalog if available.
+
+Classify eligible ACTIVE products using existing merchandising signals:
+1. ShopSource collection/category mapping
+2. productType
+3. merchant tags
+4. title keywords only as fallback
+
+Produce counts for at least:
+- Trunk & Cargo
+- Seat & Backseat
+- Console & Small Storage
+- Trash & Cleanup
+- Cup Holder & Convenience
+- Document & Visor
+- Travel Organization
+- General Organization
+
+Do not treat a category as ready if count = 0.
+
+If the remote catalog cache is stale and network works, refresh READ-ONLY only.
+No Shopify write.
+
+======================================================================
+2. SELECT THE BEST FOUR SHORTCUTS
+======================================================================
+
+Choose exactly 4 categories using:
+- actual non-zero product count
+- broad customer usefulness
+- diversity of use case
+- Cabin Tidy relevance
+- avoid vehicle-specific repair/replacement parts
+- avoid categories with only a handful of weak-fit products unless no better option
+
+Prefer the previously discussed concepts ONLY if actual data supports them:
+- Trunk Organizers
+- Seat Organizers / Seat & Backseat
+- Console Storage / Console & Small Storage
+- Trash & Cleanup
+
+If one is weak/empty, replace it with a stronger real category such as Cup Holder & Convenience or another actual category.
+
+Report why each was selected.
+
+======================================================================
+3. COLLECTION PLAN / MAPPING READINESS
+======================================================================
+
+For each selected category:
+- identify current local collection_plan entry if present
+- identify actual Shopify collection mapping if present
+- verify handle
+- verify collection id
+- verify actual storefront URL
+- verify non-empty product count when available
+
+If mapping is missing:
+- prepare a deterministic proposed collection definition locally
+- do NOT invent a remote Shopify ID
+- do NOT mark mapping READY
+
+If existing Shopify collection is found by safe read-only lookup:
+- bind/read mapping only if identity/handle is unambiguous
+- do not modify remote collection contents in this task
+
+No collection creation/update/publish in this task.
+
+======================================================================
+4. CATEGORY IMAGE READINESS
+======================================================================
+
+For each selected category:
+- search existing approved collection/homepage image assets
+- prefer already-approved assets
+- verify file exists
+- verify valid image
+- verify aspect ratio suitable for category card (prefer square/near-square)
+- verify no text/logo/watermark where current rules prohibit it
+- verify asset is not duplicated across multiple categories
+
+If no approved image exists:
+- generate a PROMPT ONLY (no paid API call)
+- mark image status NEEDS_ASSET
+- do not claim ready
+
+Use consistent visual direction:
+premium automotive organization, clean interior, realistic product use, no text/logo/watermark.
+
+======================================================================
+5. CATEGORY PACKAGE MODEL
+======================================================================
+
+Create or reuse a persistent local category-shortcut package/plan if current architecture supports it.
+
+Each of 4 items should include:
+- shortcut_key
+- title
+- normalized merchandising group
+- product_count
+- collection_key
+- shopify_collection_id nullable
+- handle nullable
+- storefront_url nullable
+- mapping_status
+- image_asset_id/path nullable
+- image_status
+- alt_text
+- position
+- readiness reasons
+
+Do not create sentinel fake IDs.
+
+======================================================================
+6. UI READINESS
+======================================================================
+
+On Homepage Automation, the category-shortcut area should be able to show a compact readiness summary:
+
+카테고리 바로가기
+- 4개 선택
+- Collection mapping: 2/4 READY
+- Images: 1/4 READY
+- Theme schema: WAITING FOR LIVE READ
+- Shopify theme write: NOT RUN
+
+Buttons:
+- [카테고리 4개 보기]
+- [컬렉션 매핑 다시 확인]
+- [이미지 준비 상태]
+- [테마 다시 읽기] (read-only)
+- [미리보기] disabled until prerequisites sufficient
+
+Do not add a real apply button in this task.
+
+======================================================================
+7. TESTS
+======================================================================
+
+Add/upgrade tests for:
+- category counts from realistic product fixtures
+- zero-count category not selected
+- four categories chosen deterministically
+- vehicle-specific replacement parts not boosting category readiness
+- missing mapping remains NOT_READY
+- existing unambiguous mapping can be reused
+- no fake remote IDs
+- approved image reused
+- invalid/unapproved image rejected
+- duplicate image rejected
+- prompt-only fallback does not call paid image API
+- UI readiness summary
+- no Shopify write
+- no theme write
+
+Run full suite.
+
+======================================================================
+8. PROTECTED FILES
+======================================================================
+
+Do not stage/commit:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env / credentials
+- theme backups
+- .phase*
+- user assets
+
+======================================================================
+9. QUALITY GATES
+======================================================================
+
+Run:
+python -m compileall -q src tests
+run focused category/homepage tests
+python -m pytest -q
+git diff --check
+python -m shopsource.ui.v2 --help
+
+No live Shopify write.
+No theme write.
+No paid image generation.
+
+======================================================================
+10. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] actual product distribution
+[5] selected four categories + reasons
+[6] collection mapping readiness per category
+[7] image readiness per category
+[8] local category package/readiness model
+[9] UI readiness summary
+[10] tests/pass counts
+[11] protected files
+[12] Shopify write count
+[13] unresolved blockers
+[14] exact next user action
+
+Final:
+CATEGORY FOUR SELECTED = YES/NO
+CATEGORY COLLECTION MAPPING READY = 0/4..4/4
+CATEGORY IMAGES READY = 0/4..4/4
+THEME SCHEMA LIVE READ = READY/WAITING_NETWORK
+SHOPIFY WRITE COUNT = 0
+SAFE TO WAIT FOR THEME EXEMPTION = YES/NO
