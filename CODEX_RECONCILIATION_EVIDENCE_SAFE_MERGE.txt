@@ -1,0 +1,204 @@
+ShopSource Studio — RECONCILIATION EVIDENCE SAFE MERGE
+FAST-FORWARD ONLY + PARALLEL FALLBACK WORKTREE HANDOFF
+
+Repository
+- Local: D:\shop\001_so_amazon
+- Remote: https://github.com/1976haru/spa.git
+- Feature branch: phase/collection-reconciliation-evidence-hardening
+- Expected implementation HEAD before this prompt commit: a61746fd12940d25e120293ba3fde7cb5ffad0d9
+- Expected main base: 994da9b99c9666b16665035440e67d30e9330684
+
+Parallel-work context
+- Another worktree/branch may be implementing Theme Access CLI fallback:
+  phase/theme-write-fallback-backend
+- That fallback branch was created from main SHA 994da9b99c9666b16665035440e67d30e9330684.
+- If this reconciliation merge succeeds, the fallback branch MUST later rebase/refresh from the new main before it can merge.
+
+Feature summary
+- identity vs content compatibility separation
+- bounded read-only collection membership audit
+- precision / recall / Jaccard / count-ratio metrics
+- adoption blocked unless VERIFIED_COMPATIBLE
+- exact handle/title no longer bypasses content safety
+- dry-run chooses CREATE when reuse candidate is content-unsafe
+- full suite 901 passed, 1 skipped
+- Shopify write count 0
+
+No Shopify writes in this task.
+No category strategy approval.
+No collection adoption.
+No force push.
+No conflict auto-resolution.
+
+======================================================================
+1. PRE-MERGE FETCH / CONCURRENCY GATE
+======================================================================
+
+git fetch origin --prune
+
+Record:
+- local main
+- origin/main
+- local feature
+- origin/feature
+- merge-base
+- main...feature ahead/behind
+- git status --short
+
+Expected:
+origin/main = 994da9b99c9666b16665035440e67d30e9330684
+main ancestor of feature
+feature ahead only
+
+If origin/main moved:
+STOP and report CONCURRENT_MAIN_MOVEMENT.
+Do not rebase/merge/cherry-pick automatically.
+
+======================================================================
+2. PROTECTED FILE HASH / STATUS
+======================================================================
+
+Record before merge:
+- stores/001_cabin_tidy.json status + SHA256
+- tools/shopify_app/safe_shopify_cli.ps1 status + SHA256
+
+Do not touch/stash/reset/restore:
+- data/*.sqlite3
+- .env
+- credentials
+- .phase*
+- backups
+- user assets
+
+======================================================================
+3. DIFF SCOPE REVIEW
+======================================================================
+
+Expected implementation files:
+- src/shopsource/category_strategy.py
+- src/shopsource/category_shortcut_readiness.py
+- src/shopsource/shopify_collections.py
+- src/shopsource/ui/v2.py
+- tests/test_category_strategy.py
+- tests/test_shopify_collections.py
+- phase prompt files
+
+STOP if unexpected protected/runtime/store files are included.
+
+======================================================================
+4. PRE-MERGE QUALITY GATE
+======================================================================
+
+Run with repo-local writable basetemp:
+- python -m compileall -q src tests
+- focused reconciliation/category tests
+- full pytest
+- git diff --check
+- CLI help
+- UI help
+
+Required:
+FULL SUITE PASS
+
+======================================================================
+5. FAST-FORWARD MERGE ONLY
+======================================================================
+
+Switch to main without touching protected dirty files.
+
+Refetch and verify origin/main still equals expected pre-merge SHA.
+
+Run:
+git merge --ff-only phase/collection-reconciliation-evidence-hardening
+
+If ff-only fails:
+STOP.
+No merge commit.
+No conflict resolution.
+
+======================================================================
+6. POST-MERGE QUALITY GATE
+======================================================================
+
+Rerun:
+- focused tests
+- full suite
+- compileall
+- git diff --check
+- CLI help
+- UI help
+
+Verify protected hashes unchanged.
+
+======================================================================
+7. PUSH MAIN WITH LAST-SECOND LEASE CHECK
+======================================================================
+
+git fetch origin
+
+If origin/main moved since pre-merge:
+STOP BEFORE PUSH.
+Report REMOTE_MAIN_MOVED_AFTER_LOCAL_MERGE.
+Do not force push.
+
+If unchanged:
+git push origin main
+
+Then fetch and verify:
+main == origin/main
+main...origin/main = 0 0
+
+======================================================================
+8. PARALLEL FALLBACK BRANCH HANDOFF
+======================================================================
+
+Inspect:
+phase/theme-write-fallback-backend
+
+Do NOT modify it.
+
+Report:
+- its current origin branch SHA if available
+- its merge-base with new main
+- whether it is now BEHIND_MAIN
+
+Required final instruction:
+Before that fallback branch is merged, it must:
+1. fetch origin
+2. rebase/refresh onto SECOND_WINDOW_HANDOFF_MAIN_SHA
+3. resolve only its own new-file/backend work; if overlap occurs, STOP
+4. rerun full suite
+5. use a separate safe-merge gate
+
+======================================================================
+9. FINAL REPORT
+======================================================================
+
+Report exactly:
+
+[1] pre-merge origin/main SHA
+[2] feature HEAD SHA
+[3] merge-base
+[4] ahead/behind
+[5] protected pre-merge hashes/status
+[6] pre-merge tests
+[7] merge method
+[8] new local main SHA
+[9] post-merge tests
+[10] push result
+[11] final origin/main SHA
+[12] main...origin/main
+[13] protected post-merge hashes/status
+[14] Shopify write count
+[15] fallback branch relation to new main
+[16] SECOND_WINDOW_HANDOFF_MAIN_SHA
+[17] exact next action
+
+Final flags:
+FAST_FORWARD_ONLY = PASS/FAIL
+FULL_SUITE_POST_MERGE = PASS/FAIL
+PROTECTED_FILES_UNCHANGED = YES/NO
+SHOPIFY_WRITE_COUNT = 0
+MAIN_REMOTE_SYNC = YES/NO
+FALLBACK_BRANCH_REBASE_REQUIRED = YES/NO
+SECOND_WINDOW_HANDOFF_REQUIRED = YES
