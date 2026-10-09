@@ -1,0 +1,303 @@
+ShopSource Studio — CATEGORY SHORTCUT READINESS CORRECTION
+FIX REMOTE COLLECTION COUNT SEMANTICS + VERIFY FULL SUITE
+Branch: phase/category-shortcuts-prerequisite-readiness
+Expected baseline: 2fc340541477173c90ea01956b2d58f8ccff37ab
+
+IMPORTANT
+Do NOT merge this branch to main yet.
+Do NOT write Shopify theme, collections, products, or files.
+Do NOT use paid image generation.
+
+I reviewed the actual branch code and found a semantic bug that must be corrected before merge.
+
+CONFIRMED BUG
+In category_shortcut_readiness.py:
+
+    published_ids = ...
+    remote_count = len(published_ids)
+    mapping_valid = ... and remote_count > 0
+
+But shopify_collection_mappings.published_ids_json stores PUBLICATION IDs (for example Online Store publication IDs), not collection PRODUCT IDs.
+
+Evidence from src/shopsource/shopify_collections.py:
+- result["published_ids"].append(pub["id"])
+- published_ids_json persists result["published_ids"]
+- Shopify collection actual member count is available separately as productsCount { count precision }
+
+Therefore the current readiness code can falsely treat:
+"mapped + published to Online Store"
+as:
+"mapped + nonempty collection"
+
+That is incorrect.
+
+Goal
+Correct the category-shortcut readiness model so:
+1. collection identity,
+2. publication state,
+3. actual remote product count,
+are separate evidence fields.
+A collection must never be READY because publication_ids_json is nonempty.
+
+======================================================================
+1. CORRECT FIELD SEMANTICS
+======================================================================
+
+Treat shopify_collection_mappings.published_ids_json strictly as:
+publication_ids
+
+Never derive collection product count from it.
+
+Rename local variables accordingly.
+
+Add explicit per-item evidence:
+- mapping_identity_status
+- publication_status
+- remote_product_count
+- remote_product_count_precision
+- remote_count_status = VERIFIED / UNKNOWN
+- mapping_status
+
+Recommended mapping_status READY requirements:
+- valid Shopify collection GID
+- valid handle
+- identity confirmed against read-only Shopify collection data
+- remote productsCount.count > 0
+- collection is available/published to Online Store if that is required for storefront shortcut usability
+
+If network/current remote snapshot is unavailable:
+- preserve known local mapping identity if valid
+- but mapping_status must not become READY solely from DB row
+- use states such as REMOTE_COUNT_UNKNOWN / REMOTE_NOT_VERIFIED
+
+Do not invent remote counts.
+
+======================================================================
+2. READ-ONLY COLLECTION SNAPSHOT
+======================================================================
+
+Reuse existing ShopifyCollectionPublisher COLLECTIONS_QUERY or extract a shared read-only collection reader.
+
+Existing query already returns:
+- id
+- title
+- handle
+- productsCount { count precision }
+- image
+- sources
+
+For category readiness, support:
+- force/read-only refresh when network is available
+- local cache/snapshot so UI can show last verified evidence
+- bounded read only
+- no mutations
+
+Persist an additive local snapshot/cache if needed, for example:
+homepage_category_collection_remote_cache
+
+Suggested evidence:
+- store_id
+- fetched_at
+- source_hash
+- collections_json
+
+No credentials.
+
+Do not overload shopify_collection_mappings with product-count semantics.
+
+======================================================================
+3. PUBLICATION STATE
+======================================================================
+
+published_ids_json may be used only to indicate known publication IDs from prior ShopSource publishing.
+
+If a safe live read can verify Online Store publication state, use it.
+If not, expose publication_status = KNOWN_PUBLISHED / UNKNOWN.
+
+Do not call len(publication_ids) "product count".
+
+======================================================================
+4. READINESS RULES
+======================================================================
+
+Per category:
+
+READY only if:
+- selected category product distribution > 0
+- valid remote collection identity confirmed
+- remote collection productsCount.count > 0
+- storefront target URL can be constructed from verified handle
+- image status READY
+- theme schema READY (for preview_enabled only)
+
+Split summary:
+- identity_ready x/4
+- nonempty_remote_ready x/4
+- publication_ready x/4 or unknown
+- image_ready x/4
+- theme_schema status
+
+Preview stays disabled until the policy-required prerequisites are truly ready.
+
+======================================================================
+5. REGRESSION TEST FOR THE CONFIRMED BUG
+======================================================================
+
+Add a test proving:
+
+A mapping row with:
+- valid collection GID
+- valid handle
+- published_ids_json = ["gid://shopify/Publication/123"]
+- NO verified remote productsCount
+
+MUST NOT become mapping_status READY.
+
+Add another test:
+- same mapping + remote snapshot productsCount.count = 0
+=> NOT_READY
+
+And:
+- same mapping + remote identity match + productsCount.count > 0
+=> identity/nonempty readiness can pass.
+
+Also verify publication IDs remain publication evidence only.
+
+======================================================================
+6. FULL-SUITE 30 FAILURES
+======================================================================
+
+The previous report had:
+816 passed, 30 failed, 1 skipped
+with sandbox temporary-directory permission failures.
+
+Do not dismiss these automatically.
+
+First rerun full tests in a known writable repo-local temp location WITHOUT changing production code:
+
+PowerShell concept:
+- create a repo-local temp directory such as .test_tmp (untracked)
+- set TEMP and TMP for the pytest process to that directory
+- run full pytest
+
+If all 30 failures disappear:
+report clearly:
+FULL_SUITE_FAILURE_CAUSE = SANDBOX_TEMP_PERMISSION
+and include the clean pass count.
+
+If failures remain:
+- classify actual regressions
+- fix only regressions caused by this branch
+- do not weaken assertions
+- do not globally monkeypatch tempfile behavior in production code
+
+Remove/ignore the repo-local temp artifacts afterward; do not commit them.
+
+======================================================================
+7. KEEP CURRENT GOOD BEHAVIOR
+======================================================================
+
+Preserve:
+- 500-product cached distribution logic
+- repair/fitment exclusion
+- deterministic selection of four nonempty categories
+- no fake Shopify IDs/handles
+- prompt-only image fallback
+- image approval/validation rules
+- no theme apply
+- no paid image call
+
+Current selected categories may remain:
+- Seat & Backseat
+- Trash & Cleanup
+- Trunk & Cargo
+- Cup Holder & Convenience
+unless corrected evidence changes the ranking.
+
+======================================================================
+8. TESTS
+======================================================================
+
+Add/upgrade tests at minimum:
+
+test_publication_ids_are_not_product_count
+test_mapping_with_publication_id_but_no_remote_count_not_ready
+test_mapping_with_remote_zero_products_not_ready
+test_mapping_with_verified_remote_positive_count_ready_for_identity_count
+test_remote_collection_identity_mismatch_blocks_ready
+test_remote_snapshot_cache_reused
+test_remote_snapshot_force_refresh_read_only
+test_no_collection_mutation
+test_no_theme_mutation
+test_existing_category_selection_tests_pass
+
+Then:
+python -m compileall -q src tests
+focused category tests
+homepage tests
+full pytest with writable repo-local TEMP/TMP
+git diff --check
+python -m shopsource.ui.v2 --help
+
+======================================================================
+9. PROTECTED FILES
+======================================================================
+
+Do not stage/commit:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env / credentials
+- .phase*
+- theme backups
+- user assets
+- .test_tmp
+
+======================================================================
+10. COMMIT / PUSH
+======================================================================
+
+Stay on:
+phase/category-shortcuts-prerequisite-readiness
+
+After all tests pass:
+commit implementation/tests only
+
+Suggested:
+git commit -m "Correct category collection readiness evidence"
+
+push the same phase branch.
+
+Do NOT merge to main.
+
+======================================================================
+11. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] published_ids_json semantic bug fix
+[5] remote collection snapshot design
+[6] mapping identity readiness
+[7] remote nonempty readiness
+[8] publication readiness
+[9] selected four categories
+[10] mapping readiness per category
+[11] image readiness per category
+[12] focused tests
+[13] full-suite result with repo-local TEMP/TMP
+[14] original 30-failure root cause
+[15] protected files
+[16] Shopify write count
+[17] branch/push status
+[18] exact next user action
+
+Final flags:
+PUBLICATION IDS SEMANTICS FIXED = YES/NO
+REMOTE PRODUCT COUNT EVIDENCE CORRECT = YES/NO
+FULL SUITE = PASS/FAIL
+CATEGORY BRANCH MERGE READY = YES/NO
+SHOPIFY WRITE COUNT = 0
