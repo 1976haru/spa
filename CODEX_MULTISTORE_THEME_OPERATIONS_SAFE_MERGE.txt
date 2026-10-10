@@ -1,0 +1,328 @@
+ShopSource Studio — MULTI-STORE THEME OPERATIONS v1 SAFE MERGE
+BEGINNER UX + READ-ONLY DASHBOARD + PROTECTED DIRTY FILES
+
+Repository
+- Main repo: D:\shop\001_so_amazon
+- Feature worktree: D:\shop\001_so_amazon_multistore_theme
+- Remote: https://github.com/1976haru/spa.git
+- Feature branch: phase/multistore-theme-operations-v1
+- Expected implementation HEAD before this prompt commit: 82f2aebd8528fefbbdf16747b172537d72154451
+- Expected main/origin-main base: c3a77556017622d6c2c5d94e6a2fd192bf4f075c
+
+Feature summary
+- Existing store registry reused; no second registry
+- MultiStoreThemeOperationsService
+- non-secret status cache
+- bounded read-only checks, max concurrency 4
+- failure isolation per store
+- Korean-first beginner dashboard
+- one obvious next action per selected store
+- technical/raw state collapsed under advanced details
+- per-store Theme Access registration/deletion using OS credential store
+- explicit "save and read-check" option only
+- no bulk apply/live write controls
+- initial render/search/filter are local-only
+- full suite 1014 passed, 1 skipped
+- Shopify live write count 0
+- real Theme Access credential creation 0
+
+This merge task must NOT register a real password or run any live Shopify mutation.
+
+======================================================================
+1. FETCH / CONCURRENCY GATE
+======================================================================
+
+In main repo:
+
+git fetch origin --prune
+
+Record:
+- local main SHA
+- origin/main SHA
+- local feature SHA
+- origin feature SHA
+- merge-base
+- main...feature ahead/behind
+- git status --short
+
+Expected:
+origin/main = c3a77556017622d6c2c5d94e6a2fd192bf4f075c
+
+If origin/main moved:
+STOP and report CONCURRENT_MAIN_MOVEMENT.
+Do not auto-rebase, cherry-pick, or merge.
+
+Feature HEAD may be one commit ahead of 82f2aeb... because this safe-merge prompt itself is committed.
+
+======================================================================
+2. PROTECTED FILE GATE
+======================================================================
+
+Before merge record status + SHA256:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+
+Expected protected hashes from prior phase:
+- stores/001_cabin_tidy.json
+  9A480BE4CD24BF93BEAB8E02483512DB3801F10F506ADC610C38667C5832051F
+- tools/shopify_app/safe_shopify_cli.ps1
+  47A1BDF96BB54ADB0C9C86D7C91962A48EC6C4FDF6A0E73B6EFC8B943C275421
+
+Do not touch/stash/reset/restore:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env
+- credentials
+- .phase*
+- backups
+- user assets
+- operator temp folders
+
+Existing dirty state must remain byte-for-byte unchanged.
+
+======================================================================
+3. DIFF SCOPE REVIEW
+======================================================================
+
+Expected feature files:
+- CODEX_MULTISTORE_THEME_OPERATIONS_V1.txt
+- CODEX_MULTISTORE_BEGINNER_UX_POLISH.txt
+- CODEX_MULTISTORE_THEME_OPERATIONS_SAFE_MERGE.txt
+- src/shopsource/multistore_theme_operations.py
+- src/shopsource/multistore_theme_presentation.py
+- src/shopsource/ui/v2.py
+- tests/test_multistore_theme_operations.py
+
+Confirm NOT changed:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- src/shopsource/category_strategy.py
+- src/shopsource/category_shortcut_readiness.py
+- category reconciliation modules
+- Featured business logic / live apply behavior except UI navigation additions if none expected
+
+STOP on unexpected overlap.
+
+======================================================================
+4. BEGINNER UX REVIEW
+======================================================================
+
+Before merge explicitly confirm:
+
+A. Korean-first
+- navigation says "여러 스토어 테마 관리" or equivalent Korean label
+- page title/subtitle beginner-friendly
+- filters/buttons/statuses Korean-first
+
+B. One next action
+- selected store shows exactly one primary next-action button
+- missing Theme Access → register password
+- credential saved but not checked → read-check
+- READY → homepage navigation
+- no live apply from dashboard
+
+C. Technical details collapsed
+- GraphQL raw state / CLI state / theme GID / backend reason / diagnostic code hidden under "고급 정보 보기"
+- beginner table uses human labels
+
+D. Registration flow
+- selected store clearly shown
+- explains where Theme Access password comes from
+- password input type=password
+- never prefilled/revealed
+- save clears field
+- save-only does not run remote check
+- save-and-check runs read-only only
+- delete is secondary, explicit confirmation required
+
+E. 100-store usability
+- pagination
+- search/filter local-only
+- initial render no remote calls
+- max concurrency <=4
+- failure isolation
+
+F. Safety
+- no bulk apply
+- no theme push
+- no themeFilesUpsert on dashboard
+- no product/collection mutation
+- no automatic credential creation
+
+If any fail:
+STOP before merge.
+
+======================================================================
+5. PRE-MERGE TEST GATE
+======================================================================
+
+In feature worktree run:
+
+python -m compileall -q src tests
+
+Focused tests:
+- tests/test_multistore_theme_operations.py
+- tests/test_featured_theme_backend.py
+- tests/test_homepage_featured_products.py
+- tests/test_shopify_theme_cli.py
+- tests/test_theme_write_backend.py
+- tests/test_theme_access_credentials.py
+- tests/test_shopify_g0_readonly_hotfix.py
+
+Then full suite:
+python -m pytest -q --basetemp=<worktree-local-temp>
+
+Also:
+- git diff --check
+- python -m shopsource.cli --help
+- python -m shopsource.ui.v2 --help
+
+Expected:
+>= 1014 passed, 1 skipped
+
+Required:
+FULL SUITE PASS
+SHOPIFY LIVE WRITE COUNT = 0
+REAL THEME ACCESS CREDENTIAL CREATION = 0
+
+======================================================================
+6. FAST-FORWARD MERGE ONLY
+======================================================================
+
+Return to main repo.
+
+git fetch origin
+
+Verify origin/main is still the exact SHA recorded in step 1.
+
+Then:
+git merge --ff-only phase/multistore-theme-operations-v1
+
+If ff-only fails:
+STOP.
+No merge commit.
+No automatic conflict resolution.
+
+======================================================================
+7. POST-MERGE TEST GATE
+======================================================================
+
+On main rerun:
+- focused tests
+- full suite
+- compileall
+- git diff --check
+- CLI help
+- UI help
+
+Verify:
+- protected hashes unchanged
+- existing dirty protected files still dirty exactly as before
+- no credential created
+- no Shopify live write
+
+======================================================================
+8. PUSH MAIN WITH LAST-SECOND CHECK
+======================================================================
+
+git fetch origin
+
+If origin/main moved after local merge:
+STOP BEFORE PUSH.
+Report REMOTE_MAIN_MOVED_AFTER_LOCAL_MERGE.
+Do not force push.
+
+If unchanged:
+git push origin main
+
+Then fetch and verify:
+- main == origin/main
+- main...origin/main = 0 0
+
+======================================================================
+9. RETAIN FEATURE WORKTREE
+======================================================================
+
+Do not delete yet:
+- phase/multistore-theme-operations-v1
+- D:\shop\001_so_amazon_multistore_theme
+
+Retain until Store 001 completes its first real Theme Access registration + read-only verification.
+
+======================================================================
+10. SECOND-WINDOW HANDOFF
+======================================================================
+
+Final report must include:
+
+SECOND_WINDOW_HANDOFF_MAIN_SHA = <new main SHA>
+
+Any other active window/branch must fetch and refresh from this SHA before its next main merge.
+
+Do not modify another window's branch in this task.
+
+======================================================================
+11. NEXT ACTION AFTER SUCCESSFUL MERGE
+======================================================================
+
+Do NOT register password in this merge task.
+
+Exact next operational action:
+1. Run ShopSource UI from new main.
+2. Open "여러 스토어 테마 관리".
+3. Select 001 | Cabin Tidy.
+4. Confirm beginner flow shows "Theme Access 비밀번호 등록" as the primary next action.
+5. Only then obtain/enter Theme Access password locally.
+6. Prefer "저장 후 읽기 확인" for the first real registration because it is explicit and read-only.
+7. Review:
+   - Theme Access credential = YES
+   - Theme Access CLI = READY
+   - MAIN theme identity exact
+   - role MAIN
+   - AUTO backend = THEME_ACCESS_CLI
+8. Only after this result is reviewed should Featured/New Arrivals live apply be authorized.
+
+======================================================================
+12. FINAL REPORT
+======================================================================
+
+Report exactly:
+
+[1] pre-merge origin/main SHA
+[2] feature HEAD SHA
+[3] merge-base
+[4] ahead/behind
+[5] protected pre-merge hashes/status
+[6] diff scope review
+[7] beginner UX review
+[8] pre-merge tests
+[9] merge method
+[10] new local main SHA
+[11] post-merge tests
+[12] push result
+[13] final origin/main SHA
+[14] main...origin/main
+[15] protected post-merge hashes/status
+[16] Shopify live write count
+[17] Theme Access credential creation count
+[18] feature/worktree retained
+[19] SECOND_WINDOW_HANDOFF_MAIN_SHA
+[20] exact next action
+
+Final flags:
+FAST_FORWARD_ONLY = PASS/FAIL
+FULL_SUITE_POST_MERGE = PASS/FAIL
+MULTISTORE_THEME_DASHBOARD = READY/NOT_READY
+BEGINNER_UX = READY/NOT_READY
+KOREAN_FIRST = YES/NO
+ONE_NEXT_ACTION = YES/NO
+RAW_TECH_DETAILS_COLLAPSED = YES/NO
+BULK_CHECK_READONLY = YES/NO
+NO_BULK_LIVE_APPLY = YES/NO
+PER_STORE_CREDENTIAL_ISOLATION = YES/NO
+PROTECTED_FILES_UNCHANGED = YES/NO
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+MAIN_REMOTE_SYNC = YES/NO
+SECOND_WINDOW_HANDOFF_REQUIRED = YES
