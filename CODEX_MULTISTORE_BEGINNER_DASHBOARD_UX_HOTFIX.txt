@@ -1,0 +1,224 @@
+ShopSource Studio — MULTI-STORE BEGINNER DASHBOARD UX HOTFIX
+FIX SUMMARY COUNT + SELECTED STORE CARD LAYOUT + SEARCH LABEL
+
+Repository
+- Main: cc1b1966322457edad3acfffcfee18d8ec82e2e1
+- Branch: hotfix/multistore-beginner-dashboard-ux
+- Recommended worktree: D:\shop\001_so_amazon_multistore_ux_hotfix
+
+Context from real Store 001 screenshot
+The page is functionally correct, but real UI inspection exposed beginner-facing inconsistencies:
+
+1. Top summary says "설정 필요 0"
+   while the table clearly shows:
+   - Store 001 current status "설정 필요"
+   - Store 002 "연결 설정 필요"
+   - Store 003 "연결 설정 필요"
+
+This happens because the top KPI counts raw check_status == NEEDS_SETUP,
+while initial local-only rows often have check_status NOT_CHECKED even though beginner presentation derives a setup-required state.
+
+2. The selected-store content appears ABOVE the outlined card,
+while the card itself is mostly empty except "선택한 스토어의 다음 할 일".
+The code creates selected_card_title/status/next/primary_action before entering the ui.card() context and then merely references those variables inside the card. NiceGUI elements are not reparented by variable reference.
+
+3. Search placeholder says "스토어 이름, 번호, 이메일로 검색"
+but service filtering actually searches store_id, store_name, shop_domain.
+This should say "도메인", not "이메일".
+
+Mission
+Fix only these beginner UX defects.
+No remote behavior changes.
+No Shopify writes.
+No credential creation.
+No backend logic changes.
+
+======================================================================
+1. SUMMARY KPI SEMANTICS
+======================================================================
+
+Top KPI "설정 필요" must reflect what the beginner sees, not raw internal check_status only.
+
+Preferred rule:
+- use multistore_status_label(row) or a presentation helper to classify rows
+- count as setup-needed when beginner-facing status is one of:
+  "설정 필요"
+  "연결 설정 필요"
+  "Shopify CLI 설치 확인 필요"
+  "현재 테마 확인 필요"
+  "다시 확인 필요"
+  "확인 실패"
+- do NOT count "준비 완료"
+- "아직 확인 전" should be handled carefully:
+  if next_action is credential/connection/cli/check due missing prerequisites, count as setup-needed;
+  if no prerequisite issue but simply not checked, optionally count separately or not; avoid misleading 0.
+
+Simpler acceptable implementation:
+derive from next_action/status_label consistently so screenshot with 3 stores yields a non-zero setup count matching visible rows.
+
+Do not force remote checks on page load just to calculate KPI.
+
+Add test reproducing:
+- 001 connected + no Theme Access + not checked
+- 002 not connected
+- 003 not connected
+Expected top setup-needed count = 3 or at minimum logically non-zero and consistent with table statuses.
+Prefer exact 3 for this fixture.
+
+======================================================================
+2. SELECTED STORE CARD LAYOUT
+======================================================================
+
+Create all selected-store display elements INSIDE:
+
+with ui.card().classes("w-full border-2 border-blue-300"):
+    ...
+
+Including:
+- "선택한 스토어의 다음 할 일"
+- selected store title
+- current status
+- next action text
+- large primary action button
+
+Do NOT create them before the card and reference later.
+
+Expected visual hierarchy:
+
+[선택한 스토어의 다음 할 일]
+001 | Cabin Tidy
+현재 상태: 설정 필요
+다음 할 일: Theme Access 비밀번호를 등록하세요.
+[ Theme Access 비밀번호 등록 ]  <-- primary
+
+Then secondary controls below:
+[전체 스토어 읽기 확인] [화면 새로고침] [고급 정보 보기] [선택한 스토어 읽기 확인] [Theme Access 비밀번호 관리]
+
+Add source/UI test ensuring element creation lines occur inside the ui.card block.
+
+======================================================================
+3. NEXT ACTION TEXT
+======================================================================
+
+For the selected card, avoid showing only the button label duplicated as prose.
+
+Use friendly next-action sentence, e.g.
+- credential:
+  "Theme Access 비밀번호를 등록하세요."
+- connection:
+  "먼저 Shopify 연결 설정을 확인하세요."
+- cli:
+  "Shopify CLI 설치 상태를 확인하세요."
+- check:
+  "연결 상태를 읽기 확인하세요."
+- homepage:
+  "준비가 끝났습니다. 홈페이지에서 추천 상품을 확인할 수 있습니다."
+
+You may add a presentation helper:
+next_action_message(row)
+
+Keep one primary button.
+
+======================================================================
+4. SEARCH PLACEHOLDER
+======================================================================
+
+Change:
+"스토어 이름, 번호, 이메일로 검색"
+to:
+"스토어 이름, 번호, 도메인 검색"
+
+No service search logic change needed.
+
+======================================================================
+5. KEEP ALL SAFETY
+======================================================================
+
+Do not change:
+- MultiStoreThemeOperationsService remote semantics
+- bounded concurrency 4
+- local-only initial render
+- Theme Access secret handling
+- credential store
+- GraphQL evidence logic
+- Featured apply
+- Category code
+- protected files
+
+No Shopify live write.
+No real Theme Access credential creation.
+
+======================================================================
+6. TESTS
+======================================================================
+
+Add/update tests:
+
+test_setup_kpi_matches_beginner_visible_setup_states
+test_three_store_fixture_counts_three_setup_needed
+test_selected_store_components_created_inside_card
+test_selected_store_next_action_message_is_sentence
+test_search_placeholder_uses_domain_not_email
+test_initial_render_still_no_remote_calls
+test_no_bulk_live_apply
+test_no_shopify_live_write
+
+Run focused + full suite.
+
+======================================================================
+7. QUALITY GATES
+======================================================================
+
+python -m compileall -q src tests
+python -m pytest -q tests/test_multistore_theme_operations.py
+python -m pytest -q --basetemp=<worktree-local-temp>
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Expected >= 1014 passed, 1 skipped.
+
+======================================================================
+8. COMMIT/PUSH
+======================================================================
+
+Stay on:
+hotfix/multistore-beginner-dashboard-ux
+
+Suggested commit:
+git commit -m "Fix multi-store beginner dashboard consistency"
+
+Push branch.
+Do not merge main.
+
+======================================================================
+9. COMPLETION REPORT
+======================================================================
+
+Report:
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] setup KPI fix
+[5] selected-card layout fix
+[6] next-action message fix
+[7] search placeholder fix
+[8] remote behavior unchanged
+[9] focused tests
+[10] full suite
+[11] protected files
+[12] Shopify live write count
+[13] credential creation count
+[14] merge readiness
+[15] exact next action
+
+Flags:
+SETUP_KPI_CONSISTENT = YES/NO
+SELECTED_STORE_CARD_LAYOUT = FIXED/NOT_FIXED
+NEXT_ACTION_BEGINNER_FRIENDLY = YES/NO
+SEARCH_LABEL_CORRECT = YES/NO
+REMOTE_BEHAVIOR_UNCHANGED = YES/NO
+FULL_SUITE = PASS/FAIL
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+CODE_MERGE_READY = YES/NO
