@@ -1,0 +1,556 @@
+ShopSource Studio — FEATURED PRODUCTS THEME BACKEND ROUTER INTEGRATION
+PHASE B: GRAPHQL PRIMARY + THEME ACCESS CLI FALLBACK
+NO LIVE SHOPIFY WRITE DURING IMPLEMENTATION
+
+Repository
+- Main repo: D:\shop\001_so_amazon
+- Recommended worktree: D:\shop\001_so_amazon_featured_backend
+- Remote: https://github.com/1976haru/spa.git
+- Branch: phase/featured-theme-backend-router-integration
+- Branch base: 4cad28fce6c5cc36e5a2c0c8c8314dacd712ff79
+
+Current production facts
+- ShopSource Production auth is VERIFIED.
+- read_themes is granted.
+- write_themes is requested but still NOT granted.
+- Theme Access CLI fallback backend Phase A is now merged to main.
+- Fallback backend already provides:
+  - exact theme ID verification
+  - verified MAIN/live role
+  - exact templates/index.json allowlist
+  - raw SHA precondition
+  - read-after-write verify
+  - guarded rollback
+  - secret via SHOPIFY_CLI_THEME_TOKEN only
+  - no caller bypass of MAIN role
+- Existing FeaturedProductThemeApplyService already owns:
+  - isolated one-section semantic guard
+  - exact raw backup
+  - Shopify commented JSON preservation
+  - proposed/raw/semantic hash checks
+  - 4-product identity validation
+  - storefront human verification
+  - rollback safety
+
+Mission
+Integrate the new theme backend router into Featured Products so the SAME business safety workflow can use:
+1. ADMIN_GRAPHQL when the approved GraphQL write path is actually available.
+2. THEME_ACCESS_CLI when GraphQL is unavailable and Theme Access CLI is READY.
+
+Do not weaken existing Featured Product guards.
+Do not duplicate backup/business logic inside transports.
+Do not perform a real Shopify live write in this implementation phase.
+
+======================================================================
+1. WORKTREE / CONCURRENCY
+======================================================================
+
+Before coding:
+git fetch origin --prune
+
+Verify:
+- origin/main == 4cad28fce6c5cc36e5a2c0c8c8314dacd712ff79
+- branch is based on that SHA
+- no unexpected main movement invalidates baseline
+
+If main moved:
+STOP and report CONCURRENT_MAIN_MOVEMENT.
+
+Recommended:
+git worktree add D:\shop\001_so_amazon_featured_backend phase/featured-theme-backend-router-integration
+
+Do not implement in a dirty main worktree.
+
+======================================================================
+2. INSPECT CURRENT FEATURED APPLY PATH
+======================================================================
+
+Inspect:
+- src/shopsource/homepage_featured_products.py
+- src/shopsource/theme_write_backend.py
+- src/shopsource/shopify_theme_cli.py
+- src/shopsource/theme_access_credentials.py
+- src/shopsource/shopify_theme_json.py
+- src/shopsource/ui/v2.py
+
+Document before changes:
+- current preview source hash contract
+- backup DB/file contract
+- GraphQL theme read/write calls
+- rollback contract
+- current UI apply confirmation
+
+Keep semantic validation ABOVE backend transport.
+
+======================================================================
+3. ADD FEATURED BACKEND COORDINATOR
+======================================================================
+
+Preferred new module:
+src/shopsource/featured_theme_backend.py
+
+Responsibilities:
+- build ADMIN_GRAPHQL adapter from existing authenticated Shopify connection/client
+- build THEME_ACCESS_CLI backend
+- build ThemeWriteBackendRouter
+- expose read-only capability summary for UI
+- expose selected backend metadata
+- no homepage semantic decisions
+
+Suggested API:
+FeaturedThemeBackendCoordinator(...)
+
+Methods:
+- capability_summary(store_id, theme_id, selection="AUTO")
+- select_backend(store_id, theme_id, selection="AUTO")
+- build_graphql_backend(...)
+- build_cli_backend(...)
+
+Do not put secrets in returned dictionaries.
+
+======================================================================
+4. GRAPHQL CAPABILITY MUST NOT FALSELY CLAIM EXEMPTION
+======================================================================
+
+Important:
+write_themes scope alone does NOT prove protected themeFilesUpsert exemption is active.
+
+Represent GraphQL state honestly.
+
+Suggested GraphQL states:
+- SCOPE_MISSING
+- SCOPE_GRANTED_UNVERIFIED
+- VERIFIED_ACTIVE
+- ACCESS_DENIED_LAST_ATTEMPT
+
+AUTO selection rules for this phase:
+1. ADMIN_GRAPHQL only when VERIFIED_ACTIVE evidence exists.
+2. Else THEME_ACCESS_CLI when CLI READY.
+3. Else NO_WRITE_BACKEND.
+
+Do NOT label GraphQL exemption active merely because write_themes appears in granted scopes.
+
+If there is no existing durable evidence table, add a small non-secret per-store/theme backend evidence table, e.g.:
+theme_write_backend_evidence
+
+Fields:
+- store_id
+- theme_id
+- backend_name
+- status
+- evidence_source
+- last_attempt_at
+- last_success_at
+- updated_at
+
+No token/secret.
+
+How GraphQL becomes VERIFIED_ACTIVE:
+- only after an actual successful themeFilesUpsert in a later user-confirmed live action
+- OR an existing historical success record if the repo can prove one
+Do not fabricate evidence in this task.
+
+Since current Cabin Tidy has no write_themes, expected GraphQL state remains SCOPE_MISSING.
+
+======================================================================
+5. UNIFY FEATURED APPLY TRANSPORT
+======================================================================
+
+Refactor FeaturedProductThemeApplyService.apply() carefully.
+
+New optional arguments:
+- backend_selection="AUTO"
+- allow_live=False
+- backend_coordinator=None for tests/injection
+
+Keep:
+- plan freshness checks
+- exactly 4 ACTIVE products
+- preview hash
+- MAIN theme identity
+- section ID validation
+- isolated semantic diff
+- exact backup creation
+- proposed product IDs check
+
+Remove the hard requirement that apply can proceed only when GraphQL has write_themes.
+
+New flow:
+
+A. Validate business preview exactly as today.
+
+B. Build/select backend BEFORE mutation.
+- selection locked before write
+- return backend_name + reason_code in result
+- if no backend READY => MANUAL_ACTION_REQUIRED, write_performed=False
+
+C. Read exact current templates/index.json using SELECTED backend.
+- For GraphQL adapter: existing Admin GraphQL read.
+- For CLI: Theme Access CLI read.
+- Parse with parse_shopify_json_document.
+- Require raw hash + semantic hash to match preview source.
+- require theme identity MAIN from trusted preview plus backend's verified role where backend provides role.
+
+D. Create existing exact backup only AFTER backend pre-read passes and BEFORE write.
+
+E. Build ThemeFileWriteRequest:
+- store_id
+- shop_domain
+- theme_id
+- filename=templates/index.json
+- content=proposed_raw
+- expected_remote_raw_hash=current_doc.raw_hash
+- confirmed=True
+- target_is_live=True
+- allow_live=allow_live
+
+F. Write only through ThemeWriteBackendRouter.write(selected,...).
+- no fallback after write attempt
+- capture backend status
+
+G. Unified post-write semantic verification:
+- re-read through SAME selected backend
+- exact raw hash == proposed_doc.raw_hash
+- parsed document == proposed
+- prefix/suffix preserved
+- 4 product IDs exact
+- isolated diff still safe
+
+H. Only then mark:
+REMOTE_JSON_VERIFIED
+
+Do not rely only on backend raw verification for Featured success.
+Featured business verification must remain stronger.
+
+======================================================================
+6. GRAPHQL ADAPTER
+======================================================================
+
+Build AdminGraphQLThemeBackend callbacks using current existing code.
+
+read_file:
+- require read_themes
+- exact theme ID
+- MAIN role
+- exact filename
+- return ThemeFileReadResult with raw content/hash
+
+write_file:
+- require confirmed
+- require templates/index.json
+- require expected remote hash already checked by service/adapter
+- perform themeFilesUpsert
+- map ACCESS_DENIED cleanly
+- never log body/token
+- return ThemeFileWriteResult
+
+On successful actual GraphQL themeFilesUpsert:
+- record VERIFIED_ACTIVE evidence
+
+On ACCESS_DENIED:
+- record ACCESS_DENIED_LAST_ATTEMPT
+- return failure
+- DO NOT automatically switch to CLI after attempted write
+
+No real GraphQL mutation in tests.
+
+======================================================================
+7. BACKUP RECORD MUST REMEMBER BACKEND
+======================================================================
+
+Upgrade homepage_featured_theme_backups safely.
+
+Add migration-safe columns:
+- backend_name
+- backend_selection
+- backend_reason_code
+
+Existing rows must remain readable.
+
+Backup metadata.json should also include:
+- backend_name
+- backend_selection
+- backend_reason_code
+
+No secret.
+
+Do not break existing backups.
+
+======================================================================
+8. ROLLBACK MUST USE ORIGINAL BACKEND
+======================================================================
+
+Refactor FeaturedProductThemeApplyService.rollback().
+
+Rules:
+- load backend_name stored on backup
+- select that SAME backend explicitly
+- never silently switch backend for rollback
+- pre-read current remote through original backend
+- require current raw == proposed_raw
+- if merchant drift => CONFLICT
+- restore before_raw only via original backend
+- same MAIN/allow_live gate
+- post-read exact verify
+- mark ROLLED_BACK only after exact restore
+
+Add arguments:
+- allow_live=False
+- backend_coordinator=None
+
+Existing legacy backup rows without backend_name:
+- default to ADMIN_GRAPHQL_LEGACY
+- preserve current behavior only when GraphQL path is actually available
+- never guess CLI.
+
+======================================================================
+9. THEME ACCESS CREDENTIAL UI
+======================================================================
+
+In src/shopsource/ui/v2.py, under existing:
+"Shopify 연결 설정 (토큰은 Windows 자격 증명에만 저장)"
+
+Add a compact Theme Access fallback subsection.
+
+Required controls:
+- password input:
+  "Theme Access 비밀번호 (테마 대체 경로)"
+- button:
+  "Theme Access 저장"
+- button:
+  "Theme Access 삭제"
+- status label:
+  "Theme Access credential: YES/NO"
+- button:
+  "테마 대체 경로 확인"
+
+Use:
+theme_access_credentials.save_theme_access_password
+delete_theme_access_password
+credential_present
+
+Rules:
+- password clears immediately after save
+- never echo it
+- never SQLite
+- never general auth status serialization
+
+Help text:
+"write_themes 승인이 없을 때 사용할 수 있는 스토어 소유자 제어 대체 경로입니다. 저장만으로 테마는 변경되지 않습니다."
+
+Do not automatically install Theme Access app.
+Do not open external web flow automatically.
+
+======================================================================
+10. READ-ONLY BACKEND CAPABILITY UI
+======================================================================
+
+"테마 대체 경로 확인" must be READ ONLY.
+
+It may:
+- inspect current MAIN theme ID using existing read_themes path
+- call FeaturedThemeBackendCoordinator.capability_summary(...)
+- call Shopify CLI theme list read-only if Theme Access credential exists
+
+Show:
+- GraphQL: SCOPE_MISSING / SCOPE_GRANTED_UNVERIFIED / VERIFIED_ACTIVE / ACCESS_DENIED_LAST_ATTEMPT
+- Theme Access CLI: READY / credential missing / CLI missing / theme identity problem
+- AUTO selected backend
+- verified theme ID
+- verified role
+- no secret
+
+No push.
+No themeFilesUpsert.
+No collection/product mutation.
+
+Expected current Cabin Tidy BEFORE user enters Theme Access password:
+- GraphQL: SCOPE_MISSING
+- CLI: CREDENTIAL_MISSING
+- AUTO: NO_WRITE_BACKEND
+
+That is correct.
+
+======================================================================
+11. FEATURED APPLY UI
+======================================================================
+
+Update Featured Products apply dialog.
+
+Before confirmation show:
+- Backend selection: AUTO / ADMIN_GRAPHQL / THEME_ACCESS_CLI
+- AUTO selected backend and reason
+- Theme ID/name
+- verified MAIN/live status
+- selected products 4
+- scope of change: Featured section only
+
+Default:
+AUTO
+
+Existing confirmation stays:
+"추천 상품 section만 Shopify 테마에 적용하는 것을 확인했습니다."
+
+Add MAIN-specific second checkbox:
+"현재 MAIN 테마에 live 적용하는 것을 확인했습니다."
+
+Apply button remains disabled/blocked unless:
+- preview valid
+- backend READY
+- both confirmations true for MAIN target
+
+Pass:
+backend_selection=<selected value>
+allow_live=True only when second MAIN confirmation is true
+
+No hidden auto-fallback after write attempt.
+
+======================================================================
+12. FEATURED ROLLBACK UI
+======================================================================
+
+Rollback dialog must show:
+- original backend stored in backup
+- MAIN live target
+- exact backup ID
+
+Require:
+- rollback confirmation
+- MAIN live confirmation
+
+Pass allow_live=True only after explicit MAIN confirmation.
+
+No backend switching.
+
+======================================================================
+13. DO NOT IMPLEMENT CATEGORY THEME APPLY YET
+======================================================================
+
+This Phase B integrates Featured Products only.
+
+Do not wire Category Shortcuts theme apply in this task.
+We will reuse this proven integration after Featured succeeds.
+
+Do not modify category strategy/reconciliation unless a test fixture import requires a trivial non-behavioral update.
+If behavior overlap is required:
+STOP and report.
+
+======================================================================
+14. TESTS
+======================================================================
+
+Add focused tests, suggested:
+tests/test_featured_theme_backend.py
+extend tests/test_homepage_featured_products.py
+extend UI source/behavior tests as appropriate
+
+At minimum:
+
+test_featured_auto_uses_cli_when_graphql_scope_missing_and_cli_ready
+test_featured_auto_no_backend_when_graphql_missing_and_cli_credential_missing
+test_featured_graphql_scope_does_not_equal_verified_exemption
+test_graphql_success_records_verified_active
+test_graphql_access_denied_records_denied_evidence
+test_featured_selected_backend_locked_before_write
+test_featured_never_falls_back_after_write_attempt
+test_featured_cli_pre_read_must_match_preview_raw_hash
+test_featured_cli_apply_keeps_isolated_diff_guard
+test_featured_cli_apply_requires_live_confirmation
+test_featured_cli_apply_semantic_post_verify
+test_featured_backup_records_backend
+test_featured_rollback_uses_original_backend
+test_featured_rollback_never_switches_backend
+test_legacy_backup_does_not_guess_cli
+test_theme_access_password_ui_never_echoes_secret
+test_theme_access_save_clears_input
+test_backend_capability_check_is_read_only
+test_current_cabin_without_theme_access_would_show_no_backend
+test_no_shopify_live_write
+
+All Shopify subprocess/GraphQL mutation paths mocked.
+
+======================================================================
+15. PROTECTED FILES
+======================================================================
+
+Do not edit/stage/commit:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env
+- credentials
+- .phase*
+- backups
+- user assets
+
+Do not create a real Theme Access password.
+
+======================================================================
+16. QUALITY GATES
+======================================================================
+
+Run:
+python -m compileall -q src tests
+focused Featured/backend/UI tests
+python -m pytest -q --basetemp=<worktree-local-writable-temp>
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Required:
+FULL SUITE PASS
+SHOPIFY LIVE WRITE COUNT = 0
+THEME ACCESS REAL CREDENTIAL CREATION = 0
+
+======================================================================
+17. COMMIT / PUSH
+======================================================================
+
+Stay on:
+phase/featured-theme-backend-router-integration
+
+Suggested commit:
+git commit -m "Integrate theme backend router with Featured Products"
+
+Push same branch.
+Do NOT merge main.
+
+======================================================================
+18. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] baseline SHA
+[2] final SHA
+[3] worktree path
+[4] files changed
+[5] coordinator architecture
+[6] GraphQL capability/evidence model
+[7] Featured apply unified backend flow
+[8] backup backend persistence
+[9] rollback original-backend behavior
+[10] Theme Access credential UI
+[11] read-only backend status UI
+[12] Featured apply UI confirmation flow
+[13] focused tests
+[14] full-suite result
+[15] protected files
+[16] Shopify live write count
+[17] real Theme Access credential creation count
+[18] current expected Cabin Tidy backend state without Theme Access credential
+[19] merge readiness
+[20] exact next action
+
+Final flags:
+FEATURED_BACKEND_ROUTER = READY/NOT_READY
+GRAPHQL_EXEMPTION_EVIDENCE_HONEST = YES/NO
+CLI_FALLBACK_INTEGRATED = YES/NO
+BACKUP_BACKEND_PERSISTED = YES/NO
+ROLLBACK_BACKEND_LOCKED = YES/NO
+THEME_ACCESS_UI_READY = YES/NO
+READONLY_CAPABILITY_CHECK = PASS/FAIL
+FULL_SUITE = PASS/FAIL
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+CODE_MERGE_READY = YES/NO
