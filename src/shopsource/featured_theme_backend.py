@@ -72,6 +72,10 @@ class FeaturedThemeBackendCoordinator:
                         (str(store_id), str(theme_id), status, evidence_source, now, last_success, now))
 
     def build_graphql_backend(self, *, client=None):
+        """Build a conservative adapter; scope-only GraphQL remains unavailable."""
+        return self._build_graphql_backend(client=client, allow_unverified_probe=False)
+
+    def _build_graphql_backend(self, *, client=None, allow_unverified_probe=False):
         fixed_client = client
 
         def client_for(store_id):
@@ -115,6 +119,10 @@ class FeaturedThemeBackendCoordinator:
                        "target_is_live": True, "identity_verified": True}
             if state == "VERIFIED_ACTIVE":
                 return ThemeBackendCapabilities("ADMIN_GRAPHQL", "READY", "GRAPHQL_EXEMPTION_VERIFIED", details)
+            if state == "SCOPE_GRANTED_UNVERIFIED" and allow_unverified_probe:
+                details["verification_attempt"] = True
+                return ThemeBackendCapabilities("ADMIN_GRAPHQL", "READY",
+                    "USER_SELECTED_GRAPHQL_VERIFICATION_ATTEMPT", details)
             return ThemeBackendCapabilities("ADMIN_GRAPHQL", "UNAVAILABLE", state, details)
 
         def read(store_id, shop_domain, theme_id, filename):
@@ -200,11 +208,19 @@ class FeaturedThemeBackendCoordinator:
     def build_cli_backend(self):
         return self.cli_backend
 
-    def _router(self, *, client=None):
-        return ThemeWriteBackendRouter(self.build_graphql_backend(client=client), self.build_cli_backend())
+    def _router(self, *, client=None, allow_unverified_probe=False):
+        return ThemeWriteBackendRouter(self._build_graphql_backend(
+            client=client, allow_unverified_probe=allow_unverified_probe), self.build_cli_backend())
 
     def select_backend(self, store_id, theme_id, selection="AUTO", *, client=None):
-        return self._router(client=client).select(store_id, theme_id=theme_id, selection=selection)
+        explicit_graphql = str(selection or "AUTO").upper() == "ADMIN_GRAPHQL"
+        selected = self._router(client=client, allow_unverified_probe=explicit_graphql).select(
+            store_id, theme_id=theme_id, selection=selection)
+        graph = selected["capabilities"]["ADMIN_GRAPHQL"]
+        if (explicit_graphql and selected.get("backend_name") == "ADMIN_GRAPHQL"
+                and graph.reason_code == "USER_SELECTED_GRAPHQL_VERIFICATION_ATTEMPT"):
+            selected["reason_code"] = graph.reason_code
+        return selected
 
     def capability_summary(self, store_id, theme_id=None, selection="AUTO"):
         identity = {"id": theme_id, "name": None, "role": None}
@@ -230,6 +246,7 @@ class FeaturedThemeBackendCoordinator:
                         "role": main.get("verified_theme_role")}
         return {"graphql_state": graph.details.get("state", graph.status),
                 "graphql_reason_code": graph.reason_code,
+                "verification_attempt": bool(graph.details.get("verification_attempt")),
                 "theme_access_cli_state": "READY" if cli.ready else ("CREDENTIAL_MISSING" if not has_credential else cli.reason_code),
                 "theme_access_cli_reason_code": cli.reason_code,
                 "selected_backend": selected.get("backend_name"), "selection_reason": selected.get("reason_code"),

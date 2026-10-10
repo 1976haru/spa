@@ -2421,7 +2421,10 @@ class OperatorUI:
                                     f"({summary.get('selection_reason')}) | GraphQL: {summary.get('graphql_state')} | "
                                     f"Theme Access CLI: {summary.get('theme_access_cli_state')} | "
                                     f"Verified theme: {summary.get('verified_theme_id') or theme.get('id')} / "
-                                    f"{summary.get('verified_theme_role') or 'unverified'}")
+                                    f"{summary.get('verified_theme_role') or 'unverified'}" +
+                                    ("\nGraphQL scope is granted but exemption is not yet verified. "
+                                     "This explicit live apply will test the approved path."
+                                     if summary.get("verification_attempt") else ""))
                             except Exception as exc:
                                 backend_state["ready"] = False
                                 backend_summary_label.set_text(f"Backend capability check failed: {_safe_error(exc)}")

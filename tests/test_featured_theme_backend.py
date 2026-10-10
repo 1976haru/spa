@@ -12,9 +12,11 @@ RAW = '/* preserved */\n{"sections":{},"order":[]}\n'
 
 
 class MockGraphQL:
-    def __init__(self, scopes=(), *, access_denied=False):
+    def __init__(self, scopes=(), *, access_denied=False, identity_id=THEME_ID, role="MAIN"):
         self.scopes = set(scopes)
         self.access_denied = access_denied
+        self.identity_id = identity_id
+        self.role = role
         self.raw = RAW
         self.mutations = 0
         self.queries = []
@@ -24,11 +26,11 @@ class MockGraphQL:
         if "FeaturedScopes" in query or "FeaturedThemeEvidence" in query:
             data = {"currentAppInstallation": {"accessScopes": [{"handle": s} for s in self.scopes]}}
             if "theme(" in query:
-                data["theme"] = {"id": THEME_ID, "name": "Main", "role": "MAIN", "files": {"nodes": [
+                data["theme"] = {"id": self.identity_id, "name": "Main", "role": self.role, "files": {"nodes": [
                     {"filename": "templates/index.json", "body": {"content": self.raw}}]}}
             return data
         if "FeaturedThemeIdentity" in query:
-            return {"theme": {"id": THEME_ID, "name": "Main", "role": "MAIN"}}
+            return {"theme": {"id": self.identity_id, "name": "Main", "role": self.role}}
         if "themeFilesUpsert" in query:
             self.mutations += 1
             if self.access_denied:
@@ -110,7 +112,8 @@ def test_graphql_scope_does_not_equal_verified_exemption(tmp_path, monkeypatch):
     assert selected["backend_name"] is None
     assert selected["capabilities"]["ADMIN_GRAPHQL"].reason_code == "SCOPE_GRANTED_UNVERIFIED"
     explicitly_selected = coordinator.select_backend("s1", THEME_ID, "ADMIN_GRAPHQL")
-    assert explicitly_selected["backend_name"] is None
+    assert explicitly_selected["backend_name"] == "ADMIN_GRAPHQL"
+    assert explicitly_selected["reason_code"] == "USER_SELECTED_GRAPHQL_VERIFICATION_ATTEMPT"
     with connect(db) as con:
         assert con.execute("SELECT COUNT(*) FROM theme_write_backend_evidence").fetchone()[0] == 0
     assert graph.mutations == 0
@@ -118,6 +121,110 @@ def test_graphql_scope_does_not_equal_verified_exemption(tmp_path, monkeypatch):
         __import__("hashlib").sha256(RAW.encode()).hexdigest(), confirmed=True, allow_live=True, target_is_live=True)
     denied = coordinator.build_graphql_backend().write_file(request)
     assert not denied.write_performed and graph.mutations == 0
+
+
+def test_auto_never_uses_scope_granted_unverified_graphql(tmp_path, monkeypatch):
+    graph = MockGraphQL({"read_themes", "write_themes"})
+    cli = MockBackend("THEME_ACCESS_CLI")
+    _db, coordinator = _coordinator(tmp_path, monkeypatch, graph, cli)
+    selected = coordinator.select_backend("s1", THEME_ID, "AUTO")
+    assert selected["backend_name"] == "THEME_ACCESS_CLI"
+    assert selected["capabilities"]["ADMIN_GRAPHQL"].reason_code == "SCOPE_GRANTED_UNVERIFIED"
+    assert not selected["capabilities"]["ADMIN_GRAPHQL"].ready
+    assert graph.mutations == 0
+
+
+def test_explicit_graphql_allows_single_verification_attempt_when_scope_granted(tmp_path, monkeypatch):
+    graph = MockGraphQL({"read_themes", "write_themes"})
+    _db, coordinator = _coordinator(tmp_path, monkeypatch, graph, MockBackend("THEME_ACCESS_CLI", "CREDENTIAL_MISSING"))
+    selected = coordinator.select_backend("s1", THEME_ID, "ADMIN_GRAPHQL")
+    assert selected["backend_name"] == "ADMIN_GRAPHQL"
+    assert selected["reason_code"] == "USER_SELECTED_GRAPHQL_VERIFICATION_ATTEMPT"
+    assert selected["capabilities"]["ADMIN_GRAPHQL"].details["verification_attempt"] is True
+    assert graph.mutations == 0  # Selection/probe preparation is read-only.
+
+
+def test_explicit_graphql_probe_still_requires_main_identity(tmp_path, monkeypatch):
+    graph = MockGraphQL({"read_themes", "write_themes"}, role="UNPUBLISHED")
+    _db, coordinator = _coordinator(tmp_path, monkeypatch, graph, MockBackend("THEME_ACCESS_CLI", "CREDENTIAL_MISSING"))
+    selected = coordinator.select_backend("s1", THEME_ID, "ADMIN_GRAPHQL")
+    assert selected["backend_name"] is None
+    assert selected["capabilities"]["ADMIN_GRAPHQL"].reason_code == "MAIN_THEME_IDENTITY_UNVERIFIED"
+    assert graph.mutations == 0
+
+
+def test_explicit_graphql_probe_still_requires_live_confirmation(tmp_path, monkeypatch):
+    graph = MockGraphQL({"read_themes", "write_themes"})
+    _db, coordinator = _coordinator(tmp_path, monkeypatch, graph, MockBackend("THEME_ACCESS_CLI", "CREDENTIAL_MISSING"))
+    backend = coordinator.select_backend("s1", THEME_ID, "ADMIN_GRAPHQL")["backend"]
+    request = ThemeFileWriteRequest("s1", "sample.myshopify.com", THEME_ID, "templates/index.json", RAW,
+        __import__("hashlib").sha256(RAW.encode()).hexdigest(), confirmed=True, allow_live=False, target_is_live=True)
+    result = backend.write_file(request)
+    assert not result.write_performed and result.reason_code == "MAIN_CONFIRMATION_OR_ALLOWLIST_REQUIRED"
+    assert graph.mutations == 0
+
+
+def test_explicit_graphql_probe_success_records_verified_active(tmp_path, monkeypatch):
+    graph = MockGraphQL({"read_themes", "write_themes"})
+    db, coordinator = _coordinator(tmp_path, monkeypatch, graph, MockBackend("THEME_ACCESS_CLI", "CREDENTIAL_MISSING"))
+    selected = coordinator.select_backend("s1", THEME_ID, "ADMIN_GRAPHQL")
+    request = ThemeFileWriteRequest("s1", "sample.myshopify.com", THEME_ID, "templates/index.json",
+        '{"sections":{},"order":[]}\n', __import__("hashlib").sha256(RAW.encode()).hexdigest(),
+        confirmed=True, allow_live=True, target_is_live=True)
+    result = selected["backend"].write_file(request)
+    assert result.write_performed and graph.mutations == 1
+    with connect(db) as con:
+        assert con.execute("SELECT status FROM theme_write_backend_evidence").fetchone()[0] == "VERIFIED_ACTIVE"
+
+
+def test_explicit_graphql_probe_access_denied_records_denied(tmp_path, monkeypatch):
+    graph = MockGraphQL({"read_themes", "write_themes"}, access_denied=True)
+    db, coordinator = _coordinator(tmp_path, monkeypatch, graph, MockBackend("THEME_ACCESS_CLI"))
+    selected = coordinator.select_backend("s1", THEME_ID, "ADMIN_GRAPHQL")
+    request = ThemeFileWriteRequest("s1", "sample.myshopify.com", THEME_ID, "templates/index.json", RAW,
+        __import__("hashlib").sha256(RAW.encode()).hexdigest(), confirmed=True, allow_live=True, target_is_live=True)
+    result = selected["backend"].write_file(request)
+    assert result.status == "ACCESS_DENIED" and graph.mutations == 1
+    with connect(db) as con:
+        assert con.execute("SELECT status FROM theme_write_backend_evidence").fetchone()[0] == "ACCESS_DENIED_LAST_ATTEMPT"
+
+
+def test_explicit_graphql_probe_never_falls_back_to_cli_after_attempt(tmp_path, monkeypatch):
+    graph = MockGraphQL({"read_themes", "write_themes"}, access_denied=True)
+    cli = MockBackend("THEME_ACCESS_CLI")
+    _db, coordinator = _coordinator(tmp_path, monkeypatch, graph, cli)
+    selected = coordinator.select_backend("s1", THEME_ID, "ADMIN_GRAPHQL")
+    result = selected["backend"].write_file(ThemeFileWriteRequest(
+        "s1", "sample.myshopify.com", THEME_ID, "templates/index.json", RAW,
+        __import__("hashlib").sha256(RAW.encode()).hexdigest(), confirmed=True, allow_live=True, target_is_live=True))
+    assert result.status == "ACCESS_DENIED" and cli.writes == 0 and graph.mutations == 1
+
+
+def test_access_denied_last_attempt_blocks_explicit_probe(tmp_path, monkeypatch):
+    graph = MockGraphQL({"read_themes", "write_themes"})
+    db, coordinator = _coordinator(tmp_path, monkeypatch, graph, MockBackend("THEME_ACCESS_CLI"))
+    coordinator._record("s1", THEME_ID, "ACCESS_DENIED_LAST_ATTEMPT", "TEST_DENIED")
+    selected = coordinator.select_backend("s1", THEME_ID, "ADMIN_GRAPHQL")
+    assert selected["backend_name"] is None
+    assert selected["capabilities"]["ADMIN_GRAPHQL"].reason_code == "ACCESS_DENIED_LAST_ATTEMPT"
+    assert graph.mutations == 0
+
+
+def test_scope_removed_after_historical_success_is_not_ready(tmp_path, monkeypatch):
+    graph = MockGraphQL({"read_themes"})
+    db, coordinator = _coordinator(tmp_path, monkeypatch, graph, MockBackend("THEME_ACCESS_CLI", "CREDENTIAL_MISSING"))
+    _seed_historical_success(db)
+    selected = coordinator.select_backend("s1", THEME_ID, "ADMIN_GRAPHQL")
+    capability = selected["capabilities"]["ADMIN_GRAPHQL"]
+    assert selected["backend_name"] is None and not capability.ready
+    assert capability.details["state"] == "SCOPE_MISSING"
+
+
+def test_no_shopify_live_write_in_test_setup(tmp_path, monkeypatch):
+    graph = MockGraphQL({"read_themes", "write_themes"})
+    _db, coordinator = _coordinator(tmp_path, monkeypatch, graph, MockBackend("THEME_ACCESS_CLI"))
+    coordinator.select_backend("s1", THEME_ID, "ADMIN_GRAPHQL")
+    assert graph.mutations == 0
 
 
 def test_graphql_success_records_verified_active(tmp_path, monkeypatch):
