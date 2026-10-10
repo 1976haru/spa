@@ -1,0 +1,270 @@
+ShopSource Studio — MULTI-STORE BEGINNER DASHBOARD UX HOTFIX SAFE MERGE
+
+Repository
+- Main repo: D:\shop\001_so_amazon
+- Hotfix worktree: D:\shop\001_so_amazon_multistore_ux_hotfix
+- Remote: https://github.com/1976haru/spa.git
+- Branch: hotfix/multistore-beginner-dashboard-ux
+- Expected implementation HEAD before this prompt commit: eca8f1f328b71ac62cf837f72e06132c979d9dfb
+- Expected main/origin-main: cc1b1966322457edad3acfffcfee18d8ec82e2e1
+
+Hotfix scope
+- setup-needed KPI now matches beginner-visible state
+- 3-store fixture => setup needed 3
+- selected-store title/status/next action/primary button are created inside the blue card
+- beginner-friendly next-action sentence
+- search placeholder uses domain, not email
+- remote behavior unchanged
+- no Shopify live write
+- no real Theme Access credential creation
+- full suite 1019 passed, 1 skipped
+
+======================================================================
+1. CONCURRENCY GATE
+======================================================================
+
+In main repo:
+
+git fetch origin --prune
+
+Record:
+- local main SHA
+- origin/main SHA
+- local hotfix SHA
+- origin hotfix SHA
+- merge-base
+- ahead/behind
+- git status --short
+
+Expected:
+origin/main = cc1b1966322457edad3acfffcfee18d8ec82e2e1
+
+If origin/main moved:
+STOP with CONCURRENT_MAIN_MOVEMENT.
+Do not auto-rebase/cherry-pick/merge.
+
+Hotfix HEAD may be one commit ahead of eca8f1f... because this safe-merge prompt itself is committed.
+
+======================================================================
+2. PROTECTED FILE GATE
+======================================================================
+
+Record status + SHA256 before merge:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+
+Expected hashes:
+- Cabin Tidy
+  9A480BE4CD24BF93BEAB8E02483512DB3801F10F506ADC610C38667C5832051F
+- safe CLI
+  47A1BDF96BB54ADB0C9C86D7C91962A48EC6C4FDF6A0E73B6EFC8B943C275421
+
+Do not touch/stash/reset/restore protected dirty files, DB, .env, credentials, .phase*, backups, user assets, operator temp folders.
+
+======================================================================
+3. DIFF SCOPE
+======================================================================
+
+Expected hotfix files:
+- CODEX_MULTISTORE_BEGINNER_DASHBOARD_UX_HOTFIX.txt
+- CODEX_MULTISTORE_BEGINNER_DASHBOARD_UX_HOTFIX_SAFE_MERGE.txt
+- src/shopsource/multistore_theme_presentation.py
+- src/shopsource/ui/v2.py
+- tests/test_multistore_theme_operations.py
+
+Confirm service/backend behavior files are NOT modified:
+- src/shopsource/multistore_theme_operations.py
+- src/shopsource/featured_theme_backend.py
+- src/shopsource/theme_write_backend.py
+- src/shopsource/shopify_theme_cli.py
+- category/reconciliation files
+
+STOP on unexpected scope.
+
+======================================================================
+4. UX SAFETY REVIEW
+======================================================================
+
+Confirm in source/tests:
+
+A. KPI
+- "설정 필요" derives from beginner-visible state
+- fixture 001 connected/no password + 002/003 not connected => 3
+
+B. Card layout
+- selected store title/status/next message/primary button created inside blue card context
+- secondary controls remain below card
+
+C. Next action
+- credential => "Theme Access 비밀번호를 등록하세요."
+- connection => beginner sentence
+- CLI => beginner sentence
+- check => beginner sentence
+- ready => homepage sentence
+- exactly one primary next-action button
+
+D. Search
+- placeholder says "스토어 이름, 번호, 도메인 검색"
+
+E. Safety unchanged
+- initial render local-only
+- no remote checks on search/filter
+- no bulk apply
+- no Shopify live write
+- no credential creation
+
+======================================================================
+5. PRE-MERGE TESTS
+======================================================================
+
+In hotfix worktree:
+
+python -m compileall -q src tests
+
+Focused:
+python -m pytest -q tests/test_multistore_theme_operations.py
+python -m pytest -q tests/test_featured_theme_backend.py tests/test_homepage_featured_products.py tests/test_shopify_theme_cli.py tests/test_theme_write_backend.py tests/test_theme_access_credentials.py tests/test_shopify_g0_readonly_hotfix.py
+
+Full:
+python -m pytest -q --basetemp=<worktree-local-temp>
+
+Also:
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Required:
+FULL SUITE PASS
+Expected >= 1019 passed, 1 skipped
+SHOPIFY LIVE WRITE COUNT = 0
+REAL THEME ACCESS CREDENTIAL CREATION = 0
+
+======================================================================
+6. FAST-FORWARD MERGE ONLY
+======================================================================
+
+Return to main repo.
+
+git fetch origin
+
+Verify origin/main still equals the SHA recorded in step 1.
+
+Then:
+git merge --ff-only hotfix/multistore-beginner-dashboard-ux
+
+If ff-only fails:
+STOP.
+No merge commit.
+No conflict auto-resolution.
+
+======================================================================
+7. POST-MERGE TESTS
+======================================================================
+
+On main rerun:
+- focused tests
+- full suite
+- compileall
+- diff-check
+- CLI help
+- UI help
+
+Verify protected hashes/status unchanged.
+No Shopify write.
+No Theme Access credential created.
+
+======================================================================
+8. PUSH WITH LAST-SECOND REMOTE CHECK
+======================================================================
+
+git fetch origin
+
+If origin/main moved:
+STOP before push.
+Report REMOTE_MAIN_MOVED_AFTER_LOCAL_MERGE.
+Do not force push.
+
+If unchanged:
+git push origin main
+
+Then verify:
+- main == origin/main
+- main...origin/main = 0 0
+
+======================================================================
+9. KEEP HOTFIX WORKTREE TEMPORARILY
+======================================================================
+
+Retain:
+- hotfix/multistore-beginner-dashboard-ux
+- D:\shop\001_so_amazon_multistore_ux_hotfix
+
+until the first real post-merge UI screenshot is visually confirmed.
+
+======================================================================
+10. NEXT ACTION
+======================================================================
+
+Do NOT register a Theme Access password in this merge task.
+
+After successful merge:
+1. run ShopSource from main
+2. open "여러 스토어 테마 관리"
+3. visually verify:
+   - 등록된 스토어 3
+   - Shopify 연결됨 1
+   - 설정 필요 3
+   - 001 selected card content is entirely inside blue card
+   - primary action says Theme Access 비밀번호 등록
+   - search says 도메인
+4. then send screenshot for review
+5. only after screenshot approval proceed to real Store 001 Theme Access registration
+
+======================================================================
+11. SECOND WINDOW HANDOFF
+======================================================================
+
+Final report must include:
+SECOND_WINDOW_HANDOFF_MAIN_SHA = <new main SHA>
+
+Other active window must fetch this SHA before next main merge.
+
+======================================================================
+12. FINAL REPORT
+======================================================================
+
+Report:
+[1] pre-merge origin/main
+[2] hotfix HEAD
+[3] merge-base
+[4] ahead/behind
+[5] protected pre hashes/status
+[6] diff scope
+[7] UX review
+[8] pre-merge tests
+[9] merge method
+[10] new local main
+[11] post-merge tests
+[12] push result
+[13] final origin/main
+[14] main...origin/main
+[15] protected post hashes/status
+[16] Shopify live write count
+[17] Theme Access credential creation count
+[18] hotfix/worktree retained
+[19] SECOND_WINDOW_HANDOFF_MAIN_SHA
+[20] exact next action
+
+Flags:
+FAST_FORWARD_ONLY = PASS/FAIL
+SETUP_KPI_CONSISTENT = YES/NO
+SELECTED_STORE_CARD_LAYOUT = FIXED/NOT_FIXED
+NEXT_ACTION_BEGINNER_FRIENDLY = YES/NO
+SEARCH_LABEL_CORRECT = YES/NO
+REMOTE_BEHAVIOR_UNCHANGED = YES/NO
+FULL_SUITE_POST_MERGE = PASS/FAIL
+PROTECTED_FILES_UNCHANGED = YES/NO
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+MAIN_REMOTE_SYNC = YES/NO
+SECOND_WINDOW_HANDOFF_REQUIRED = YES
