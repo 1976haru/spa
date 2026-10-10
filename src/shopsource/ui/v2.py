@@ -36,6 +36,7 @@ from ..homepage_assignment import HomepageAssignmentService, homepage_assignment
 from ..homepage_featured_products import FeaturedProductAssignmentService, FeaturedProductThemeApplyService
 from ..featured_theme_backend import FeaturedThemeBackendCoordinator
 from ..multistore_theme_operations import MultiStoreThemeOperationsService
+from ..multistore_theme_presentation import next_action as multistore_next_action, status_label as multistore_status_label, table_statuses as multistore_table_statuses
 from ..theme_access_credentials import (credential_present as theme_access_credential_present,
     delete_theme_access_password, save_theme_access_password)
 from ..homepage_session import HomepagePrerequisiteService
@@ -68,7 +69,7 @@ from .production_control_center import (GATE_ACTION_REGISTRY, gate_board_rows,
     production_summary, resolve_gate_click)
 
 NAV_ITEMS = [
-    ("/theme-operations", "hub", "Multi-store Theme Operations"),
+    ("/theme-operations", "hub", "여러 스토어 테마 관리"),
     ("/production", "rocket_launch", "실전 스토어 완성"),
     ("/completion", "fact_check", "스토어 완성"),
     ("/source-safety", "health_and_safety", "소스 재고·가격 안전"),
@@ -3505,13 +3506,17 @@ class OperatorUI:
     def _multistore_theme_operations(self):
         ui = self.ui
         service = MultiStoreThemeOperationsService()
-        self._heading("Multi-store Theme Operations",
-                      "Inspect registered stores' Shopify GraphQL and Theme Access status. Remote checks are read-only and run only on request.")
+        self._heading("여러 스토어 테마 관리",
+                      "스토어별 테마 연결 상태를 확인합니다. 처음 화면에서는 인터넷 확인을 실행하지 않습니다.")
+        with ui.card().classes("w-full border-l-4 border-blue-500 bg-blue-50"):
+            ui.label("처음이라면 이렇게 하세요").classes("text-lg font-bold")
+            ui.label("1. 아래 목록에서 스토어를 선택합니다.\n2. 필요한 경우 Theme Access 비밀번호를 해당 스토어에 등록합니다.\n3. ‘읽기 확인’을 직접 눌러 연결 상태를 확인합니다.\n4. 준비 완료가 되면 홈페이지에서 추천 상품을 살펴봅니다.").classes("whitespace-pre-wrap")
+            ui.label("이 화면은 상태 확인만 합니다. 테마나 상품을 Shopify에 적용하거나 변경하지 않습니다.").classes("font-semibold")
         state_filter = ui.select({
-            "ALL": "All stores", "READY": "Ready", "NEEDS_SETUP": "Needs setup",
-            "GRAPHQL_ISSUE": "GraphQL issue", "THEME_ACCESS_ISSUE": "Theme Access issue",
-        }, value="ALL", label="Filter").classes("w-56")
-        search = ui.input("Search store ID, name, or domain").classes("w-80")
+            "ALL": "전체", "READY": "준비 완료", "NEEDS_SETUP": "설정 필요",
+            "GRAPHQL_ISSUE": "Shopify 연결 확인 필요", "THEME_ACCESS_ISSUE": "Theme Access 확인 필요",
+        }, value="ALL", label="상태로 찾기").classes("w-56")
+        search = ui.input("스토어 이름, 번호, 이메일로 검색").classes("w-80")
         rows = service.list_rows()
         initial_counts = {"total": len(rows), "connected": sum(row["shopify_connection"] == "CONNECTED" for row in rows),
                           "graphql_ready": sum(row["graphql_state"] == "VERIFIED_ACTIVE" and not row["cache_stale"] for row in rows),
@@ -3519,17 +3524,16 @@ class OperatorUI:
                           "needs_setup": sum(row["check_status"] == "NEEDS_SETUP" for row in rows)}
         summary_values = {}
         with ui.row().classes("w-full flex-wrap gap-3"):
-            for label, key in (("Registered stores", "total"), ("Shopify connected", "connected"),
-                               ("GraphQL ready", "graphql_ready"), ("Theme Access ready", "cli_ready"),
-                               ("Needs setup", "needs_setup")):
+            for label, key in (("등록된 스토어", "total"), ("Shopify 연결됨", "connected"),
+                               ("승인 확인됨", "graphql_ready"), ("비밀번호 확인됨", "cli_ready"),
+                               ("설정 필요", "needs_setup")):
                 with ui.card().classes("min-w-40 p-4"):
                     ui.label(label).classes("text-sm text-slate-600")
                     summary_values[key] = ui.label(str(initial_counts[key])).classes("ss-kpi")
-        progress_label = ui.label("Initial view uses local store metadata and cached non-secret results only.").classes("ss-help")
+        progress_label = ui.label("저장된 정보만 표시 중입니다. 원격 확인은 버튼을 눌렀을 때만 실행됩니다.").classes("ss-help")
         columns = [{"name": key, "label": label, "field": key, "align": "left", "sortable": True} for key, label in (
-            ("store", "Store"), ("shopify_connection", "Shopify"), ("graphql_state", "GraphQL"),
-            ("theme_access", "Theme Access"), ("main_theme", "MAIN Theme"),
-            ("auto_backend", "AUTO Backend"), ("last_checked", "Last Check"), ("action", "Action"))]
+            ("store", "스토어"), ("status", "현재 상태"), ("shopify_connection", "Shopify 연결"),
+            ("theme_access", "비밀번호 상태"), ("next", "다음 할 일"), ("last_checked", "최근 확인"))]
         table = ui.table(columns=columns, rows=[], row_key="store_id", pagination={"rowsPerPage": 25}).classes("w-full")
 
         def refresh_table():
@@ -3544,13 +3548,12 @@ class OperatorUI:
             displayed = service.list_rows(query=search.value or "", status_filter=state_filter.value or "ALL")
             table.rows = [{
                 "store_id": row["store_id"], "store": f"{row['store_id']} | {row['store_name']}",
-                "shopify_connection": row["shopify_connection"], "graphql_state": row["graphql_state"],
-                "theme_access": f"{row['theme_access_credential']} / {row['theme_access_cli_state']}",
-                "main_theme": (f"{row.get('main_theme_name') or 'Unknown'} / {row.get('main_theme_role') or 'Unknown'}"),
-                "auto_backend": row["auto_backend"],
-                "last_checked": ((row["last_checked_at"] or row["check_status"]) +
-                                 (" · STALE" if row["last_checked_at"] and row["cache_stale"] else "")),
-                "action": "Select below",
+                "status": multistore_status_label(row),
+                "shopify_connection": multistore_table_statuses(row)["shopify"],
+                "theme_access": multistore_table_statuses(row)["theme_access"],
+                "next": multistore_next_action(row)[0],
+                "last_checked": ((row["last_checked_at"] or "아직 확인 전") +
+                                 (" · 다시 확인 필요" if row["last_checked_at"] and row["cache_stale"] else "")),
             } for row in displayed]
             table.update()
         refresh_table()
@@ -3559,102 +3562,165 @@ class OperatorUI:
 
         registered = service.list_rows()
         store_options = {row["store_id"]: f"{row['store_id']} | {row['store_name']}" for row in registered}
-        selected_store = ui.select(store_options, value=next(iter(store_options), None), label="Selected store").classes("w-72")
+        selected_store = ui.select(store_options, value=next(iter(store_options), None), label="선택한 스토어").classes("w-72")
+        selected_card_title = ui.label("선택한 스토어").classes("text-xl font-bold")
+        selected_card_status = ui.label("스토어를 선택하세요").classes("text-lg")
+        selected_card_next = ui.label("").classes("ss-help")
+        primary_action = ui.button("다음 할 일", icon="arrow_forward").props("color=primary size=lg")
+        primary_action_state = {"action": "check"}
+        with ui.card().classes("w-full border-2 border-blue-300"):
+            ui.label("선택한 스토어의 다음 할 일").classes("font-semibold")
+            selected_card_title
+            selected_card_status
+            selected_card_next
+            primary_action
         with ui.row().classes("w-full flex-wrap gap-2"):
-            run_all_button = ui.button("Check all stores (read-only)", icon="fact_check").props("color=primary")
-            refresh_button = ui.button("Refresh", icon="refresh").props("outline")
-            detail_button = ui.button("Details", icon="info").props("outline")
-            check_one_button = ui.button("Check selected (read-only)", icon="verified_user").props("outline")
-            credential_button = ui.button("Register / change Theme Access", icon="vpn_key").props("outline")
+            run_all_button = ui.button("전체 스토어 읽기 확인", icon="fact_check").props("outline")
+            refresh_button = ui.button("화면 새로고침", icon="refresh").props("outline")
+            detail_button = ui.button("고급 정보 보기", icon="info").props("outline")
+            check_one_button = ui.button("선택한 스토어 읽기 확인", icon="verified_user").props("outline")
+            credential_button = ui.button("Theme Access 비밀번호 관리", icon="vpn_key").props("outline")
 
         with ui.dialog() as detail_dialog, ui.card().classes("w-[min(760px,95vw)] max-h-[85vh] overflow-auto"):
-            detail_title = ui.label("Store details").classes("ss-card-title")
-            detail_text = ui.label("Select a registered store.").classes("whitespace-pre-wrap")
-            ui.button("Close", on_click=detail_dialog.close, icon="close").props("outline")
+            detail_title = ui.label("스토어 고급 정보").classes("ss-card-title")
+            detail_text = ui.label("스토어를 선택하세요.").classes("whitespace-pre-wrap")
+            with ui.expansion("고급 정보 보기", icon="code"):
+                advanced_detail_text = ui.label("").classes("whitespace-pre-wrap")
+            ui.button("닫기", on_click=detail_dialog.close, icon="close").props("outline")
 
         def show_details():
             store_id = str(selected_store.value or "")
             row = next((item for item in service.list_rows() if item["store_id"] == store_id), None)
             if row is None:
-                ui.notify("Select a registered store first.", type="warning")
+                ui.notify("먼저 스토어를 선택하세요.", type="warning")
                 return
             detail_title.set_text(f"{row['store_id']} | {row['store_name']}")
-            detail_text.set_text("\n".join((
+            detail_text.set_text("이 정보는 문제 확인을 돕는 고급 정보입니다. 변경 작업은 제공하지 않습니다.")
+            advanced_detail_text.set_text("\n".join((
                 f"Shop domain: {row.get('shop_domain') or 'Not configured'}",
-                f"Shopify connection: {row['shopify_connection']}",
-                f"App binding: {row['app_binding']}",
-                f"GraphQL: {row['graphql_state']} ({row.get('selection_reason')})",
-                f"Theme Access credential: {row['theme_access_credential']}",
-                f"Theme Access CLI: {row['theme_access_cli_state']}",
-                f"MAIN theme: {row.get('main_theme_name') or 'Unknown'} | {row.get('main_theme_id') or 'Unknown'} | {row.get('main_theme_role') or 'Unknown'}",
-                f"AUTO backend: {row['auto_backend']}",
-                f"Last checked: {row['last_checked_at'] or 'Not checked'}",
-                f"Status: {row['check_status']} | cache {'STALE' if row['last_checked_at'] and row['cache_stale'] else ('NOT_CHECKED' if not row['last_checked_at'] else 'current')}",
+                f"App binding: {row['app_binding']} · GraphQL state: {row['graphql_state']} ({row.get('selection_reason')})",
+                f"Theme Access credential: {row['theme_access_credential']} · CLI state: {row['theme_access_cli_state']}",
+                f"MAIN theme: {row.get('main_theme_name') or 'Unknown'} | {row.get('main_theme_id') or 'Unknown'} | role {row.get('main_theme_role') or 'Unknown'}",
+                f"Selected backend: {row['auto_backend']} · reason: {row.get('selection_reason')}",
+                f"Last checked UTC: {row['last_checked_at'] or 'NOT_CHECKED'} · status {row['check_status']}",
                 f"Diagnostic: {row.get('diagnostic_code') or '—'}",
-                "No theme, product, or collection write is available on this page.",
             )))
             detail_dialog.open()
 
         def open_credentials():
             store_id = str(selected_store.value or "")
             if store_id not in store_options:
-                ui.notify("Select a registered store first.", type="warning")
+                ui.notify("먼저 스토어를 선택하세요.", type="warning")
                 return
             present = theme_access_credential_present(store_id)
             with ui.dialog() as dialog, ui.card().classes("w-[min(560px,95vw)]"):
-                ui.label(f"Theme Access | {store_options[store_id]}").classes("ss-card-title")
-                ui.label("The password is stored only in this store's Windows Credential Manager entry. It is never shown or prefilled.").classes("ss-help")
-                ui.label(f"Credential currently stored: {'YES' if present else 'NO'}")
-                password = ui.input("Theme Access password").props("type=password autocomplete=new-password").classes("w-full")
-                confirm_delete = ui.checkbox(f"Confirm deleting this store's Theme Access credential ({store_id})")
+                ui.label(f"Theme Access 비밀번호 등록 · {store_options[store_id]}").classes("ss-card-title")
+                ui.label("비밀번호는 이 스토어에만 사용됩니다. Windows 자격 증명 관리자에 안전하게 저장되며 화면에 다시 표시되지 않습니다.").classes("ss-help")
+                ui.label("Shopify 관리자에서 발급한 Theme Access 비밀번호를 입력하세요. 앱 설치나 원격 확인은 자동으로 하지 않습니다.")
+                with ui.expansion("비밀번호 발급 위치 보기"):
+                    ui.label("1. Shopify 관리자에 로그인합니다.\n2. 앱 및 판매 채널에서 Theme Access를 엽니다.\n3. 테마 비밀번호를 발급하고 이메일에서 확인합니다.\n4. 이 화면에 붙여 넣어 저장합니다.").classes("whitespace-pre-wrap")
+                ui.label(f"현재 등록 상태: {'등록됨' if present else '미등록'}")
+                password = ui.input("Theme Access 비밀번호").props("type=password autocomplete=new-password").classes("w-full")
 
                 def save_password():
                     try:
                         save_theme_access_password(store_id, password.value or "")
-                        ui.notify("Credential saved securely. No remote check was run.", type="positive")
+                        ui.notify("비밀번호를 안전하게 저장했습니다. 원격 확인은 실행하지 않았습니다.", type="positive")
                     except Exception as exc:
                         ui.notify(_safe_error(exc), type="negative")
                     finally:
                         password.value = ""
                     dialog.close()
                     refresh_table()
+                    refresh_selected_card()
+
+                async def save_and_check():
+                    try:
+                        save_theme_access_password(store_id, password.value or "")
+                        password.value = ""
+                    except Exception as exc:
+                        password.value = ""
+                        ui.notify(_safe_error(exc), type="negative")
+                        return
+                    dialog.close()
+                    ui.notify("저장했습니다. 요청하신 읽기 확인을 시작합니다.", type="positive")
+                    await check_one_for_store(store_id)
 
                 def delete_password():
                     if not confirm_delete.value:
-                        ui.notify("Confirm removal for this store first.", type="warning")
+                        ui.notify("삭제하려면 확인란을 선택하세요.", type="warning")
                         return
                     delete_theme_access_password(store_id)
                     password.value = ""
-                    ui.notify("Credential removed for the selected store.", type="warning")
+                    ui.notify("선택한 스토어의 비밀번호를 삭제했습니다.", type="warning")
                     dialog.close()
                     refresh_table()
 
-                with ui.row().classes("gap-2"):
-                    ui.button("Save", on_click=save_password, icon="save").props("color=primary")
-                    ui.button("Delete selected store credential", on_click=delete_password, icon="delete").props("outline color=negative")
-                    ui.button("Cancel", on_click=dialog.close, icon="close").props("outline")
+                ui.button("저장만 하기", on_click=save_password, icon="save").props("color=primary")
+                ui.button("저장 후 읽기 확인", on_click=save_and_check, icon="verified_user").props("outline")
+                with ui.expansion("고급 관리", icon="settings"):
+                    confirm_delete = ui.checkbox(f"이 스토어({store_id})의 비밀번호 삭제에 동의합니다")
+                    ui.button("등록된 비밀번호 삭제", on_click=delete_password, icon="delete").props("outline color=negative")
+                ui.button("취소", on_click=dialog.close, icon="close").props("outline")
             dialog.open()
 
-        async def check_one():
-            store_id = str(selected_store.value or "")
+        async def check_one_for_store(store_id):
             if not store_id:
-                ui.notify("Select a registered store first.", type="warning")
+                ui.notify("먼저 스토어를 선택하세요.", type="warning")
                 return
             check_one_button.disable()
-            progress_label.set_text(f"Read-only check running for {store_id}…")
+            progress_label.set_text(f"{store_options.get(store_id, store_id)} 읽기 확인 중…")
             try:
                 result = await asyncio.to_thread(service.check_store, store_id)
-                progress_label.set_text(f"{store_id}: {result['check_status']} | no write performed")
+                outcome = next((r for r in service.list_rows() if r["store_id"] == store_id), result)
+                progress_label.set_text("읽기 확인을 마쳤습니다. 스토어나 테마는 변경되지 않았습니다. " + multistore_status_label(outcome))
                 refresh_table()
+                refresh_selected_card()
             finally:
                 check_one_button.enable()
+
+        async def check_one():
+            await check_one_for_store(str(selected_store.value or ""))
+
+        def refresh_selected_card():
+            store_id = str(selected_store.value or "")
+            row = next((item for item in service.list_rows() if item["store_id"] == store_id), None)
+            if row is None:
+                selected_card_title.set_text("등록된 스토어가 없습니다")
+                selected_card_status.set_text("먼저 스토어를 등록하세요.")
+                selected_card_next.set_text("")
+                primary_action.set_text("다음 할 일")
+                primary_action.disable()
+                return
+            label, action = multistore_next_action(row)
+            selected_card_title.set_text(store_options[store_id])
+            selected_card_status.set_text("현재 상태: " + multistore_status_label(row))
+            selected_card_next.set_text("다음에 할 일: " + label)
+            primary_action.set_text(label)
+            primary_action.enable()
+
+            primary_action_state["action"] = action
+
+        selected_store.on_value_change(lambda _event: refresh_selected_card())
+        refresh_selected_card()
+
+        def run_primary_action():
+            action = primary_action_state["action"]
+            if action == "credential":
+                open_credentials()
+            elif action in ("check", "connection", "cli"):
+                check_one()
+            else:
+                ui.navigate.to("/")
+
+        primary_action.on_click(run_primary_action)
 
         async def check_all():
             run_all_button.disable()
             refresh_button.disable()
             progress_queue = asyncio.Queue()
             loop = asyncio.get_running_loop()
-            progress_label.set_text(f"Checking {len(store_options)} registered stores; at most {service.max_workers} concurrent read-only checks…")
+            progress_label.set_text(f"{len(store_options)}개 스토어를 읽기 확인합니다. 동시에 최대 {service.max_workers}개까지 확인합니다…")
 
             def report_progress(item):
                 loop.call_soon_threadsafe(progress_queue.put_nowait, item)
@@ -3663,16 +3729,16 @@ class OperatorUI:
             while not task.done():
                 try:
                     item = await asyncio.wait_for(progress_queue.get(), timeout=0.25)
-                    progress_label.set_text(f"Read-only checks: {item['completed']}/{item['total']} completed (max {service.max_workers} concurrent)…")
+                    progress_label.set_text(f"읽기 확인: {item['completed']}/{item['total']}개 완료 (동시 최대 {service.max_workers}개)…")
                 except asyncio.TimeoutError:
                     pass
             try:
                 result = await task
                 refresh_table()
                 checked = result["counts"]
-                progress_label.set_text(f"Done: {checked['total']} stores | READY {checked['READY']} | NEEDS_SETUP {checked['NEEDS_SETUP']} | ERROR {checked['ERROR']} | write performed: NO")
+                progress_label.set_text(f"전체 읽기 확인 완료: 준비 완료 {checked['READY']}개 · 설정 필요 {checked['NEEDS_SETUP']}개 · 확인 실패 {checked['ERROR']}개. 스토어 변경은 없었습니다.")
             except Exception as exc:
-                progress_label.set_text(f"Read-only checks failed safely: {_safe_error(exc)}")
+                progress_label.set_text(f"읽기 확인에 실패했습니다. 스토어는 변경되지 않았습니다. {_safe_error(exc)}")
             finally:
                 run_all_button.enable()
                 refresh_button.enable()

@@ -183,8 +183,8 @@ def test_password_save_never_returns_or_displays_secret():
     source = Path("src/shopsource/ui/v2.py").read_text(encoding="utf-8")
     panel = source[source.index("def _multistore_theme_operations") : source.index("def _stores(self)", source.index("def _multistore_theme_operations"))]
     assert "password.value}" not in panel
-    assert "No remote check was run." in panel
-    assert "Theme Access password" in panel
+    assert "원격 확인은 실행하지 않았습니다." in panel
+    assert "Theme Access 비밀번호" in panel
 
 
 def test_password_input_clears_after_save():
@@ -209,7 +209,7 @@ def test_store_001_not_hardcoded():
 def test_no_bulk_apply_control():
     source = Path("src/shopsource/ui/v2.py").read_text(encoding="utf-8")
     panel = source[source.index("def _multistore_theme_operations") : source.index("def _stores(self)", source.index("def _multistore_theme_operations"))]
-    assert "Check all stores (read-only)" in panel
+    assert "전체 스토어 읽기 확인" in panel
     assert "Bulk apply" not in panel and "bulk apply" not in panel
 
 
@@ -222,5 +222,107 @@ def test_no_shopify_live_write():
 
 def test_dashboard_has_dedicated_navigation_route():
     source = Path("src/shopsource/ui/v2.py").read_text(encoding="utf-8")
-    assert '("/theme-operations", "hub", "Multi-store Theme Operations")' in source
+    assert '("/theme-operations", "hub", "여러 스토어 테마 관리")' in source
     assert 'path == "/theme-operations"' in source
+
+
+def test_multistore_nav_is_korean_beginner_label():
+    source = Path("src/shopsource/ui/v2.py").read_text(encoding="utf-8")
+    assert '("/theme-operations", "hub", "여러 스토어 테마 관리")' in source
+
+
+def test_page_has_beginner_four_step_guide():
+    source = Path("src/shopsource/ui/v2.py").read_text(encoding="utf-8")
+    panel = source[source.index("def _multistore_theme_operations") : source.index("def _stores(self)", source.index("def _multistore_theme_operations"))]
+    assert "처음이라면 이렇게 하세요" in panel
+    assert "1. 아래 목록에서 스토어를 선택합니다." in panel
+    assert "4. 준비 완료가 되면 홈페이지" in panel
+
+
+def test_user_visible_statuses_are_human_readable():
+    from shopsource.multistore_theme_presentation import status_label, table_statuses
+    row = {"check_status": "NEEDS_SETUP", "shopify_connection": "CONNECTED",
+           "graphql_state": "SCOPE_MISSING", "theme_access_cli_state": "CREDENTIAL_MISSING",
+           "theme_access_credential": "NO", "cache_stale": False}
+    assert status_label(row) == "설정 필요"
+    assert "SCOPE_MISSING" not in str(table_statuses(row))
+    assert table_statuses(row)["graphql"] == "승인 또는 사용 불가"
+
+
+def test_raw_states_remain_available_in_advanced_details():
+    source = Path("src/shopsource/ui/v2.py").read_text(encoding="utf-8")
+    panel = source[source.index("def _multistore_theme_operations") : source.index("def _stores(self)", source.index("def _multistore_theme_operations"))]
+    assert 'ui.expansion("고급 정보 보기"' in panel
+    assert "GraphQL state: {row['graphql_state']}" in panel
+    assert "Selected backend: {row['auto_backend']}" in panel
+
+
+def test_selected_store_has_single_primary_next_action():
+    source = Path("src/shopsource/ui/v2.py").read_text(encoding="utf-8")
+    panel = source[source.index("def _multistore_theme_operations") : source.index("def _stores(self)", source.index("def _multistore_theme_operations"))]
+    assert "선택한 스토어의 다음 할 일" in panel
+    assert 'primary_action = ui.button' in panel
+    assert 'primary_action.on_click(run_primary_action)' in panel
+
+
+def test_missing_theme_access_next_action_is_register():
+    from shopsource.multistore_theme_presentation import next_action
+    row = {"check_status": "NOT_CHECKED", "shopify_connection": "CONNECTED",
+           "graphql_state": "SCOPE_MISSING", "theme_access_credential": "NO"}
+    assert next_action(row) == ("Theme Access 비밀번호 등록", "credential")
+
+
+def test_credential_present_next_action_is_read_check():
+    from shopsource.multistore_theme_presentation import next_action
+    row = {"check_status": "NOT_CHECKED", "shopify_connection": "CONNECTED",
+           "graphql_state": "SCOPE_MISSING", "theme_access_credential": "YES",
+           "theme_access_cli_state": "NOT_CHECKED"}
+    assert next_action(row) == ("선택한 스토어 읽기 확인", "check")
+
+
+def test_ready_next_action_is_homepage():
+    from shopsource.multistore_theme_presentation import next_action
+    row = {"check_status": "READY", "cache_stale": False}
+    assert next_action(row) == ("홈페이지 화면에서 추천 상품 보기", "homepage")
+
+
+def test_registration_dialog_explains_where_password_comes_from():
+    source = Path("src/shopsource/ui/v2.py").read_text(encoding="utf-8")
+    assert "Shopify 관리자에서 발급한 Theme Access 비밀번호" in source
+    assert "비밀번호 발급 위치 보기" in source
+
+
+def test_save_and_check_is_explicit_and_read_only():
+    source = Path("src/shopsource/ui/v2.py").read_text(encoding="utf-8")
+    panel = source[source.index("def _multistore_theme_operations") : source.index("def _stores(self)", source.index("def _multistore_theme_operations"))]
+    assert 'ui.button("저장 후 읽기 확인", on_click=save_and_check' in panel
+    assert "await check_one_for_store(store_id)" in panel
+    assert "service.check_store, store_id" in panel
+
+
+def test_delete_is_secondary_and_confirmed():
+    source = Path("src/shopsource/ui/v2.py").read_text(encoding="utf-8")
+    panel = source[source.index("def _multistore_theme_operations") : source.index("def _stores(self)", source.index("def _multistore_theme_operations"))]
+    assert 'ui.expansion("고급 관리"' in panel
+    assert "if not confirm_delete.value" in panel
+
+
+def test_bulk_check_message_says_no_store_change():
+    source = Path("src/shopsource/ui/v2.py").read_text(encoding="utf-8")
+    assert "스토어 변경은 없었습니다." in source
+
+
+def test_initial_render_still_no_remote_calls():
+    source = Path("src/shopsource/ui/v2.py").read_text(encoding="utf-8")
+    panel = source[source.index("def _multistore_theme_operations") : source.index("def _stores(self)", source.index("def _multistore_theme_operations"))]
+    assert "Remote checks are read-only and run only on request." not in panel
+    assert "service.check_store" in panel and "service.check_all" in panel
+    assert panel.index("service.list_rows()") < panel.index("def check_all")
+
+
+def test_no_live_write_controls_in_multistore_panel():
+    source = Path("src/shopsource/ui/v2.py").read_text(encoding="utf-8")
+    panel = source[source.index("def _multistore_theme_operations") : source.index("def _stores(self)", source.index("def _multistore_theme_operations"))]
+    assert "themeFilesUpsert" not in panel
+    assert "theme push" not in panel
+    assert "테마나 상품을 Shopify에 적용하거나 변경하지 않습니다." in panel
