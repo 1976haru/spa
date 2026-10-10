@@ -37,6 +37,27 @@ def next_action(row: dict) -> tuple[str, str]:
     return "선택한 스토어 읽기 확인", "check"
 
 
+def next_action_message(row: dict) -> str:
+    """A beginner-friendly sentence that explains the selected next step."""
+    action = next_action(row)[1]
+    return {
+        "credential": "Theme Access 비밀번호를 등록하세요.",
+        "connection": "먼저 Shopify 연결 설정을 확인하세요.",
+        "cli": "Shopify CLI 설치 상태를 확인하세요.",
+        "check": "연결 상태를 읽기 확인하세요.",
+        "homepage": "준비가 끝났습니다. 홈페이지에서 추천 상품을 확인할 수 있습니다.",
+    }[action]
+
+
+def setup_needed_count(rows: list[dict]) -> int:
+    """Count rows shown to beginners as needing setup or attention."""
+    setup_statuses = {
+        "설정 필요", "연결 설정 필요", "Shopify CLI 설치 확인 필요",
+        "현재 테마 확인 필요", "다시 확인 필요", "확인 실패",
+    }
+    return sum(status_label(row) in setup_statuses for row in rows)
+
+
 def table_statuses(row: dict) -> dict[str, str]:
     """Human-readable summary values; raw evidence stays in advanced details."""
     shop = {"CONNECTED": "연결됨", "NOT_CONFIGURED": "연결 설정 필요", "CREDENTIAL_MISSING": "인증정보 확인 필요"}

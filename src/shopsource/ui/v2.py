@@ -36,7 +36,7 @@ from ..homepage_assignment import HomepageAssignmentService, homepage_assignment
 from ..homepage_featured_products import FeaturedProductAssignmentService, FeaturedProductThemeApplyService
 from ..featured_theme_backend import FeaturedThemeBackendCoordinator
 from ..multistore_theme_operations import MultiStoreThemeOperationsService
-from ..multistore_theme_presentation import next_action as multistore_next_action, status_label as multistore_status_label, table_statuses as multistore_table_statuses
+from ..multistore_theme_presentation import next_action as multistore_next_action, next_action_message as multistore_next_action_message, setup_needed_count as multistore_setup_needed_count, status_label as multistore_status_label, table_statuses as multistore_table_statuses
 from ..theme_access_credentials import (credential_present as theme_access_credential_present,
     delete_theme_access_password, save_theme_access_password)
 from ..homepage_session import HomepagePrerequisiteService
@@ -3516,12 +3516,12 @@ class OperatorUI:
             "ALL": "전체", "READY": "준비 완료", "NEEDS_SETUP": "설정 필요",
             "GRAPHQL_ISSUE": "Shopify 연결 확인 필요", "THEME_ACCESS_ISSUE": "Theme Access 확인 필요",
         }, value="ALL", label="상태로 찾기").classes("w-56")
-        search = ui.input("스토어 이름, 번호, 이메일로 검색").classes("w-80")
+        search = ui.input("스토어 이름, 번호, 도메인 검색").classes("w-80")
         rows = service.list_rows()
         initial_counts = {"total": len(rows), "connected": sum(row["shopify_connection"] == "CONNECTED" for row in rows),
                           "graphql_ready": sum(row["graphql_state"] == "VERIFIED_ACTIVE" and not row["cache_stale"] for row in rows),
                           "cli_ready": sum(row["theme_access_cli_state"] == "READY" and not row["cache_stale"] for row in rows),
-                          "needs_setup": sum(row["check_status"] == "NEEDS_SETUP" for row in rows)}
+                          "needs_setup": multistore_setup_needed_count(rows)}
         summary_values = {}
         with ui.row().classes("w-full flex-wrap gap-3"):
             for label, key in (("등록된 스토어", "total"), ("Shopify 연결됨", "connected"),
@@ -3542,7 +3542,7 @@ class OperatorUI:
                 "connected": sum(row["shopify_connection"] == "CONNECTED" for row in all_rows),
                 "graphql_ready": sum(row["graphql_state"] == "VERIFIED_ACTIVE" and not row["cache_stale"] for row in all_rows),
                 "cli_ready": sum(row["theme_access_cli_state"] == "READY" and not row["cache_stale"] for row in all_rows),
-                "needs_setup": sum(row["check_status"] == "NEEDS_SETUP" for row in all_rows)}
+                "needs_setup": multistore_setup_needed_count(all_rows)}
             for key, value in current_counts.items():
                 summary_values[key].set_text(str(value))
             displayed = service.list_rows(query=search.value or "", status_filter=state_filter.value or "ALL")
@@ -3563,17 +3563,13 @@ class OperatorUI:
         registered = service.list_rows()
         store_options = {row["store_id"]: f"{row['store_id']} | {row['store_name']}" for row in registered}
         selected_store = ui.select(store_options, value=next(iter(store_options), None), label="선택한 스토어").classes("w-72")
-        selected_card_title = ui.label("선택한 스토어").classes("text-xl font-bold")
-        selected_card_status = ui.label("스토어를 선택하세요").classes("text-lg")
-        selected_card_next = ui.label("").classes("ss-help")
-        primary_action = ui.button("다음 할 일", icon="arrow_forward").props("color=primary size=lg")
-        primary_action_state = {"action": "check"}
         with ui.card().classes("w-full border-2 border-blue-300"):
             ui.label("선택한 스토어의 다음 할 일").classes("font-semibold")
-            selected_card_title
-            selected_card_status
-            selected_card_next
-            primary_action
+            selected_card_title = ui.label("선택한 스토어").classes("text-xl font-bold")
+            selected_card_status = ui.label("스토어를 선택하세요").classes("text-lg")
+            selected_card_next = ui.label("").classes("ss-help")
+            primary_action = ui.button("다음 할 일", icon="arrow_forward").props("color=primary size=lg")
+        primary_action_state = {"action": "check"}
         with ui.row().classes("w-full flex-wrap gap-2"):
             run_all_button = ui.button("전체 스토어 읽기 확인", icon="fact_check").props("outline")
             refresh_button = ui.button("화면 새로고침", icon="refresh").props("outline")
@@ -3695,7 +3691,7 @@ class OperatorUI:
             label, action = multistore_next_action(row)
             selected_card_title.set_text(store_options[store_id])
             selected_card_status.set_text("현재 상태: " + multistore_status_label(row))
-            selected_card_next.set_text("다음에 할 일: " + label)
+            selected_card_next.set_text(multistore_next_action_message(row))
             primary_action.set_text(label)
             primary_action.enable()
 

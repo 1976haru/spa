@@ -326,3 +326,66 @@ def test_no_live_write_controls_in_multistore_panel():
     assert "themeFilesUpsert" not in panel
     assert "theme push" not in panel
     assert "테마나 상품을 Shopify에 적용하거나 변경하지 않습니다." in panel
+
+
+def test_setup_kpi_matches_beginner_visible_setup_states():
+    from shopsource.multistore_theme_presentation import setup_needed_count, status_label
+    rows = [
+        {"check_status": "NEEDS_SETUP", "shopify_connection": "CONNECTED", "graphql_state": "SCOPE_MISSING",
+         "theme_access_cli_state": "CREDENTIAL_MISSING", "theme_access_credential": "NO"},
+        {"check_status": "READY", "shopify_connection": "CONNECTED", "graphql_state": "VERIFIED_ACTIVE",
+         "theme_access_cli_state": "UNKNOWN", "theme_access_credential": "NO"},
+        {"check_status": "ERROR", "shopify_connection": "CONNECTED", "graphql_state": "UNKNOWN",
+         "theme_access_cli_state": "UNKNOWN", "theme_access_credential": "NO"},
+        {"check_status": "NOT_CHECKED", "shopify_connection": "CONNECTED", "graphql_state": "VERIFIED_ACTIVE",
+         "theme_access_cli_state": "NOT_CHECKED", "theme_access_credential": "NO"},
+    ]
+    assert setup_needed_count(rows) == sum(status_label(row) in {
+        "설정 필요", "연결 설정 필요", "Shopify CLI 설치 확인 필요",
+        "현재 테마 확인 필요", "다시 확인 필요", "확인 실패",
+    } for row in rows)
+
+
+def test_three_store_fixture_counts_three_setup_needed():
+    from shopsource.multistore_theme_presentation import setup_needed_count, status_label
+    rows = [
+        {"store_id": "001", "check_status": "NOT_CHECKED", "shopify_connection": "CONNECTED",
+         "graphql_state": "SCOPE_MISSING", "theme_access_cli_state": "CREDENTIAL_MISSING",
+         "theme_access_credential": "NO", "cache_stale": False},
+        {"store_id": "002", "check_status": "NOT_CHECKED", "shopify_connection": "NOT_CONFIGURED",
+         "graphql_state": "NOT_CHECKED", "theme_access_cli_state": "NOT_CHECKED",
+         "theme_access_credential": "NO", "cache_stale": False},
+        {"store_id": "003", "check_status": "NOT_CHECKED", "shopify_connection": "NOT_CONFIGURED",
+         "graphql_state": "NOT_CHECKED", "theme_access_cli_state": "NOT_CHECKED",
+         "theme_access_credential": "NO", "cache_stale": False},
+    ]
+    assert [status_label(row) for row in rows] == ["설정 필요", "연결 설정 필요", "연결 설정 필요"]
+    assert setup_needed_count(rows) == 3
+
+
+def test_selected_store_components_created_inside_card():
+    source = Path("src/shopsource/ui/v2.py").read_text(encoding="utf-8")
+    panel = source[source.index("def _multistore_theme_operations") : source.index("def _stores(self)", source.index("def _multistore_theme_operations"))]
+    card_start = panel.index('with ui.card().classes("w-full border-2 border-blue-300"):')
+    card_end = panel.index('with ui.row().classes("w-full flex-wrap gap-2")', card_start)
+    card_block = panel[card_start:card_end]
+    assert 'ui.label("선택한 스토어의 다음 할 일")' in card_block
+    assert 'selected_card_title = ui.label' in card_block
+    assert 'selected_card_status = ui.label' in card_block
+    assert 'selected_card_next = ui.label' in card_block
+    assert 'primary_action = ui.button' in card_block
+
+
+def test_selected_store_next_action_message_is_sentence():
+    from shopsource.multistore_theme_presentation import next_action_message
+    row = {"check_status": "NOT_CHECKED", "shopify_connection": "CONNECTED",
+           "graphql_state": "SCOPE_MISSING", "theme_access_credential": "NO"}
+    assert next_action_message(row) == "Theme Access 비밀번호를 등록하세요."
+    assert next_action_message({"check_status": "READY", "cache_stale": False}) == "준비가 끝났습니다. 홈페이지에서 추천 상품을 확인할 수 있습니다."
+
+
+def test_search_placeholder_uses_domain_not_email():
+    source = Path("src/shopsource/ui/v2.py").read_text(encoding="utf-8")
+    panel = source[source.index("def _multistore_theme_operations") : source.index("def _stores(self)", source.index("def _multistore_theme_operations"))]
+    assert 'ui.input("스토어 이름, 번호, 도메인 검색")' in panel
+    assert "이메일로 검색" not in panel
