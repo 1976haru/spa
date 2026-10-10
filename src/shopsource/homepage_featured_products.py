@@ -74,6 +74,15 @@ def _json(value): return json.dumps(value, ensure_ascii=False, sort_keys=True, s
 def _hash(value): return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
 
 
+def _same_theme_id(left, right):
+    def normalize(value):
+        raw = str(value or "").strip()
+        prefix = "gid://shopify/OnlineStoreTheme/"
+        if raw.startswith(prefix): raw = raw[len(prefix):]
+        return raw
+    return bool(normalize(left) and normalize(left) == normalize(right) and normalize(left).isdigit())
+
+
 def _install(db=None):
     install_product_schema(db)
     with connect(db) as con:
@@ -101,6 +110,10 @@ def _install(db=None):
           plan_id TEXT NOT NULL,preview_hash TEXT NOT NULL,section_id TEXT NOT NULL,folder TEXT NOT NULL,
           before_raw_hash TEXT NOT NULL,proposed_raw_hash TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL);
         """)
+        backup_columns = {row["name"] for row in con.execute("PRAGMA table_info(homepage_featured_theme_backups)")}
+        for column in ("backend_name", "backend_selection", "backend_reason_code"):
+            if column not in backup_columns:
+                con.execute(f"ALTER TABLE homepage_featured_theme_backups ADD COLUMN {column} TEXT")
         plan_columns = {row["name"] for row in con.execute("PRAGMA table_info(homepage_featured_product_plans)")}
         if "remote_json_verified" not in plan_columns:
             con.execute("ALTER TABLE homepage_featured_product_plans ADD COLUMN remote_json_verified INTEGER NOT NULL DEFAULT 0")
@@ -622,7 +635,9 @@ class FeaturedProductThemeApplyService:
                 return False
         return True
 
-    def apply(self, plan_id: str, preview: dict, *, store_id: str, confirmed: bool = False, client=None) -> dict:
+    def apply(self, plan_id: str, preview: dict, *, store_id: str, confirmed: bool = False,
+              backend_selection: str = "AUTO", allow_live: bool = False,
+              backend_coordinator=None, client=None) -> dict:
         if confirmed is not True: return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Explicit user confirmation required", "write_performed": False}
         if not isinstance(preview, dict) or preview.get("status") != "PREVIEW" or preview.get("plan_id") != plan_id:
             return {"status": "CONFLICT", "reason": "Current featured preview is missing or stale", "write_performed": False}
@@ -644,38 +659,72 @@ class FeaturedProductThemeApplyService:
                 or not source.get("before_raw_hash") or not source.get("before_semantic_hash")
                 or not row["preview_hash"] or row["preview_hash"] != preview.get("preview_hash")):
             return {"status": "CONFLICT", "reason": "Unsupported capability or preview identity/hash mismatch", "write_performed": False}
-        config, token = get_connection(store_id, db=self.db), get_shopify_token(store_id, db=self.db)[0]
-        if not config or not token: return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Shopify connection or credential missing", "write_performed": False}
-        client = client or self.client_factory(config["shop_domain"], token, config["api_version"])
-        scopes = {x.get("handle") for x in (client.execute(FEATURED_SCOPES_QUERY).get("currentAppInstallation") or {}).get("accessScopes", [])}
-        if not {"read_themes", "write_themes"}.issubset(scopes):
-            return {"status": "MANUAL_ACTION_REQUIRED", "reason": "read_themes and write_themes scopes are required", "write_performed": False}
-        remote = client.execute(FEATURED_THEME_FILE_QUERY, {"id": theme["id"], "filenames": [filename]}).get("theme") or {}
-        if remote.get("id") != theme["id"] or remote.get("role") != "MAIN":
-            return {"status": "CONFLICT", "reason": "MAIN theme identity changed", "write_performed": False}
-        try: before_raw, document = self._remote_document(remote, filename)
-        except (ValueError, ShopifyJsonDocumentError) as exc:
-            return {"status": "CONFLICT", "reason": str(exc), "write_performed": False}
+        from .featured_theme_backend import FeaturedThemeBackendCoordinator
+        from .theme_write_backend import ThemeFileWriteRequest, ThemeWriteBackendRouter
+        coordinator = backend_coordinator or FeaturedThemeBackendCoordinator(
+            db=self.db, client_factory=self.client_factory, client=client)
+        selected = coordinator.select_backend(store_id, theme["id"], backend_selection, client=client)
+        backend, backend_name = selected.get("backend"), selected.get("backend_name")
+        backend_reason = selected.get("reason_code")
+        if backend is None:
+            return {"status": "MANUAL_ACTION_REQUIRED", "reason": "No approved Featured theme write backend is READY",
+                    "backend_name": None, "backend_selection": backend_selection,
+                    "backend_reason_code": backend_reason, "write_performed": False}
+        if allow_live is not True:
+            return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Explicit MAIN theme live confirmation required",
+                    "backend_name": backend_name, "backend_selection": backend_selection,
+                    "backend_reason_code": "MAIN_LIVE_CONFIRMATION_REQUIRED", "write_performed": False}
+        capability = selected["capabilities"][backend_name]
+        if (capability.details.get("identity_verified") is not True
+                or not _same_theme_id(capability.details.get("verified_theme_id"), theme["id"])
+                or capability.details.get("verified_theme_role") != "MAIN"
+                or capability.details.get("target_is_live") is not True):
+            return {"status": "CONFLICT", "reason": "Selected backend did not verify the exact MAIN theme",
+                    "backend_name": backend_name, "backend_selection": backend_selection,
+                    "backend_reason_code": "MAIN_THEME_IDENTITY_UNVERIFIED", "write_performed": False}
+        config = get_connection(store_id, db=self.db)
+        if not config:
+            return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Shopify shop is not configured",
+                    "backend_name": backend_name, "backend_selection": backend_selection,
+                    "backend_reason_code": "STORE_NOT_CONFIGURED", "write_performed": False}
+        try:
+            before_result = backend.read_file(store_id, config["shop_domain"], theme["id"], filename)
+            if (before_result.theme_id != theme["id"] or before_result.filename != filename
+                    or before_result.backend_name != backend_name):
+                raise ValueError("Selected backend returned a different target identity")
+            before_raw = before_result.content
+            document = parse_shopify_json_document(before_raw)
+        except (ValueError, ShopifyJsonDocumentError, RuntimeError) as exc:
+            return {"status": "CONFLICT", "reason": str(exc), "backend_name": backend_name,
+                    "backend_selection": backend_selection, "backend_reason_code": "REMOTE_READ_FAILED", "write_performed": False}
         if document.raw_hash != source["before_raw_hash"] or document.semantic_hash != source["before_semantic_hash"]:
-            return {"status": "CONFLICT", "reason": "Remote source raw/semantic hash drifted", "write_performed": False}
+            return {"status": "CONFLICT", "reason": "Remote source raw/semantic hash drifted", "backend_name": backend_name,
+                    "backend_selection": backend_selection, "backend_reason_code": "REMOTE_HASH_DRIFT", "write_performed": False}
         proposed = preview.get("proposed")
         migration = preview.get("migration") or {}
         legacy_id = migration.get("from")
         if legacy_id and (legacy_id != expected_legacy or legacy_shopify_instance_kind(legacy_id) != "featured_products"):
-            return {"status": "CONFLICT", "reason": "Unrecognized legacy migration identity", "write_performed": False}
+            return {"status": "CONFLICT", "reason": "Unrecognized legacy migration identity", "backend_name": backend_name,
+                    "backend_selection": backend_selection, "backend_reason_code": "LEGACY_IDENTITY_INVALID", "write_performed": False}
         guard = validate_isolated_featured_diff(document.parsed, proposed, section_id, legacy_id=legacy_id, store_id=store_id)
-        if not guard["safe"]: return {"status": "CONFLICT", "reason": "Unexpected semantic changes", "unexpected_paths": guard["unexpected_paths"], "write_performed": False}
+        if not guard["safe"]: return {"status": "CONFLICT", "reason": "Unexpected semantic changes", "unexpected_paths": guard["unexpected_paths"],
+                                      "backend_name": backend_name, "backend_selection": backend_selection,
+                                      "backend_reason_code": "ISOLATED_DIFF_UNSAFE", "write_performed": False}
         expected_ids = [x["shopify_product_id"] for x in plan["items"]]
         selected_section = ((proposed.get("sections") or {}).get(section_id) or {}) if isinstance(proposed, dict) else {}
         field_id = (preview.get("capability", {}).get("product_field") or {}).get("id")
         proposed_ids = (selected_section.get("settings") or {}).get(field_id) if field_id else None
         if proposed_ids != expected_ids:
-            return {"status": "CONFLICT", "reason": "Featured preview product IDs no longer match the current four-item plan", "write_performed": False}
+            return {"status": "CONFLICT", "reason": "Featured preview product IDs no longer match the current four-item plan",
+                    "backend_name": backend_name, "backend_selection": backend_selection,
+                    "backend_reason_code": "PRODUCT_IDS_MISMATCH", "write_performed": False}
         proposed_raw = render_shopify_json_document(document, proposed)
         proposed_doc = parse_shopify_json_document(proposed_raw)
         if (proposed_doc.prefix != document.prefix or proposed_doc.suffix != document.suffix
                 or (source.get("proposed_raw_hash") and proposed_doc.raw_hash != source["proposed_raw_hash"])):
-            return {"status": "CONFLICT", "reason": "Comment-aware raw render mismatch", "write_performed": False}
+            return {"status": "CONFLICT", "reason": "Comment-aware raw render mismatch", "backend_name": backend_name,
+                    "backend_selection": backend_selection, "backend_reason_code": "COMMENTED_JSON_RENDER_MISMATCH",
+                    "write_performed": False}
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         folder = self.export_dir / "theme_backups" / str(store_id) / (stamp + "-featured-products")
         folder.mkdir(parents=True, exist_ok=False)
@@ -683,7 +732,9 @@ class FeaturedProductThemeApplyService:
         metadata = {"store_id": str(store_id), "theme_id": theme["id"], "theme_role": "MAIN", "template_filename": filename,
             "plan_id": plan_id, "preview_hash": preview["preview_hash"], "section_id": section_id,
             "before_raw_hash": document.raw_hash, "before_semantic_hash": document.semantic_hash,
-            "proposed_raw_hash": proposed_doc.raw_hash, "selected_products": items, "timestamp": _now()}
+            "proposed_raw_hash": proposed_doc.raw_hash, "selected_products": items, "timestamp": _now(),
+            "backend_name": backend_name, "backend_selection": backend_selection,
+            "backend_reason_code": backend_reason}
         (folder / "before.raw.json").write_text(before_raw, encoding="utf-8", newline="")
         (folder / "proposed.raw.json").write_text(proposed_raw, encoding="utf-8", newline="")
         (folder / "before.parsed.json").write_text(json.dumps(document.parsed, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -693,56 +744,104 @@ class FeaturedProductThemeApplyService:
         (folder / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
         backup_id = "HFPB_" + secrets.token_hex(8)
         with connect(self.db) as con:
-            con.execute("INSERT INTO homepage_featured_theme_backups VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            con.execute("""INSERT INTO homepage_featured_theme_backups
+                (backup_id,store_id,theme_id,filename,plan_id,preview_hash,section_id,folder,before_raw_hash,
+                 proposed_raw_hash,status,created_at,backend_name,backend_selection,backend_reason_code)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (backup_id, str(store_id), theme["id"], filename, plan_id, preview["preview_hash"], section_id,
-                 str(folder), document.raw_hash, proposed_doc.raw_hash, "BACKED_UP", _now()))
+                 str(folder), document.raw_hash, proposed_doc.raw_hash, "BACKED_UP", _now(), backend_name,
+                 backend_selection, backend_reason))
+        request = ThemeFileWriteRequest(store_id=str(store_id), shop_domain=config["shop_domain"],
+            theme_id=theme["id"], filename=filename, content=proposed_raw,
+            expected_remote_raw_hash=document.raw_hash, confirmed=True, allow_live=True, target_is_live=True)
+        write_result = ThemeWriteBackendRouter.write(selected, request)
+        if not write_result.write_performed:
+            return {"status": "CONFLICT" if write_result.reason_code == "REMOTE_CHANGED_ABORT" else "FAILED",
+                    "backup_id": backup_id, "backend_name": backend_name, "backend_selection": backend_selection,
+                    "backend_reason_code": write_result.reason_code or backend_reason, "write_performed": False}
+        if write_result.status not in {"WRITE_ATTEMPTED", "REMOTE_JSON_VERIFIED"}:
+            return {"status": "FAILED", "backup_id": backup_id, "backend_name": backend_name,
+                    "backend_selection": backend_selection, "backend_reason_code": write_result.reason_code,
+                    "write_performed": True}
         try:
-            from .homepage_automation import UPSERT_THEME_FILES
-            response = client.execute(UPSERT_THEME_FILES, {"themeId": theme["id"], "files": [{"filename": filename, "body": {"type": "TEXT", "value": proposed_raw}}]}).get("themeFilesUpsert") or {}
-        except RuntimeError as exc:
-            return {"status": "MANUAL_ACTION_REQUIRED" if "access denied" in str(exc).casefold() else "FAILED", "reason": "Shopify rejected the isolated theme write", "backup_id": backup_id, "write_performed": True}
-        if response.get("userErrors"):
-            return {"status": "FAILED", "backup_id": backup_id, "errors": response["userErrors"], "write_performed": True}
-        after_theme = client.execute(FEATURED_THEME_FILE_QUERY, {"id": theme["id"], "filenames": [filename]}).get("theme") or {}
-        try: after_raw, after_doc = self._remote_document(after_theme, filename)
-        except (ValueError, ShopifyJsonDocumentError): after_raw, after_doc = None, None
+            after_result = backend.read_file(store_id, config["shop_domain"], theme["id"], filename)
+            if (after_result.theme_id != theme["id"] or after_result.filename != filename
+                    or after_result.backend_name != backend_name):
+                raise ValueError("Selected backend returned a different post-write target")
+            after_raw = after_result.content
+            after_doc = parse_shopify_json_document(after_raw)
+        except (ValueError, ShopifyJsonDocumentError, RuntimeError):
+            after_raw, after_doc, after_result = None, None, None
         after = after_doc.parsed if after_doc else None
         after_guard = validate_isolated_featured_diff(document.parsed, after, section_id, legacy_id=legacy_id, store_id=store_id) if isinstance(after, dict) else {"safe": False, "unexpected_paths": ["$"], "allowed_changes": []}
         actual_ids = (((after or {}).get("sections") or {}).get(section_id) or {}).get("settings", {}).get(preview["capability"]["product_field"]["id"], [])
-        verified = bool(after_theme.get("id") == theme["id"] and after_theme.get("role") == "MAIN" and after == proposed
+        verified = bool(after_result is not None and after_result.metadata.get("verified_theme_role", "MAIN") == "MAIN"
+                        and after == proposed
                         and after_doc and after_doc.raw_hash == proposed_doc.raw_hash and after_doc.prefix == document.prefix
                         and after_doc.suffix == document.suffix and actual_ids == expected_ids and len(actual_ids) == 4 and after_guard["safe"])
         status = "REMOTE_JSON_VERIFIED" if verified else "VERIFY_FAILED"
         with connect(self.db) as con:
             con.execute("UPDATE homepage_featured_theme_backups SET status=? WHERE backup_id=?", (status, backup_id))
             if verified: con.execute("UPDATE homepage_featured_product_plans SET status='REMOTE_JSON_VERIFIED',remote_verified=0,remote_json_verified=1,storefront_verified=0,updated_at=? WHERE plan_id=?", (_now(), plan_id))
-        return {"status": status, "backup_id": backup_id, "theme_id": theme["id"], "product_ids_match": actual_ids == expected_ids,
+        return {"status": status, "backup_id": backup_id, "theme_id": theme["id"], "backend_name": backend_name,
+                "backend_selection": backend_selection, "backend_reason_code": backend_reason,
+                "product_ids_match": actual_ids == expected_ids,
                 "unrelated_sections_unchanged": after_guard["safe"], "write_performed": True}
 
-    def rollback(self, backup_id: str, *, confirmed: bool = False, client=None) -> dict:
+    def rollback(self, backup_id: str, *, confirmed: bool = False, allow_live: bool = False,
+                 backend_coordinator=None, client=None) -> dict:
         if confirmed is not True: return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Explicit rollback confirmation required", "write_performed": False}
+        if allow_live is not True: return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Explicit MAIN theme live confirmation required", "write_performed": False}
         with connect(self.db) as con: row = con.execute("SELECT * FROM homepage_featured_theme_backups WHERE backup_id=?", (backup_id,)).fetchone()
         if not row: return {"status": "NOT_FOUND", "write_performed": False}
         folder = Path(row["folder"]); before_raw = (folder / "before.raw.json").read_text(encoding="utf-8")
         proposed_raw = (folder / "proposed.raw.json").read_text(encoding="utf-8")
-        config, token = get_connection(row["store_id"], db=self.db), get_shopify_token(row["store_id"], db=self.db)[0]
-        if not config or not token: return {"status": "MANUAL_ACTION_REQUIRED", "write_performed": False}
-        client = client or self.client_factory(config["shop_domain"], token, config["api_version"])
-        scopes = {x.get("handle") for x in (client.execute(FEATURED_SCOPES_QUERY).get("currentAppInstallation") or {}).get("accessScopes", [])}
-        if not {"read_themes", "write_themes"}.issubset(scopes): return {"status": "MANUAL_ACTION_REQUIRED", "write_performed": False}
-        current_theme = client.execute(FEATURED_THEME_FILE_QUERY, {"id": row["theme_id"], "filenames": [row["filename"]]}).get("theme") or {}
-        try: current_raw, current_doc = self._remote_document(current_theme, row["filename"])
-        except (ValueError, ShopifyJsonDocumentError): return {"status": "CONFLICT", "reason": "Current template is unreadable", "write_performed": False}
-        if current_theme.get("id") != row["theme_id"] or current_theme.get("role") != "MAIN" or current_raw != proposed_raw:
+        from .featured_theme_backend import FeaturedThemeBackendCoordinator
+        from .theme_write_backend import ThemeFileWriteRequest, ThemeWriteBackendRouter
+        coordinator = backend_coordinator or FeaturedThemeBackendCoordinator(
+            db=self.db, client_factory=self.client_factory, client=client)
+        stored_backend = row["backend_name"] or "ADMIN_GRAPHQL_LEGACY"
+        selection = "ADMIN_GRAPHQL" if stored_backend == "ADMIN_GRAPHQL_LEGACY" else stored_backend
+        selected = coordinator.select_backend(row["store_id"], row["theme_id"], selection, client=client)
+        backend = selected.get("backend")
+        if backend is None or (stored_backend == "ADMIN_GRAPHQL_LEGACY" and selected.get("backend_name") != "ADMIN_GRAPHQL") or \
+                (stored_backend != "ADMIN_GRAPHQL_LEGACY" and selected.get("backend_name") != stored_backend):
+            return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Original backup backend is not READY",
+                    "backend_name": stored_backend, "backend_reason_code": selected.get("reason_code"), "write_performed": False}
+        config = get_connection(row["store_id"], db=self.db)
+        capability = selected["capabilities"].get(selected.get("backend_name"))
+        if not config or not capability or capability.details.get("identity_verified") is not True or \
+                not _same_theme_id(capability.details.get("verified_theme_id"), row["theme_id"]) or \
+                capability.details.get("verified_theme_role") != "MAIN" or capability.details.get("target_is_live") is not True:
+            return {"status": "CONFLICT", "reason": "Original backend did not verify the exact MAIN theme",
+                    "backend_name": stored_backend, "write_performed": False}
+        try:
+            current_result = backend.read_file(row["store_id"], config["shop_domain"], row["theme_id"], row["filename"])
+        except Exception:
+            return {"status": "CONFLICT", "reason": "Current template is unreadable", "write_performed": False}
+        if (current_result.theme_id != row["theme_id"] or current_result.filename != row["filename"]
+                or current_result.backend_name != selected.get("backend_name") or current_result.content != proposed_raw):
             return {"status": "CONFLICT", "reason": "Merchant changes detected; rollback will not overwrite them", "write_performed": False}
-        from .homepage_automation import UPSERT_THEME_FILES
-        result = client.execute(UPSERT_THEME_FILES, {"themeId": row["theme_id"], "files": [{"filename": row["filename"], "body": {"type": "TEXT", "value": before_raw}}]}).get("themeFilesUpsert") or {}
-        if result.get("userErrors"): return {"status": "FAILED", "backup_id": backup_id, "write_performed": True}
-        restored_theme = client.execute(FEATURED_THEME_FILE_QUERY, {"id": row["theme_id"], "filenames": [row["filename"]]}).get("theme") or {}
-        try: restored_raw, _ = self._remote_document(restored_theme, row["filename"])
-        except (ValueError, ShopifyJsonDocumentError): restored_raw = None
-        verified = restored_theme.get("role") == "MAIN" and restored_theme.get("id") == row["theme_id"] and restored_raw == before_raw
+        request = ThemeFileWriteRequest(store_id=row["store_id"], shop_domain=config["shop_domain"],
+            theme_id=row["theme_id"], filename=row["filename"], content=before_raw,
+            expected_remote_raw_hash=current_result.raw_sha256, confirmed=True, allow_live=True, target_is_live=True)
+        write_result = ThemeWriteBackendRouter.write(selected, request)
+        if not write_result.write_performed or write_result.status not in {"WRITE_ATTEMPTED", "REMOTE_JSON_VERIFIED"}:
+            return {"status": "FAILED", "backup_id": backup_id, "backend_name": stored_backend,
+                    "backend_reason_code": write_result.reason_code, "write_performed": write_result.write_performed}
+        try:
+            restored_result = backend.read_file(row["store_id"], config["shop_domain"], row["theme_id"], row["filename"])
+            verified = restored_result.theme_id == row["theme_id"] and restored_result.content == before_raw
+        except Exception:
+            verified = False
         with connect(self.db) as con:
             con.execute("UPDATE homepage_featured_theme_backups SET status=? WHERE backup_id=?", ("ROLLED_BACK" if verified else "ROLLBACK_VERIFY_FAILED", backup_id))
             if verified: con.execute("UPDATE homepage_featured_product_plans SET status='READY',remote_verified=0,remote_json_verified=0,storefront_verified=0,updated_at=? WHERE plan_id=?", (_now(), row["plan_id"]))
-        return {"status": "ROLLED_BACK" if verified else "ROLLBACK_VERIFY_FAILED", "backup_id": backup_id, "write_performed": True}
+        return {"status": "ROLLED_BACK" if verified else "ROLLBACK_VERIFY_FAILED", "backup_id": backup_id,
+                "backend_name": stored_backend, "write_performed": True}
+
+    def backup_details(self, backup_id: str) -> dict | None:
+        with connect(self.db) as con:
+            row = con.execute("SELECT backup_id,store_id,theme_id,filename,backend_name,backend_selection,backend_reason_code,status FROM homepage_featured_theme_backups WHERE backup_id=?",
+                              (backup_id,)).fetchone()
+        return dict(row) if row else None

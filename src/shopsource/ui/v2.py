@@ -34,6 +34,9 @@ from ..homepage_automation import (HomepageAutomationService, assignment_banner_
     suggested_theme_image_ref, upload_approved_hero_asset, validate_homepage_image)
 from ..homepage_assignment import HomepageAssignmentService, homepage_assignment_workflow
 from ..homepage_featured_products import FeaturedProductAssignmentService, FeaturedProductThemeApplyService
+from ..featured_theme_backend import FeaturedThemeBackendCoordinator
+from ..theme_access_credentials import (credential_present as theme_access_credential_present,
+    delete_theme_access_password, save_theme_access_password)
 from ..homepage_session import HomepagePrerequisiteService
 from ..automation import AutomationTaskError, WorkflowAutomationService, collection_prerequisite_workflow
 from ..collection_prerequisite import CollectionPrerequisiteService, prepare_homepage_prerequisites
@@ -2399,15 +2402,60 @@ class OperatorUI:
                         ui.label("추천 상품 4개를 Shopify에 적용").classes("text-xl font-bold")
                         ui.label(f"Store: {self.current_store} | {brand_name} · Theme: {theme.get('name') or theme.get('id') or '확인 필요'} · Section: {preview.get('section_id')}")
                         ui.label(f"Selected products: {len(plan.get('items', []))}")
+                        ui.label("Theme target role: MAIN / live").classes("font-semibold text-amber-800")
+                        backend_selection_control = ui.select(
+                            {"AUTO": "AUTO", "ADMIN_GRAPHQL": "ADMIN_GRAPHQL", "THEME_ACCESS_CLI": "THEME_ACCESS_CLI"},
+                            value="AUTO", label="Backend selection").classes("w-96")
+                        backend_summary_label = ui.label("Checking backend capability (read-only)…").classes("text-sm")
+                        backend_state = {"ready": False, "summary": None}
+
+                        def refresh_featured_backend_summary():
+                            try:
+                                summary = FeaturedThemeBackendCoordinator().capability_summary(
+                                    self.current_store, theme_id=theme.get("id"),
+                                    selection=backend_selection_control.value or "AUTO")
+                                backend_state["ready"] = bool(summary.get("selected_backend"))
+                                backend_state["summary"] = summary
+                                backend_summary_label.set_text(
+                                    f"Selected: {summary.get('selected_backend') or 'NO_WRITE_BACKEND'} "
+                                    f"({summary.get('selection_reason')}) | GraphQL: {summary.get('graphql_state')} | "
+                                    f"Theme Access CLI: {summary.get('theme_access_cli_state')} | "
+                                    f"Verified theme: {summary.get('verified_theme_id') or theme.get('id')} / "
+                                    f"{summary.get('verified_theme_role') or 'unverified'}")
+                            except Exception as exc:
+                                backend_state["ready"] = False
+                                backend_summary_label.set_text(f"Backend capability check failed: {_safe_error(exc)}")
+                            update_apply_enabled()
                         ui.label("변경 범위: 추천 상품 section 하나만 · Hero/Category/Product data 변경 없음")
                         ui.label("적용 전 exact raw backup 생성, 적용 후 4개 product ID와 무관 section 재검증")
                         confirmed = ui.checkbox("추천 상품 section만 Shopify 테마에 적용하는 것을 확인했습니다.")
+                        live_confirmed = ui.checkbox("I confirm this targets the current MAIN theme and is a live Shopify theme write.")
+                        apply_button = None
+
+                        def update_apply_enabled():
+                            if apply_button is not None:
+                                if backend_state["ready"] and confirmed.value and live_confirmed.value:
+                                    apply_button.enable()
+                                else:
+                                    apply_button.disable()
+
+                        confirmed.on_value_change(lambda _: update_apply_enabled())
+                        live_confirmed.on_value_change(lambda _: update_apply_enabled())
+                        backend_selection_control.on_value_change(lambda _: refresh_featured_backend_summary())
+                        refresh_featured_backend_summary()
+
                         async def perform_apply():
+                            if not backend_state["ready"] or not live_confirmed.value:
+                                ui.notify("A READY backend and explicit MAIN live confirmation are required.", type="warning")
+                                return
                             if not confirmed.value: ui.notify("확인 체크박스를 선택해야 합니다.", type="warning"); return
                             result = await asyncio.to_thread(FeaturedProductThemeApplyService().apply,
-                                plan["plan_id"], preview, store_id=self.current_store, confirmed=True)
+                                plan["plan_id"], preview, store_id=self.current_store, confirmed=True,
+                                backend_selection=backend_selection_control.value or "AUTO",
+                                allow_live=bool(live_confirmed.value))
                             state["featured_apply_status"] = result.get("status", "FAILED")
                             state["backup_id"] = result.get("backup_id")
+                            state["featured_backend_name"] = result.get("backend_name")
                             featured_apply_persistent.set_text(f"Shopify 적용: {result.get('status')} · storefront 확인 필요")
                             if result.get("status") == "REMOTE_JSON_VERIFIED":
                                 config = get_shopify_connection(self.current_store) or {}
@@ -2423,18 +2471,26 @@ class OperatorUI:
                             dialog.close()
                             ui.notify("추천 상품 isolated apply: " + result.get("status", "FAILED"), type="positive" if result.get("status") == "REMOTE_JSON_VERIFIED" else "warning")
                         ui.button("취소", on_click=dialog.close).props("outline")
-                        ui.button("추천 상품만 적용", on_click=perform_apply).props("color=primary")
+                        apply_button = ui.button("추천 상품만 적용", on_click=perform_apply).props("color=primary")
+                        update_apply_enabled()
                     dialog.open()
 
                 async def rollback_featured():
                     backup_id = state.get("backup_id")
+                    backup_details = FeaturedProductThemeApplyService().backup_details(backup_id) if backup_id else {}
                     if not backup_id: ui.notify("추천 상품 적용 backup이 없습니다.", type="warning"); return
                     with ui.dialog() as dialog, ui.card():
+                        ui.label(f"Backup: {backup_id} | Original backend: {(backup_details or {}).get('backend_name') or 'ADMIN_GRAPHQL_LEGACY'} | Theme: {(backup_details or {}).get('theme_id')} / MAIN live")
                         ui.label("추천 상품 section만 exact raw backup으로 롤백합니다.")
                         confirmed = ui.checkbox("추천 상품 section 롤백을 확인했습니다.")
+                        live_confirmed = ui.checkbox("I confirm rollback writes to the current MAIN live theme using the original backend.")
                         async def perform_rollback():
+                            if not live_confirmed.value:
+                                ui.notify("Explicit MAIN live rollback confirmation is required.", type="warning")
+                                return
                             if not confirmed.value: ui.notify("확인 체크박스를 선택하세요.", type="warning"); return
-                            result = await asyncio.to_thread(FeaturedProductThemeApplyService().rollback, backup_id, confirmed=True)
+                            result = await asyncio.to_thread(FeaturedProductThemeApplyService().rollback,
+                                                            backup_id, confirmed=True, allow_live=bool(live_confirmed.value))
                             state["featured_apply_status"] = result.get("status", "FAILED")
                             featured_apply_persistent.set_text("Shopify 적용: " + result.get("status", "FAILED"))
                             dialog.close()
@@ -3119,6 +3175,54 @@ class OperatorUI:
                     connection_detail.set_text(f"확인 실패: {_safe_error(exc)}")
                     ui.notify(_safe_error(exc), type="negative")
             ui.button("Shopify 연결 확인 / 권한 확인", on_click=verify_shopify, icon="verified_user").props("outline")
+            with ui.expansion("Theme Access fallback (Featured Products only)", icon="vpn_key"):
+                ui.label("Merchant-controlled Theme Access credential for Featured theme files when GraphQL write is unavailable. Saving a password does not modify a theme.").classes("ss-help")
+                theme_access_password = ui.input("Theme Access password (theme-only credential)").props("type=password autocomplete=new-password").classes("w-96")
+                theme_access_credential_status = ui.label("Theme Access credential: NO").classes("text-sm")
+                theme_backend_status = ui.label("Backend capability: NOT CHECKED").classes("text-sm")
+
+                def refresh_theme_access_credential_status():
+                    present = theme_access_credential_present(self.current_store)
+                    theme_access_credential_status.set_text(f"Theme Access credential: {'YES' if present else 'NO'}")
+                    return present
+
+                def save_theme_access_credential():
+                    try:
+                        save_theme_access_password(self.current_store, theme_access_password.value or "")
+                        ui.notify("Theme Access credential saved securely. Secret was not displayed.", type="positive")
+                    except Exception as exc:
+                        ui.notify(_safe_error(exc), type="negative")
+                    finally:
+                        theme_access_password.value = ""
+                        refresh_theme_access_credential_status()
+
+                def remove_theme_access_credential():
+                    delete_theme_access_password(self.current_store)
+                    theme_access_password.value = ""
+                    refresh_theme_access_credential_status()
+                    ui.notify("Theme Access credential removed from the operating-system credential store.", type="warning")
+
+                def inspect_featured_theme_backends():
+                    try:
+                        summary = FeaturedThemeBackendCoordinator().capability_summary(self.current_store)
+                        theme_backend_status.set_text(
+                            f"GraphQL: {summary['graphql_state']} ({summary['graphql_reason_code']}) | "
+                            f"Theme Access CLI: {summary['theme_access_cli_state']} | AUTO: "
+                            f"{summary['selected_backend'] or 'NO_WRITE_BACKEND'} ({summary['selection_reason']}) | "
+                            f"Theme: {summary.get('verified_theme_id') or 'unknown'} / "
+                            f"{summary.get('verified_theme_role') or 'unknown'}")
+                        ui.notify("Read-only theme backend capability check complete. No theme write was attempted.",
+                                  type="positive" if summary.get("selected_backend") else "info")
+                    except Exception as exc:
+                        theme_backend_status.set_text(f"Backend capability check failed: {_safe_error(exc)}")
+                        ui.notify(_safe_error(exc), type="negative")
+
+                with ui.row().classes("items-center gap-2"):
+                    ui.button("Save Theme Access", on_click=save_theme_access_credential, icon="save").props("outline")
+                    ui.button("Delete Theme Access", on_click=remove_theme_access_credential, icon="delete").props("outline color=negative")
+                    ui.button("Check theme write backend (read-only)", on_click=inspect_featured_theme_backends,
+                              icon="verified_user").props("outline")
+                refresh_theme_access_credential_status()
             generate_opt_in = ui.checkbox("이미지 자동 생성 사용 (체크해야 유료 API 호출 가능)", value=False)
             publish_opt_in = ui.checkbox("온라인 스토어에 공개", value=False)
             image_area = ui.column().classes("w-full")

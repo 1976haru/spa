@@ -129,7 +129,9 @@ class ThemeWriteBackendRouter:
         elif graph.ready:
             chosen, reason = self.admin_graphql, "GRAPHQL_EXEMPTION_ACTIVE"
         elif cli.ready:
-            reason = "GRAPHQL_DENIED_CLI_READY" if graph.reason_code in {"AUTH_FAILED", "ACCESS_DENIED", "GRAPHQL_DENIED"} else "GRAPHQL_SCOPE_MISSING_CLI_READY"
+            reason = "GRAPHQL_DENIED_CLI_READY" if graph.reason_code in {
+                "AUTH_FAILED", "ACCESS_DENIED", "GRAPHQL_DENIED", "ACCESS_DENIED_LAST_ATTEMPT"
+            } else "GRAPHQL_SCOPE_MISSING_CLI_READY"
             chosen = self.theme_access_cli
         else:
             chosen, reason = None, "NO_APPROVED_WRITE_PATH"

@@ -13,6 +13,8 @@ from shopsource.homepage_automation import _managed_id
 from shopsource.homepage_collections import _section_id
 from shopsource.store_build import STAGES
 from shopsource.store_completion import DOMAINS, StoreCompletionService
+from shopsource.theme_write_backend import (ThemeBackendCapabilities, ThemeFileReadResult,
+    ThemeFileWriteResult)
 
 
 def add_product(db, number, category, *, handle=None, remote_id=None, price=49.0,
@@ -157,6 +159,15 @@ def isolated_apply_fixture(tmp_path, monkeypatch):
                 "files": {"nodes": [{"filename": "templates/index.json", "body": {"__typename": "OnlineStoreThemeFileBodyText", "content": self.raw}}]}}}
     client = FakeClient()
     writer = feature_module.FeaturedProductThemeApplyService(db=db, export_dir=tmp_path / "exports")
+    import shopsource.featured_theme_backend as backend_module
+    from shopsource.featured_theme_backend import FeaturedThemeBackendCoordinator
+    monkeypatch.setattr(backend_module, "get_connection", lambda *a, **k: {"shop_domain": "sample.myshopify.com", "api_version": "2026-07"})
+    FeaturedThemeBackendCoordinator(db=db, client=client)
+    with connect(db) as con:
+        con.execute("""INSERT INTO theme_write_backend_evidence
+            (store_id,theme_id,backend_name,status,evidence_source,last_attempt_at,last_success_at,updated_at)
+            VALUES('s1',?,'ADMIN_GRAPHQL','VERIFIED_ACTIVE','TEST_HISTORICAL_SUCCESS','test','test','test')""",
+                    (snapshot["theme"]["id"],))
     return db, plan, preview, client, writer
 
 
@@ -164,7 +175,7 @@ def test_isolated_feature_apply_confirmation_and_one_file_write_with_comment_bac
     db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
     refused = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=False, client=client)
     assert refused["status"] == "MANUAL_ACTION_REQUIRED" and client.write_count == 0
-    result = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, client=client)
+    result = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, allow_live=True, client=client)
     assert result["status"] == "REMOTE_JSON_VERIFIED" and result["product_ids_match"]
     assert "ss_featured_products_" not in client.raw
     assert client.write_count == 1 and client.raw.startswith("/* Shopify header comment */")
@@ -178,6 +189,12 @@ def test_isolated_feature_apply_confirmation_and_one_file_write_with_comment_bac
     folder = next((tmp_path / "exports" / "theme_backups" / "s1").iterdir())
     assert {"before.raw.json", "proposed.raw.json", "before.parsed.json", "proposed.parsed.json",
             "selected_products.json", "diff.md", "metadata.json"}.issubset({x.name for x in folder.iterdir()})
+    metadata = json.loads((folder / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["backend_name"] == "ADMIN_GRAPHQL"
+    with connect(db) as con:
+        backup = con.execute("SELECT backend_name,backend_selection,backend_reason_code FROM homepage_featured_theme_backups WHERE backup_id=?",
+                             (result["backup_id"],)).fetchone()
+    assert backup["backend_name"] == "ADMIN_GRAPHQL" and backup["backend_selection"] == "AUTO"
 
 
 def test_isolated_apply_rejects_non_alphanumeric_generated_id_before_write(tmp_path, monkeypatch):
@@ -190,25 +207,25 @@ def test_isolated_apply_rejects_non_alphanumeric_generated_id_before_write(tmp_p
 def test_isolated_feature_apply_blocks_proposal_drift_and_rollback_checks_merchant_drift(tmp_path, monkeypatch):
     db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
     preview["proposed"]["sections"]["hero"]["settings"]["title"] = "changed"
-    blocked = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, client=client)
+    blocked = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, allow_live=True, client=client)
     assert blocked["status"] == "CONFLICT" and client.write_count == 0
 
 
 def test_isolated_feature_rollback_restores_exact_raw_and_refuses_merchant_drift(tmp_path, monkeypatch):
     db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
     original_raw = client.raw
-    applied = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, client=client)
+    applied = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, allow_live=True, client=client)
     assert applied["status"] == "REMOTE_JSON_VERIFIED" and client.write_count == 1
-    restored = writer.rollback(applied["backup_id"], confirmed=True, client=client)
+    restored = writer.rollback(applied["backup_id"], confirmed=True, allow_live=True, client=client)
     assert restored["status"] == "ROLLED_BACK" and client.raw == original_raw and client.write_count == 2
 
     merchant_dir = tmp_path / "merchant"
     merchant_dir.mkdir()
     db2, plan2, preview2, client2, writer2 = isolated_apply_fixture(merchant_dir, monkeypatch)
-    applied2 = writer2.apply(plan2["plan_id"], preview2, store_id="s1", confirmed=True, client=client2)
+    applied2 = writer2.apply(plan2["plan_id"], preview2, store_id="s1", confirmed=True, allow_live=True, client=client2)
     assert applied2["status"] == "REMOTE_JSON_VERIFIED"
     client2.raw += "\n/* merchant drift */"
-    refused = writer2.rollback(applied2["backup_id"], confirmed=True, client=client2)
+    refused = writer2.rollback(applied2["backup_id"], confirmed=True, allow_live=True, client=client2)
     assert refused["status"] == "CONFLICT" and client2.write_count == 1
 
 
@@ -216,14 +233,14 @@ def test_isolated_feature_apply_rejects_stale_plan_and_raw_semantic_drift(tmp_pa
     db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
     service_for_db = FeaturedProductAssignmentService(db=db)
     service_for_db.create_plan("s1", requested_count=4)
-    stale = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, client=client)
+    stale = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, allow_live=True, client=client)
     assert stale["status"] == "CONFLICT" and client.write_count == 0
 
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir()
     db2, plan2, preview2, client2, writer2 = isolated_apply_fixture(raw_dir, monkeypatch)
     client2.raw += " "
-    raw_drift = writer2.apply(plan2["plan_id"], preview2, store_id="s1", confirmed=True, client=client2)
+    raw_drift = writer2.apply(plan2["plan_id"], preview2, store_id="s1", confirmed=True, allow_live=True, client=client2)
     assert raw_drift["status"] == "CONFLICT" and client2.write_count == 0
 
     semantic_dir = tmp_path / "semantic"
@@ -232,7 +249,7 @@ def test_isolated_feature_apply_rejects_stale_plan_and_raw_semantic_drift(tmp_pa
     source = preview3["source_document"]
     source["before_raw_hash"] = hashlib.sha256(client3.raw.encode("utf-8")).hexdigest()
     source["before_semantic_hash"] = "deliberately-stale-semantic-hash"
-    semantic_drift = writer3.apply(plan3["plan_id"], preview3, store_id="s1", confirmed=True, client=client3)
+    semantic_drift = writer3.apply(plan3["plan_id"], preview3, store_id="s1", confirmed=True, allow_live=True, client=client3)
     assert semantic_drift["status"] == "CONFLICT" and client3.write_count == 0
 
 
@@ -514,3 +531,158 @@ def test_reselection_reuses_only_when_alternatives_insufficient(tmp_path):
     second = svc.reselect(first)
     assert len(second["items"]) == 4 and second["reselection_reused_previous"] is True
     assert {x["shopify_product_id"] for x in second["items"]} == {x["shopify_product_id"] for x in first["items"]}
+
+
+class StubThemeTransport:
+    def __init__(self, name, raw, *, ready=True, write_mode="success"):
+        self.backend_name, self.raw = name, raw
+        self.ready, self.write_mode = ready, write_mode
+        self.write_attempts = 0
+
+    def capability_status(self, _store_id, *, theme_id=None):
+        return ThemeBackendCapabilities(self.backend_name, "READY" if self.ready else "UNAVAILABLE",
+            "READY" if self.ready else "NOT_READY", {"identity_verified": self.ready,
+            "verified_theme_id": theme_id if self.ready else None, "verified_theme_role": "MAIN" if self.ready else None,
+            "target_is_live": True if self.ready else None})
+
+    def read_file(self, store_id, shop_domain, theme_id, filename):
+        return ThemeFileReadResult(filename, self.raw, hashlib.sha256(self.raw.encode()).hexdigest(),
+            self.backend_name, store_id, shop_domain, theme_id, {"verified_theme_role": "MAIN"})
+
+    def write_file(self, request):
+        self.write_attempts += 1
+        if self.write_mode == "access_denied":
+            return ThemeFileWriteResult("ACCESS_DENIED", self.backend_name, request.filename, True,
+                                        reason_code="ACCESS_DENIED")
+        self.raw = request.content
+        if self.write_mode == "semantic_drift":
+            parsed = json.loads(self.raw.split("*/", 1)[-1])
+            parsed["unrelated_after_write"] = True
+            self.raw = "/* Shopify header comment */\n" + json.dumps(parsed) + "\n"
+        return ThemeFileWriteResult("WRITE_ATTEMPTED", self.backend_name, request.filename, True)
+
+
+class StubThemeCoordinator:
+    def __init__(self, graph, cli, *, auto="ADMIN_GRAPHQL"):
+        self.graph, self.cli, self.auto = graph, cli, auto
+        self.selections = []
+
+    def select_backend(self, store_id, theme_id, selection="AUTO", *, client=None):
+        self.selections.append(selection)
+        chosen_name = self.auto if selection == "AUTO" else selection
+        backends = {"ADMIN_GRAPHQL": self.graph, "THEME_ACCESS_CLI": self.cli}
+        graph_cap = self.graph.capability_status(store_id, theme_id=theme_id)
+        cli_cap = self.cli.capability_status(store_id, theme_id=theme_id)
+        backend = backends.get(chosen_name)
+        capability = graph_cap if chosen_name == "ADMIN_GRAPHQL" else cli_cap
+        if selection == "ADMIN_GRAPHQL_LEGACY":
+            backend = None
+        if capability is None or not capability.ready:
+            backend = None
+        return {"backend": backend, "backend_name": chosen_name if backend else None,
+                "reason_code": "STUB_SELECTION", "selection": selection, "selection_locked": True,
+                "capabilities": {"ADMIN_GRAPHQL": graph_cap, "THEME_ACCESS_CLI": cli_cap}}
+
+
+def test_featured_apply_requires_explicit_main_live_confirmation(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    graph = StubThemeTransport("ADMIN_GRAPHQL", client.raw)
+    cli = StubThemeTransport("THEME_ACCESS_CLI", client.raw)
+    coordinator = StubThemeCoordinator(graph, cli)
+    result = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True,
+                          backend_coordinator=coordinator)
+    assert result["status"] == "MANUAL_ACTION_REQUIRED"
+    assert result["backend_reason_code"] == "MAIN_LIVE_CONFIRMATION_REQUIRED"
+    assert graph.write_attempts == cli.write_attempts == 0
+
+
+def test_featured_cli_pre_read_must_match_preview_raw_hash(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    cli = StubThemeTransport("THEME_ACCESS_CLI", client.raw + " ")
+    coordinator = StubThemeCoordinator(StubThemeTransport("ADMIN_GRAPHQL", client.raw), cli, auto="THEME_ACCESS_CLI")
+    result = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, allow_live=True,
+                          backend_selection="AUTO", backend_coordinator=coordinator)
+    assert result["status"] == "CONFLICT" and result["backend_name"] == "THEME_ACCESS_CLI"
+    assert cli.write_attempts == 0
+
+
+def test_featured_cli_apply_keeps_isolated_diff_guard(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    preview["proposed"]["sections"]["hero"]["settings"]["title"] = "unrelated mutation"
+    cli = StubThemeTransport("THEME_ACCESS_CLI", client.raw)
+    coordinator = StubThemeCoordinator(StubThemeTransport("ADMIN_GRAPHQL", client.raw), cli, auto="THEME_ACCESS_CLI")
+    result = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, allow_live=True,
+                          backend_coordinator=coordinator)
+    assert result["status"] == "CONFLICT" and cli.write_attempts == 0
+
+
+def test_featured_never_falls_back_after_write_attempt(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    graph = StubThemeTransport("ADMIN_GRAPHQL", client.raw, write_mode="access_denied")
+    cli = StubThemeTransport("THEME_ACCESS_CLI", client.raw)
+    coordinator = StubThemeCoordinator(graph, cli)
+    result = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, allow_live=True,
+                          backend_coordinator=coordinator)
+    assert result["status"] == "FAILED" and result["write_performed"] is True
+    assert graph.write_attempts == 1 and cli.write_attempts == 0
+
+
+def test_featured_cli_apply_semantic_post_verify(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    cli = StubThemeTransport("THEME_ACCESS_CLI", client.raw, write_mode="semantic_drift")
+    coordinator = StubThemeCoordinator(StubThemeTransport("ADMIN_GRAPHQL", client.raw), cli, auto="THEME_ACCESS_CLI")
+    result = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, allow_live=True,
+                          backend_coordinator=coordinator)
+    assert result["status"] == "VERIFY_FAILED" and result["write_performed"] is True
+
+
+def test_featured_rollback_uses_original_backend_and_never_switches(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    original = client.raw
+    graph = StubThemeTransport("ADMIN_GRAPHQL", client.raw)
+    cli = StubThemeTransport("THEME_ACCESS_CLI", client.raw)
+    coordinator = StubThemeCoordinator(graph, cli, auto="THEME_ACCESS_CLI")
+    applied = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, allow_live=True,
+                           backend_selection="THEME_ACCESS_CLI", backend_coordinator=coordinator)
+    assert applied["status"] == "REMOTE_JSON_VERIFIED" and applied["backend_name"] == "THEME_ACCESS_CLI"
+    rolled = writer.rollback(applied["backup_id"], confirmed=True, allow_live=True, backend_coordinator=coordinator)
+    assert rolled["status"] == "ROLLED_BACK" and cli.raw == original
+    assert coordinator.selections == ["THEME_ACCESS_CLI", "THEME_ACCESS_CLI"]
+    assert cli.write_attempts == 2 and graph.write_attempts == 0
+
+
+def test_legacy_backup_does_not_guess_cli(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    graph = StubThemeTransport("ADMIN_GRAPHQL", client.raw, ready=False)
+    cli = StubThemeTransport("THEME_ACCESS_CLI", client.raw, ready=True)
+    coordinator = StubThemeCoordinator(graph, cli, auto="THEME_ACCESS_CLI")
+    applied = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, allow_live=True,
+                           backend_selection="THEME_ACCESS_CLI", backend_coordinator=coordinator)
+    assert applied["status"] == "REMOTE_JSON_VERIFIED"
+    with connect(db) as con:
+        con.execute("UPDATE homepage_featured_theme_backups SET backend_name=NULL WHERE backup_id=?",
+                    (applied["backup_id"],))
+    writes_before = cli.write_attempts
+    result = writer.rollback(applied["backup_id"], confirmed=True, allow_live=True,
+                             backend_coordinator=coordinator)
+    assert result["status"] == "MANUAL_ACTION_REQUIRED"
+    assert coordinator.selections[-1] == "ADMIN_GRAPHQL"
+    assert cli.write_attempts == writes_before
+
+
+def test_featured_backup_backend_columns_migrate_without_hiding_legacy_rows(tmp_path):
+    db = tmp_path / "legacy-backups.sqlite3"
+    init_db(db)
+    with connect(db) as con:
+        con.execute("""CREATE TABLE homepage_featured_theme_backups(
+            backup_id TEXT PRIMARY KEY,store_id TEXT NOT NULL,theme_id TEXT NOT NULL,filename TEXT NOT NULL,
+            plan_id TEXT NOT NULL,preview_hash TEXT NOT NULL,section_id TEXT NOT NULL,folder TEXT NOT NULL,
+            before_raw_hash TEXT NOT NULL,proposed_raw_hash TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL)""")
+        con.execute("INSERT INTO homepage_featured_theme_backups VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    ("HFPB_legacy", "s1", "55", "templates/index.json", "plan", "preview", "section",
+                     "folder", "before", "proposed", "BACKED_UP", "then"))
+    from shopsource.homepage_featured_products import FeaturedProductThemeApplyService
+    FeaturedProductThemeApplyService(db=db, export_dir=tmp_path / "exports")
+    with connect(db) as con:
+        row = con.execute("SELECT backup_id,status,backend_name,backend_selection,backend_reason_code FROM homepage_featured_theme_backups WHERE backup_id='HFPB_legacy'").fetchone()
+    assert tuple(row) == ("HFPB_legacy", "BACKED_UP", None, None, None)
