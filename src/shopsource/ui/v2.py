@@ -35,6 +35,7 @@ from ..homepage_automation import (HomepageAutomationService, assignment_banner_
 from ..homepage_assignment import HomepageAssignmentService, homepage_assignment_workflow
 from ..homepage_featured_products import FeaturedProductAssignmentService, FeaturedProductThemeApplyService
 from ..featured_theme_backend import FeaturedThemeBackendCoordinator
+from ..multistore_theme_operations import MultiStoreThemeOperationsService
 from ..theme_access_credentials import (credential_present as theme_access_credential_present,
     delete_theme_access_password, save_theme_access_password)
 from ..homepage_session import HomepagePrerequisiteService
@@ -67,6 +68,7 @@ from .production_control_center import (GATE_ACTION_REGISTRY, gate_board_rows,
     production_summary, resolve_gate_click)
 
 NAV_ITEMS = [
+    ("/theme-operations", "hub", "Multi-store Theme Operations"),
     ("/production", "rocket_launch", "실전 스토어 완성"),
     ("/completion", "fact_check", "스토어 완성"),
     ("/source-safety", "health_and_safety", "소스 재고·가격 안전"),
@@ -308,6 +310,7 @@ class OperatorUI:
             elif path == "/pilot": self._shopify_pilot()
             elif path == "/brand": self._brand_automation()
             elif path == "/stores": self._stores()
+            elif path == "/theme-operations": self._multistore_theme_operations()
             elif path == "/sourcing": self._sourcing()
             elif path == "/collections": self._collections()
             elif path == "/navigation": self._navigation()
@@ -3498,6 +3501,187 @@ class OperatorUI:
                 ui.table(columns=[{"name": key, "label": key, "field": key} for key in ("작업", "상태", "시각")], rows=recent).classes("w-full")
             else:
                 ui.label("표시할 최근 작업이 없습니다.").classes("text-slate-500")
+
+    def _multistore_theme_operations(self):
+        ui = self.ui
+        service = MultiStoreThemeOperationsService()
+        self._heading("Multi-store Theme Operations",
+                      "Inspect registered stores' Shopify GraphQL and Theme Access status. Remote checks are read-only and run only on request.")
+        state_filter = ui.select({
+            "ALL": "All stores", "READY": "Ready", "NEEDS_SETUP": "Needs setup",
+            "GRAPHQL_ISSUE": "GraphQL issue", "THEME_ACCESS_ISSUE": "Theme Access issue",
+        }, value="ALL", label="Filter").classes("w-56")
+        search = ui.input("Search store ID, name, or domain").classes("w-80")
+        rows = service.list_rows()
+        initial_counts = {"total": len(rows), "connected": sum(row["shopify_connection"] == "CONNECTED" for row in rows),
+                          "graphql_ready": sum(row["graphql_state"] == "VERIFIED_ACTIVE" and not row["cache_stale"] for row in rows),
+                          "cli_ready": sum(row["theme_access_cli_state"] == "READY" and not row["cache_stale"] for row in rows),
+                          "needs_setup": sum(row["check_status"] == "NEEDS_SETUP" for row in rows)}
+        summary_values = {}
+        with ui.row().classes("w-full flex-wrap gap-3"):
+            for label, key in (("Registered stores", "total"), ("Shopify connected", "connected"),
+                               ("GraphQL ready", "graphql_ready"), ("Theme Access ready", "cli_ready"),
+                               ("Needs setup", "needs_setup")):
+                with ui.card().classes("min-w-40 p-4"):
+                    ui.label(label).classes("text-sm text-slate-600")
+                    summary_values[key] = ui.label(str(initial_counts[key])).classes("ss-kpi")
+        progress_label = ui.label("Initial view uses local store metadata and cached non-secret results only.").classes("ss-help")
+        columns = [{"name": key, "label": label, "field": key, "align": "left", "sortable": True} for key, label in (
+            ("store", "Store"), ("shopify_connection", "Shopify"), ("graphql_state", "GraphQL"),
+            ("theme_access", "Theme Access"), ("main_theme", "MAIN Theme"),
+            ("auto_backend", "AUTO Backend"), ("last_checked", "Last Check"), ("action", "Action"))]
+        table = ui.table(columns=columns, rows=[], row_key="store_id", pagination={"rowsPerPage": 25}).classes("w-full")
+
+        def refresh_table():
+            all_rows = service.list_rows()
+            current_counts = {"total": len(all_rows),
+                "connected": sum(row["shopify_connection"] == "CONNECTED" for row in all_rows),
+                "graphql_ready": sum(row["graphql_state"] == "VERIFIED_ACTIVE" and not row["cache_stale"] for row in all_rows),
+                "cli_ready": sum(row["theme_access_cli_state"] == "READY" and not row["cache_stale"] for row in all_rows),
+                "needs_setup": sum(row["check_status"] == "NEEDS_SETUP" for row in all_rows)}
+            for key, value in current_counts.items():
+                summary_values[key].set_text(str(value))
+            displayed = service.list_rows(query=search.value or "", status_filter=state_filter.value or "ALL")
+            table.rows = [{
+                "store_id": row["store_id"], "store": f"{row['store_id']} | {row['store_name']}",
+                "shopify_connection": row["shopify_connection"], "graphql_state": row["graphql_state"],
+                "theme_access": f"{row['theme_access_credential']} / {row['theme_access_cli_state']}",
+                "main_theme": (f"{row.get('main_theme_name') or 'Unknown'} / {row.get('main_theme_role') or 'Unknown'}"),
+                "auto_backend": row["auto_backend"],
+                "last_checked": ((row["last_checked_at"] or row["check_status"]) +
+                                 (" · STALE" if row["last_checked_at"] and row["cache_stale"] else "")),
+                "action": "Select below",
+            } for row in displayed]
+            table.update()
+        refresh_table()
+        state_filter.on_value_change(lambda _event: refresh_table())
+        search.on_value_change(lambda _event: refresh_table())
+
+        registered = service.list_rows()
+        store_options = {row["store_id"]: f"{row['store_id']} | {row['store_name']}" for row in registered}
+        selected_store = ui.select(store_options, value=next(iter(store_options), None), label="Selected store").classes("w-72")
+        with ui.row().classes("w-full flex-wrap gap-2"):
+            run_all_button = ui.button("Check all stores (read-only)", icon="fact_check").props("color=primary")
+            refresh_button = ui.button("Refresh", icon="refresh").props("outline")
+            detail_button = ui.button("Details", icon="info").props("outline")
+            check_one_button = ui.button("Check selected (read-only)", icon="verified_user").props("outline")
+            credential_button = ui.button("Register / change Theme Access", icon="vpn_key").props("outline")
+
+        with ui.dialog() as detail_dialog, ui.card().classes("w-[min(760px,95vw)] max-h-[85vh] overflow-auto"):
+            detail_title = ui.label("Store details").classes("ss-card-title")
+            detail_text = ui.label("Select a registered store.").classes("whitespace-pre-wrap")
+            ui.button("Close", on_click=detail_dialog.close, icon="close").props("outline")
+
+        def show_details():
+            store_id = str(selected_store.value or "")
+            row = next((item for item in service.list_rows() if item["store_id"] == store_id), None)
+            if row is None:
+                ui.notify("Select a registered store first.", type="warning")
+                return
+            detail_title.set_text(f"{row['store_id']} | {row['store_name']}")
+            detail_text.set_text("\n".join((
+                f"Shop domain: {row.get('shop_domain') or 'Not configured'}",
+                f"Shopify connection: {row['shopify_connection']}",
+                f"App binding: {row['app_binding']}",
+                f"GraphQL: {row['graphql_state']} ({row.get('selection_reason')})",
+                f"Theme Access credential: {row['theme_access_credential']}",
+                f"Theme Access CLI: {row['theme_access_cli_state']}",
+                f"MAIN theme: {row.get('main_theme_name') or 'Unknown'} | {row.get('main_theme_id') or 'Unknown'} | {row.get('main_theme_role') or 'Unknown'}",
+                f"AUTO backend: {row['auto_backend']}",
+                f"Last checked: {row['last_checked_at'] or 'Not checked'}",
+                f"Status: {row['check_status']} | cache {'STALE' if row['last_checked_at'] and row['cache_stale'] else ('NOT_CHECKED' if not row['last_checked_at'] else 'current')}",
+                f"Diagnostic: {row.get('diagnostic_code') or '—'}",
+                "No theme, product, or collection write is available on this page.",
+            )))
+            detail_dialog.open()
+
+        def open_credentials():
+            store_id = str(selected_store.value or "")
+            if store_id not in store_options:
+                ui.notify("Select a registered store first.", type="warning")
+                return
+            present = theme_access_credential_present(store_id)
+            with ui.dialog() as dialog, ui.card().classes("w-[min(560px,95vw)]"):
+                ui.label(f"Theme Access | {store_options[store_id]}").classes("ss-card-title")
+                ui.label("The password is stored only in this store's Windows Credential Manager entry. It is never shown or prefilled.").classes("ss-help")
+                ui.label(f"Credential currently stored: {'YES' if present else 'NO'}")
+                password = ui.input("Theme Access password").props("type=password autocomplete=new-password").classes("w-full")
+                confirm_delete = ui.checkbox(f"Confirm deleting this store's Theme Access credential ({store_id})")
+
+                def save_password():
+                    try:
+                        save_theme_access_password(store_id, password.value or "")
+                        ui.notify("Credential saved securely. No remote check was run.", type="positive")
+                    except Exception as exc:
+                        ui.notify(_safe_error(exc), type="negative")
+                    finally:
+                        password.value = ""
+                    dialog.close()
+                    refresh_table()
+
+                def delete_password():
+                    if not confirm_delete.value:
+                        ui.notify("Confirm removal for this store first.", type="warning")
+                        return
+                    delete_theme_access_password(store_id)
+                    password.value = ""
+                    ui.notify("Credential removed for the selected store.", type="warning")
+                    dialog.close()
+                    refresh_table()
+
+                with ui.row().classes("gap-2"):
+                    ui.button("Save", on_click=save_password, icon="save").props("color=primary")
+                    ui.button("Delete selected store credential", on_click=delete_password, icon="delete").props("outline color=negative")
+                    ui.button("Cancel", on_click=dialog.close, icon="close").props("outline")
+            dialog.open()
+
+        async def check_one():
+            store_id = str(selected_store.value or "")
+            if not store_id:
+                ui.notify("Select a registered store first.", type="warning")
+                return
+            check_one_button.disable()
+            progress_label.set_text(f"Read-only check running for {store_id}…")
+            try:
+                result = await asyncio.to_thread(service.check_store, store_id)
+                progress_label.set_text(f"{store_id}: {result['check_status']} | no write performed")
+                refresh_table()
+            finally:
+                check_one_button.enable()
+
+        async def check_all():
+            run_all_button.disable()
+            refresh_button.disable()
+            progress_queue = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+            progress_label.set_text(f"Checking {len(store_options)} registered stores; at most {service.max_workers} concurrent read-only checks…")
+
+            def report_progress(item):
+                loop.call_soon_threadsafe(progress_queue.put_nowait, item)
+
+            task = asyncio.create_task(asyncio.to_thread(service.check_all, progress_callback=report_progress))
+            while not task.done():
+                try:
+                    item = await asyncio.wait_for(progress_queue.get(), timeout=0.25)
+                    progress_label.set_text(f"Read-only checks: {item['completed']}/{item['total']} completed (max {service.max_workers} concurrent)…")
+                except asyncio.TimeoutError:
+                    pass
+            try:
+                result = await task
+                refresh_table()
+                checked = result["counts"]
+                progress_label.set_text(f"Done: {checked['total']} stores | READY {checked['READY']} | NEEDS_SETUP {checked['NEEDS_SETUP']} | ERROR {checked['ERROR']} | write performed: NO")
+            except Exception as exc:
+                progress_label.set_text(f"Read-only checks failed safely: {_safe_error(exc)}")
+            finally:
+                run_all_button.enable()
+                refresh_button.enable()
+
+        run_all_button.on_click(check_all)
+        refresh_button.on_click(refresh_table)
+        detail_button.on_click(show_details)
+        check_one_button.on_click(check_one)
+        credential_button.on_click(open_credentials)
 
     def _stores(self):
         ui = self.ui
