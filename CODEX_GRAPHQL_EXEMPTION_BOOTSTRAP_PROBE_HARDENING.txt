@@ -1,0 +1,239 @@
+ShopSource Studio — GRAPHQL EXEMPTION BOOTSTRAP PROBE HARDENING
+FIX EXPLICIT ADMIN_GRAPHQL DEADLOCK BEFORE PHASE B MERGE
+
+Repository
+- Worktree: D:\shop\001_so_amazon_featured_backend
+- Remote: https://github.com/1976haru/spa.git
+- Branch: phase/featured-theme-backend-router-integration
+- Expected current implementation HEAD before this prompt commit: c472504d5133c1e5d7cf42b2c0c9460c68260614
+- Main base: 4cad28fce6c5cc36e5a2c0c8c8314dacd712ff79
+
+Independent review finding
+The current GraphQL evidence model is honest, but it has a bootstrap deadlock:
+
+- write_themes granted + no previous success => SCOPE_GRANTED_UNVERIFIED
+- ADMIN_GRAPHQL capability is UNAVAILABLE unless VERIFIED_ACTIVE
+- explicit ADMIN_GRAPHQL selection is therefore blocked
+- GraphQL write_file() also refuses unless capability is already READY
+- VERIFIED_ACTIVE is only recorded after a successful themeFilesUpsert
+
+Therefore a newly-approved Shopify exemption can never become VERIFIED_ACTIVE through the product UI unless evidence is manually seeded.
+
+This must be fixed before merge.
+
+Mission
+Keep AUTO conservative, but allow one explicit, user-confirmed ADMIN_GRAPHQL verification attempt when:
+- read_themes granted
+- write_themes granted
+- exact MAIN theme identity verified
+- state is SCOPE_GRANTED_UNVERIFIED
+- user explicitly selected ADMIN_GRAPHQL
+- existing Featured preview/business guards passed
+- confirmed=True
+- allow_live=True
+
+The attempt itself is the evidence probe:
+- success => VERIFIED_ACTIVE
+- access denied => ACCESS_DENIED_LAST_ATTEMPT
+- no automatic fallback after attempt
+
+No live Shopify write in this implementation task; tests/mock only.
+
+======================================================================
+1. PRESERVE AUTO BEHAVIOR
+======================================================================
+
+AUTO must remain:
+1. ADMIN_GRAPHQL only if state == VERIFIED_ACTIVE
+2. else THEME_ACCESS_CLI if READY
+3. else NO_WRITE_BACKEND
+
+AUTO must NEVER use SCOPE_GRANTED_UNVERIFIED GraphQL.
+
+======================================================================
+2. EXPLICIT GRAPHQL PROBE MODE
+======================================================================
+
+Add an explicit probe mode that can only be reached by selection="ADMIN_GRAPHQL".
+
+Preferred architecture:
+- FeaturedThemeBackendCoordinator.select_backend(...)
+  may build/select a GraphQL adapter with allow_unverified_probe=True ONLY for explicit ADMIN_GRAPHQL selection.
+- Generic ThemeWriteBackendRouter should remain conservative and reusable.
+
+Do not make global AdminGraphQLThemeBackend behavior less safe.
+
+For explicit ADMIN_GRAPHQL:
+- if state VERIFIED_ACTIVE => normal READY
+- if state SCOPE_GRANTED_UNVERIFIED and identity/scope checks pass => READY_FOR_VERIFICATION_ATTEMPT
+- if state SCOPE_MISSING => blocked
+- if ACCESS_DENIED_LAST_ATTEMPT => blocked by default; require a future explicit retry-reset workflow, not this task
+- identity mismatch/unknown => blocked
+
+Return reason code:
+USER_SELECTED_GRAPHQL_VERIFICATION_ATTEMPT
+or similarly explicit wording.
+
+The UI must clearly display:
+"GraphQL scope is granted but exemption is not yet verified. This explicit live apply will test the approved path."
+
+Do not call it VERIFIED_ACTIVE before success.
+
+======================================================================
+3. WRITE PATH
+======================================================================
+
+GraphQL write_file must allow the one explicit verification attempt only when the adapter was built in probe mode.
+
+Still require:
+- templates/index.json allowlist
+- confirmed=True
+- target_is_live=True
+- allow_live=True
+- read_themes + write_themes currently granted
+- exact MAIN identity
+- remote raw hash precondition
+
+Then:
+- perform themeFilesUpsert
+- success + returned target filename => record VERIFIED_ACTIVE
+- access denied => record ACCESS_DENIED_LAST_ATTEMPT
+- other error => no success evidence
+
+No fallback to CLI after this attempted write.
+
+======================================================================
+4. EVIDENCE SEMANTICS
+======================================================================
+
+Keep:
+SCOPE_MISSING
+SCOPE_GRANTED_UNVERIFIED
+VERIFIED_ACTIVE
+ACCESS_DENIED_LAST_ATTEMPT
+
+Do not convert to VERIFIED_ACTIVE based on scopes alone.
+
+If a previous VERIFIED_ACTIVE exists but current scope disappears:
+- capability should become SCOPE_MISSING / unavailable
+- keep historical last_success_at but current state must not appear READY
+
+If ACCESS_DENIED_LAST_ATTEMPT exists:
+- AUTO may use CLI if READY
+- explicit ADMIN_GRAPHQL should remain blocked in this task
+- a later dedicated "retry GraphQL verification" control can clear/retry after admin decision; do not implement hidden retries now.
+
+======================================================================
+5. UI BEHAVIOR
+======================================================================
+
+Featured apply dialog:
+
+When ADMIN_GRAPHQL explicitly selected and state is SCOPE_GRANTED_UNVERIFIED:
+- backend_state ready may be true only as "verification attempt"
+- show warning text that this is an explicit exemption verification write
+- both Featured confirmation + MAIN live confirmation still required
+- no extra automatic write beyond the one actual Featured apply
+
+AUTO must not select it.
+
+Current Cabin Tidy today has write_themes missing, so expected state remains blocked; this change only matters if Shopify later grants the scope.
+
+======================================================================
+6. TESTS
+======================================================================
+
+Add/update tests at minimum:
+
+test_auto_never_uses_scope_granted_unverified_graphql
+test_explicit_graphql_allows_single_verification_attempt_when_scope_granted
+test_explicit_graphql_probe_still_requires_main_identity
+test_explicit_graphql_probe_still_requires_live_confirmation
+test_explicit_graphql_probe_success_records_verified_active
+test_explicit_graphql_probe_access_denied_records_denied
+test_explicit_graphql_probe_never_falls_back_to_cli_after_attempt
+test_access_denied_last_attempt_blocks_explicit_probe
+test_scope_removed_after_historical_success_is_not_ready
+test_current_cabin_scope_missing_remains_blocked
+test_no_shopify_live_write
+
+All mutation tests mocked.
+
+======================================================================
+7. DO NOT TOUCH CATEGORY / PROTECTED FILES
+======================================================================
+
+Do not modify:
+- src/shopsource/category_strategy.py
+- src/shopsource/category_shortcut_readiness.py
+- tools/shopify_app/safe_shopify_cli.ps1
+- stores/001_cabin_tidy.json
+- data/*.sqlite3
+- .env
+- real credentials
+- backups
+- user assets
+
+======================================================================
+8. QUALITY GATES
+======================================================================
+
+Run:
+python -m compileall -q src tests
+focused Featured/backend tests
+python -m pytest -q --basetemp=<worktree-local-temp>
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Required:
+FULL SUITE PASS
+SHOPIFY LIVE WRITE COUNT = 0
+REAL THEME ACCESS CREDENTIAL CREATION = 0
+
+======================================================================
+9. COMMIT / PUSH
+======================================================================
+
+Stay on:
+phase/featured-theme-backend-router-integration
+
+Suggested commit:
+git commit -m "Allow explicit GraphQL exemption verification probe"
+
+Push same branch.
+Do not merge main.
+
+======================================================================
+10. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] bootstrap deadlock fix
+[5] AUTO behavior
+[6] explicit ADMIN_GRAPHQL verification attempt behavior
+[7] success evidence
+[8] access denied evidence
+[9] no-fallback guarantee
+[10] UI warning/confirmation
+[11] focused tests
+[12] full-suite result
+[13] protected files
+[14] Shopify live write count
+[15] merge readiness
+[16] exact next action
+
+Final:
+GRAPHQL_BOOTSTRAP_DEADLOCK_FIXED = YES/NO
+AUTO_SCOPE_UNVERIFIED_BLOCKED = YES/NO
+EXPLICIT_GRAPHQL_PROBE = READY/NOT_READY
+SUCCESS_RECORDS_VERIFIED_ACTIVE = YES/NO
+DENIED_RECORDS_ACCESS_DENIED = YES/NO
+NO_POST_ATTEMPT_FALLBACK = YES/NO
+FULL_SUITE = PASS/FAIL
+SHOPIFY_LIVE_WRITE_COUNT = 0
+CODE_MERGE_READY = YES/NO
