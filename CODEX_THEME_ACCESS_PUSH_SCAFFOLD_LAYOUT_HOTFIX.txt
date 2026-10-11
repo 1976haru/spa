@@ -1,0 +1,306 @@
+ShopSource Studio — THEME ACCESS PUSH SCAFFOLD LAYOUT HOTFIX
+FIX STEP-5 APPLY FALLING BACK TO STEP 4
+NO REAL SHOPIFY WRITE DURING DEVELOPMENT/TEST
+
+Repository
+- Baseline main: acfef6224b6960e1111378287d943f0a37219aa1
+- Branch: hotfix/theme-access-push-scaffold-layout
+- Recommended worktree: D:\shop\001_so_amazon_theme_push_layout
+
+Observed real behavior
+- Store 001 step 4 preflight now succeeds:
+  reason_code=READY_TO_APPLY
+  raw_equal=True
+  semantic_equal=True
+  prefix_equal=True
+  suffix_equal=True
+  backend=THEME_ACCESS_CLI
+  MAIN identity verified
+- User opens step 5 apply gate, checks both confirmations, clicks "추천 상품만 적용".
+- Guided Flow then returns to:
+  3/7 complete
+  step 4 current
+  "4단계 · 안전 검사 다시 실행"
+- This is NOT an explicit rollback action; it is the guided flow falling back after the apply result was not REMOTE_JSON_VERIFIED.
+
+Root-cause evidence in current ShopSource code
+src/shopsource/shopify_theme_cli.py:
+
+_push():
+    temp = mkdtemp(...)
+    self._scaffold(temp)
+    ...
+    shopify theme push ... --path temp --nodelete --strict --json [--allow-live]
+
+_scaffold():
+    creates:
+      config/
+      templates/
+      config/settings_schema.json
+    DOES NOT create:
+      layout/
+
+Verified Shopify CLI source behavior
+Current Shopify CLI theme push does:
+    hasRequiredThemeDirectories(workingDirectory)
+
+and required directories are:
+    config
+    layout
+    templates
+
+If missing, Shopify CLI enters ensureDirectoryConfirmed(...).
+Our push subprocess is non-interactive and does not intentionally handle that confirmation.
+Therefore the current partial scaffold is invalid for push.
+
+Mission
+Make the isolated push temp directory a valid minimal Shopify theme directory by adding layout/.
+Do not touch pull behavior; pull must stay EMPTY before CLI invocation.
+
+Also make tests catch this exact regression.
+
+======================================================================
+1. SAFETY
+======================================================================
+
+Do not modify:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env
+- credentials
+- Featured selection logic
+- category/reconciliation logic
+
+No real Shopify push in tests.
+No real Theme Access credential use.
+No rollback.
+No main merge.
+
+======================================================================
+2. MINIMAL PUSH SCAFFOLD FIX
+======================================================================
+
+In ShopifyThemeCLI._scaffold(root):
+
+Current:
+- create config/
+- create templates/
+- create config/settings_schema.json with []\n
+
+Change to:
+- create config/
+- create layout/
+- create templates/
+- keep config/settings_schema.json behavior
+
+Do NOT create layout/theme.liquid unless tests or actual Shopify CLI behavior proves an empty layout directory is insufficient.
+The Shopify CLI directory gate only checks required directory presence.
+
+Do NOT add --force.
+
+Do NOT add --no-input to push unless independently required and justified.
+The correct fix is a valid theme directory, not bypassing validation.
+
+======================================================================
+3. PULL MUST REMAIN UNCHANGED
+======================================================================
+
+Confirm:
+- _pull() does NOT call _scaffold()
+- pull temp starts empty
+- pull command includes --no-input
+- pull command does not include --json
+- pull uses --only templates/index.json
+- canonical domain preserved
+
+No regression from the prior empty-temp hotfix.
+
+======================================================================
+4. PUSH FLAGS / SAFETY MUST REMAIN
+======================================================================
+
+Confirm push still includes:
+- --only templates/index.json
+- --nodelete
+- --strict
+- --json
+- conditional --allow-live for verified MAIN
+
+Preserve:
+- expected_remote_raw_hash precondition
+- exact MAIN identity
+- canonical CLI domain
+- target role check
+- confirmed=True
+- allow_live=True for MAIN
+- password env-only SHOPIFY_CLI_THEME_TOKEN
+- post-write pull verification
+- no backend fallback after write attempt
+
+======================================================================
+5. MOCK SHOPIFY PUSH DIRECTORY-GATE REGRESSION
+======================================================================
+
+Extend tests/test_shopify_theme_cli.py.
+
+The mock runner already records:
+- push_path_entries
+- push_scaffold_exists
+
+Add/extend a push directory-gate emulation analogous to the pull gate.
+
+Required behavior:
+- if push --path lacks any of config/layout/templates:
+  mock returns non-success or no-upload outcome
+- if all required dirs exist:
+  mock allows templates/index.json upload
+
+Required assertions:
+- before mocked push writes anything, push path contains:
+  config
+  layout
+  templates
+- config/settings_schema.json exists
+- layout directory exists
+- pull path remains empty
+- pull does NOT inherit the push scaffold
+
+Add regression test:
+test_push_scaffold_satisfies_shopify_required_theme_directories
+
+Also ensure:
+test_cli_write_uses_nodelete_strict_json
+continues to pass and explicitly expects {"config","layout","templates"}.
+
+======================================================================
+6. FEATURED APPLY REGRESSION
+======================================================================
+
+Add/adjust mocked Featured apply integration test to prove:
+
+Given:
+- preflight READY_TO_APPLY
+- Theme Access backend
+- current remote hash equals preview source
+- push mock succeeds
+- post-write pull returns proposed raw content
+
+Then:
+- apply result == REMOTE_JSON_VERIFIED
+- write_performed == True
+- backup status == REMOTE_JSON_VERIFIED
+- plan status == REMOTE_JSON_VERIFIED
+- 4 product IDs match
+- unrelated section guard remains safe
+
+Also prove when push mock fails:
+- no false REMOTE_JSON_VERIFIED
+- fail-closed result remains
+- no automatic rollback
+
+No real network.
+
+======================================================================
+7. OPTIONAL SMALL UX DIAGNOSTIC HARDENING
+======================================================================
+
+Only if low-risk and covered by tests:
+
+When FeaturedProductThemeApplyService.apply() returns a non-success write result,
+preserve the backend write reason in safe UI state so the user sees a useful message instead of only:
+"안전 검사 다시 실행".
+
+Examples:
+- CLI_PUSH_FAILED_CONTENT_NOT_VERIFIED
+- REMOTE_CONTENT_UNCHANGED
+- POST_WRITE_READ_FAILED
+
+Do NOT expose raw stdout/stderr or secrets.
+
+Do NOT redesign the guided flow in this hotfix.
+The primary objective is the push scaffold.
+
+======================================================================
+8. TESTS
+======================================================================
+
+Run:
+python -m compileall -q src tests
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Focused:
+python -m pytest -q tests/test_shopify_theme_cli.py tests/test_homepage_featured_products.py tests/test_featured_guided_flow.py tests/test_featured_theme_backend.py tests/test_theme_write_backend.py tests/test_multistore_theme_operations.py tests/test_theme_access_credentials.py tests/test_shopify_g0_readonly_hotfix.py
+
+Full:
+python -m pytest -q --basetemp=<fresh-worktree-local-temp>
+
+Expected >= 1048 passed, 1 skipped.
+
+======================================================================
+9. PROTECTED FILES
+======================================================================
+
+Do not touch/stash/reset/restore:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- .phase*
+- .recon_focus_initial/
+- pytest temp folders
+- data/*.sqlite3
+- credentials
+- backups
+- user assets
+
+======================================================================
+10. COMMIT/PUSH
+======================================================================
+
+Commit only validated implementation/tests on:
+hotfix/theme-access-push-scaffold-layout
+
+Suggested commit:
+Fix Theme Access push scaffold validation
+
+Push branch.
+Do not merge main.
+
+======================================================================
+11. REPORT
+======================================================================
+
+Report:
+[1] baseline SHA
+[2] final feature SHA
+[3] files changed
+[4] root cause
+[5] scaffold before
+[6] scaffold after
+[7] pull empty-temp preserved
+[8] push flags preserved
+[9] live confirmation preserved
+[10] mock directory-gate regression
+[11] Featured apply mocked result
+[12] focused tests
+[13] full suite
+[14] protected files
+[15] Shopify live write count
+[16] real credential use/creation count
+[17] merge readiness
+[18] exact next action
+
+Final flags:
+PUSH_REQUIRED_DIRS = PASS/FAIL
+PUSH_LAYOUT_DIR_PRESENT = YES/NO
+PULL_TEMP_EMPTY_PRESERVED = YES/NO
+THEME_PUSH_JSON_PRESERVED = YES/NO
+PUSH_NODELETE_STRICT_PRESERVED = YES/NO
+LIVE_WRITE_CONFIRMATION_PRESERVED = YES/NO
+MOCK_FEATURED_APPLY_REMOTE_JSON_VERIFIED = YES/NO
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_USED = NO
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+FULL_SUITE = PASS/FAIL
+CODE_MERGE_READY = YES/NO
