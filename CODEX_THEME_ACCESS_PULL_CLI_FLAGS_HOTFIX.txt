@@ -1,0 +1,239 @@
+ShopSource Studio — THEME ACCESS CLI PULL FLAG HOTFIX
+FIX READ-ONLY templates/index.json PULL FAILURE
+NO LIVE SHOPIFY WRITE
+
+Repository
+- Baseline main: 3eebd1bdbf71bf79588ef0904da874733b6f2975
+- Branch: hotfix/theme-access-pull-cli-flags
+- Recommended worktree: D:\shop\001_so_amazon_theme_pull_hotfix
+
+Observed real failure
+- Store 001 Theme Access capability/list check is READY.
+- Backend selected: THEME_ACCESS_CLI.
+- MAIN theme identity is verified.
+- Guided Flow reaches step 4 preflight.
+- read_file() fails with REMOTE_READ_FAILED.
+- current raw/semantic hash remain None.
+- No Shopify write has occurred.
+
+Root-cause evidence from current code
+src/shopsource/shopify_theme_cli.py -> _pull() builds:
+  shopify theme pull ... --only templates/index.json --path <temp> --json
+
+Current official Shopify CLI documentation for "theme pull" lists:
+- --store
+- --theme
+- --only
+- --path
+- --no-input
+- --password
+- --live / --development / etc.
+but DOES NOT list --json.
+
+Current official documentation for "theme push" DOES list --json.
+
+Therefore:
+- remove --json from theme pull only.
+- DO NOT remove --json from theme push.
+- preserve all canonical domain / credential / MAIN identity safety.
+
+Mission
+Restore Theme Access read_file() so the existing read-only preflight can pull templates/index.json successfully.
+
+======================================================================
+1. SAFETY
+======================================================================
+
+Do not modify:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env
+- credentials
+- Featured product selection logic
+- category/reconciliation logic
+
+No actual Shopify push.
+No themeFilesUpsert.
+No rollback.
+No credential creation/deletion.
+No real Theme Access credential use during tests.
+Do not merge main.
+
+======================================================================
+2. MINIMAL PULL COMMAND FIX
+======================================================================
+
+In ShopifyThemeCLI._pull():
+
+Current command includes:
+--json
+
+Change pull command so it does NOT include --json.
+
+Preferred read-only command shape:
+
+shopify theme pull
+  --store <verified canonical myshopify domain>
+  --theme <verified numeric theme id>
+  --only templates/index.json
+  --path <isolated temp folder>
+  --no-input
+
+You MAY add --no-input if compatible with current test architecture.
+This is preferred because:
+- all required target values are already supplied
+- the runtime must not fall back to browser/interactive auth
+- Theme Access password remains in SHOPIFY_CLI_THEME_TOKEN env only
+
+Do NOT pass password in argv.
+
+Do NOT change push command behavior except tests proving push still retains:
+- --json
+- --nodelete
+- --strict
+- --allow-live when required
+
+======================================================================
+3. SAFE READ FAILURE CLASSIFICATION
+======================================================================
+
+Current _invoke() intentionally hides raw stdout/stderr for secret safety.
+Preserve that principle.
+
+Improve pull failure diagnostics without exposing raw output if practical.
+
+Allowed safe reason codes:
+- CLI_PULL_UNSUPPORTED_FLAG
+- CLI_PULL_AUTH_FAILED
+- CLI_PULL_NETWORK_ERROR
+- CLI_PULL_FILE_MISSING
+- CLI_PULL_FAILED
+
+Do not return/store raw stdout/stderr.
+Do not return/store env.
+Do not return password/token.
+
+If implementing this would significantly broaden scope, minimum acceptable hotfix is:
+- remove unsupported --json from pull
+- distinguish "file missing" from generic pull failure
+- leave all secret-safe behavior intact
+
+Featured preflight may continue mapping backend exception to REMOTE_READ_FAILED.
+Do not weaken apply safety.
+
+======================================================================
+4. TESTS
+======================================================================
+
+Add/adjust tests in tests/test_shopify_theme_cli.py and related focused tests.
+
+Required assertions:
+- read_file / _pull command contains:
+  theme pull
+  --store
+  canonical myshopify domain
+  --theme
+  numeric theme id
+  --only templates/index.json
+  --path
+- pull command DOES NOT contain --json
+- pull command uses --no-input if added
+- Theme Access credential is only supplied through SHOPIFY_CLI_THEME_TOKEN
+- password never appears in command argv
+- canonical CLI domain is still used
+- wrong configured store / wrong theme identity still fail closed
+- returned templates/index.json bytes are preserved exactly
+- read_file remains read-only
+- temp folder cleanup remains intact
+- push command STILL contains --json
+- push command still has --nodelete and --strict
+- live push still requires --allow-live
+- no actual credential usage
+- no actual Shopify network call
+
+Add regression test reflecting real incident:
+"capability READY + pull runner rejects --json" should fail before hotfix;
+after hotfix command excludes --json and succeeds with mock runner that writes templates/index.json.
+
+======================================================================
+5. FEATURED PREFLIGHT REGRESSION
+======================================================================
+
+Run existing Featured preflight tests to prove:
+- REMOTE_READ_FAILED behavior remains fail-closed when read genuinely fails
+- READY_TO_APPLY is possible when Theme Access read succeeds
+- no backup created by preflight
+- no write triggered by preflight
+
+Do not change hash policy in this hotfix.
+If next real run yields RAW_ONLY or SEMANTIC drift, handle that separately.
+
+======================================================================
+6. QUALITY GATES
+======================================================================
+
+Run:
+python -m compileall -q src tests
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Focused:
+python -m pytest -q tests/test_shopify_theme_cli.py tests/test_homepage_featured_products.py tests/test_featured_guided_flow.py tests/test_featured_theme_backend.py tests/test_theme_write_backend.py tests/test_multistore_theme_operations.py tests/test_theme_access_credentials.py tests/test_shopify_g0_readonly_hotfix.py
+
+Full:
+python -m pytest -q --basetemp=<worktree-local-temp>
+
+Expected >= 1046 passed, 1 skipped.
+
+======================================================================
+7. COMMIT/PUSH
+======================================================================
+
+Commit only validated code/tests/prompt files on:
+hotfix/theme-access-pull-cli-flags
+
+Suggested commit:
+Fix Theme Access CLI pull flags
+
+Push same branch.
+Do not merge main.
+
+======================================================================
+8. COMPLETION REPORT
+======================================================================
+
+Report:
+[1] baseline SHA
+[2] final feature SHA
+[3] files changed
+[4] exact pull command before
+[5] exact pull command after, with secret values redacted
+[6] --json removed from pull
+[7] --json retained on push
+[8] --no-input behavior
+[9] canonical domain preserved
+[10] credential transport preserved
+[11] pull byte preservation
+[12] read-only guarantee
+[13] focused tests
+[14] full suite
+[15] protected files
+[16] Shopify live write count
+[17] real credential use/creation count
+[18] merge readiness
+[19] exact next action
+
+Final flags:
+THEME_PULL_JSON_REMOVED = YES/NO
+THEME_PUSH_JSON_PRESERVED = YES/NO
+PULL_NO_INPUT = YES/NO
+CANONICAL_DOMAIN_PRESERVED = YES/NO
+PASSWORD_ARGV_EXPOSURE = NO
+READ_ONLY_PULL = YES/NO
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_USED = NO
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+FULL_SUITE = PASS/FAIL
+CODE_MERGE_READY = YES/NO
