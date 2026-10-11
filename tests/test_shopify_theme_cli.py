@@ -18,7 +18,7 @@ from shopsource.theme_write_backend import (ThemeBackendCapabilities, ThemeFileW
 
 class Runner:
     def __init__(self, root: Path, *, remote=None, version="3.80.0", role="unpublished", themes=None,
-                 reject_pull_json=False):
+                 reject_pull_json=False, emulate_pull_directory_gate=False):
         self.root = root
         self.remote = remote or "/* Shopify header comment */\n{\"sections\":{},\"order\":[]}\n"
         self.version = version
@@ -28,6 +28,11 @@ class Runner:
         self.theme_list_json_override = None
         self.unsupported_id_filter = False
         self.reject_pull_json = reject_pull_json
+        self.emulate_pull_directory_gate = emulate_pull_directory_gate
+        self.pull_path_entries = []
+        self.pull_scaffold_exists = []
+        self.push_path_entries = []
+        self.push_scaffold_exists = []
 
     def __call__(self, command, **kwargs):
         self.calls.append((list(command), dict(kwargs)))
@@ -50,11 +55,18 @@ class Runner:
         path = Path(command[command.index("--path") + 1])
         file_path = path / TARGET_FILE
         if command[command.index("theme") + 1] == "pull":
+            entries = tuple(sorted(item.name for item in path.iterdir()))
+            self.pull_path_entries.append(entries)
+            self.pull_scaffold_exists.append((path / "config" / "settings_schema.json").exists())
             if self.reject_pull_json and "--json" in command:
                 return subprocess.CompletedProcess(command, 1, stdout="unsupported --json", stderr="unsupported --json")
+            if self.emulate_pull_directory_gate and entries and not {"config", "layout", "templates"}.issubset(entries):
+                return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_bytes(self.remote.encode("utf-8"))
             return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
+        self.push_path_entries.append(tuple(sorted(item.name for item in path.iterdir())))
+        self.push_scaffold_exists.append((path / "config" / "settings_schema.json").is_file())
         if self.fail_push:
             return subprocess.CompletedProcess(command, 1, stdout="merchant-password", stderr="merchant-password")
         self.remote = file_path.read_bytes().decode("utf-8")
@@ -221,6 +233,19 @@ def test_capability_ready_pull_without_json_flag_preserves_file_bytes(tmp_path, 
     assert "merchant-password" not in command
 
 
+def test_pull_starts_with_empty_temp_and_passes_mock_shopify_directory_gate(tmp_path, monkeypatch):
+    runner = Runner(tmp_path, emulate_pull_directory_gate=True)
+    cli, runner, _, _ = setup(tmp_path, monkeypatch, runner=runner)
+
+    result = cli.read_file("store-a", "example.myshopify.com", "123", TARGET_FILE)
+
+    command = next(command for command, _ in runner.calls if command[1:3] == ["theme", "pull"])
+    assert result.content == runner.remote
+    assert runner.pull_path_entries == [()]
+    assert runner.pull_scaffold_exists == [False]
+    assert "--no-input" in command and "--json" not in command and "--force" not in command
+
+
 def test_cli_read_uses_isolated_temp_theme(tmp_path, monkeypatch):
     source_repo = tmp_path / "repo"
     source_repo.mkdir()
@@ -273,6 +298,9 @@ def test_cli_write_uses_nodelete_strict_json(tmp_path, monkeypatch):
     command, _ = next((c, k) for c, k in runner.calls if len(c) > 2 and c[1:3] == ["theme", "push"])
     assert result.status == "REMOTE_JSON_VERIFIED"
     assert {"--nodelete", "--strict", "--json", "--only"}.issubset(set(command))
+    assert runner.push_path_entries
+    assert {"config", "templates"}.issubset(set(runner.push_path_entries[-1]))
+    assert runner.push_scaffold_exists[-1]
     pull_commands = [c for c, _ in runner.calls if len(c) > 2 and c[1:3] == ["theme", "pull"]]
     assert pull_commands and all("--json" not in c and "--no-input" in c for c in pull_commands)
     assert runner.remote.startswith("/* Shopify header comment */")

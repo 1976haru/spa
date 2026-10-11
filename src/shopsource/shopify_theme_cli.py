@@ -322,7 +322,8 @@ class ShopifyThemeCLI:
         cli_store_domain = _capability_cli_domain(capability, shop_domain)
         temp = Path(tempfile.mkdtemp(prefix="shopsource-theme-pull-", dir=self.temp_dir))
         try:
-            self._scaffold(temp)
+            # Keep pull's isolated directory empty; Shopify's no-input pull rejects
+            # partial theme scaffolds and should not need the hidden --force flag.
             command = [self._executable(), "theme", "pull", "--store", cli_store_domain,
                        "--theme", self._theme_id(theme_id), "--only", TARGET_FILE,
                        "--path", str(temp), "--no-input"]
