@@ -1,0 +1,385 @@
+ShopSource Studio — FEATURED APPLY READ-ONLY PREFLIGHT DIAGNOSTICS
+RUN INSIDE THE REAL SHOPSource UI PROCESS THAT ALREADY HAS WINDOWS CREDENTIAL ACCESS
+
+Repository
+- Main baseline: 8d5eb35e9c8ff30823437d4ee1326d2edb7118f4
+- Branch: hotfix/featured-conflict-preflight-diagnostics
+- Recommended worktree: D:\shop\001_so_amazon_featured_preflight
+
+Real incident
+- Store 001 Theme Access credential is stored and UI can use it.
+- Theme Access CLI = READY.
+- Featured plan = 4/4 READY.
+- Featured preview = PREVIEW.
+- Explicit MAIN live confirmation was given.
+- Apply result shown in UI = CONFLICT.
+- No backup row was created, so conflict happened before backup/write.
+- External diagnosis worktree could not access Windows credentials and therefore could not determine the conflict reason.
+
+Mission
+Move the read-only preflight diagnosis INTO ShopSource itself, where the same runtime/user profile already has credential access.
+
+The operator must be able to click one beginner-safe button and see the exact first failing gate BEFORE any write.
+
+No Shopify mutation in this task.
+No real live apply.
+No rollback.
+No credential creation/deletion.
+
+======================================================================
+1. EXTRACT SHARED READ-ONLY PREFLIGHT
+======================================================================
+
+Refactor FeaturedProductThemeApplyService so the pre-backup/pre-write guards are reusable in a read-only method.
+
+Preferred API:
+
+FeaturedProductThemeApplyService.preflight(
+    plan_id,
+    preview,
+    *,
+    store_id,
+    backend_selection="AUTO",
+    allow_live=False,
+    backend_coordinator=None,
+    client=None,
+) -> dict
+
+Requirements:
+- MUST NOT create backup files
+- MUST NOT insert backup DB rows
+- MUST NOT call ThemeWriteBackendRouter.write()
+- MUST NOT call themeFilesUpsert
+- MUST NOT run shopify theme push
+- MAY perform read-only backend capability/read_file operations
+- return write_performed=False always
+
+Refactor apply() to call the same shared preflight logic first so diagnostic and actual apply cannot drift.
+
+Do not weaken any existing safety guard.
+
+======================================================================
+2. PREFLIGHT OUTPUT CONTRACT
+======================================================================
+
+Return a normalized safe result, e.g.
+
+{
+  "status": "READY_TO_APPLY" | "CONFLICT" | "MANUAL_ACTION_REQUIRED" | "READ_FAILED",
+  "reason_code": "...",
+  "human_message": "...",
+  "backend_name": "THEME_ACCESS_CLI" | "ADMIN_GRAPHQL" | null,
+  "backend_selection": "AUTO",
+  "backend_reason_code": "...",
+  "theme_id": "...",
+  "theme_role": "MAIN",
+  "filename": "templates/index.json",
+  "source_raw_hash": "...",
+  "current_raw_hash": "...",
+  "source_semantic_hash": "...",
+  "current_semantic_hash": "...",
+  "raw_equal": true/false/null,
+  "semantic_equal": true/false/null,
+  "prefix_equal": true/false/null,
+  "suffix_equal": true/false/null,
+  "isolated_diff_safe": true/false/null,
+  "product_ids_match": true/false/null,
+  "write_performed": false
+}
+
+Never include:
+- access token
+- client secret
+- Theme Access password
+- subprocess env
+- raw theme contents
+- raw stdout/stderr
+
+Hashes are allowed.
+
+======================================================================
+3. EXACT REASON CODES
+======================================================================
+
+Use exact first-failing-gate codes.
+
+At minimum:
+- EXPLICIT_CONFIRMATION_REQUIRED
+- STALE_OR_MISSING_PREVIEW
+- LATEST_PLAN_CHANGED
+- FOUR_READY_REQUIRED
+- PREVIEW_IDENTITY_HASH_MISMATCH
+- NO_APPROVED_BACKEND
+- MAIN_LIVE_CONFIRMATION_REQUIRED
+- MAIN_THEME_IDENTITY_UNVERIFIED
+- STORE_NOT_CONFIGURED
+- REMOTE_READ_FAILED
+- REMOTE_HASH_DRIFT_RAW_ONLY
+- REMOTE_HASH_DRIFT_SEMANTIC
+- LEGACY_IDENTITY_INVALID
+- ISOLATED_DIFF_UNSAFE
+- PRODUCT_IDS_MISMATCH
+- COMMENTED_JSON_RENDER_MISMATCH
+- READY_TO_APPLY
+
+For hash comparison:
+- raw differs + semantic equal => REMOTE_HASH_DRIFT_RAW_ONLY
+- semantic differs => REMOTE_HASH_DRIFT_SEMANTIC
+
+Do not silently allow RAW_ONLY_MISMATCH in this task.
+This task diagnoses; a later fix can change policy after evidence.
+
+======================================================================
+4. APPLY() MUST REUSE PREFLIGHT
+======================================================================
+
+Actual apply() flow should become conceptually:
+
+1. preflight(...)
+2. if preflight status != READY_TO_APPLY => return equivalent guarded result, no write
+3. create exact backup
+4. router write
+5. same-backend post-read verify
+6. REMOTE_JSON_VERIFIED or VERIFY_FAILED
+
+Preserve:
+- confirmed=True requirement
+- allow_live=True requirement
+- exact MAIN identity
+- 4 ACTIVE products
+- isolated diff
+- commented JSON preservation
+- exact product IDs
+- no backend fallback after write attempt
+- rollback behavior unchanged
+
+Because apply() currently has many inline guards, refactor carefully and add regression tests.
+
+======================================================================
+5. UI — BEGINNER BUTTON
+======================================================================
+
+In the Featured / "추천 상품(신상품)" card add a button:
+
+"적용 전 안전 검사"
+
+Place it near:
+- 추천 상품 미리보기
+- Shopify 적용
+
+Expected beginner order:
+[추천 상품 미리보기]
+[적용 전 안전 검사]
+[Shopify 적용]
+
+This button:
+- requires current plan + PREVIEW
+- runs preflight with backend_selection=AUTO
+- allow_live may be false for preflight; but MAIN identity/backend readiness must still be checked.
+- MUST NOT require the live-write checkbox because it does not write.
+- MUST NOT write Shopify.
+
+If current implementation needs allow_live to pass deep guards, introduce a diagnostic mode instead of pretending a live confirmation was given.
+Do not loosen apply() live confirmation.
+
+======================================================================
+6. UI RESULT DIALOG
+======================================================================
+
+For beginner-friendly output:
+
+If READY_TO_APPLY:
+Title: "적용 준비 완료"
+Message:
+"추천 상품 4개를 현재 MAIN 테마에 안전하게 적용할 준비가 되었습니다. 아직 Shopify는 변경되지 않았습니다."
+
+Show:
+- Backend: Theme Access
+- Current theme: Design by klarjoy / MAIN
+- Product count: 4
+- "스토어 변경 없음"
+
+If RAW_ONLY_MISMATCH:
+Title: "파일 형식 차이를 확인해야 합니다"
+Message:
+"상품이나 테마 내용은 같을 수 있지만, 읽기 경로에 따라 파일 원문 형식이 달라 적용을 안전하게 중단했습니다."
+
+If semantic mismatch:
+"미리보기 이후 테마 내용이 변경되었습니다. 새 미리보기가 필요합니다."
+
+If other:
+show human_message.
+
+Add collapsed:
+"고급 정보 보기"
+containing reason_code, backend, hash equality, semantic equality, theme ID, filename.
+
+No secrets.
+
+======================================================================
+7. UI — STORE LAST APPLY RESULT SAFELY
+======================================================================
+
+When perform_apply() returns, persist only safe, non-secret result fields into in-memory state:
+- status
+- reason
+- reason_code
+- backend_name
+- backend_reason_code
+- backup_id
+- write_performed
+
+Display under Featured status when failed:
+"최근 적용 결과: CONFLICT · <human message>"
+
+Do NOT print raw exceptions/env/stdout.
+
+This avoids losing the exact reason next time.
+
+======================================================================
+8. OPTIONAL LOCAL NON-SECRET DIAGNOSTIC HISTORY
+======================================================================
+
+If straightforward, add a small non-secret table:
+homepage_featured_apply_diagnostics
+
+Columns:
+- id
+- store_id
+- plan_id
+- checked_at
+- status
+- reason_code
+- backend_name
+- backend_reason_code
+- source_raw_hash
+- current_raw_hash
+- source_semantic_hash
+- current_semantic_hash
+- raw_equal
+- semantic_equal
+- write_performed
+
+No secrets.
+This is optional; do not overcomplicate.
+
+======================================================================
+9. TESTS
+======================================================================
+
+Add/update tests at minimum:
+
+test_preflight_never_writes
+test_preflight_never_creates_backup
+test_preflight_uses_auto_selected_backend_readonly
+test_preflight_ready_to_apply
+test_preflight_raw_only_mismatch_classification
+test_preflight_semantic_mismatch_classification
+test_preflight_latest_plan_changed
+test_preflight_main_identity_guard
+test_preflight_product_ids_guard
+test_preflight_commented_json_guard
+test_apply_reuses_preflight_and_no_write_on_conflict
+test_apply_still_requires_live_confirmation
+test_no_backend_fallback_after_write_attempt
+test_ui_has_beginner_preflight_button
+test_ui_preflight_button_does_not_require_live_write_confirmation
+test_ui_failed_apply_preserves_safe_reason
+test_no_secret_in_preflight_result
+test_no_shopify_live_write
+
+All remote/theme writes mocked.
+
+======================================================================
+10. PROTECTED FILES
+======================================================================
+
+Do not modify:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env
+- credentials
+- category/reconciliation logic
+- Theme Access credential store
+- user assets
+
+No real credential use in tests.
+No Shopify mutation.
+
+======================================================================
+11. QUALITY GATES
+======================================================================
+
+Run:
+python -m compileall -q src tests
+
+Focused:
+- tests/test_homepage_featured_products.py
+- tests/test_featured_theme_backend.py
+- tests/test_shopify_theme_cli.py
+- tests/test_theme_write_backend.py
+- tests/test_multistore_theme_operations.py
+- tests/test_theme_access_credentials.py
+- tests/test_shopify_g0_readonly_hotfix.py
+
+Full:
+python -m pytest -q --basetemp=<worktree-local-temp>
+
+Also:
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Expected full suite >= 1029 passed, 1 skipped.
+
+======================================================================
+12. COMMIT / PUSH
+======================================================================
+
+Stay on:
+hotfix/featured-conflict-preflight-diagnostics
+
+Suggested commit:
+git commit -m "Add read-only Featured apply preflight diagnostics"
+
+Push same branch.
+Do not merge main.
+
+======================================================================
+13. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] preflight API
+[5] apply reuse
+[6] exact reason codes
+[7] raw-only vs semantic mismatch classification
+[8] beginner UI button
+[9] result dialog
+[10] safe last-apply result persistence
+[11] no-write guarantee
+[12] focused tests
+[13] full-suite result
+[14] protected files
+[15] Shopify live write count
+[16] real credential use/creation count
+[17] merge readiness
+[18] exact next action after merge
+
+Final flags:
+FEATURED_PREFLIGHT = READY/NOT_READY
+APPLY_REUSES_PREFLIGHT = YES/NO
+RAW_ONLY_CLASSIFIED = YES/NO
+SEMANTIC_MISMATCH_CLASSIFIED = YES/NO
+BEGINNER_PREFLIGHT_UI = READY/NOT_READY
+PREFLIGHT_WRITE_COUNT = 0
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_USED = NO
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+FULL_SUITE = PASS/FAIL
+CODE_MERGE_READY = YES/NO
