@@ -1,0 +1,306 @@
+ShopSource Studio — FEATURED APPLY CONFLICT READ-ONLY DIAGNOSIS
+NO SHOPIFY WRITE, NO RETRY APPLY, NO ROLLBACK
+
+Repository
+- Main baseline: 8d5eb35e9c8ff30823437d4ee1326d2edb7118f4
+- Branch: diag/featured-apply-conflict-readonly
+- Recommended worktree: D:\shop\001_so_amazon_featured_conflict_diag
+
+Observed real state
+- Store 001 | Cabin Tidy
+- Theme Access credential: YES
+- Theme Access CLI: READY
+- canonical CLI domain: kgxbpi-it.myshopify.com
+- MAIN theme: Design by klarjoy
+- theme GID: gid://shopify/OnlineStoreTheme/162910503161
+- backend selected before apply: THEME_ACCESS_CLI
+- Featured plan: 4/4 READY
+- Featured preview: PREVIEW
+- user explicitly confirmed MAIN live write
+- result shown in UI: "Shopify 적용: CONFLICT · storefront 확인 필요"
+
+Important implementation fact
+In FeaturedProductThemeApplyService.apply(), every CONFLICT return is write_performed=False.
+Post-write failures use FAILED or VERIFY_FAILED, not CONFLICT.
+Therefore this diagnosis must assume no successful write occurred and must not rollback.
+
+Mission
+Identify the exact CONFLICT reason using read-only evidence only.
+
+Do NOT:
+- call FeaturedProductThemeApplyService.apply()
+- call ThemeWriteBackendRouter.write()
+- run shopify theme push
+- run themeFilesUpsert
+- rollback
+- modify Shopify products/collections/theme/files
+- modify credentials
+- delete backups
+- modify protected files
+- commit code changes
+
+======================================================================
+1. SAFETY / BASELINE
+======================================================================
+
+git fetch origin --prune
+Verify origin/main == 8d5eb35e9c8ff30823437d4ee1326d2edb7118f4
+
+Use a separate worktree on diag/featured-apply-conflict-readonly.
+
+Record protected hashes/status:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+
+Do not touch them.
+
+======================================================================
+2. INSPECT LATEST FEATURED PLAN + BACKUP EVIDENCE
+======================================================================
+
+Read local DB only.
+
+For Store 001:
+- latest homepage_featured_product_plans row
+- plan_id
+- status
+- preview_hash
+- remote_json_verified
+- storefront_verified
+- updated_at
+
+Read latest homepage_featured_theme_backups row for this store/plan if any:
+- backup_id
+- status
+- backend_name
+- backend_selection
+- backend_reason_code
+- before_raw_hash
+- proposed_raw_hash
+- created_at
+- folder path
+
+Interpretation:
+- no backup row => conflict happened before backup creation
+- BACKED_UP row with no write => likely router precondition REMOTE_CHANGED_ABORT
+- do not infer more than evidence
+
+Do not reveal any secret.
+
+======================================================================
+3. READ CURRENT THEME THROUGH GRAPHQL PATH
+======================================================================
+
+Use existing ShopifyThemeReader / read_themes path only.
+
+Read exact MAIN theme:
+gid://shopify/OnlineStoreTheme/162910503161
+
+Read exact:
+templates/index.json
+
+Capture only:
+- configured shop domain
+- canonical myshopify domain
+- theme ID/name/role
+- raw SHA-256
+- semantic SHA-256 using parse_shopify_json_document
+- leading-comment flag
+- prefix hash
+- suffix hash
+
+Do not print raw theme file contents.
+
+======================================================================
+4. READ SAME FILE THROUGH THEME ACCESS CLI
+======================================================================
+
+Use existing ShopifyThemeCLI.read_file() only.
+This is read-only theme pull.
+
+Use:
+- Store 001
+- configured ShopSource domain
+- exact theme ID
+- templates/index.json
+
+Capture only:
+- backend status
+- cli_store_domain
+- cli_store_domain_source
+- verified theme ID/role
+- raw SHA-256
+- semantic SHA-256
+- leading-comment flag
+- prefix hash
+- suffix hash
+
+Do not print:
+- Theme Access password
+- subprocess env
+- raw stdout/stderr
+- raw theme file content
+
+======================================================================
+5. CROSS-BACKEND COMPARISON
+======================================================================
+
+Compare GraphQL read vs CLI read:
+
+- raw hash equal?
+- semantic hash equal?
+- parsed JSON equal?
+- prefix equal?
+- suffix equal?
+- section/order count equal?
+- target featured section currently present?
+- legacy featured section currently present?
+
+Expected target section:
+ssfeaturedproductsb530645c3492
+
+Expected legacy:
+ss_featured_products_e193a01e
+
+Do not mutate either representation.
+
+Classify:
+A. RAW_ONLY_MISMATCH
+   semantic equal, raw differs
+B. SEMANTIC_MISMATCH
+   parsed/semantic differs
+C. IDENTICAL
+D. READ_FAILURE
+
+======================================================================
+6. REBUILD A FRESH FEATURED PREVIEW READ-ONLY
+======================================================================
+
+Without invoking apply:
+
+- use latest 4-item READY plan
+- force a fresh ShopifyThemeReader.discover() read
+- build FeaturedProductAssignmentService.build_theme_preview(...)
+- attach the same preview identity fields HomepagePrerequisiteService would attach if needed for analysis
+- do not apply anything
+
+Capture:
+- preview status
+- section_id
+- action CREATE/UPDATE/NO_CHANGE
+- source before_raw_hash
+- source before_semantic_hash
+- proposed_raw_hash
+- plan preview_hash
+- theme ID/role
+- product field ID
+- proposed 4 product IDs
+
+Compare fresh preview source hashes to:
+- current GraphQL read
+- current CLI read
+
+======================================================================
+7. DETERMINE EXACT LIKELY CONFLICT GATE
+======================================================================
+
+Evaluate the apply preconditions READ-ONLY in the same order, without calling apply():
+
+- preview identity/hash current?
+- latest plan still same?
+- exact 4 ready?
+- selected backend capability exact MAIN?
+- backend read identity?
+- source before raw hash vs CLI current raw hash
+- source semantic hash vs CLI current semantic hash
+- isolated diff guard
+- product IDs match
+- commented JSON render/prefix/suffix/proposed hash
+
+Return exactly one primary diagnosis code, preferably one of:
+- STALE_PREVIEW
+- LATEST_PLAN_CHANGED
+- MAIN_THEME_IDENTITY_UNVERIFIED
+- REMOTE_READ_FAILED
+- REMOTE_HASH_DRIFT_RAW_ONLY
+- REMOTE_HASH_DRIFT_SEMANTIC
+- LEGACY_IDENTITY_INVALID
+- ISOLATED_DIFF_UNSAFE
+- PRODUCT_IDS_MISMATCH
+- COMMENTED_JSON_RENDER_MISMATCH
+- ROUTER_REMOTE_CHANGED_ABORT
+- UNKNOWN_READONLY_DIAGNOSIS
+
+If multiple, list secondary evidence separately.
+
+======================================================================
+8. RECOMMENDATION
+======================================================================
+
+Based on evidence choose only one next action.
+
+If RAW_ONLY_MISMATCH:
+- recommend code hardening so preview/apply use the selected backend's fresh read for exact raw precondition while retaining semantic equivalence and isolated diff guards.
+- do NOT retry apply.
+
+If SEMANTIC_MISMATCH:
+- recommend regenerate preview from latest remote and re-check unrelated merchant changes before any apply.
+
+If STALE_PREVIEW or latest plan changed:
+- recommend fresh preview only, then user review.
+
+If ROUTER_REMOTE_CHANGED_ABORT:
+- recommend fresh preview/read immediately before write and preserve no-overwrite guard.
+
+If READ_FAILURE:
+- fix read transport before retry.
+
+If IDENTICAL and all preconditions pass:
+- investigate UI/state mismatch and latest result reason; do not retry apply until explained.
+
+======================================================================
+9. NO CODE CHANGE IN THIS DIAG PHASE
+======================================================================
+
+Do not edit application source.
+Do not commit implementation.
+Do not merge main.
+
+Temporary local diagnostic scripts may be created only outside tracked source or removed before finishing.
+
+======================================================================
+10. REPORT
+======================================================================
+
+Report:
+
+[1] main SHA
+[2] Store / theme identity
+[3] latest plan status
+[4] latest backup evidence
+[5] GraphQL read hashes
+[6] CLI read hashes
+[7] raw equality
+[8] semantic equality
+[9] prefix/suffix equality
+[10] target/legacy section presence
+[11] fresh preview hashes
+[12] exact first failing precondition
+[13] primary diagnosis code
+[14] evidence
+[15] whether Shopify write occurred
+[16] whether rollback is needed
+[17] recommended fix/action
+[18] protected files status
+[19] Shopify mutation count
+[20] exact next step
+
+Final flags:
+READONLY_DIAGNOSIS = PASS/FAIL
+SHOPIFY_WRITE_OCCURRED = YES/NO/UNKNOWN
+ROLLBACK_REQUIRED = YES/NO
+GRAPHQL_CLI_RAW_EQUAL = YES/NO/UNKNOWN
+GRAPHQL_CLI_SEMANTIC_EQUAL = YES/NO/UNKNOWN
+PRIMARY_DIAGNOSIS = <code>
+SHOPIFY_MUTATION_COUNT = 0
+CODE_CHANGED = NO
