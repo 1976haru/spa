@@ -779,6 +779,51 @@ def test_featured_cli_apply_semantic_post_verify(tmp_path, monkeypatch):
     assert result["status"] == "VERIFY_FAILED" and result["write_performed"] is True
 
 
+def test_featured_cli_mock_apply_reaches_remote_json_verified(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    cli = StubThemeTransport("THEME_ACCESS_CLI", client.raw)
+    coordinator = StubThemeCoordinator(StubThemeTransport("ADMIN_GRAPHQL", client.raw), cli,
+                                       auto="THEME_ACCESS_CLI")
+
+    result = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, allow_live=True,
+                          backend_coordinator=coordinator)
+
+    assert result["status"] == "REMOTE_JSON_VERIFIED"
+    assert result["write_performed"] is True
+    assert result["product_ids_match"] is True
+    assert result["unrelated_sections_unchanged"] is True
+    parsed = json.loads(cli.raw.split("*/", 1)[1])
+    assert parsed["sections"]["merchant"]["settings"]["text"] == "Preserve"
+    assert len(parsed["sections"][preview["section_id"]]["settings"]["products"]) == 4
+    with connect(db) as con:
+        backup_status = con.execute(
+            "SELECT status FROM homepage_featured_theme_backups WHERE backup_id=?",
+            (result["backup_id"],)).fetchone()[0]
+        plan_status = con.execute(
+            "SELECT status FROM homepage_featured_product_plans WHERE plan_id=?",
+            (plan["plan_id"],)).fetchone()[0]
+    assert backup_status == plan_status == "REMOTE_JSON_VERIFIED"
+
+
+def test_featured_cli_mock_push_failure_fails_closed_without_rollback(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    cli = StubThemeTransport("THEME_ACCESS_CLI", client.raw, write_mode="access_denied")
+    coordinator = StubThemeCoordinator(StubThemeTransport("ADMIN_GRAPHQL", client.raw), cli,
+                                       auto="THEME_ACCESS_CLI")
+
+    result = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, allow_live=True,
+                          backend_coordinator=coordinator)
+
+    assert result["status"] == "FAILED"
+    assert result["write_performed"] is True
+    assert cli.write_attempts == 1
+    assert cli.raw == client.raw
+    with connect(db) as con:
+        assert con.execute(
+            "SELECT status FROM homepage_featured_theme_backups WHERE backup_id=?",
+            (result["backup_id"],)).fetchone()[0] == "BACKED_UP"
+
+
 def test_featured_rollback_uses_original_backend_and_never_switches(tmp_path, monkeypatch):
     db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
     original = client.raw

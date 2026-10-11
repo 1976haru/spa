@@ -18,7 +18,8 @@ from shopsource.theme_write_backend import (ThemeBackendCapabilities, ThemeFileW
 
 class Runner:
     def __init__(self, root: Path, *, remote=None, version="3.80.0", role="unpublished", themes=None,
-                 reject_pull_json=False, emulate_pull_directory_gate=False):
+                 reject_pull_json=False, emulate_pull_directory_gate=False,
+                 emulate_push_directory_gate=False):
         self.root = root
         self.remote = remote or "/* Shopify header comment */\n{\"sections\":{},\"order\":[]}\n"
         self.version = version
@@ -29,6 +30,7 @@ class Runner:
         self.unsupported_id_filter = False
         self.reject_pull_json = reject_pull_json
         self.emulate_pull_directory_gate = emulate_pull_directory_gate
+        self.emulate_push_directory_gate = emulate_push_directory_gate
         self.pull_path_entries = []
         self.pull_scaffold_exists = []
         self.push_path_entries = []
@@ -67,6 +69,9 @@ class Runner:
             return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
         self.push_path_entries.append(tuple(sorted(item.name for item in path.iterdir())))
         self.push_scaffold_exists.append((path / "config" / "settings_schema.json").is_file())
+        if (self.emulate_push_directory_gate
+                and not {"config", "layout", "templates"}.issubset(self.push_path_entries[-1])):
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="invalid theme directory")
         if self.fail_push:
             return subprocess.CompletedProcess(command, 1, stdout="merchant-password", stderr="merchant-password")
         self.remote = file_path.read_bytes().decode("utf-8")
@@ -299,11 +304,30 @@ def test_cli_write_uses_nodelete_strict_json(tmp_path, monkeypatch):
     assert result.status == "REMOTE_JSON_VERIFIED"
     assert {"--nodelete", "--strict", "--json", "--only"}.issubset(set(command))
     assert runner.push_path_entries
-    assert {"config", "templates"}.issubset(set(runner.push_path_entries[-1]))
+    assert {"config", "layout", "templates"}.issubset(set(runner.push_path_entries[-1]))
     assert runner.push_scaffold_exists[-1]
     pull_commands = [c for c, _ in runner.calls if len(c) > 2 and c[1:3] == ["theme", "pull"]]
     assert pull_commands and all("--json" not in c and "--no-input" in c for c in pull_commands)
     assert runner.remote.startswith("/* Shopify header comment */")
+
+
+def test_push_scaffold_satisfies_shopify_required_theme_directories(tmp_path, monkeypatch):
+    runner = Runner(tmp_path, emulate_push_directory_gate=True)
+    cli, runner, _, _ = setup(tmp_path, monkeypatch, runner=runner)
+    before = runner.remote
+
+    result = cli.write_file(ThemeFileWriteRequest(
+        "store-a", "example.myshopify.com", "123", TARGET_FILE, "{}",
+        raw_sha256(before), confirmed=True))
+
+    assert result.status == "REMOTE_JSON_VERIFIED"
+    assert runner.push_path_entries == [("config", "layout", "templates")]
+    assert runner.push_scaffold_exists == [True]
+    assert runner.pull_path_entries == [(), ()]
+    assert runner.pull_scaffold_exists == [False, False]
+    push = next(command for command, _ in runner.calls if command[1:3] == ["theme", "push"])
+    assert {"--json", "--nodelete", "--strict"}.issubset(push)
+    assert "--force" not in push
 
 
 def test_cli_live_requires_allow_live(tmp_path, monkeypatch):

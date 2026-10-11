@@ -285,6 +285,7 @@ class ShopifyThemeCLI:
     @staticmethod
     def _scaffold(root: Path):
         (root / "config").mkdir(parents=True, exist_ok=True)
+        (root / "layout").mkdir(parents=True, exist_ok=True)
         (root / "templates").mkdir(parents=True, exist_ok=True)
         schema = root / "config" / "settings_schema.json"
         if not schema.exists():
