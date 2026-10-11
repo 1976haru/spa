@@ -8,7 +8,7 @@ import pytest
 from shopsource.db import connect, init_db
 from shopsource.featured_guided_flow import (record_featured_apply_result,
     record_featured_assignment_result, record_featured_storefront_result,
-    resolve_featured_guided_state)
+    hydrate_featured_postwrite_state, resolve_featured_guided_state)
 from shopsource.homepage_assignment import HomepageAssignmentService, homepage_assignment_workflow
 from shopsource.homepage_featured_products import (
     FeaturedProductAssignmentService, ShopifyExistingProductReader, discover_featured_product_schema,
@@ -996,7 +996,8 @@ def test_postwrite_raw_only_adoption_one_write_total_to_assignment_ready(tmp_pat
     adopt_flow = resolve_featured_guided_state(state, plan, preview, preflight, last_apply)
     assert adopt_flow["primary_action"] == "ADOPT_POST_WRITE"
 
-    adopted = writer.adopt_verified_remote(applied["backup_id"], diagnosis, confirmed=True)
+    adopted = writer.adopt_verified_remote(applied["backup_id"], diagnosis, confirmed=True,
+                                            backend_coordinator=coordinator)
     last_apply = record_featured_apply_result(state, adopted, plan["plan_id"])
     refreshed = FeaturedProductAssignmentService(db=db).get_plan(plan["plan_id"])
     assert adopted["status"] == "REMOTE_JSON_VERIFIED" and adopted["write_performed"] is False
@@ -1017,6 +1018,75 @@ def test_postwrite_raw_only_adoption_one_write_total_to_assignment_ready(tmp_pat
     done = resolve_featured_guided_state(state, refreshed, preview, preflight, last_apply)
     assert checklist["status"] == "ASSIGNMENT_READY"
     assert done["primary_action"] == "NONE" and cli.write_attempts == 1
+
+
+def test_postwrite_restart_recovery_routes_to_diagnosis_without_second_write(tmp_path, monkeypatch):
+    db, plan, preview, writer, cli, coordinator, _preflight, applied = _postwrite_backup(
+        tmp_path, monkeypatch, write_mode="raw_normalized")
+    assert applied["status"] == "VERIFY_FAILED" and cli.write_attempts == 1
+    durable = writer.latest_post_write_backup("s1", plan["plan_id"])
+    assert durable["backup_id"] == applied["backup_id"]
+    assert set(durable) == {"backup_id", "store_id", "plan_id", "theme_id", "filename", "status",
+                            "backend_name", "backend_selection", "backend_reason_code", "created_at"}
+
+    # New process: no preview, preflight, backup id, or result survives in memory.
+    restarted = {"featured_products_plan": FeaturedProductAssignmentService(db=db).get_plan(plan["plan_id"])}
+    hydrate_featured_postwrite_state(restarted, restarted["featured_products_plan"], durable)
+    recovered = restarted["featured_last_apply_result"]
+    assert recovered["reason_code"] == "POST_WRITE_DIAGNOSIS_REQUIRED"
+    assert recovered["backend_reason_code"] == "STUB_SELECTION"
+    assert restarted["backup_id"] == applied["backup_id"]
+    route = resolve_featured_guided_state(restarted, restarted["featured_products_plan"], None, None, recovered)
+    assert (route["current_step"], route["primary_action"]) == (5, "DIAGNOSE_POST_WRITE")
+    assert cli.write_attempts == 1
+
+    diagnosis = writer.diagnose_post_write(applied["backup_id"], backend_coordinator=coordinator)
+    adopted = writer.adopt_verified_remote(applied["backup_id"], diagnosis, confirmed=True,
+                                            backend_coordinator=coordinator)
+    assert adopted["status"] == "REMOTE_JSON_VERIFIED" and cli.write_attempts == 1
+    verified_plan = FeaturedProductAssignmentService(db=db).get_plan(plan["plan_id"])
+    route6 = resolve_featured_guided_state(restarted, verified_plan, None, None,
+                                            {"status": "REMOTE_JSON_VERIFIED"})
+    assert (route6["current_step"], route6["primary_action"]) == (6, "OPEN_STOREFRONT")
+
+
+def test_postwrite_adoption_refuses_stale_diagnosis_after_remote_change(tmp_path, monkeypatch):
+    db, plan, _preview, writer, cli, coordinator, _preflight, applied = _postwrite_backup(
+        tmp_path, monkeypatch, write_mode="raw_normalized")
+    stale = writer.diagnose_post_write(applied["backup_id"], backend_coordinator=coordinator)
+    assert stale["reason_code"] == "POST_WRITE_RAW_ONLY_NORMALIZED"
+    prefix, payload = cli.raw.split("*/", 1)
+    parsed = json.loads(payload)
+    parsed["sections"]["merchant"]["settings"]["text"] = "Changed after diagnosis"
+    cli.raw = prefix + "*/\n" + json.dumps(parsed) + "\n"
+    writes_before = cli.write_attempts
+
+    refused = writer.adopt_verified_remote(applied["backup_id"], stale, confirmed=True,
+                                            backend_coordinator=coordinator)
+    assert refused["status"] == "ADOPTION_REFUSED"
+    assert refused["reason_code"] == "POST_WRITE_UNRELATED_SECTION_DRIFT"
+    assert cli.write_attempts == writes_before == 1
+    with connect(db) as con:
+        backup_status = con.execute("SELECT status FROM homepage_featured_theme_backups WHERE backup_id=?",
+                                     (applied["backup_id"],)).fetchone()[0]
+        plan_status = con.execute("SELECT status FROM homepage_featured_product_plans WHERE plan_id=?",
+                                  (plan["plan_id"],)).fetchone()[0]
+    assert backup_status == "VERIFY_FAILED" and plan_status != "REMOTE_JSON_VERIFIED"
+
+
+def test_old_store001_verify_failed_backup_metadata_remains_diagnosable(tmp_path, monkeypatch):
+    db, plan, _preview, writer, cli, coordinator, _preflight, applied = _postwrite_backup(
+        tmp_path, monkeypatch, write_mode="raw_normalized")
+    # Represents the legacy Store 001 code path's backend-selection explanation.
+    with connect(db) as con:
+        con.execute("UPDATE homepage_featured_theme_backups SET backend_reason_code=? WHERE backup_id=?",
+                    ("GRAPHQL_SCOPE_MISSING_CLI_READY", applied["backup_id"]))
+    durable = writer.latest_post_write_backup("s1", plan["plan_id"])
+    assert durable["backend_reason_code"] == "GRAPHQL_SCOPE_MISSING_CLI_READY"
+    diagnosis = writer.diagnose_post_write(applied["backup_id"], backend_coordinator=coordinator)
+    assert diagnosis["reason_code"] == "POST_WRITE_RAW_ONLY_NORMALIZED"
+    assert diagnosis["backend_reason_code"] == "GRAPHQL_SCOPE_MISSING_CLI_READY"
+    assert cli.write_attempts == 1
 
 
 @pytest.mark.parametrize("case,expected", [
@@ -1055,7 +1125,8 @@ def test_postwrite_diagnosis_matrix_and_mismatch_adoption_refusal(tmp_path, monk
     assert diagnosis["reason_code"] == expected
     assert diagnosis["write_performed"] is False
     writes_before = cli.write_attempts
-    adopted = writer.adopt_verified_remote(applied["backup_id"], diagnosis, confirmed=True)
+    adopted = writer.adopt_verified_remote(applied["backup_id"], diagnosis, confirmed=True,
+                                            backend_coordinator=coordinator)
     if case == "exact":
         assert adopted["status"] == "REMOTE_JSON_VERIFIED"
     else:

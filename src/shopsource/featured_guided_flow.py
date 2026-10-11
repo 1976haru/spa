@@ -36,6 +36,34 @@ def record_featured_apply_result(state: dict, result: dict, plan_id: str | None)
     return last_result
 
 
+def hydrate_featured_postwrite_state(state: dict, plan: dict, backup: dict | None) -> dict:
+    """Hydrate only absent session state from safe durable backup metadata."""
+    if (not backup or state.get("backup_id") or state.get("featured_last_apply_result")
+            or str(backup.get("store_id")) != str(plan.get("store_id"))
+            or str(backup.get("plan_id")) != str(plan.get("plan_id"))):
+        return state
+    state["backup_id"] = backup.get("backup_id")
+    state["featured_last_apply_plan_id"] = backup.get("plan_id")
+    state["featured_backend_name"] = backup.get("backend_name")
+    state["featured_products_reviewed_plan_id"] = backup.get("plan_id")
+    if backup.get("status") == "VERIFY_FAILED":
+        state["featured_apply_status"] = state["featured_last_apply_status"] = "VERIFY_FAILED"
+        state["featured_last_apply_result"] = {
+            "status": "VERIFY_FAILED", "reason_code": "POST_WRITE_DIAGNOSIS_REQUIRED",
+            "backend_name": backup.get("backend_name"),
+            "backend_reason_code": backup.get("backend_reason_code"),
+            "backup_id": backup.get("backup_id"), "write_performed": True,
+            "reason": "이전 적용 시도 결과를 읽기 전용으로 진단해야 합니다."}
+    elif backup.get("status") == "REMOTE_JSON_VERIFIED" and plan.get("remote_json_verified"):
+        state["featured_apply_status"] = state["featured_last_apply_status"] = "REMOTE_JSON_VERIFIED"
+        state["featured_last_apply_result"] = {
+            "status": "REMOTE_JSON_VERIFIED", "reason_code": "REMOTE_JSON_VERIFIED",
+            "backend_name": backup.get("backend_name"),
+            "backend_reason_code": backup.get("backend_reason_code"),
+            "backup_id": backup.get("backup_id"), "write_performed": False}
+    return state
+
+
 def record_featured_storefront_result(state: dict, result: dict) -> None:
     state["featured_storefront_status"] = result.get("status")
     state["featured_assignment_status"] = None
@@ -79,6 +107,25 @@ def resolve_featured_guided_state(state: dict | None, plan: dict | None, preview
                 "primary_help": "스토어에서 추천 상품 후보를 확인합니다. 아직 Shopify 테마는 변경하지 않습니다.",
                 "problem_code": state.get("featured_load_problem"), "can_advance": True}
     steps[0]["status"] = "complete"
+
+    # A durable failed write takes precedence over transient review/preview
+    # session state: resuming it must never lead back to another apply.
+    durable_failure = (last_apply_result.get("status") == "VERIFY_FAILED"
+        and last_apply_result.get("reason_code") == "POST_WRITE_DIAGNOSIS_REQUIRED")
+    if durable_failure:
+        steps[3]["status"] = "complete"
+        return finish(5, "DIAGNOSE_POST_WRITE", "5단계 · 이전 적용 결과 읽기 전용 진단",
+                      "이전 적용 시도가 있습니다. 다시 적용하지 않고 현재 MAIN 테마를 읽어 실제 상태를 확인합니다.")
+
+    if (plan.get("status") in {"REMOTE_JSON_VERIFIED", "STOREFRONT_VERIFIED"}
+            or plan.get("remote_json_verified")):
+        steps[1]["status"] = "complete"
+        steps[2]["status"] = "complete"
+        steps[3]["status"] = "complete"
+        steps[4]["status"] = "complete"
+        if not plan.get("storefront_verified"):
+            return finish(6, "OPEN_STOREFRONT", "6단계 · 스토어에서 확인",
+                          "적용 상태는 로컬에 저장되어 있습니다. 스토어 화면에서 실제 표시를 확인합니다.")
 
     reviewed = state.get("featured_products_reviewed_plan_id") == plan_id
     if not reviewed:

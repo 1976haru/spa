@@ -606,6 +606,19 @@ class FeaturedProductThemeApplyService:
         self.db, self.export_dir, self.client_factory = db, Path(export_dir) if export_dir else EXPORT_DIR, client_factory
         _install(db)
 
+    def latest_post_write_backup(self, store_id: str, plan_id: str | None = None) -> dict | None:
+        """Return safe durable recovery metadata; never expose saved theme contents."""
+        query = ("SELECT backup_id,store_id,plan_id,theme_id,filename,status,backend_name,"
+                 "backend_selection,backend_reason_code,created_at FROM homepage_featured_theme_backups "
+                 "WHERE store_id=? AND status IN ('VERIFY_FAILED','REMOTE_JSON_VERIFIED')")
+        params = [str(store_id)]
+        if plan_id is not None:
+            query += " AND plan_id=?"; params.append(str(plan_id))
+        query += " ORDER BY created_at DESC,rowid DESC LIMIT 1"
+        with connect(self.db) as con:
+            row = con.execute(query, params).fetchone()
+        return dict(row) if row else None
+
     @staticmethod
     def _remote_document(theme: dict, filename: str):
         import base64
@@ -1036,26 +1049,35 @@ class FeaturedProductThemeApplyService:
                 "plan_id": row["plan_id"], "backend_reason_code": row.get("backend_reason_code"),
                 **facts, "write_performed": False}
 
-    def adopt_verified_remote(self, backup_id: str, diagnosis: dict, *, confirmed: bool = False) -> dict:
-        """Adopt a proven remote state locally; never performs a Shopify operation."""
+    def adopt_verified_remote(self, backup_id: str, diagnosis: dict | None = None, *, confirmed: bool = False,
+                              backend_coordinator=None, client=None) -> dict:
+        """Re-diagnose immediately before local adoption; never performs a Shopify write."""
         allowed = {"POST_WRITE_VERIFIED", "POST_WRITE_RAW_ONLY_NORMALIZED"}
-        safe = (confirmed is True and diagnosis.get("backup_id") == backup_id
-                and diagnosis.get("reason_code") in allowed
-                and diagnosis.get("semantic_equal") is True
-                and diagnosis.get("product_ids_match") is True
-                and diagnosis.get("unrelated_sections_unchanged") is True
-                and diagnosis.get("prefix_equal") is True and diagnosis.get("suffix_equal") is True)
         with connect(self.db) as con:
             row = con.execute("SELECT * FROM homepage_featured_theme_backups WHERE backup_id=?",
                               (backup_id,)).fetchone()
-        if not row or not safe or diagnosis.get("expected_proposed_raw_hash") != row["proposed_raw_hash"]:
-            return {"status": "ADOPTION_REFUSED", "reason_code": diagnosis.get("reason_code"),
+        if confirmed is not True or not row:
+            return {"status": "ADOPTION_REFUSED", "reason_code": "POST_WRITE_DIAGNOSIS_REQUIRED",
                     "backup_id": backup_id, "write_performed": False}
-        audit = {key: diagnosis.get(key) for key in (
-            "reason_code", "current_raw_hash", "expected_proposed_raw_hash", "current_semantic_hash",
-            "expected_proposed_semantic_hash", "raw_equal", "semantic_equal", "prefix_equal",
-            "suffix_equal", "product_ids_match", "unrelated_sections_unchanged", "backend_name",
-            "theme_id", "theme_role", "backup_id", "write_performed")}
+        row = dict(row)
+        fresh = self.diagnose_post_write(backup_id, backend_coordinator=backend_coordinator, client=client)
+        immutable_ok = (diagnosis is None or
+            (diagnosis.get("backup_id") == backup_id
+             and diagnosis.get("expected_proposed_raw_hash") == row["proposed_raw_hash"]))
+        safe = (fresh.get("reason_code") in allowed
+                and fresh.get("expected_proposed_raw_hash") == row["proposed_raw_hash"]
+                and fresh.get("semantic_equal") is True
+                and fresh.get("product_ids_match") is True
+                and fresh.get("unrelated_sections_unchanged") is True
+                and fresh.get("prefix_equal") is True and fresh.get("suffix_equal") is True
+                and fresh.get("theme_role") == "MAIN")
+        if not immutable_ok or not safe:
+            return {"status": "ADOPTION_REFUSED", "reason_code": fresh.get("reason_code"),
+                    "backup_id": backup_id, "write_performed": False}
+        audit = {key: fresh.get(key) for key in ("reason_code", "current_raw_hash", "expected_proposed_raw_hash",
+                "current_semantic_hash", "expected_proposed_semantic_hash", "raw_equal", "semantic_equal",
+                "prefix_equal", "suffix_equal", "product_ids_match", "unrelated_sections_unchanged",
+                "backend_name", "theme_id", "theme_role", "backup_id", "write_performed")}
         Path(row["folder"]).joinpath("post_write_diagnosis.json").write_text(
             json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
         with connect(self.db) as con:
@@ -1063,7 +1085,7 @@ class FeaturedProductThemeApplyService:
                         (backup_id,))
             con.execute("UPDATE homepage_featured_product_plans SET status='REMOTE_JSON_VERIFIED',remote_verified=0,remote_json_verified=1,storefront_verified=0,updated_at=? WHERE plan_id=?",
                         (_now(), row["plan_id"]))
-        return {"status": "REMOTE_JSON_VERIFIED", "reason_code": diagnosis["reason_code"],
+        return {"status": "REMOTE_JSON_VERIFIED", "reason_code": fresh["reason_code"],
                 "backup_id": backup_id, "backend_name": row["backend_name"], "write_performed": False}
 
     def rollback(self, backup_id: str, *, confirmed: bool = False, allow_live: bool = False,

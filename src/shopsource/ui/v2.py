@@ -36,7 +36,7 @@ from ..homepage_assignment import HomepageAssignmentService, homepage_assignment
 from ..homepage_featured_products import FeaturedProductAssignmentService, FeaturedProductThemeApplyService
 from ..featured_guided_flow import (record_featured_apply_result,
     record_featured_assignment_result, record_featured_storefront_result,
-    resolve_featured_guided_state)
+    hydrate_featured_postwrite_state, resolve_featured_guided_state)
 from .guided_flow import render_guided_stepper
 from ..featured_theme_backend import FeaturedThemeBackendCoordinator
 from ..multistore_theme_operations import MultiStoreThemeOperationsService
@@ -2365,6 +2365,11 @@ class OperatorUI:
 
                 def render_featured(plan=None):
                     plan = plan or state.get("featured_products_plan")
+                    # Recover only when this session has no newer in-memory apply.
+                    if plan and plan.get("plan_id") and not state.get("backup_id") and not state.get("featured_last_apply_result"):
+                        durable = FeaturedProductThemeApplyService().latest_post_write_backup(
+                            self.current_store, plan.get("plan_id"))
+                        hydrate_featured_postwrite_state(state, plan, durable)
                     count = len((plan or {}).get("items", []))
                     preflight = state.get("featured_preflight_result") or {}
                     last_apply = state.get("featured_last_apply_result") or {}
