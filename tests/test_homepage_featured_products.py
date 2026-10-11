@@ -3,6 +3,8 @@ import hashlib
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from shopsource.db import connect, init_db
 from shopsource.featured_guided_flow import (record_featured_apply_result,
     record_featured_assignment_result, record_featured_storefront_result,
@@ -563,6 +565,10 @@ class StubThemeTransport:
             return ThemeFileWriteResult("ACCESS_DENIED", self.backend_name, request.filename, True,
                                         reason_code="ACCESS_DENIED")
         self.raw = request.content
+        if self.write_mode == "raw_normalized":
+            prefix, payload = self.raw.split("*/", 1)
+            parsed = json.loads(payload)
+            self.raw = prefix + "*/\n" + json.dumps(parsed, separators=(",", ":")) + "\n"
         if self.write_mode == "semantic_drift":
             parsed = json.loads(self.raw.split("*/", 1)[-1])
             parsed["unrelated_after_write"] = True
@@ -951,6 +957,110 @@ def test_theme_access_featured_apply_end_to_end_to_assignment_ready(tmp_path, mo
     assert state["featured_assignment_status"] == "ASSIGNMENT_READY"
     assert completed["primary_action"] == "NONE"
     assert all(step["status"] == "complete" for step in completed["steps"])
+
+
+def _postwrite_backup(tmp_path, monkeypatch, *, write_mode="success"):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    cli = StubThemeTransport("THEME_ACCESS_CLI", client.raw, write_mode=write_mode)
+    coordinator = StubThemeCoordinator(StubThemeTransport("ADMIN_GRAPHQL", client.raw), cli,
+                                       auto="THEME_ACCESS_CLI")
+    preflight = writer.preflight(plan["plan_id"], preview, store_id="s1",
+                                 backend_coordinator=coordinator)
+    applied = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, allow_live=True,
+                           backend_coordinator=coordinator)
+    return db, plan, preview, writer, cli, coordinator, preflight, applied
+
+
+def test_postwrite_raw_only_adoption_one_write_total_to_assignment_ready(tmp_path, monkeypatch):
+    db, plan, preview, writer, cli, coordinator, preflight, applied = _postwrite_backup(
+        tmp_path, monkeypatch, write_mode="raw_normalized")
+    assert applied["status"] == "VERIFY_FAILED"
+    assert applied["reason_code"] == "POST_WRITE_RAW_ONLY_NORMALIZED"
+    assert applied["backend_reason_code"] == "STUB_SELECTION"
+    assert cli.write_attempts == 1
+
+    state = {"featured_products_reviewed_plan_id": plan["plan_id"],
+             "featured_preflight_plan_id": plan["plan_id"],
+             "featured_preflight_preview_hash": preview["preview_hash"]}
+    last_apply = record_featured_apply_result(state, applied, plan["plan_id"])
+    recovery = resolve_featured_guided_state(state, plan, preview, preflight, last_apply)
+    assert (recovery["current_step"], recovery["primary_action"]) == (5, "DIAGNOSE_POST_WRITE")
+
+    diagnosis = writer.diagnose_post_write(applied["backup_id"], backend_coordinator=coordinator)
+    state["featured_postwrite_diagnosis"] = diagnosis
+    assert diagnosis["reason_code"] == "POST_WRITE_RAW_ONLY_NORMALIZED"
+    assert not diagnosis["raw_equal"] and diagnosis["semantic_equal"]
+    assert diagnosis["prefix_equal"] and diagnosis["suffix_equal"]
+    assert diagnosis["product_ids_match"] and diagnosis["unrelated_sections_unchanged"]
+    assert diagnosis["write_performed"] is False and cli.write_attempts == 1
+    adopt_flow = resolve_featured_guided_state(state, plan, preview, preflight, last_apply)
+    assert adopt_flow["primary_action"] == "ADOPT_POST_WRITE"
+
+    adopted = writer.adopt_verified_remote(applied["backup_id"], diagnosis, confirmed=True)
+    last_apply = record_featured_apply_result(state, adopted, plan["plan_id"])
+    refreshed = FeaturedProductAssignmentService(db=db).get_plan(plan["plan_id"])
+    assert adopted["status"] == "REMOTE_JSON_VERIFIED" and adopted["write_performed"] is False
+    assert cli.write_attempts == 1
+    step6 = resolve_featured_guided_state(state, refreshed, preview, preflight, last_apply)
+    assert (step6["current_step"], step6["primary_action"]) == (6, "OPEN_STOREFRONT")
+
+    assignment = FeaturedProductAssignmentService(db=db)
+    storefront = assignment.confirm_storefront(plan["plan_id"], checks={
+        "desktop_title": True, "four_cards": True, "product_links": True, "mobile_section": True},
+        confirmed=True)
+    record_featured_storefront_result(state, storefront)
+    refreshed = assignment.get_plan(plan["plan_id"])
+    step7 = resolve_featured_guided_state(state, refreshed, preview, preflight, last_apply)
+    assert (step7["current_step"], step7["primary_action"]) == (7, "OPEN_ASSIGNMENT_CHECK")
+    checklist = assignment.checklist(refreshed, remote_verified=True, storefront_verified=True)
+    record_featured_assignment_result(state, checklist)
+    done = resolve_featured_guided_state(state, refreshed, preview, preflight, last_apply)
+    assert checklist["status"] == "ASSIGNMENT_READY"
+    assert done["primary_action"] == "NONE" and cli.write_attempts == 1
+
+
+@pytest.mark.parametrize("case,expected", [
+    ("exact", "POST_WRITE_VERIFIED"),
+    ("product_ids", "POST_WRITE_PRODUCT_IDS_MISMATCH"),
+    ("unrelated", "POST_WRITE_UNRELATED_SECTION_DRIFT"),
+    ("semantic", "POST_WRITE_SEMANTIC_MISMATCH"),
+    ("prefix", "POST_WRITE_PREFIX_SUFFIX_MISMATCH"),
+    ("read", "POST_WRITE_READ_FAILED"),
+    ("identity", "POST_WRITE_TARGET_IDENTITY_MISMATCH"),
+])
+def test_postwrite_diagnosis_matrix_and_mismatch_adoption_refusal(tmp_path, monkeypatch, case, expected):
+    db, plan, preview, writer, cli, coordinator, _preflight, applied = _postwrite_backup(
+        tmp_path, monkeypatch)
+    if case in {"product_ids", "unrelated", "semantic"}:
+        prefix, payload = cli.raw.split("*/", 1)
+        parsed = json.loads(payload)
+        if case == "product_ids":
+            parsed["sections"][preview["section_id"]]["settings"]["products"][0] = "gid://shopify/Product/999"
+        elif case == "unrelated":
+            parsed["sections"]["merchant"]["settings"]["text"] = "Merchant changed"
+        else:
+            parsed["sections"][preview["section_id"]]["settings"]["diagnostic_other"] = True
+        cli.raw = prefix + "*/\n" + json.dumps(parsed) + "\n"
+    elif case == "prefix":
+        cli.raw = cli.raw.replace("/* Shopify header comment */", "/* Merchant header changed */", 1)
+    elif case == "read":
+        def fail_read(*_args, **_kwargs):
+            raise RuntimeError("mock read failure")
+        monkeypatch.setattr(cli, "read_file", fail_read)
+    elif case == "identity":
+        cli.verified_role = "UNPUBLISHED"
+
+    diagnosis = writer.diagnose_post_write(applied["backup_id"], backend_coordinator=coordinator)
+
+    assert diagnosis["reason_code"] == expected
+    assert diagnosis["write_performed"] is False
+    writes_before = cli.write_attempts
+    adopted = writer.adopt_verified_remote(applied["backup_id"], diagnosis, confirmed=True)
+    if case == "exact":
+        assert adopted["status"] == "REMOTE_JSON_VERIFIED"
+    else:
+        assert adopted["status"] == "ADOPTION_REFUSED"
+    assert adopted["write_performed"] is False and cli.write_attempts == writes_before
 
 
 def test_featured_rollback_uses_original_backend_and_never_switches(tmp_path, monkeypatch):

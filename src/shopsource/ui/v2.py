@@ -2368,7 +2368,10 @@ class OperatorUI:
                     count = len((plan or {}).get("items", []))
                     preflight = state.get("featured_preflight_result") or {}
                     last_apply = state.get("featured_last_apply_result") or {}
-                    if (last_apply and state.get("featured_last_apply_plan_id") == (plan or {}).get("plan_id")
+                    diagnosis = state.get("featured_postwrite_diagnosis") or {}
+                    if diagnosis and last_apply.get("status") == "VERIFY_FAILED":
+                        visible_preflight = diagnosis
+                    elif (last_apply and state.get("featured_last_apply_plan_id") == (plan or {}).get("plan_id")
                             and last_apply.get("status") != "REMOTE_JSON_VERIFIED"):
                         visible_preflight = last_apply
                     else:
@@ -2456,6 +2459,7 @@ class OperatorUI:
                         state["featured_preflight_plan_id"] = None
                         state["featured_preflight_preview_hash"] = None
                         state["featured_last_apply_plan_id"] = None
+                        state["featured_postwrite_diagnosis"] = None
                         state["featured_apply_status"] = "NOT RUN"
                         state["featured_storefront_status"] = None
                         state["featured_assignment_status"] = None
@@ -2653,6 +2657,7 @@ class OperatorUI:
                                 plan["plan_id"], preview, store_id=self.current_store, confirmed=True,
                                 backend_selection=backend_selection_control.value or "AUTO",
                                 allow_live=bool(live_confirmed.value))
+                            state["featured_postwrite_diagnosis"] = None
                             record_featured_apply_result(state, result, plan.get("plan_id"))
                             if state["featured_last_apply_result"].get("status") == "CONFLICT":
                                 state["featured_last_apply_result"]["reason"] = (
@@ -2791,6 +2796,49 @@ class OperatorUI:
                         ui.button("닫기", on_click=dialog.close).props("outline")
                     dialog.open()
 
+                async def featured_postwrite_diagnosis():
+                    backup_id = state.get("backup_id")
+                    if not backup_id:
+                        ui.notify("진단할 적용 backup이 없습니다.", type="warning")
+                        return
+                    result = await asyncio.to_thread(
+                        FeaturedProductThemeApplyService().diagnose_post_write, backup_id)
+                    state["featured_postwrite_diagnosis"] = result
+                    if state.get("featured_last_apply_result") is not None:
+                        state["featured_last_apply_result"]["reason_code"] = result.get("reason_code")
+                        state["featured_last_apply_result"]["reason"] = result.get("reason_code")
+                    render_featured()
+                    ui.notify("5단계 적용 결과 읽기 전용 진단: " + str(result.get("reason_code")),
+                              type="positive" if result.get("reason_code") in {
+                                  "POST_WRITE_VERIFIED", "POST_WRITE_RAW_ONLY_NORMALIZED"} else "warning")
+
+                def featured_postwrite_adoption():
+                    backup_id = state.get("backup_id")
+                    diagnosis = state.get("featured_postwrite_diagnosis") or {}
+                    with ui.dialog() as dialog, ui.card().classes("w-[min(680px,95vw)]"):
+                        ui.label("5단계 적용 결과 읽기 전용 진단").classes("text-xl font-bold")
+                        ui.label("현재 원격 테마가 의도한 추천 상품 변경과 내용상 일치함을 확인했습니다.")
+                        confirmed = ui.checkbox(
+                            "현재 원격 테마가 의도한 추천 상품 변경과 내용상 일치함을 확인했습니다. "
+                            "Shopify에 다시 쓰지 않고 검증 상태만 갱신합니다.")
+                        def adopt():
+                            result = FeaturedProductThemeApplyService().adopt_verified_remote(
+                                backup_id, diagnosis, confirmed=bool(confirmed.value))
+                            record_featured_apply_result(
+                                state, result, (state.get("featured_products_plan") or {}).get("plan_id"))
+                            if result.get("status") == "REMOTE_JSON_VERIFIED":
+                                plan_id = (state.get("featured_products_plan") or {}).get("plan_id")
+                                state["featured_products_plan"] = FeaturedProductAssignmentService().get_plan(plan_id)
+                                state["featured_storefront_status"] = None
+                                state["featured_assignment_status"] = None
+                            dialog.close()
+                            render_featured()
+                            ui.notify("로컬 검증 상태: " + result.get("status", "ADOPTION_REFUSED"),
+                                      type="positive" if result.get("status") == "REMOTE_JSON_VERIFIED" else "warning")
+                        ui.button("취소", on_click=dialog.close).props("outline")
+                        ui.button("검증 상태 확정", on_click=adopt).props("color=primary")
+                    dialog.open()
+
                 def run_featured_primary_action():
                     flow = resolve_featured_guided_state(state, state.get("featured_products_plan"),
                         state.get("featured_products_preview"), state.get("featured_preflight_result"),
@@ -2804,6 +2852,8 @@ class OperatorUI:
                         "OPEN_APPLY_GATE": featured_apply_gate,
                         "OPEN_STOREFRONT": featured_storefront_check,
                         "OPEN_ASSIGNMENT_CHECK": featured_assignment_check,
+                        "DIAGNOSE_POST_WRITE": featured_postwrite_diagnosis,
+                        "ADOPT_POST_WRITE": featured_postwrite_adoption,
                     }
                     handler = handlers.get(flow["primary_action"])
                     if handler:

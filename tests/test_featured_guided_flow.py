@@ -137,6 +137,27 @@ def test_apply_backend_reason_code_survives_in_ui_state():
     assert last_result["reason"] == "CLI_PUSH_FAILED_CONTENT_NOT_VERIFIED"
 
 
+def test_verify_failed_uses_read_only_diagnosis_then_local_adoption_action():
+    plan, preview = _plan(), _preview()
+    state, preflight = _preflight(_reviewed_state(), plan, preview)
+    state["featured_last_apply_plan_id"] = plan["plan_id"]
+    failed = {"status": "VERIFY_FAILED", "reason_code": "POST_WRITE_RAW_ONLY_NORMALIZED"}
+
+    diagnose = resolve_featured_guided_state(state, plan, preview, preflight, failed)
+    assert (diagnose["current_step"], diagnose["primary_action"]) == (5, "DIAGNOSE_POST_WRITE")
+
+    state["featured_postwrite_diagnosis"] = {
+        "reason_code": "POST_WRITE_RAW_ONLY_NORMALIZED", "semantic_equal": True,
+        "product_ids_match": True, "unrelated_sections_unchanged": True,
+        "prefix_equal": True, "suffix_equal": True}
+    adopt = resolve_featured_guided_state(state, plan, preview, preflight, failed)
+    assert (adopt["current_step"], adopt["primary_action"]) == (5, "ADOPT_POST_WRITE")
+
+    state["featured_postwrite_diagnosis"]["reason_code"] = "POST_WRITE_PRODUCT_IDS_MISMATCH"
+    blocked = resolve_featured_guided_state(state, plan, preview, preflight, failed)
+    assert blocked["primary_action"] == "NONE" and blocked["can_advance"] is False
+
+
 def test_reselection_and_new_preview_invalidate_old_progress():
     old_plan, new_plan = _plan("old"), _plan("new")
     old_preview = _preview("old", "old-preview")

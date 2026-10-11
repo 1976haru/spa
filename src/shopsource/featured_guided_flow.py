@@ -108,6 +108,22 @@ def resolve_featured_guided_state(state: dict | None, plan: dict | None, preview
                       "선택한 상품 네 개를 현재 홈페이지 제안에 안전하게 반영해 봅니다.")
     steps[2]["status"] = "complete"
 
+    if apply_plan_matches and last_apply_result.get("status") == "VERIFY_FAILED":
+        steps[3]["status"] = "complete"
+        diagnosis = state.get("featured_postwrite_diagnosis") or {}
+        reason = diagnosis.get("reason_code")
+        if not diagnosis:
+            return finish(5, "DIAGNOSE_POST_WRITE", "5단계 적용 결과 확인 필요",
+                          "Shopify에 다시 쓰지 않고 현재 MAIN 테마의 저장 결과를 읽기 전용으로 진단합니다.")
+        if reason in {"POST_WRITE_VERIFIED", "POST_WRITE_RAW_ONLY_NORMALIZED"}:
+            label = ("검증 상태 확정" if reason == "POST_WRITE_VERIFIED" else
+                     "내용상 동일함 확인 및 검증 상태 확정")
+            return finish(5, "ADOPT_POST_WRITE", label,
+                          "Shopify에 다시 쓰지 않고 로컬 검증 상태만 갱신합니다.")
+        return finish(5, "NONE", "5단계 적용 결과 확인 필요",
+                      "원격 테마가 제안과 일치하지 않아 자동 적용 또는 롤백하지 않습니다.",
+                      problem_code=reason, can_advance=False)
+
     active_result = current_result
     code = active_result.get("reason_code")
     if not active_result:

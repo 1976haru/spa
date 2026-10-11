@@ -905,28 +905,166 @@ class FeaturedProductThemeApplyService:
                     "write_performed": True}
         try:
             after_result = backend.read_file(store_id, config["shop_domain"], theme["id"], filename)
-            if (after_result.theme_id != theme["id"] or after_result.filename != filename
-                    or after_result.backend_name != backend_name):
-                raise ValueError("Selected backend returned a different post-write target")
-            after_raw = after_result.content
-            after_doc = parse_shopify_json_document(after_raw)
         except (ValueError, ShopifyJsonDocumentError, RuntimeError):
-            after_raw, after_doc, after_result = None, None, None
-        after = after_doc.parsed if after_doc else None
-        after_guard = validate_isolated_featured_diff(document.parsed, after, section_id, legacy_id=legacy_id, store_id=store_id) if isinstance(after, dict) else {"safe": False, "unexpected_paths": ["$"], "allowed_changes": []}
-        actual_ids = (((after or {}).get("sections") or {}).get(section_id) or {}).get("settings", {}).get(preview["capability"]["product_field"]["id"], [])
-        verified = bool(after_result is not None and after_result.metadata.get("verified_theme_role", "MAIN") == "MAIN"
-                        and after == proposed
-                        and after_doc and after_doc.raw_hash == proposed_doc.raw_hash and after_doc.prefix == document.prefix
-                        and after_doc.suffix == document.suffix and actual_ids == expected_ids and len(actual_ids) == 4 and after_guard["safe"])
+            after_result = None
+        facts = self._post_write_facts(document, proposed_doc, after_result, section_id=section_id,
+            product_field_id=preview["capability"]["product_field"]["id"], expected_ids=expected_ids,
+            legacy_id=legacy_id, store_id=str(store_id), expected_backend=backend_name,
+            expected_theme_id=theme["id"], expected_filename=filename)
+        verified = facts["reason_code"] == "POST_WRITE_VERIFIED"
         status = "REMOTE_JSON_VERIFIED" if verified else "VERIFY_FAILED"
         with connect(self.db) as con:
             con.execute("UPDATE homepage_featured_theme_backups SET status=? WHERE backup_id=?", (status, backup_id))
             if verified: con.execute("UPDATE homepage_featured_product_plans SET status='REMOTE_JSON_VERIFIED',remote_verified=0,remote_json_verified=1,storefront_verified=0,updated_at=? WHERE plan_id=?", (_now(), plan_id))
         return {"status": status, "backup_id": backup_id, "theme_id": theme["id"], "backend_name": backend_name,
                 "backend_selection": backend_selection, "backend_reason_code": backend_reason,
-                "product_ids_match": actual_ids == expected_ids,
-                "unrelated_sections_unchanged": after_guard["safe"], "write_performed": True}
+                **facts, "write_performed": True}
+
+    @staticmethod
+    def _post_write_facts(before_doc, proposed_doc, current_result, *, section_id, product_field_id,
+                          expected_ids, legacy_id, store_id, expected_backend, expected_theme_id,
+                          expected_filename):
+        base = {"backend_name": expected_backend, "theme_id": expected_theme_id,
+                "theme_role": "MAIN", "expected_proposed_raw_hash": proposed_doc.raw_hash,
+                "expected_proposed_semantic_hash": proposed_doc.semantic_hash,
+                "raw_equal": False, "semantic_equal": False, "prefix_equal": False,
+                "suffix_equal": False, "product_ids_match": False,
+                "unrelated_sections_unchanged": False}
+        if current_result is None:
+            return {**base, "reason_code": "POST_WRITE_READ_FAILED", "current_raw_hash": None,
+                    "current_semantic_hash": None}
+        if (current_result.backend_name != expected_backend
+                or not _same_theme_id(current_result.theme_id, expected_theme_id)
+                or current_result.filename != expected_filename
+                or current_result.metadata.get("verified_theme_role", "MAIN") != "MAIN"):
+            return {**base, "reason_code": "POST_WRITE_TARGET_IDENTITY_MISMATCH",
+                    "current_raw_hash": current_result.raw_sha256, "current_semantic_hash": None}
+        try:
+            current_doc = parse_shopify_json_document(current_result.content)
+        except ShopifyJsonDocumentError:
+            return {**base, "reason_code": "POST_WRITE_SEMANTIC_MISMATCH",
+                    "current_raw_hash": current_result.raw_sha256, "current_semantic_hash": None}
+        current = current_doc.parsed
+        actual_ids = (((current or {}).get("sections") or {}).get(section_id) or {}).get(
+            "settings", {}).get(product_field_id, []) if isinstance(current, dict) else []
+        guard = validate_isolated_featured_diff(before_doc.parsed, current, section_id,
+                                                 legacy_id=legacy_id, store_id=store_id)
+        facts = {**base, "current_raw_hash": current_doc.raw_hash,
+            "current_semantic_hash": current_doc.semantic_hash,
+            "raw_equal": current_doc.raw_hash == proposed_doc.raw_hash,
+            "semantic_equal": current_doc.semantic_hash == proposed_doc.semantic_hash,
+            "prefix_equal": current_doc.prefix == proposed_doc.prefix,
+            "suffix_equal": current_doc.suffix == proposed_doc.suffix,
+            "product_ids_match": actual_ids == expected_ids and len(actual_ids) == 4,
+            "unrelated_sections_unchanged": guard["safe"]}
+        if not facts["product_ids_match"]:
+            reason = "POST_WRITE_PRODUCT_IDS_MISMATCH"
+        elif not facts["unrelated_sections_unchanged"]:
+            reason = "POST_WRITE_UNRELATED_SECTION_DRIFT"
+        elif not facts["semantic_equal"]:
+            reason = "POST_WRITE_SEMANTIC_MISMATCH"
+        elif not facts["prefix_equal"] or not facts["suffix_equal"]:
+            reason = "POST_WRITE_PREFIX_SUFFIX_MISMATCH"
+        elif facts["raw_equal"]:
+            reason = "POST_WRITE_VERIFIED"
+        else:
+            reason = "POST_WRITE_RAW_ONLY_NORMALIZED"
+        return {**facts, "reason_code": reason}
+
+    def diagnose_post_write(self, backup_id: str, *, backend_coordinator=None, client=None) -> dict:
+        """Read and classify the current remote file without mutation or raw-content disclosure."""
+        with connect(self.db) as con:
+            row = con.execute("SELECT * FROM homepage_featured_theme_backups WHERE backup_id=?",
+                              (backup_id,)).fetchone()
+        if not row:
+            return {"status": "NOT_FOUND", "reason_code": "POST_WRITE_READ_FAILED",
+                    "backup_id": backup_id, "write_performed": False}
+        row = dict(row); folder = Path(row["folder"])
+        try:
+            before_doc = parse_shopify_json_document((folder / "before.raw.json").read_text(encoding="utf-8"))
+            proposed_doc = parse_shopify_json_document((folder / "proposed.raw.json").read_text(encoding="utf-8"))
+            metadata = json.loads((folder / "metadata.json").read_text(encoding="utf-8"))
+            selected_products = json.loads((folder / "selected_products.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, ShopifyJsonDocumentError):
+            return {"status": "DIAGNOSIS_FAILED", "reason_code": "POST_WRITE_READ_FAILED",
+                    "backup_id": backup_id, "backend_name": row.get("backend_name"),
+                    "write_performed": False}
+        expected_ids = [item.get("shopify_product_id") for item in selected_products]
+        section = ((proposed_doc.parsed.get("sections") or {}).get(row["section_id"]) or {})
+        settings = section.get("settings") or {}
+        product_field_id = next((key for key, value in settings.items() if value == expected_ids), None)
+        if not product_field_id:
+            return {"status": "DIAGNOSIS_FAILED", "reason_code": "POST_WRITE_PRODUCT_IDS_MISMATCH",
+                    "backup_id": backup_id, "backend_name": row.get("backend_name"),
+                    "write_performed": False}
+        from .featured_theme_backend import FeaturedThemeBackendCoordinator
+        coordinator = backend_coordinator or FeaturedThemeBackendCoordinator(
+            db=self.db, client_factory=self.client_factory, client=client)
+        stored_backend = row.get("backend_name") or "ADMIN_GRAPHQL_LEGACY"
+        selection = "ADMIN_GRAPHQL" if stored_backend == "ADMIN_GRAPHQL_LEGACY" else stored_backend
+        try:
+            selected = coordinator.select_backend(row["store_id"], row["theme_id"], selection, client=client)
+        except Exception:
+            selected = {}
+        backend = selected.get("backend")
+        capability = (selected.get("capabilities") or {}).get(selected.get("backend_name"))
+        backup_identity_ok = (str(metadata.get("store_id")) == str(row["store_id"])
+            and _same_theme_id(metadata.get("theme_id"), row["theme_id"])
+            and metadata.get("theme_role") == "MAIN"
+            and metadata.get("template_filename") == row["filename"])
+        identity_ok = bool(backup_identity_ok and backend is not None and selected.get("backend_name") == selection
+            and capability and capability.details.get("identity_verified") is True
+            and _same_theme_id(capability.details.get("verified_theme_id"), row["theme_id"])
+            and capability.details.get("verified_theme_role") == "MAIN"
+            and capability.details.get("target_is_live") is True)
+        current_result = None
+        if identity_ok:
+            config = get_connection(row["store_id"], db=self.db)
+            try:
+                if config and config.get("shop_domain"):
+                    current_result = backend.read_file(row["store_id"], config["shop_domain"],
+                                                       row["theme_id"], row["filename"])
+            except Exception:
+                current_result = None
+        facts = self._post_write_facts(before_doc, proposed_doc, current_result,
+            section_id=row["section_id"], product_field_id=product_field_id, expected_ids=expected_ids,
+            legacy_id=legacy_featured_id_for_store(row["store_id"]), store_id=row["store_id"],
+            expected_backend=selection, expected_theme_id=row["theme_id"], expected_filename=row["filename"])
+        if not identity_ok:
+            facts["reason_code"] = "POST_WRITE_TARGET_IDENTITY_MISMATCH"
+        return {"status": "POST_WRITE_DIAGNOSIS", "backup_id": backup_id,
+                "plan_id": row["plan_id"], "backend_reason_code": row.get("backend_reason_code"),
+                **facts, "write_performed": False}
+
+    def adopt_verified_remote(self, backup_id: str, diagnosis: dict, *, confirmed: bool = False) -> dict:
+        """Adopt a proven remote state locally; never performs a Shopify operation."""
+        allowed = {"POST_WRITE_VERIFIED", "POST_WRITE_RAW_ONLY_NORMALIZED"}
+        safe = (confirmed is True and diagnosis.get("backup_id") == backup_id
+                and diagnosis.get("reason_code") in allowed
+                and diagnosis.get("semantic_equal") is True
+                and diagnosis.get("product_ids_match") is True
+                and diagnosis.get("unrelated_sections_unchanged") is True
+                and diagnosis.get("prefix_equal") is True and diagnosis.get("suffix_equal") is True)
+        with connect(self.db) as con:
+            row = con.execute("SELECT * FROM homepage_featured_theme_backups WHERE backup_id=?",
+                              (backup_id,)).fetchone()
+        if not row or not safe or diagnosis.get("expected_proposed_raw_hash") != row["proposed_raw_hash"]:
+            return {"status": "ADOPTION_REFUSED", "reason_code": diagnosis.get("reason_code"),
+                    "backup_id": backup_id, "write_performed": False}
+        audit = {key: diagnosis.get(key) for key in (
+            "reason_code", "current_raw_hash", "expected_proposed_raw_hash", "current_semantic_hash",
+            "expected_proposed_semantic_hash", "raw_equal", "semantic_equal", "prefix_equal",
+            "suffix_equal", "product_ids_match", "unrelated_sections_unchanged", "backend_name",
+            "theme_id", "theme_role", "backup_id", "write_performed")}
+        Path(row["folder"]).joinpath("post_write_diagnosis.json").write_text(
+            json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
+        with connect(self.db) as con:
+            con.execute("UPDATE homepage_featured_theme_backups SET status='REMOTE_JSON_VERIFIED' WHERE backup_id=?",
+                        (backup_id,))
+            con.execute("UPDATE homepage_featured_product_plans SET status='REMOTE_JSON_VERIFIED',remote_verified=0,remote_json_verified=1,storefront_verified=0,updated_at=? WHERE plan_id=?",
+                        (_now(), row["plan_id"]))
+        return {"status": "REMOTE_JSON_VERIFIED", "reason_code": diagnosis["reason_code"],
+                "backup_id": backup_id, "backend_name": row["backend_name"], "write_performed": False}
 
     def rollback(self, backup_id: str, *, confirmed: bool = False, allow_live: bool = False,
                  backend_coordinator=None, client=None) -> dict:
