@@ -1,0 +1,307 @@
+ShopSource Studio — WINDOWS THEME CLI UTF-8 SUBPROCESS HOTFIX
+FIX cp949 UnicodeDecodeError IN subprocess reader threads
+NO SHOPIFY WRITE
+
+Repository
+- Baseline main: 6a10d76cc525ebf5d1579fac33ae1837c7c86f7f
+- Branch: hotfix/theme-cli-windows-utf8-subprocess
+- Recommended worktree: D:\shop\001_so_amazon_theme_cli_utf8
+
+Real observed error on Windows / Python 3.14
+Repeated terminal errors:
+
+UnicodeDecodeError: 'cp949' codec can't decode byte 0xe2 ...
+File subprocess.py, line 1614, in _readerthread
+    buffer.append(fh.read())
+
+Observed UI at same time
+- durable recovery correctly routes to step 5
+- current last apply result shows:
+  VERIFY_FAILED · POST_WRITE_PRODUCT_IDS_MISMATCH
+- DO NOT trust this as final business diagnosis until CLI subprocess decoding is hardened and read-only diagnosis is rerun.
+- No second Shopify apply.
+- No rollback.
+
+Root cause in current code
+src/shopsource/shopify_theme_cli.py uses subprocess.run(... capture_output=True, text=True ...)
+without explicit encoding in multiple places:
+- Shopify CLI version probe
+- theme list --json probe
+- fallback theme list probe
+- _invoke() used by theme pull/push
+
+On Korean Windows, text=True defaults to locale encoding cp949.
+Shopify CLI emits UTF-8 output and Unicode symbols (e.g. bytes beginning 0xE2).
+Python reader threads attempt cp949 decoding and throw UnicodeDecodeError.
+
+Mission
+Harden EVERY ShopifyThemeCLI subprocess path against Windows locale decoding.
+Do this in one compressed pass.
+
+======================================================================
+1. SAFETY
+======================================================================
+
+Do not modify:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env
+- credentials
+- Featured product plan/data
+- category/reconciliation logic
+
+No real Shopify network/write in tests.
+No real Theme Access credential use.
+No rollback.
+Do not merge main.
+
+======================================================================
+2. SUBPROCESS CONTRACT
+======================================================================
+
+Use TWO explicit subprocess modes.
+
+A. STRUCTURED/TEXT PROBES that need stdout parsing:
+- shopify version
+- shopify theme list --json
+- fallback theme list --json
+
+These MUST use:
+  capture_output=True
+  text=True
+  encoding="utf-8"
+  errors="replace"
+  check=False
+  explicit timeout
+  env=...
+
+Do not rely on locale.getpreferredencoding().
+Do not use cp949.
+Do not globally change Windows code page.
+
+B. PULL/PUSH _invoke() where stdout/stderr are intentionally not parsed:
+Prefer BINARY capture:
+  capture_output=True
+  text=False
+  check=False
+  timeout=120
+  env=...
+
+Or omit text entirely so bytes are captured.
+Do NOT decode output at all.
+The code only needs returncode.
+This is safer than decoding ignored CLI decoration.
+
+Never log/return raw stdout/stderr.
+
+======================================================================
+3. OPTIONAL HELPER TO PREVENT REGRESSION
+======================================================================
+
+Centralize kwargs if useful, e.g.:
+
+def _utf8_text_run_kwargs(...):
+    return {
+      "capture_output": True,
+      "text": True,
+      "encoding": "utf-8",
+      "errors": "replace",
+      ...
+    }
+
+and/or a dedicated binary _invoke path.
+
+Goal:
+No future Theme Access subprocess call can accidentally fall back to Windows locale decoding.
+
+Do not over-refactor.
+
+======================================================================
+4. ENVIRONMENT SAFETY
+======================================================================
+
+Preserve:
+- SHOPIFY_CLI_THEME_TOKEN env-only
+- password never argv
+- canonical myshopify domain
+- MAIN identity
+- pull --no-input
+- pull no --json
+- push --json --nodelete --strict
+- conditional --allow-live
+- empty pull temp
+- config/layout/templates push scaffold
+
+You MAY add:
+  NO_COLOR=1
+to Theme CLI subprocess env if tests show it is safe and useful,
+but it is not required for correctness.
+Do not depend on NO_COLOR for encoding safety.
+
+======================================================================
+5. REGRESSION TESTS — WINDOWS cp949 INCIDENT
+======================================================================
+
+Update tests/test_shopify_theme_cli.py.
+
+Required tests:
+
+A. version probe kwargs
+- encoding == "utf-8"
+- errors == "replace"
+- text == True
+
+B. theme list probe kwargs
+- encoding == "utf-8"
+- errors == "replace"
+- text == True
+- applies to --id path and fallback path
+
+C. _invoke binary mode
+- text is False or absent
+- no encoding-dependent text wrapper is requested
+- stdout/stderr are not decoded/logged/returned
+
+D. UTF-8 symbol regression
+Use a local fake/real subprocess or runner that emits bytes representing:
+  ✓
+  →
+  •
+or other UTF-8 sequences beginning with 0xE2.
+
+Prove:
+- no UnicodeDecodeError
+- successful return code is handled
+- raw output is not exposed
+
+E. JSON Unicode
+Mock theme list JSON containing a non-ASCII UTF-8 theme name, e.g.:
+  "테스트 ✓ Theme"
+Prove:
+- JSON parses
+- matching theme identity remains correct
+
+F. secret safety
+- password only in SHOPIFY_CLI_THEME_TOKEN
+- not argv
+- raw stdout/stderr not returned
+
+======================================================================
+6. POST-WRITE DIAGNOSIS REGRESSION
+======================================================================
+
+Run the new post-write durable recovery tests and confirm:
+- restart routes to DIAGNOSE_POST_WRITE
+- diagnosis can call Theme Access read without locale decode exception
+- no write
+- no rollback
+- stale adoption protection still works
+- POST_WRITE_PRODUCT_IDS_MISMATCH remains possible only from actual parsed remote content, not subprocess decode corruption
+
+Do NOT change business classification logic in this encoding hotfix.
+
+======================================================================
+7. ONE REALITY-CHECK TEST WITHOUT SHOPIFY
+======================================================================
+
+Add a Windows-safe local subprocess regression test if feasible:
+
+- execute sys.executable -c script that writes UTF-8 bytes for "✓ → •" to stdout and stderr
+- call the same binary capture mode used by _invoke
+- assert no decode exception and returncode 0
+
+This is local-only and does not use Shopify/network/credential.
+
+If CI/platform differences make it brittle, use a mock that enforces the kwargs contract instead.
+
+======================================================================
+8. QUALITY GATES
+======================================================================
+
+Run:
+python -m compileall -q src tests
+git diff --check
+PYTHONPATH=src python -m shopsource.cli --help
+PYTHONPATH=src python -m shopsource.ui.v2 --help
+
+Focused:
+- tests/test_shopify_theme_cli.py
+- post-write diagnosis/restart tests
+- Featured guided-flow tests
+- backend/router tests
+
+Full:
+python -m pytest -q --basetemp=<fresh-worktree-local-temp>
+
+Expected >= current 1065 passed, 1 skipped.
+
+======================================================================
+9. DO NOT TOUCH CURRENT REAL STORE STATE
+======================================================================
+
+Important:
+The current Store 001 has already had ONE live apply attempt.
+During this hotfix:
+- do not rerun apply
+- do not rollback
+- do not perform real diagnosis using credential
+- do not mutate backup/plan DB
+
+After merge, rerun ONLY:
+"5단계 · 이전 적용 결과 읽기 전용 진단"
+
+Then review the exact classification again.
+
+======================================================================
+10. COMMIT/PUSH
+======================================================================
+
+Commit validated changes to:
+hotfix/theme-cli-windows-utf8-subprocess
+
+Suggested commit:
+Fix Windows UTF-8 decoding for Shopify CLI subprocesses
+
+Push branch.
+Do not merge main.
+
+======================================================================
+11. REPORT
+======================================================================
+
+Report:
+[1] baseline SHA
+[2] final feature SHA
+[3] files changed
+[4] exact cp949 root cause
+[5] text-probe subprocess contract
+[6] binary _invoke contract
+[7] version probe encoding
+[8] theme-list encoding
+[9] UTF-8 symbol regression test
+[10] Unicode JSON theme-name test
+[11] secret safety
+[12] post-write diagnosis regression
+[13] focused tests
+[14] full suite
+[15] protected files
+[16] Shopify live write count
+[17] real credential use/creation count
+[18] merge readiness
+[19] exact next action
+
+Final flags:
+WINDOWS_CP949_DECODE_PATH_REMOVED = YES/NO
+VERSION_PROBE_UTF8 = YES/NO
+THEME_LIST_UTF8 = YES/NO
+PULL_PUSH_OUTPUT_BINARY = YES/NO
+UTF8_SYMBOL_REGRESSION = PASS/FAIL
+UNICODE_JSON_REGRESSION = PASS/FAIL
+PASSWORD_ARGV_EXPOSURE = NO
+POSTWRITE_RECOVERY_REGRESSION = PASS/FAIL
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_USED = NO
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+FULL_SUITE = PASS/FAIL
+CODE_MERGE_READY = YES/NO
