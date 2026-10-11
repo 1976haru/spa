@@ -1,0 +1,311 @@
+ShopSource Studio — FEATURED APPLY PREFLIGHT DIAGNOSTICS SAFE MERGE
+READ-ONLY PREFLIGHT + SHARED APPLY GATES + BEGINNER UI
+
+Repository
+- Main repo: D:\shop\001_so_amazon
+- Feature worktree: D:\shop\001_so_amazon_featured_preflight
+- Remote: https://github.com/1976haru/spa.git
+- Branch: hotfix/featured-conflict-preflight-diagnostics
+- Expected implementation HEAD before this prompt commit: d5c805203ee7e5bc172de15b10b3872494ecbca6
+- Expected main/origin-main: 8d5eb35e9c8ff30823437d4ee1326d2edb7118f4
+
+Feature summary
+- FeaturedProductThemeApplyService.preflight() added
+- apply() reuses same ordered preflight gates
+- preflight never writes and never creates backup
+- raw-only vs semantic drift classified separately
+- beginner "적용 전 안전 검사" button added
+- button runs only after explicit user click
+- read-only capability/read_file may use locally saved credential at runtime
+- tests use mocks only; no real credential
+- safe result dialog + advanced hash info
+- latest safe apply failure reason retained in in-memory UI state
+- full suite 1037 passed, 1 skipped
+- Shopify live write 0
+- actual credential use 0
+
+This merge task must not run the real preflight against Store 001 yet.
+No live Shopify write.
+No real credential use or creation.
+
+======================================================================
+1. CONCURRENCY GATE
+======================================================================
+
+In main repo:
+
+git fetch origin --prune
+
+Record:
+- local main SHA
+- origin/main SHA
+- local feature SHA
+- origin feature SHA
+- merge-base
+- main...feature ahead/behind
+- git status --short
+
+Expected:
+origin/main = 8d5eb35e9c8ff30823437d4ee1326d2edb7118f4
+
+If origin/main moved:
+STOP and report CONCURRENT_MAIN_MOVEMENT.
+Do not auto-rebase/cherry-pick/merge.
+
+Feature HEAD may be one commit ahead of d5c8052 because this safe-merge prompt itself is committed.
+
+======================================================================
+2. PROTECTED FILE GATE
+======================================================================
+
+Record status + SHA256 before merge:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+
+Known operator-side hashes from prior main worktree:
+- stores/001_cabin_tidy.json
+  9A480BE4CD24BF93BEAB8E02483512DB3801F10F506ADC610C38667C5832051F
+- tools/shopify_app/safe_shopify_cli.ps1
+  47A1BDF96BB54ADB0C9C86D7C91962A48EC6C4FDF6A0E73B6EFC8B943C275421
+
+Do not touch/stash/reset/restore:
+- protected files above
+- data/*.sqlite3
+- .env
+- credentials
+- .phase*
+- backups
+- user assets
+- operator temp folders
+
+Existing dirty state must remain byte-for-byte unchanged.
+
+======================================================================
+3. DIFF SCOPE REVIEW
+======================================================================
+
+Expected feature files:
+- CODEX_FEATURED_APPLY_PREFLIGHT_DIAGNOSTICS.txt
+- CODEX_FEATURED_APPLY_PREFLIGHT_DIAGNOSTICS_SAFE_MERGE.txt
+- src/shopsource/homepage_featured_products.py
+- src/shopsource/ui/v2.py
+- tests/test_homepage_featured_products.py
+
+Confirm NOT changed:
+- src/shopsource/featured_theme_backend.py
+- src/shopsource/theme_write_backend.py
+- src/shopsource/shopify_theme_cli.py
+- category/reconciliation modules
+- protected files
+
+STOP on unexpected overlap.
+
+======================================================================
+4. PREFLIGHT SAFETY REVIEW
+======================================================================
+
+Confirm in code/tests:
+
+A. preflight is strictly read-only
+- no backup folder creation
+- no backup DB row
+- no ThemeWriteBackendRouter.write
+- no themeFilesUpsert
+- no shopify theme push
+- no rollback
+- write_performed=False always
+
+B. button runtime behavior
+- "적용 전 안전 검사" exists
+- runs only on explicit user click
+- does not run on page load, preview, search, or filter
+- may use stored Theme Access credential only via existing capability/read path
+- no credential value returned/displayed/logged
+
+C. exact classifications
+- RAW differs + semantic equal => REMOTE_HASH_DRIFT_RAW_ONLY
+- semantic differs => REMOTE_HASH_DRIFT_SEMANTIC
+- first-failing gate order preserved
+- READY_TO_APPLY only after every pre-write guard passes
+
+D. apply reuse
+- apply() invokes same _run_preflight()
+- no backup/write before READY_TO_APPLY
+- confirmed=True and allow_live=True still required for actual apply
+- exact MAIN identity preserved
+- 4 ACTIVE product guard preserved
+- isolated diff guard preserved
+- product ID guard preserved
+- commented JSON/prefix/suffix guard preserved
+- no fallback after write attempt preserved
+
+E. UI safety
+- beginner result dialog
+- technical hashes/codes under advanced info
+- recent apply failure stores only safe fields
+- no raw theme content, env, stdout/stderr, password, token, client secret
+
+If any fail:
+STOP.
+
+======================================================================
+5. PRE-MERGE TEST GATE
+======================================================================
+
+In feature worktree:
+
+python -m compileall -q src tests
+
+Focused:
+python -m pytest -q tests/test_homepage_featured_products.py tests/test_featured_theme_backend.py tests/test_shopify_theme_cli.py tests/test_theme_write_backend.py tests/test_multistore_theme_operations.py tests/test_theme_access_credentials.py tests/test_shopify_g0_readonly_hotfix.py
+
+Then full:
+python -m pytest -q --basetemp=<worktree-local-temp>
+
+Also:
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Required:
+FULL SUITE PASS
+Expected >= 1037 passed, 1 skipped
+SHOPIFY LIVE WRITE COUNT = 0
+REAL THEME ACCESS CREDENTIAL USE/CREATION = 0
+
+======================================================================
+6. FAST-FORWARD MERGE ONLY
+======================================================================
+
+Return to main repo.
+
+git fetch origin
+
+Verify origin/main is still exactly the SHA recorded in step 1.
+
+Then:
+git merge --ff-only hotfix/featured-conflict-preflight-diagnostics
+
+If ff-only fails:
+STOP.
+No merge commit.
+No conflict auto-resolution.
+
+======================================================================
+7. POST-MERGE TEST GATE
+======================================================================
+
+On main rerun:
+- focused tests
+- full suite
+- compileall
+- git diff --check
+- CLI help
+- UI help
+
+Verify:
+- protected hashes/status unchanged
+- no credential used/created
+- no Shopify live write
+
+======================================================================
+8. PUSH WITH LAST-SECOND CHECK
+======================================================================
+
+git fetch origin
+
+If origin/main moved:
+STOP BEFORE PUSH.
+Report REMOTE_MAIN_MOVED_AFTER_LOCAL_MERGE.
+Do not force push.
+
+If unchanged:
+git push origin main
+
+Then verify:
+- main == origin/main
+- main...origin/main = 0 0
+
+======================================================================
+9. RETAIN FEATURE WORKTREE
+======================================================================
+
+Retain:
+- hotfix/featured-conflict-preflight-diagnostics
+- D:\shop\001_so_amazon_featured_preflight
+
+until the first real Store 001 "적용 전 안전 검사" result is reviewed.
+
+======================================================================
+10. SECOND-WINDOW HANDOFF
+======================================================================
+
+Final report must include:
+SECOND_WINDOW_HANDOFF_MAIN_SHA = <new main SHA>
+
+Any other active project window must fetch this SHA before its next main merge.
+
+======================================================================
+11. EXACT NEXT ACTION AFTER SUCCESSFUL MERGE
+======================================================================
+
+Do NOT live apply during merge.
+
+After successful merge:
+1. run ShopSource UI from new main
+2. go to Store 001 > 스토어 디자인 > 홈페이지
+3. if current Featured preview is not PREVIEW because app restarted, run:
+   - Shopify 상품 다시 읽기 only if needed
+   - 추천 상품 미리보기
+4. click "적용 전 안전 검사"
+5. this explicit button may use the already saved Theme Access credential for READ-ONLY capability/read
+6. capture result dialog + advanced info
+7. DO NOT click Shopify 적용 again until the preflight reason is reviewed
+
+Expected useful outcomes:
+- READY_TO_APPLY
+- REMOTE_HASH_DRIFT_RAW_ONLY
+- REMOTE_HASH_DRIFT_SEMANTIC
+- another exact reason_code
+
+======================================================================
+12. FINAL REPORT
+======================================================================
+
+Report:
+[1] pre-merge origin/main SHA
+[2] feature HEAD SHA
+[3] merge-base
+[4] ahead/behind
+[5] protected pre-merge hashes/status
+[6] diff scope
+[7] preflight safety review
+[8] pre-merge tests
+[9] merge method
+[10] new local main SHA
+[11] post-merge tests
+[12] push result
+[13] final origin/main SHA
+[14] main...origin/main
+[15] protected post-merge hashes/status
+[16] Shopify live write count
+[17] Theme Access credential use/creation count
+[18] feature/worktree retained
+[19] SECOND_WINDOW_HANDOFF_MAIN_SHA
+[20] exact next action
+
+Final flags:
+FAST_FORWARD_ONLY = PASS/FAIL
+FEATURED_PREFLIGHT = READY/NOT_READY
+APPLY_REUSES_PREFLIGHT = YES/NO
+RAW_ONLY_CLASSIFIED = YES/NO
+SEMANTIC_MISMATCH_CLASSIFIED = YES/NO
+BEGINNER_PREFLIGHT_UI = READY/NOT_READY
+PREFLIGHT_WRITE_COUNT = 0
+FULL_SUITE_POST_MERGE = PASS/FAIL
+PROTECTED_FILES_UNCHANGED = YES/NO
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_USED = NO
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+MAIN_REMOTE_SYNC = YES/NO
+SECOND_WINDOW_HANDOFF_REQUIRED = YES
