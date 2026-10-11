@@ -1,0 +1,519 @@
+ShopSource Studio — WINDOWS UTF-8 + FEATURED STEP-5 VERIFICATION STABILIZATION
+ONE COMPRESSED HOTFIX
+FIX cp949 SUBPROCESS CRASH AND STEP-5 POST-WRITE PRODUCT REFERENCE MISMATCH
+NO SECOND REAL SHOPIFY WRITE DURING DEVELOPMENT
+
+Repository
+- Baseline main: 6a10d76cc525ebf5d1579fac33ae1837c7c86f7f
+- Branch: hotfix/theme-cli-windows-utf8-subprocess
+- Recommended worktree: D:\shop\001_so_amazon_theme_cli_utf8
+
+REAL OBSERVED STATE
+1. Store 001 Guided Flow is correctly recovering the existing prior Step-5 write attempt.
+2. UI shows:
+   - steps 1-4 complete
+   - step 5 current
+   - apply status VERIFY_FAILED
+   - latest result POST_WRITE_PRODUCT_IDS_MISMATCH
+3. Terminal simultaneously shows repeated:
+   UnicodeDecodeError: 'cp949' codec can't decode byte 0xe2 ...
+   in subprocess.py _readerthread
+4. There has already been ONE real Shopify live write attempt.
+5. DO NOT perform a second real apply or rollback during this hotfix.
+
+IMPORTANT
+The Step-5 failure must be handled in this SAME compressed hotfix.
+Do NOT treat this as encoding-only work.
+
+There are TWO separate issues to stabilize:
+
+A. Windows subprocess decoding
+B. Post-write product-reference verification semantics
+
+======================================================================
+1. SAFETY
+======================================================================
+
+Do not modify:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env
+- credentials
+- category/reconciliation logic
+- unrelated homepage features
+
+No real Shopify push.
+No rollback.
+No second real apply.
+No real Theme Access credential use during tests.
+No credential creation/deletion.
+Do not merge main.
+
+The current existing Store 001 VERIFY_FAILED backup must remain intact.
+
+======================================================================
+2. FIX WINDOWS cp949 SUBPROCESS PATHS
+======================================================================
+
+Current ShopifyThemeCLI uses subprocess.run(... capture_output=True, text=True ...)
+without an explicit encoding in multiple places.
+
+On Korean Windows this defaults to cp949, while Shopify CLI emits UTF-8.
+
+Harden ALL ShopifyThemeCLI subprocess paths.
+
+A. Text/structured probes that require parsing:
+- shopify version
+- theme list --json with --id
+- fallback theme list --json
+
+Use:
+  capture_output=True
+  text=True
+  encoding="utf-8"
+  errors="replace"
+  check=False
+  explicit timeout
+
+B. _invoke() used by pull/push:
+The code does NOT need stdout/stderr contents.
+Use binary capture:
+  capture_output=True
+  text=False
+or omit text entirely.
+
+Do not decode ignored CLI output.
+
+Never log or return raw stdout/stderr.
+
+Preserve:
+- SHOPIFY_CLI_THEME_TOKEN env-only
+- password absent argv
+- canonical myshopify domain
+- pull --no-input
+- pull has no --json
+- push --json --nodelete --strict
+- conditional --allow-live
+- empty pull temp
+- config/layout/templates push scaffold
+
+======================================================================
+3. STEP-5 FAILURE: DO NOT ASSUME STRICT STRING ID EQUALITY
+======================================================================
+
+Current post-write verification does:
+
+  actual_ids = current section setting value
+  product_ids_match = actual_ids == expected_ids
+
+where expected_ids are Shopify GraphQL GIDs:
+  gid://shopify/Product/<id>
+
+This is too strict for a Shopify theme setting of type:
+- product
+- product_list
+
+Shopify may persist a product reference in a theme JSON representation different from the GraphQL Admin GID used by ShopSource.
+Possible safe representations to classify include:
+- GraphQL product GID
+- numeric product ID
+- product handle
+
+Do NOT blindly accept arbitrary values.
+
+Use the durable selected_products.json backup, which already contains:
+- shopify_product_id
+- shopify_handle
+for each of the exact 4 selected products.
+
+Create a product-reference normalization/comparison layer that compares LOGICAL PRODUCT IDENTITY.
+
+Preferred pure helpers, e.g.:
+
+normalize_shopify_product_reference(value, selected_products)
+normalize_shopify_product_reference_list(values, selected_products)
+compare_shopify_product_references(actual_values, selected_products)
+
+Rules:
+- GID exact match -> map to canonical selected GID
+- numeric string/integer equal to terminal numeric component of one selected GID -> map to canonical selected GID
+- handle exact match to one selected shopify_handle -> map to canonical selected GID
+- dict/object forms must be rejected unless explicitly proven by actual theme JSON contract and covered by tests
+- unknown/ambiguous references -> mismatch
+- duplicates -> mismatch
+- order must remain the selected order unless actual Shopify/theme contract proves product_list order is not stable; default is order-sensitive
+- exactly 4 unique logical products required
+
+Do not call Shopify product mutations.
+Do not query broad product APIs just to normalize.
+
+======================================================================
+4. PRODUCT FIELD TYPE MUST BE DURABLE
+======================================================================
+
+The old backup may not explicitly store product field type.
+
+At preview/apply time, ensure NEW backups include safe metadata:
+- product_field_id
+- product_field_type ("product_list" or "product")
+- product_reference_format_written ("gid")
+
+Backward compatibility:
+- existing Store 001 backup was created before these metadata fields.
+- for old backups, derive product_field_id from proposed.raw.json ONLY as currently done.
+- derive field type from available backup/proposed/theme schema evidence if safely available.
+- if field type cannot be proven, diagnosis may still compare using selected GID/handle/numeric mappings, but MUST label:
+  reference_contract = "LEGACY_BACKUP_INFERRED"
+and never broaden beyond exact selected products.
+
+No DB migration required unless unavoidable.
+Prefer optional metadata.json fields.
+
+======================================================================
+5. POST-WRITE FACTS: RAW VALUES VS LOGICAL VALUES
+======================================================================
+
+Refactor _post_write_facts() so it records safe comparison facts:
+
+- actual_reference_count
+- expected_reference_count
+- actual_reference_format:
+  GID / NUMERIC / HANDLE / MIXED / UNKNOWN
+- logical_product_ids_match
+- raw_product_references_equal
+
+Do NOT expose actual handles or IDs in beginner UI unless already non-sensitive and needed in advanced diagnostics.
+A count/format/reason is enough for default UI.
+
+Classification:
+
+A. Exact GID list matches expected:
+  product_ids_match=True
+
+B. Actual list differs textually but normalizes to the same exact 4 selected products in same order:
+  product_ids_match=True
+  product_reference_normalized=True
+
+C. Unknown/extra/missing/different product:
+  POST_WRITE_PRODUCT_IDS_MISMATCH
+
+This normalization MUST NOT turn a real wrong-product mismatch into success.
+
+======================================================================
+6. STEP-5 SUCCESS POLICY
+======================================================================
+
+Current service-level post-write success only accepts:
+  POST_WRITE_VERIFIED
+
+Extend safe success/adoption logic so the following can be considered verified WITHOUT a second Shopify write:
+
+Case 1:
+- logical product identities match exact 4
+- unrelated sections unchanged
+- prefix/suffix safe
+- semantic content is equivalent except for Shopify product-reference serialization normalization
+
+New reason code:
+  POST_WRITE_PRODUCT_REFERENCES_NORMALIZED
+
+This is distinct from generic:
+  POST_WRITE_RAW_ONLY_NORMALIZED
+
+Only use it when the ONLY semantic difference is the representation of the selected product references.
+
+Do NOT simply ignore semantic mismatches globally.
+
+Required safe conditions:
+- exact MAIN identity
+- exact section identity
+- same product field
+- logical 4 products exact
+- no extra/missing product
+- unrelated_sections_unchanged=True
+- prefix_equal=True
+- suffix_equal=True
+- no unexpected section settings changed except product-reference representation
+- selected order preserved
+- before/proposed/current documents all parse safely
+
+If these conditions hold:
+- diagnosis reason_code = POST_WRITE_PRODUCT_REFERENCES_NORMALIZED
+- local-only adoption is allowed after fresh re-diagnosis
+- no second Shopify write
+
+If not:
+- keep POST_WRITE_PRODUCT_IDS_MISMATCH or another exact mismatch reason
+
+======================================================================
+7. DETECT "ONLY PRODUCT REFERENCE REPRESENTATION CHANGED"
+======================================================================
+
+Implement a deterministic semantic normalization for comparison.
+
+Preferred approach:
+1. Deep-copy proposed and current parsed homepage JSON.
+2. Locate ONLY the target Featured section and ONLY the verified product field.
+3. Normalize both product-field values to canonical selected GID list using the durable selected_products mapping.
+4. Recompare the full parsed documents.
+5. If normalized documents are equal:
+   product_reference_semantic_equal=True
+6. If anything else differs:
+   false
+
+Do NOT normalize:
+- heading
+- subheading
+- section type
+- other settings
+- order
+- other sections
+- custom_css
+- merchant changes
+
+This gives proof that the only semantic difference is product-reference representation.
+
+======================================================================
+8. FIX APPLY-TIME VERIFICATION TOO
+======================================================================
+
+Do not fix diagnosis only.
+
+The original Step-5 apply path itself calls _post_write_facts().
+Update it to use the same logical product reference normalization.
+
+Goal:
+On a FUTURE store/apply, if Shopify serializes product_list references as handles/numeric IDs:
+- one write attempt
+- post-write read
+- logical equivalence recognized
+- service can return REMOTE_JSON_VERIFIED or a safe normalized success path
+- Guided Flow advances to Step 6
+- no false VERIFY_FAILED loop
+
+For the CURRENT Store 001:
+- do NOT perform a second write
+- after merge, use existing backup and read-only diagnosis/adoption
+
+======================================================================
+9. WINDOWS + STEP-5 COMBINED REGRESSION MATRIX
+======================================================================
+
+Add/adjust tests covering BOTH problem classes.
+
+WINDOWS:
+1. version probe uses utf-8 + errors=replace
+2. theme-list --id uses utf-8
+3. fallback theme-list uses utf-8
+4. _invoke binary capture
+5. UTF-8 symbols "✓ → •" do not cause decode error
+6. Unicode theme name JSON parses
+
+PRODUCT REFERENCES:
+7. proposed GID list vs remote same GID list -> verified
+8. proposed GID list vs remote numeric IDs for same products -> normalized safe
+9. proposed GID list vs remote handles for same products -> normalized safe
+10. mixed but all map unambiguously to same selected products -> either safe MIXED or reject; choose one deterministic policy and document it
+11. wrong handle -> mismatch
+12. wrong numeric ID -> mismatch
+13. missing one product -> mismatch
+14. extra product -> mismatch
+15. duplicate product -> mismatch
+16. same four in wrong order -> mismatch
+17. unrelated section changed -> adoption refused
+18. heading/subheading changed -> semantic mismatch, NOT normalized success
+19. product field plus another target-setting changed -> semantic mismatch
+20. old backup without new metadata still diagnosable
+
+======================================================================
+10. ONE-WRITE-TOTAL E2E
+======================================================================
+
+Add a combined E2E test:
+
+READY_TO_APPLY
+-> one mocked Theme Access write
+-> mock Shopify remote serializes product references from GIDs to HANDLES
+-> post-write read
+-> service recognizes exact logical products
+-> safe normalized verification
+-> Step 6
+-> STOREFRONT_VERIFIED
+-> Step 7
+-> ASSIGNMENT_READY
+
+Assert:
+TOTAL SHOPIFY WRITE ATTEMPTS == 1
+
+Also test restart path:
+existing VERIFY_FAILED backup
+-> read-only diagnosis
+-> POST_WRITE_PRODUCT_REFERENCES_NORMALIZED
+-> local-only adoption with FRESH re-read
+-> Step 6
+with zero additional writes after restart.
+
+======================================================================
+11. UI
+======================================================================
+
+If current durable diagnosis shows a safe representation-only normalization:
+
+Beginner UI:
+"5단계 적용 결과 확인 완료"
+
+Message:
+"Shopify가 상품 참조 형식을 변환해 저장했지만 선택한 상품 4개는 동일합니다. 다시 적용하지 않고 검증 상태만 확정할 수 있습니다."
+
+Primary:
+"검증 상태 확정"
+
+Advanced:
+reason_code: POST_WRITE_PRODUCT_REFERENCES_NORMALIZED
+actual reference format: HANDLE / NUMERIC / ...
+logical products match: True
+unrelated sections unchanged: True
+
+Do not show raw theme JSON.
+Do not show stdout/stderr.
+
+If still real mismatch:
+"5단계 상품 연결 불일치"
+and no adoption/apply retry button as primary.
+
+======================================================================
+12. REAL STORE 001 AFTER MERGE
+======================================================================
+
+DO NOT perform this during development/tests.
+
+After safe merge:
+
+1. launch latest main
+2. durable recovery finds existing VERIFY_FAILED backup
+3. click ONLY:
+   "5단계 · 이전 적용 결과 읽기 전용 진단"
+4. no write
+5. inspect result
+
+If:
+POST_WRITE_PRODUCT_REFERENCES_NORMALIZED
+or POST_WRITE_VERIFIED
+or POST_WRITE_RAW_ONLY_NORMALIZED
+then local-only adoption may be offered.
+
+Adoption:
+- fresh read-only re-diagnosis
+- no second write
+- if still safe -> Step 6
+
+If POST_WRITE_PRODUCT_IDS_MISMATCH remains after UTF-8 fix + logical normalization:
+- STOP
+- capture advanced safe facts:
+  actual_reference_count
+  actual_reference_format
+  logical_product_ids_match
+  product_reference_semantic_equal
+- do not reapply
+- diagnose exact four values via a developer-only redacted/hashed diagnostic if necessary
+
+======================================================================
+13. QUALITY GATES
+======================================================================
+
+Run:
+python -m compileall -q src tests
+git diff --check
+PYTHONPATH=src python -m shopsource.cli --help
+PYTHONPATH=src python -m shopsource.ui.v2 --help
+
+Focused:
+- tests/test_shopify_theme_cli.py
+- Featured post-write diagnosis tests
+- Featured restart/TOCTOU tests
+- Featured guided-flow tests
+- homepage Featured apply tests
+- backend/router safety tests
+
+Full:
+python -m pytest -q --basetemp=<fresh-worktree-local-temp>
+
+Expected >= current 1065 passed, 1 skipped.
+
+======================================================================
+14. PROTECTED FILES
+======================================================================
+
+Do not touch/stash/reset/restore:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- .phase*
+- .recon_focus_initial/
+- pytest temp folders
+- data/*.sqlite3
+- credentials
+- backup files outside test fixtures
+
+======================================================================
+15. COMMIT/PUSH
+======================================================================
+
+Commit validated changes to SAME branch:
+hotfix/theme-cli-windows-utf8-subprocess
+
+Suggested commit:
+Stabilize Windows Theme CLI and Featured product verification
+
+Push branch.
+Do not merge main.
+
+======================================================================
+16. REPORT
+======================================================================
+
+Report:
+[1] baseline SHA
+[2] final feature SHA
+[3] files changed
+[4] cp949 root cause
+[5] subprocess UTF-8/binary contracts
+[6] Step-5 strict ID comparison root cause
+[7] product reference normalization policy
+[8] supported reference formats
+[9] unsafe formats/mismatches rejected
+[10] semantic normalization proof
+[11] apply-time verification change
+[12] restart diagnosis/adoption behavior
+[13] one-write-total E2E result
+[14] UTF-8 regression tests
+[15] product-reference regression matrix
+[16] focused tests
+[17] full suite
+[18] protected files
+[19] Shopify live write count
+[20] real credential use/creation count
+[21] merge readiness
+[22] exact next action
+
+Final flags:
+WINDOWS_CP949_DECODE_PATH_REMOVED = YES/NO
+VERSION_PROBE_UTF8 = YES/NO
+THEME_LIST_UTF8 = YES/NO
+PULL_PUSH_OUTPUT_BINARY = YES/NO
+STEP5_STRICT_GID_COMPARISON_REMOVED = YES/NO
+PRODUCT_REFERENCE_NORMALIZATION = READY/NOT_READY
+GID_REFERENCE_TEST = PASS/FAIL
+NUMERIC_REFERENCE_TEST = PASS/FAIL
+HANDLE_REFERENCE_TEST = PASS/FAIL
+WRONG_PRODUCT_REJECTED = YES/NO
+UNRELATED_DRIFT_REJECTED = YES/NO
+POST_WRITE_PRODUCT_REFERENCES_NORMALIZED = READY/NOT_READY
+ONE_WRITE_TOTAL_E2E = PASS/FAIL
+SECOND_REAL_SHOPIFY_WRITE_REQUIRED = NO
+PASSWORD_ARGV_EXPOSURE = NO
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_USED = NO
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+FULL_SUITE = PASS/FAIL
+CODE_MERGE_READY = YES/NO
