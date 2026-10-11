@@ -1,0 +1,437 @@
+ShopSource Studio — BEGINNER GUIDED FLOW UX FOR FEATURED PRODUCTS
+ONE OBVIOUS NEXT ACTION, A→B→C, PROGRESSIVE DISCLOSURE
+
+Repository
+- Baseline main: 29df61c9e360bcfe9390fc50f35057271a7699cb
+- Branch: ux/featured-guided-stepper
+- Recommended worktree: D:\shop\001_so_amazon_featured_guided_ux
+
+Observed beginner problem
+The Featured card currently shows many same-weight buttons at once:
+- 추천 상품 자동 구성
+- 상품 4개 보기
+- 다시 선택
+- Shopify 상품 다시 읽기
+- 추천 상품 미리보기
+- 적용 전 안전 검사
+- Shopify 적용
+- 추천 상품 롤백
+- 과제 제출용 확인
+
+A novice does not know which button to press next.
+The UI must behave like a guided workflow:
+A → B → C → D → E → F
+with exactly one obvious primary next action.
+
+Current real state example:
+- 4/4 READY
+- PREVIEW
+- preflight result REMOTE_READ_FAILED
+- backend THEME_ACCESS_CLI
+- theme MAIN
+The current dialog says the read failed, but it does not give one obvious repair action.
+
+Mission
+Redesign the Featured/New Arrivals UI into a stateful beginner stepper while preserving all existing safety behavior and existing advanced/manual operations.
+
+Do NOT weaken write confirmation.
+Do NOT auto-apply Shopify.
+Do NOT auto-run credential reads on page load.
+Do NOT modify category/reconciliation logic.
+Do NOT remove advanced troubleshooting actions; move them behind progressive disclosure.
+
+======================================================================
+1. BEGINNER FLOW
+======================================================================
+
+Default Featured card must show a 7-step horizontal/vertical stepper:
+
+1. 상품 불러오기
+2. 상품 4개 확인
+3. 미리보기 만들기
+4. 적용 전 안전 검사
+5. Shopify 적용
+6. 스토어 확인
+7. 과제 제출 확인
+
+For each step render one of:
+- 완료 ✓
+- 현재 단계
+- 대기
+- 문제 해결 필요
+
+The current step must be visually obvious.
+
+Example for current state:
+1 상품 불러오기 ✓
+2 상품 4개 확인 ✓
+3 미리보기 만들기 ✓
+4 적용 전 안전 검사 — 문제 해결 필요
+5 Shopify 적용 — 대기
+6 스토어 확인 — 대기
+7 과제 제출 확인 — 대기
+
+Below the stepper show ONE large primary button only:
+"다음: 연결 상태 다시 확인"
+or
+"다음: 적용 전 안전 검사"
+or
+"다음: Shopify에 추천 상품 4개 적용"
+depending on state.
+
+Do not show 8 equal-weight buttons in beginner mode.
+
+======================================================================
+2. STATE MACHINE
+======================================================================
+
+Implement a deterministic Featured guided-flow resolver.
+
+Preferred pure helper:
+resolve_featured_guided_state(state, plan, preview, preflight_result, last_apply_result) -> dict
+
+Return:
+{
+  "current_step": 1..7,
+  "steps": [...],
+  "primary_action": "<action_key>",
+  "primary_label": "...",
+  "primary_help": "...",
+  "problem_code": "...|null",
+  "can_advance": true/false
+}
+
+Suggested action keys:
+- REFRESH_PRODUCTS
+- REVIEW_PRODUCTS
+- BUILD_PREVIEW
+- RUN_PREFLIGHT
+- RECHECK_THEME_CONNECTION
+- OPEN_APPLY_GATE
+- OPEN_STOREFRONT
+- OPEN_ASSIGNMENT_CHECK
+- NONE
+
+State rules:
+
+Step 1 complete:
+plan status READY and 4 items.
+
+Step 2 complete:
+store a session flag after user explicitly opens/reviews "상품 4개 확인".
+Do not require write.
+
+Step 3 complete:
+preview status PREVIEW and current plan ID matches.
+
+Step 4 complete:
+preflight status READY_TO_APPLY.
+
+If preflight reason == REMOTE_READ_FAILED:
+- step 4 = PROBLEM
+- primary action = RECHECK_THEME_CONNECTION
+- primary label = "다음: 연결 상태 다시 확인"
+- help = "Theme Access로 현재 MAIN 테마 파일을 읽을 수 있는지 다시 확인합니다. Shopify는 변경하지 않습니다."
+
+If preflight reason == REMOTE_HASH_DRIFT_RAW_ONLY:
+- step 4 = PROBLEM
+- primary action = NONE or RUN_PREFLIGHT only after code-policy fix; do NOT suggest live apply
+- label = "파일 형식 차이 확인 필요"
+- expose advanced troubleshooting
+
+If preflight reason == REMOTE_HASH_DRIFT_SEMANTIC:
+- step 3 becomes stale/problem
+- primary action = BUILD_PREVIEW
+- label = "다음: 최신 테마로 미리보기 다시 만들기"
+
+Step 5 complete:
+last apply status REMOTE_JSON_VERIFIED.
+
+Step 6 complete:
+featured product plan storefront_verified true.
+
+Step 7 complete:
+assignment status STOREFRONT_VERIFIED / assignment ready per existing service.
+
+======================================================================
+3. PRIMARY ACTION ROUTING
+======================================================================
+
+Implement a single large button in beginner mode:
+"다음 단계"
+
+Its label changes to exact next action.
+
+Examples:
+- no plan:
+  "1단계 · Shopify 상품 불러오기"
+- 4/4 ready but not reviewed:
+  "2단계 · 상품 4개 확인"
+- reviewed but no preview:
+  "3단계 · 추천 상품 미리보기 만들기"
+- PREVIEW but no preflight:
+  "4단계 · 적용 전 안전 검사"
+- REMOTE_READ_FAILED:
+  "4단계 · 연결 상태 다시 확인"
+- READY_TO_APPLY:
+  "5단계 · Shopify에 추천 상품 4개 적용"
+- REMOTE_JSON_VERIFIED:
+  "6단계 · 스토어에서 확인"
+- storefront verified:
+  "7단계 · 과제 제출용 확인"
+
+Never automatically trigger a live write.
+Step 5 only opens the existing apply confirmation dialog.
+The user must still check both existing confirmation boxes and click the existing final apply control.
+
+======================================================================
+4. REMOTE_READ_FAILED REPAIR UX
+======================================================================
+
+This real error must become beginner-actionable.
+
+Current:
+"현재 테마 파일을 안전하게 읽지 못했습니다. 연결 상태를 확인해 주세요."
+
+New:
+Title:
+"4단계에서 연결 확인이 필요합니다"
+
+Body:
+"상품과 미리보기는 준비되었습니다. Theme Access가 현재 MAIN 테마 파일을 읽는 과정에서 멈췄습니다. 아래 버튼으로 읽기 연결만 다시 확인하세요. Shopify는 변경되지 않습니다."
+
+Primary:
+"연결 상태 다시 확인"
+
+Secondary:
+"나중에 하기"
+
+Advanced expansion:
+- reason_code
+- backend
+- backend reason
+- theme ID/role
+- filename
+- hashes when available
+
+"연결 상태 다시 확인" must:
+- perform read-only Theme Access / backend check using existing safe read/check path
+- never write Shopify
+- never create/delete credential
+- never expose credential
+- if READY, close/refresh state and show:
+  "연결 확인 완료. 다시 적용 전 안전 검사를 실행합니다."
+- Optionally automatically run preflight immediately after a successful explicit recheck because both are read-only and are part of the same user-initiated repair action.
+  If implementing auto-preflight after successful recheck, make this explicit in tests and UI copy.
+- if still failed, remain on step 4 and show one next action, not a button wall.
+
+Do not redirect the user to a hidden expert dashboard unless the local in-place recheck cannot function.
+
+======================================================================
+5. ADVANCED ACTIONS
+======================================================================
+
+Move maintenance/recovery buttons into:
+
+"고급 / 문제 해결"
+
+Inside may remain:
+- Shopify 상품 다시 읽기
+- 다시 선택
+- 추천 상품 롤백
+- 고급 preflight info
+- manual backend details
+
+Rules:
+- "추천 상품 롤백" only enabled if a valid backup exists.
+- Do not show rollback as a normal beginner-flow action.
+- Do not show "다시 선택" as a normal next action after a valid 4/4 plan.
+- Existing functionality must remain available.
+
+======================================================================
+6. VISUAL HIERARCHY
+======================================================================
+
+Beginner mode default:
+A. compact status header:
+"추천 상품 만들기 · 3/7 완료"
+
+B. stepper
+
+C. one primary action card:
+"지금 할 일"
+"4단계 · 연결 상태 다시 확인"
+description
+[큰 primary button]
+
+D. selected products summary, collapsed by default after step 2:
+"선택 상품 4개 ✓"
+
+E. "고급 / 문제 해결" expansion
+
+Avoid technical strings in default view:
+- GraphQL state
+- CLI state
+- GID
+- raw hash
+- semantic hash
+These belong only under advanced info.
+
+Keep "New Arrivals", product titles/prices as user-facing content.
+
+======================================================================
+7. GENERALIZABLE COMPONENT
+======================================================================
+
+Do not hard-code this only as scattered if-statements in one render block.
+
+Create a reusable local UI/state helper suitable for later:
+- Category Shortcuts
+- Hero
+- Brand info
+- Blog assignment
+
+Examples:
+GuidedStep
+GuidedFlowState
+render_guided_stepper(...)
+or equivalent lightweight structure.
+
+Scope this implementation to Featured only, but make the helper reusable.
+
+No large framework rewrite.
+
+======================================================================
+8. CURRENT ERROR PRESERVATION
+======================================================================
+
+The existing safe:
+state["featured_preflight_result"]
+state["featured_last_apply_result"]
+
+must continue to work.
+
+If the app has:
+- preview PREVIEW
+- preflight REMOTE_READ_FAILED
+
+do not reset the user back to step 1.
+The resolver must place them at step 4 repair.
+
+If a new preview invalidates old preflight:
+clear/mark old preflight stale.
+
+If product reselection invalidates preview:
+return to step 3.
+
+======================================================================
+9. TESTS
+======================================================================
+
+Add tests for the pure guided state resolver and UI wiring.
+
+At minimum:
+- no plan -> step 1 REFRESH_PRODUCTS
+- 4/4 READY -> step 2 REVIEW_PRODUCTS
+- reviewed -> step 3 BUILD_PREVIEW
+- PREVIEW -> step 4 RUN_PREFLIGHT
+- REMOTE_READ_FAILED -> step 4 RECHECK_THEME_CONNECTION
+- READY_TO_APPLY -> step 5 OPEN_APPLY_GATE
+- REMOTE_JSON_VERIFIED -> step 6 OPEN_STOREFRONT
+- storefront verified -> step 7 OPEN_ASSIGNMENT_CHECK
+- assignment ready -> all complete / NONE
+- reselection invalidates later steps
+- new preview invalidates old preflight
+- rollback hidden from beginner primary actions
+- only one beginner primary action rendered
+- apply primary action only opens gate; no direct write
+- connection recheck is read-only
+- no actual credential use in tests
+- no Shopify live write
+
+Keep all existing preflight/apply tests green.
+
+======================================================================
+10. SAFETY
+======================================================================
+
+Do not modify:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env
+- credentials
+- category/reconciliation modules
+
+No real Shopify write.
+No actual Theme Access credential use in tests.
+No credential creation/deletion.
+No main merge.
+
+======================================================================
+11. QUALITY GATES
+======================================================================
+
+Run:
+python -m compileall -q src tests
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Focused:
+python -m pytest -q tests/test_homepage_featured_products.py
+plus any new UI/state helper test file.
+
+Full:
+python -m pytest -q --basetemp=<worktree-local-temp>
+
+Expected >= 1037 passed, 1 skipped.
+
+======================================================================
+12. COMMIT/PUSH
+======================================================================
+
+Commit only validated implementation/test files on:
+ux/featured-guided-stepper
+
+Suggested commit:
+"Add beginner guided Featured workflow"
+
+Push branch.
+Do not merge main.
+
+======================================================================
+13. REPORT
+======================================================================
+
+Report:
+[1] baseline SHA
+[2] final feature SHA
+[3] files changed
+[4] guided state helper
+[5] 7-step flow
+[6] one-primary-action behavior
+[7] REMOTE_READ_FAILED repair path
+[8] advanced action placement
+[9] live apply confirmation preserved
+[10] invalidation rules
+[11] focused tests
+[12] full suite
+[13] protected files
+[14] Shopify live write count
+[15] actual credential use/creation count
+[16] merge readiness
+[17] screenshots/manual render notes if available
+[18] exact next action
+
+Final flags:
+FEATURED_GUIDED_FLOW = READY/NOT_READY
+ONE_PRIMARY_ACTION = YES/NO
+REMOTE_READ_REPAIR = READY/NOT_READY
+ADVANCED_ACTIONS_COLLAPSED = YES/NO
+LIVE_WRITE_CONFIRMATION_PRESERVED = YES/NO
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_USED = NO
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+FULL_SUITE = PASS/FAIL
+CODE_MERGE_READY = YES/NO
