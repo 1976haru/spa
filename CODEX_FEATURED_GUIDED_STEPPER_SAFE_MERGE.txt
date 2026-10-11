@@ -1,0 +1,334 @@
+ShopSource Studio — FEATURED GUIDED FLOW SAFE MERGE
+A→B→C BEGINNER UX + STOREFRONT CONFIRMATION FIX
+
+Repository
+- Main repo: D:\shop\001_so_amazon
+- Feature worktree: D:\shop\001_so_amazon_featured_guided_ux
+- Remote: https://github.com/1976haru/spa.git
+- Branch: ux/featured-guided-stepper
+- Expected implementation HEAD before this prompt commit: 434e19ea998db56b45cc8c1e423b74e620e2c8de
+- Expected main/origin-main: 29df61c9e360bcfe9390fc50f35057271a7699cb
+
+Feature summary
+- 7-step beginner Featured flow
+- one obvious primary action
+- advanced recovery actions collapsed
+- REMOTE_READ_FAILED routes to one read-only repair action
+- Shopify apply remains explicit confirmation gate only
+- Step 6 storefront confirmation fixed
+- Step 6 -> Step 7 progression verified
+- Step 7 only completes on ASSIGNMENT_READY
+- full suite 1046 passed, 1 skipped
+- Shopify live write 0
+- actual credential use/creation 0
+
+Do not run real preflight or live apply during merge.
+No real Theme Access credential use.
+No rollback.
+
+======================================================================
+1. CONCURRENCY GATE
+======================================================================
+
+In main repo:
+
+git fetch origin --prune
+
+Record:
+- local main SHA
+- origin/main SHA
+- local feature SHA
+- origin feature SHA
+- merge-base
+- main...feature ahead/behind
+- git status --short
+
+Expected:
+origin/main = 29df61c9e360bcfe9390fc50f35057271a7699cb
+
+If origin/main moved:
+STOP and report CONCURRENT_MAIN_MOVEMENT.
+Do not auto-rebase/cherry-pick/merge.
+
+Feature HEAD may be one commit ahead of 434e19e because this safe-merge prompt is committed.
+
+======================================================================
+2. PROTECTED FILE GATE
+======================================================================
+
+Record status + SHA256 before merge:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+
+Expected operator-side hashes:
+- stores/001_cabin_tidy.json
+  9A480BE4CD24BF93BEAB8E02483512DB3801F10F506ADC610C38667C5832051F
+- tools/shopify_app/safe_shopify_cli.ps1
+  47A1BDF96BB54ADB0C9C86D7C91962A48EC6C4FDF6A0E73B6EFC8B943C275421
+
+Do not touch/stash/reset/restore:
+- protected files above
+- data/*.sqlite3
+- .env
+- credentials
+- .phase*
+- backups
+- user assets
+- operator temp folders
+
+Existing dirty state must remain byte-for-byte unchanged.
+
+======================================================================
+3. DIFF SCOPE REVIEW
+======================================================================
+
+Expected feature files:
+- CODEX_FEATURED_GUIDED_STEPPER_UX.txt
+- CODEX_FEATURED_GUIDED_STEPPER_REVIEW_FIX.txt
+- CODEX_FEATURED_GUIDED_STEPPER_SAFE_MERGE.txt
+- src/shopsource/featured_guided_flow.py
+- src/shopsource/ui/guided_flow.py
+- src/shopsource/ui/v2.py
+- tests/test_featured_guided_flow.py
+- tests/test_homepage_featured_products.py
+- tests/test_homepage_golden_path.py
+
+Confirm NOT changed:
+- protected files
+- src/shopsource/featured_theme_backend.py
+- src/shopsource/theme_write_backend.py
+- src/shopsource/shopify_theme_cli.py
+- category/reconciliation logic
+
+STOP on unexpected overlap.
+
+======================================================================
+4. GUIDED FLOW SAFETY REVIEW
+======================================================================
+
+Confirm in code/tests:
+
+A. Beginner flow
+- exactly 7 steps:
+  1 상품 불러오기
+  2 상품 4개 확인
+  3 미리보기 만들기
+  4 적용 전 안전 검사
+  5 Shopify 적용
+  6 스토어 확인
+  7 과제 제출 확인
+- default Featured card exposes one large primary action only
+- old same-weight button wall is removed from beginner mode
+- maintenance/recovery actions are under "고급 / 문제 해결"
+
+B. Current real failure routing
+For:
+- 4/4 READY
+- reviewed
+- PREVIEW
+- preflight REMOTE_READ_FAILED
+
+Resolver returns:
+- current_step=4
+- primary_action=RECHECK_THEME_CONNECTION
+- primary_label="4단계 · 연결 상태 다시 확인"
+
+The recheck path:
+- is read-only
+- calls preflight/read only
+- does not call apply
+- does not call ThemeWriteBackendRouter.write
+- does not rollback
+- does not auto-run on page load
+
+C. Apply safety
+- OPEN_APPLY_GATE only opens existing apply confirmation dialog
+- actual apply still requires both confirmation checkboxes
+- no automatic live apply from guided dispatcher
+- no direct write in guided-flow resolver/helper
+
+D. Step 6 -> Step 7 fix
+Inside storefront confirmation:
+- save confirmation.get("status") to featured_storefront_status
+- do not concatenate None
+- featured_assignment_status remains None
+- refresh durable plan after confirm_storefront()
+- if storefront_verified=true, resolver advances to step 7
+- STOREFRONT_VERIFIED does NOT count as assignment complete
+- only ASSIGNMENT_READY completes step 7
+
+E. State invalidation
+- reselection clears reviewed/preview/preflight/apply/storefront/assignment dependent state
+- new preview invalidates old preflight
+- stale failed apply does not override fresh successful preflight after new preview
+- rollback does not falsely leave later steps complete
+
+F. UI safety
+- selected product summary collapsible
+- advanced diagnostics collapsed
+- no GID/raw hash/CLI technical detail in default beginner view
+- no secrets displayed
+
+If any fail:
+STOP.
+
+======================================================================
+5. PRE-MERGE TEST GATE
+======================================================================
+
+In feature worktree:
+
+python -m compileall -q src tests
+
+Focused:
+python -m pytest -q tests/test_featured_guided_flow.py tests/test_homepage_featured_products.py tests/test_homepage_golden_path.py tests/test_featured_theme_backend.py tests/test_shopify_theme_cli.py tests/test_theme_write_backend.py tests/test_multistore_theme_operations.py tests/test_theme_access_credentials.py tests/test_shopify_g0_readonly_hotfix.py
+
+Full:
+python -m pytest -q --basetemp=<worktree-local-temp>
+
+Also:
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Required:
+FULL SUITE PASS
+Expected >= 1046 passed, 1 skipped
+SHOPIFY LIVE WRITE COUNT = 0
+REAL THEME ACCESS CREDENTIAL USE/CREATION = 0
+
+======================================================================
+6. FAST-FORWARD MERGE ONLY
+======================================================================
+
+Return to main repo.
+
+git fetch origin
+
+Verify origin/main is still exactly the SHA recorded in step 1.
+
+Then:
+git merge --ff-only ux/featured-guided-stepper
+
+If ff-only fails:
+STOP.
+No merge commit.
+No conflict auto-resolution.
+
+======================================================================
+7. POST-MERGE TEST GATE
+======================================================================
+
+On main rerun:
+- compileall
+- focused tests
+- full suite
+- git diff --check
+- CLI help
+- UI help
+
+Verify:
+- protected hashes/status unchanged
+- no credential used/created
+- no Shopify live write
+
+======================================================================
+8. PUSH WITH LAST-SECOND CHECK
+======================================================================
+
+git fetch origin
+
+If origin/main moved:
+STOP BEFORE PUSH.
+Report REMOTE_MAIN_MOVED_AFTER_LOCAL_MERGE.
+Do not force push.
+
+If unchanged:
+git push origin main
+
+Then verify:
+- main == origin/main
+- main...origin/main = 0 0
+
+======================================================================
+9. RETAIN FEATURE WORKTREE
+======================================================================
+
+Retain:
+- ux/featured-guided-stepper
+- D:\shop\001_so_amazon_featured_guided_ux
+
+until first real Store 001 guided-flow run is reviewed.
+
+======================================================================
+10. SECOND-WINDOW HANDOFF
+======================================================================
+
+Final report must include:
+SECOND_WINDOW_HANDOFF_MAIN_SHA = <new main SHA>
+
+Any other active project window must fetch this SHA before its next main merge.
+
+======================================================================
+11. EXACT NEXT ACTION AFTER SUCCESSFUL MERGE
+======================================================================
+
+Do NOT live apply during merge.
+
+After successful merge:
+1. run ShopSource UI from new main
+2. go to Store 001 > 스토어 디자인 > 홈페이지
+3. Featured card should show:
+   - 7-step progress
+   - "지금 할 일"
+   - one primary button
+4. Because previous in-memory preflight state will likely be gone after restart:
+   - if plan READY but review flag missing, follow the single primary button to review 4 products
+   - then follow the single primary button to build preview
+   - then run preflight
+5. If REMOTE_READ_FAILED:
+   click only "4단계 · 연결 상태 다시 확인"
+6. capture resulting screen
+7. DO NOT click live Shopify apply until result is reviewed
+
+======================================================================
+12. FINAL REPORT
+======================================================================
+
+Report:
+[1] pre-merge origin/main SHA
+[2] feature HEAD SHA
+[3] merge-base
+[4] ahead/behind
+[5] protected pre-merge hashes/status
+[6] diff scope
+[7] guided-flow safety review
+[8] step6->step7 review
+[9] pre-merge tests
+[10] merge method
+[11] new local main SHA
+[12] post-merge tests
+[13] push result
+[14] final origin/main SHA
+[15] main...origin/main
+[16] protected post-merge hashes/status
+[17] Shopify live write count
+[18] Theme Access credential use/creation count
+[19] feature/worktree retained
+[20] SECOND_WINDOW_HANDOFF_MAIN_SHA
+[21] exact next action
+
+Final flags:
+FAST_FORWARD_ONLY = PASS/FAIL
+FEATURED_GUIDED_FLOW = READY/NOT_READY
+ONE_PRIMARY_ACTION = YES/NO
+REMOTE_READ_REPAIR = READY/NOT_READY
+STEP6_TO_STEP7 = PASS/FAIL
+LIVE_WRITE_CONFIRMATION_PRESERVED = YES/NO
+FULL_SUITE_POST_MERGE = PASS/FAIL
+PROTECTED_FILES_UNCHANGED = YES/NO
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_USED = NO
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+MAIN_REMOTE_SYNC = YES/NO
+SECOND_WINDOW_HANDOFF_REQUIRED = YES
