@@ -1,0 +1,66 @@
+ShopSource Studio — WINDOWS UTF-8 + FEATURED STEP-5 SAFE MERGE
+
+Baseline main: 6a10d76cc525ebf5d1579fac33ae1837c7c86f7f
+Feature implementation SHA: 9f1505e864142e09834ce5980047255877166548
+Branch: hotfix/theme-cli-windows-utf8-subprocess
+
+Goal:
+Safely fast-forward merge the already validated Windows UTF-8 and Featured Step-5 stabilization into main.
+
+1. Fetch origin. Record local main, origin/main, feature HEAD, merge-base, ahead/behind, status.
+2. If origin/main is not exactly the baseline SHA above, STOP. Do not rebase, cherry-pick, or auto-merge.
+3. Preserve all existing dirty/protected files and temp folders exactly as-is. Do not stash, reset, restore, clean, or delete them.
+4. Review feature diff. Expected implementation files:
+   - src/shopsource/shopify_theme_cli.py
+   - src/shopsource/homepage_featured_products.py
+   - src/shopsource/featured_guided_flow.py
+   - src/shopsource/ui/v2.py
+   - tests/test_shopify_theme_cli.py
+   - tests/test_homepage_featured_products.py
+   plus prompt files.
+5. Confirm:
+   - Windows text probes explicitly decode UTF-8 safely.
+   - pull/push invocation does not depend on Windows locale decoding.
+   - existing pull/push safety flags and identity guards remain.
+   - Step-5 verification compares logical selected-product identity, not only raw GID strings.
+   - GID, numeric IDs, handles, and only deterministic unambiguous mappings are accepted.
+   - wrong/missing/extra/duplicate/wrong-order products remain rejected.
+   - only the target Featured product field may be normalized.
+   - unrelated section/setting drift remains rejected.
+   - POST_WRITE_PRODUCT_REFERENCES_NORMALIZED can be locally verified after a fresh read-only recheck.
+   - no second live write is required for current Store 001 recovery.
+6. Run compileall, diff-check, CLI/UI help, focused tests, one-write-total E2E, restart recovery/adoption tests, and full pytest using a fresh basetemp.
+   Expected at least: focused 239 passed; full 1083 passed, 1 skipped.
+7. Do not perform any real Shopify mutation during merge validation.
+8. Fetch origin again. If origin/main moved, STOP.
+9. Merge only with:
+   git merge --ff-only hotfix/theme-cli-windows-utf8-subprocess
+10. Rerun the same tests on main.
+11. Fetch origin once more. If origin/main moved, STOP before push.
+12. Push main normally, never force.
+13. Verify main == origin/main and ahead/behind is 0/0.
+14. Retain the feature branch/worktree until the existing Store 001 read-only diagnosis is reviewed.
+15. Final report must include SECOND_WINDOW_HANDOFF_MAIN_SHA.
+
+After successful merge:
+- Do NOT run a second Shopify apply.
+- Do NOT rollback.
+- Launch latest main and run only the existing Step-5 read-only diagnosis.
+- Confirm the terminal no longer shows cp949 UnicodeDecodeError.
+- If diagnosis is POST_WRITE_VERIFIED, POST_WRITE_RAW_ONLY_NORMALIZED, or POST_WRITE_PRODUCT_REFERENCES_NORMALIZED, use the local-only verification path after its fresh read-only recheck and then continue to Step 6.
+- If POST_WRITE_PRODUCT_IDS_MISMATCH remains, stop and report its safe advanced comparison facts before any further change.
+
+Final flags:
+FAST_FORWARD_ONLY
+WINDOWS_CP949_DECODE_PATH_REMOVED
+PULL_PUSH_OUTPUT_BINARY
+STEP5_STRICT_GID_COMPARISON_REMOVED
+PRODUCT_REFERENCE_NORMALIZATION
+POST_WRITE_PRODUCT_REFERENCES_NORMALIZED
+ONE_WRITE_TOTAL_E2E
+SECOND_REAL_SHOPIFY_WRITE_REQUIRED=NO
+FULL_SUITE_POST_MERGE
+PROTECTED_FILES_UNCHANGED
+SHOPIFY_LIVE_WRITE_COUNT=0
+MAIN_REMOTE_SYNC
+SECOND_WINDOW_HANDOFF_MAIN_SHA
