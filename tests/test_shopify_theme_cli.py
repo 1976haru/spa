@@ -17,7 +17,8 @@ from shopsource.theme_write_backend import (ThemeBackendCapabilities, ThemeFileW
 
 
 class Runner:
-    def __init__(self, root: Path, *, remote=None, version="3.80.0", role="unpublished", themes=None):
+    def __init__(self, root: Path, *, remote=None, version="3.80.0", role="unpublished", themes=None,
+                 reject_pull_json=False):
         self.root = root
         self.remote = remote or "/* Shopify header comment */\n{\"sections\":{},\"order\":[]}\n"
         self.version = version
@@ -26,6 +27,7 @@ class Runner:
         self.themes = themes if themes is not None else [{"id": "123", "name": "Mock theme", "role": role}]
         self.theme_list_json_override = None
         self.unsupported_id_filter = False
+        self.reject_pull_json = reject_pull_json
 
     def __call__(self, command, **kwargs):
         self.calls.append((list(command), dict(kwargs)))
@@ -48,6 +50,8 @@ class Runner:
         path = Path(command[command.index("--path") + 1])
         file_path = path / TARGET_FILE
         if command[command.index("theme") + 1] == "pull":
+            if self.reject_pull_json and "--json" in command:
+                return subprocess.CompletedProcess(command, 1, stdout="unsupported --json", stderr="unsupported --json")
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_bytes(self.remote.encode("utf-8"))
             return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
@@ -187,6 +191,34 @@ def test_cli_read_uses_only_target_file(tmp_path, monkeypatch):
     only_index = command.index("--only")
     assert command[only_index + 1] == "templates/index.json"
     assert command[1:3] == ["theme", "pull"]
+    assert command[command.index("--store") + 1] == "example.myshopify.com"
+    assert command[command.index("--theme") + 1] == "123"
+    assert command[command.index("--path") + 1]
+    assert "--json" not in command
+    assert "--no-input" in command
+
+
+def test_capability_ready_pull_without_json_flag_preserves_file_bytes(tmp_path, monkeypatch):
+    payload = "/* Shopify header */\r\n{\"sections\":{\"featured\":{}},\"order\":[\"featured\"]}\r\n"
+    runner = Runner(tmp_path, remote=payload, reject_pull_json=True)
+    cli, runner, _, _ = setup(tmp_path, monkeypatch, runner=runner)
+
+    capability = cli.capability_status("store-a", theme_id="123")
+    assert capability.ready
+    result = cli.read_file("store-a", "example.myshopify.com", "123", TARGET_FILE)
+
+    command, kwargs = next((command, kwargs) for command, kwargs in runner.calls
+                           if command[1:3] == ["theme", "pull"])
+    assert result.content == payload
+    assert result.raw_sha256 == raw_sha256(payload)
+    assert result.metadata["read_only"] is True
+    assert command[command.index("--store") + 1] == "example.myshopify.com"
+    assert command[command.index("--theme") + 1] == "123"
+    assert command[command.index("--only") + 1] == TARGET_FILE
+    assert "--path" in command and "--no-input" in command
+    assert "--json" not in command
+    assert kwargs["env"]["SHOPIFY_CLI_THEME_TOKEN"] == "merchant-password"
+    assert "merchant-password" not in command
 
 
 def test_cli_read_uses_isolated_temp_theme(tmp_path, monkeypatch):
@@ -241,6 +273,8 @@ def test_cli_write_uses_nodelete_strict_json(tmp_path, monkeypatch):
     command, _ = next((c, k) for c, k in runner.calls if len(c) > 2 and c[1:3] == ["theme", "push"])
     assert result.status == "REMOTE_JSON_VERIFIED"
     assert {"--nodelete", "--strict", "--json", "--only"}.issubset(set(command))
+    pull_commands = [c for c, _ in runner.calls if len(c) > 2 and c[1:3] == ["theme", "pull"]]
+    assert pull_commands and all("--json" not in c and "--no-input" in c for c in pull_commands)
     assert runner.remote.startswith("/* Shopify header comment */")
 
 

@@ -325,7 +325,7 @@ class ShopifyThemeCLI:
             self._scaffold(temp)
             command = [self._executable(), "theme", "pull", "--store", cli_store_domain,
                        "--theme", self._theme_id(theme_id), "--only", TARGET_FILE,
-                       "--path", str(temp), "--json"]
+                       "--path", str(temp), "--no-input"]
             if self._invoke(command, password) is None:
                 raise RuntimeError("Theme Access CLI pull failed")
             target = temp / TARGET_FILE
