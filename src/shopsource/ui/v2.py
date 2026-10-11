@@ -2419,7 +2419,9 @@ class OperatorUI:
                         f"미리보기: {preview.get('status', 'NOT READY')} · 적용: {state.get('featured_apply_status', 'NOT RUN')}")
                     if last_apply:
                         last_status = last_apply.get("status")
-                        last_message = ("스토어에서 확인할 수 있습니다." if last_status == "REMOTE_JSON_VERIFIED"
+                        last_message = ("Shopify가 상품 참조 형식을 바꿔 저장했지만 선택한 상품 4개는 동일합니다. 재적용 없이 검증 상태만 확정할 수 있습니다."
+                                        if last_apply.get("reason_code") == "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED" else
+                                        "스토어에서 확인할 수 있습니다." if last_status == "REMOTE_JSON_VERIFIED"
                                         else last_apply.get("reason") or "안전 검사에서 멈췄습니다.")
                         featured_last_apply_result.set_text(f"최근 적용 결과: {last_status} · {last_message}")
                     else:
@@ -2438,6 +2440,11 @@ class OperatorUI:
                                 ui.label(f"backend: {visible_preflight.get('backend_name')} · reason: {visible_preflight.get('backend_reason_code')}")
                                 ui.label(f"theme ID: {visible_preflight.get('theme_id')} · role: {visible_preflight.get('theme_role')}")
                                 ui.label(f"파일: {visible_preflight.get('filename')}")
+                                if "actual_reference_count" in visible_preflight:
+                                    ui.label(f"actual reference format: {visible_preflight.get('actual_reference_format')}")
+                                    ui.label(f"logical products match: {visible_preflight.get('logical_product_ids_match')}")
+                                    ui.label(f"references: {visible_preflight.get('actual_reference_count')} / {visible_preflight.get('expected_reference_count')}")
+                                    ui.label(f"unrelated sections unchanged: {visible_preflight.get('unrelated_sections_unchanged')}")
 
                 def select_featured_products(force_remote=False, reselect=False):
                     try:
@@ -2815,7 +2822,8 @@ class OperatorUI:
                     render_featured()
                     ui.notify("5단계 적용 결과 읽기 전용 진단: " + str(result.get("reason_code")),
                               type="positive" if result.get("reason_code") in {
-                                  "POST_WRITE_VERIFIED", "POST_WRITE_RAW_ONLY_NORMALIZED"} else "warning")
+                                  "POST_WRITE_VERIFIED", "POST_WRITE_RAW_ONLY_NORMALIZED",
+                                  "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED"} else "warning")
 
                 def featured_postwrite_adoption():
                     backup_id = state.get("backup_id")

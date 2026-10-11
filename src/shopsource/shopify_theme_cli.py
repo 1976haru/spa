@@ -162,6 +162,7 @@ class ShopifyThemeCLI:
             return ThemeBackendCapabilities(self.backend_name, "CLI_NOT_INSTALLED", "CLI_NOT_INSTALLED")
         try:
             result = self.runner([executable, "version"], capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace",
                                  timeout=15, check=False, env={**os.environ, "SHOPIFY_CLI_THEME_TOKEN": ""})
         except (OSError, subprocess.TimeoutExpired):
             return ThemeBackendCapabilities(self.backend_name, "UNSUPPORTED_CLI", "UNSUPPORTED_CLI")
@@ -201,7 +202,8 @@ class ShopifyThemeCLI:
         env = {**os.environ, "SHOPIFY_CLI_THEME_TOKEN": password}
         try:
             probe = self.runner([*base, "--id", numeric_id, "--json"], capture_output=True,
-                                text=True, timeout=30, check=False, env=env)
+                                text=True, encoding="utf-8", errors="replace",
+                                timeout=30, check=False, env=env)
         except subprocess.TimeoutExpired:
             return ThemeBackendCapabilities(self.backend_name, "NETWORK_ERROR", "NETWORK_ERROR")
         except OSError:
@@ -211,6 +213,7 @@ class ShopifyThemeCLI:
             if _unsupported_id_filter(diagnostic):
                 try:
                     probe = self.runner([*base, "--json"], capture_output=True, text=True,
+                                        encoding="utf-8", errors="replace",
                                         timeout=30, check=False, env=env)
                 except subprocess.TimeoutExpired:
                     return ThemeBackendCapabilities(self.backend_name, "NETWORK_ERROR", "NETWORK_ERROR")
@@ -295,7 +298,7 @@ class ShopifyThemeCLI:
         env = os.environ.copy()
         env["SHOPIFY_CLI_THEME_TOKEN"] = password
         try:
-            result = self.runner(command, capture_output=True, text=True, timeout=120, check=False, env=env)
+            result = self.runner(command, capture_output=True, text=False, timeout=120, check=False, env=env)
         except Exception:
             return None
         # Never return or log raw subprocess output; it can echo environment values.

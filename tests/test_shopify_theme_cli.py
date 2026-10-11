@@ -526,6 +526,24 @@ def test_cli_id_filter_fallback_uses_exact_local_filter(tmp_path, monkeypatch):
     assert any("--id" not in command for command, _ in runner.calls if command[1:3] == ["theme", "list"])
 
 
+def test_cli_probes_decode_utf8_and_pull_push_capture_binary(tmp_path, monkeypatch):
+    cli, runner, _, _ = setup(tmp_path, monkeypatch)
+    runner.themes = [{"id": "123", "name": "主題 🏷️ Collection", "role": "main"}]
+    runner.unsupported_id_filter = True
+    capability = cli.capability_status("store-a", theme_id="123")
+    assert capability.ready and capability.details["verified_theme_name"] == "主題 🏷️ Collection"
+    version_call = next(kwargs for command, kwargs in runner.calls if command[1:] == ["version"])
+    theme_list_calls = [kwargs for command, kwargs in runner.calls if command[1:3] == ["theme", "list"]]
+    assert version_call["encoding"] == "utf-8" and version_call["errors"] == "replace"
+    assert len(theme_list_calls) == 2
+    assert all(call["encoding"] == "utf-8" and call["errors"] == "replace" for call in theme_list_calls)
+    cli.read_file("store-a", "example.myshopify.com", "123", TARGET_FILE)
+    invoke_calls = [(command, kwargs) for command, kwargs in runner.calls
+                    if command[1:3] in (["theme", "pull"], ["theme", "push"])]
+    assert invoke_calls and all(kwargs["capture_output"] is True and kwargs["text"] is False
+                                for _, kwargs in invoke_calls)
+
+
 def test_router_cli_not_ready_when_theme_identity_unverified(tmp_path, monkeypatch):
     cli, _, _, _ = setup(tmp_path, monkeypatch)
     graph = type("NoGraphQL", (), {"backend_name": "ADMIN_GRAPHQL",

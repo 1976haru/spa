@@ -74,6 +74,74 @@ def _json(value): return json.dumps(value, ensure_ascii=False, sort_keys=True, s
 def _hash(value): return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
 
 
+def normalize_shopify_product_reference(value, selected_products) -> tuple[str | None, str]:
+    """Map an explicitly supported scalar reference to one selected product GID."""
+    rows = selected_products if isinstance(selected_products, list) else []
+    by_gid, by_numeric, by_handle = {}, {}, {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        gid, handle = str(row.get("shopify_product_id") or ""), row.get("shopify_handle")
+        match = re.fullmatch(r"gid://shopify/Product/([1-9][0-9]*)", gid)
+        if not match:
+            continue
+        by_gid[gid] = gid
+        by_numeric.setdefault(match.group(1), []).append(gid)
+        if isinstance(handle, str) and handle:
+            by_handle.setdefault(handle, []).append(gid)
+    if isinstance(value, bool) or value is None or isinstance(value, (dict, list, tuple)):
+        return None, "UNKNOWN"
+    if isinstance(value, int):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value
+    else:
+        return None, "UNKNOWN"
+    if text in by_gid:
+        return by_gid[text], "GID"
+    if re.fullmatch(r"[0-9]+", text):
+        matches = by_numeric.get(str(int(text)), [])
+        return (matches[0], "NUMERIC") if len(matches) == 1 else (None, "UNKNOWN")
+    matches = by_handle.get(text, [])
+    return (matches[0], "HANDLE") if len(matches) == 1 else (None, "UNKNOWN")
+
+
+def normalize_shopify_product_reference_list(values, selected_products) -> dict:
+    """Normalize ordered product_list references; mixed formats are allowed only when each maps uniquely."""
+    count = len(values) if isinstance(values, list) else (0 if values is None else 1)
+    if not isinstance(values, list):
+        return {"canonical_ids": [], "format": "UNKNOWN", "reference_count": count, "valid": False}
+    pairs = [normalize_shopify_product_reference(value, selected_products) for value in values]
+    formats = {kind for canonical, kind in pairs if canonical is not None}
+    known = bool(pairs) and all(canonical is not None for canonical, _ in pairs)
+    ref_format = (next(iter(formats)) if known and len(formats) == 1
+                  else "MIXED" if known else "UNKNOWN")
+    canonical_ids = [canonical for canonical, _ in pairs] if known else []
+    return {"canonical_ids": canonical_ids, "format": ref_format,
+            "reference_count": count, "valid": known}
+
+
+def compare_shopify_product_references(actual_values, selected_products) -> dict:
+    """Require exactly four unique selected product identities in the selected order."""
+    selected = selected_products if isinstance(selected_products, list) else []
+    expected = [str(item.get("shopify_product_id") or "") for item in selected if isinstance(item, dict)]
+    normalized = normalize_shopify_product_reference_list(actual_values, selected)
+    valid_expected = (len(selected) == len(expected) == 4 and len(set(expected)) == 4
+                      and all(re.fullmatch(r"gid://shopify/Product/[1-9][0-9]*", gid) for gid in expected))
+    logical_match = bool(valid_expected and normalized["valid"]
+                         and normalized["reference_count"] == 4
+                         and len(set(normalized["canonical_ids"])) == 4
+                         and normalized["canonical_ids"] == expected)
+    return {"actual_reference_count": normalized["reference_count"],
+            "expected_reference_count": len(expected),
+            "actual_reference_format": normalized["format"],
+            "logical_product_ids_match": logical_match,
+            "product_ids_match": logical_match,
+            "raw_product_references_equal": actual_values == expected,
+            "product_reference_normalized": bool(logical_match and actual_values != expected),
+            "canonical_ids": normalized["canonical_ids"] if logical_match else []}
+
+
 def _same_theme_id(left, right):
     def normalize(value):
         raw = str(value or "").strip()
@@ -877,6 +945,9 @@ class FeaturedProductThemeApplyService:
         config, selected = context["config"], context["selected"]
         backend, backend_name, backend_reason = context["backend"], context["backend_name"], context["backend_reason"]
         legacy_id, guard, expected_ids = context["legacy_id"], context["guard"], context["expected_ids"]
+        product_field = preview["capability"].get("product_field") or {}
+        product_field_id = product_field.get("id")
+        product_field_type = product_field.get("type")
         from .theme_write_backend import ThemeFileWriteRequest, ThemeWriteBackendRouter
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         folder = self.export_dir / "theme_backups" / str(store_id) / (stamp + "-featured-products")
@@ -886,6 +957,8 @@ class FeaturedProductThemeApplyService:
             "plan_id": plan_id, "preview_hash": preview["preview_hash"], "section_id": section_id,
             "before_raw_hash": document.raw_hash, "before_semantic_hash": document.semantic_hash,
             "proposed_raw_hash": proposed_doc.raw_hash, "selected_products": items, "timestamp": _now(),
+            "product_field_id": product_field_id, "product_field_type": product_field_type,
+            "product_reference_format_written": "gid",
             "backend_name": backend_name, "backend_selection": backend_selection,
             "backend_reason_code": backend_reason}
         (folder / "before.raw.json").write_text(before_raw, encoding="utf-8", newline="")
@@ -921,10 +994,12 @@ class FeaturedProductThemeApplyService:
         except (ValueError, ShopifyJsonDocumentError, RuntimeError):
             after_result = None
         facts = self._post_write_facts(document, proposed_doc, after_result, section_id=section_id,
-            product_field_id=preview["capability"]["product_field"]["id"], expected_ids=expected_ids,
+            product_field_id=product_field_id, expected_ids=expected_ids,
+            selected_products=items, product_field_type=product_field_type,
+            reference_contract="THEME_SCHEMA_VERIFIED",
             legacy_id=legacy_id, store_id=str(store_id), expected_backend=backend_name,
             expected_theme_id=theme["id"], expected_filename=filename)
-        verified = facts["reason_code"] == "POST_WRITE_VERIFIED"
+        verified = facts["reason_code"] in {"POST_WRITE_VERIFIED", "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED"}
         status = "REMOTE_JSON_VERIFIED" if verified else "VERIFY_FAILED"
         with connect(self.db) as con:
             con.execute("UPDATE homepage_featured_theme_backups SET status=? WHERE backup_id=?", (status, backup_id))
@@ -935,13 +1010,20 @@ class FeaturedProductThemeApplyService:
 
     @staticmethod
     def _post_write_facts(before_doc, proposed_doc, current_result, *, section_id, product_field_id,
-                          expected_ids, legacy_id, store_id, expected_backend, expected_theme_id,
-                          expected_filename):
+                          expected_ids, selected_products, product_field_type=None,
+                          reference_contract="THEME_SCHEMA_VERIFIED", legacy_id, store_id,
+                          expected_backend, expected_theme_id, expected_filename):
         base = {"backend_name": expected_backend, "theme_id": expected_theme_id,
                 "theme_role": "MAIN", "expected_proposed_raw_hash": proposed_doc.raw_hash,
                 "expected_proposed_semantic_hash": proposed_doc.semantic_hash,
                 "raw_equal": False, "semantic_equal": False, "prefix_equal": False,
                 "suffix_equal": False, "product_ids_match": False,
+                "actual_reference_count": 0, "expected_reference_count": 4,
+                "actual_reference_format": "UNKNOWN", "logical_product_ids_match": False,
+                "raw_product_references_equal": False, "product_reference_normalized": False,
+                "product_reference_semantic_equal": False,
+                "product_field_id": product_field_id, "product_field_type": product_field_type,
+                "reference_contract": reference_contract,
                 "unrelated_sections_unchanged": False}
         if current_result is None:
             return {**base, "reason_code": "POST_WRITE_READ_FAILED", "current_raw_hash": None,
@@ -958,8 +1040,20 @@ class FeaturedProductThemeApplyService:
             return {**base, "reason_code": "POST_WRITE_SEMANTIC_MISMATCH",
                     "current_raw_hash": current_result.raw_sha256, "current_semantic_hash": None}
         current = current_doc.parsed
-        actual_ids = (((current or {}).get("sections") or {}).get(section_id) or {}).get(
-            "settings", {}).get(product_field_id, []) if isinstance(current, dict) else []
+        actual_values = (((current or {}).get("sections") or {}).get(section_id) or {}).get(
+            "settings", {}).get(product_field_id) if isinstance(current, dict) else None
+        references = compare_shopify_product_references(actual_values, selected_products)
+        proposed_values = (((proposed_doc.parsed.get("sections") or {}).get(section_id) or {}).get(
+            "settings") or {}).get(product_field_id)
+        proposed_refs = compare_shopify_product_references(proposed_values, selected_products)
+        normalized_semantic_equal = False
+        if (product_field_type in {"product", "product_list"}
+                and references["logical_product_ids_match"]
+                and proposed_refs["logical_product_ids_match"]):
+            proposed_normalized, current_normalized = deepcopy(proposed_doc.parsed), deepcopy(current)
+            proposed_normalized["sections"][section_id]["settings"][product_field_id] = expected_ids
+            current_normalized["sections"][section_id]["settings"][product_field_id] = expected_ids
+            normalized_semantic_equal = proposed_normalized == current_normalized
         guard = validate_isolated_featured_diff(before_doc.parsed, current, section_id,
                                                  legacy_id=legacy_id, store_id=store_id)
         facts = {**base, "current_raw_hash": current_doc.raw_hash,
@@ -968,12 +1062,15 @@ class FeaturedProductThemeApplyService:
             "semantic_equal": current_doc.semantic_hash == proposed_doc.semantic_hash,
             "prefix_equal": current_doc.prefix == proposed_doc.prefix,
             "suffix_equal": current_doc.suffix == proposed_doc.suffix,
-            "product_ids_match": actual_ids == expected_ids and len(actual_ids) == 4,
+            **{key: value for key, value in references.items() if key != "canonical_ids"},
+            "product_reference_semantic_equal": normalized_semantic_equal,
             "unrelated_sections_unchanged": guard["safe"]}
         if not facts["product_ids_match"]:
             reason = "POST_WRITE_PRODUCT_IDS_MISMATCH"
         elif not facts["unrelated_sections_unchanged"]:
             reason = "POST_WRITE_UNRELATED_SECTION_DRIFT"
+        elif not facts["semantic_equal"] and facts["product_reference_semantic_equal"]:
+            reason = "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED"
         elif not facts["semantic_equal"]:
             reason = "POST_WRITE_SEMANTIC_MISMATCH"
         elif not facts["prefix_equal"] or not facts["suffix_equal"]:
@@ -1005,11 +1102,21 @@ class FeaturedProductThemeApplyService:
         expected_ids = [item.get("shopify_product_id") for item in selected_products]
         section = ((proposed_doc.parsed.get("sections") or {}).get(row["section_id"]) or {})
         settings = section.get("settings") or {}
-        product_field_id = next((key for key, value in settings.items() if value == expected_ids), None)
+        derived_field_id = next((key for key, value in settings.items() if value == expected_ids), None)
+        metadata_field_id = metadata.get("product_field_id")
+        if metadata_field_id is not None and metadata_field_id != derived_field_id:
+            return {"status": "DIAGNOSIS_FAILED", "reason_code": "POST_WRITE_PRODUCT_IDS_MISMATCH",
+                    "backup_id": backup_id, "backend_name": row.get("backend_name"),
+                    "write_performed": False}
+        product_field_id = metadata_field_id or derived_field_id
         if not product_field_id:
             return {"status": "DIAGNOSIS_FAILED", "reason_code": "POST_WRITE_PRODUCT_IDS_MISMATCH",
                     "backup_id": backup_id, "backend_name": row.get("backend_name"),
                     "write_performed": False}
+        stored_field_type = metadata.get("product_field_type")
+        product_field_type = stored_field_type if stored_field_type in {"product", "product_list"} else "product_list"
+        reference_contract = ("THEME_SCHEMA_VERIFIED" if stored_field_type in {"product", "product_list"}
+                              else "LEGACY_BACKUP_INFERRED")
         from .featured_theme_backend import FeaturedThemeBackendCoordinator
         coordinator = backend_coordinator or FeaturedThemeBackendCoordinator(
             db=self.db, client_factory=self.client_factory, client=client)
@@ -1041,6 +1148,8 @@ class FeaturedProductThemeApplyService:
                 current_result = None
         facts = self._post_write_facts(before_doc, proposed_doc, current_result,
             section_id=row["section_id"], product_field_id=product_field_id, expected_ids=expected_ids,
+            selected_products=selected_products, product_field_type=product_field_type,
+            reference_contract=reference_contract,
             legacy_id=legacy_featured_id_for_store(row["store_id"]), store_id=row["store_id"],
             expected_backend=selection, expected_theme_id=row["theme_id"], expected_filename=row["filename"])
         if not identity_ok:
@@ -1052,7 +1161,8 @@ class FeaturedProductThemeApplyService:
     def adopt_verified_remote(self, backup_id: str, diagnosis: dict | None = None, *, confirmed: bool = False,
                               backend_coordinator=None, client=None) -> dict:
         """Re-diagnose immediately before local adoption; never performs a Shopify write."""
-        allowed = {"POST_WRITE_VERIFIED", "POST_WRITE_RAW_ONLY_NORMALIZED"}
+        allowed = {"POST_WRITE_VERIFIED", "POST_WRITE_RAW_ONLY_NORMALIZED",
+                   "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED"}
         with connect(self.db) as con:
             row = con.execute("SELECT * FROM homepage_featured_theme_backups WHERE backup_id=?",
                               (backup_id,)).fetchone()
@@ -1064,9 +1174,12 @@ class FeaturedProductThemeApplyService:
         immutable_ok = (diagnosis is None or
             (diagnosis.get("backup_id") == backup_id
              and diagnosis.get("expected_proposed_raw_hash") == row["proposed_raw_hash"]))
+        semantic_safe = (fresh.get("semantic_equal") is True
+                         or (fresh.get("reason_code") == "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED"
+                             and fresh.get("product_reference_semantic_equal") is True))
         safe = (fresh.get("reason_code") in allowed
                 and fresh.get("expected_proposed_raw_hash") == row["proposed_raw_hash"]
-                and fresh.get("semantic_equal") is True
+                and semantic_safe
                 and fresh.get("product_ids_match") is True
                 and fresh.get("unrelated_sections_unchanged") is True
                 and fresh.get("prefix_equal") is True and fresh.get("suffix_equal") is True
@@ -1077,6 +1190,9 @@ class FeaturedProductThemeApplyService:
         audit = {key: fresh.get(key) for key in ("reason_code", "current_raw_hash", "expected_proposed_raw_hash",
                 "current_semantic_hash", "expected_proposed_semantic_hash", "raw_equal", "semantic_equal",
                 "prefix_equal", "suffix_equal", "product_ids_match", "unrelated_sections_unchanged",
+                "actual_reference_count", "expected_reference_count", "actual_reference_format",
+                "logical_product_ids_match", "raw_product_references_equal", "product_reference_normalized",
+                "product_reference_semantic_equal", "product_field_id", "product_field_type", "reference_contract",
                 "backend_name", "theme_id", "theme_role", "backup_id", "write_performed")}
         Path(row["folder"]).joinpath("post_write_diagnosis.json").write_text(
             json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")

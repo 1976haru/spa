@@ -12,7 +12,8 @@ from shopsource.featured_guided_flow import (record_featured_apply_result,
 from shopsource.homepage_assignment import HomepageAssignmentService, homepage_assignment_workflow
 from shopsource.homepage_featured_products import (
     FeaturedProductAssignmentService, ShopifyExistingProductReader, discover_featured_product_schema,
-    merchandising_suitability, normalize_merchandising_group, validate_isolated_featured_diff,
+    compare_shopify_product_references, merchandising_suitability, normalize_merchandising_group,
+    validate_isolated_featured_diff,
 )
 from shopsource.shopify_theme_ids import is_valid_shopify_instance_id, legacy_featured_id_for_store, legacy_shopify_instance_kind, shopify_instance_id
 from shopsource.homepage_automation import _managed_id
@@ -547,6 +548,8 @@ class StubThemeTransport:
         self.ready, self.write_mode = ready, write_mode
         self.write_attempts, self.read_calls = 0, 0
         self.verified_role = "MAIN"
+        self.reference_handles = {}
+        self.product_section_id = None
 
     def capability_status(self, _store_id, *, theme_id=None):
         return ThemeBackendCapabilities(self.backend_name, "READY" if self.ready else "UNAVAILABLE",
@@ -573,6 +576,41 @@ class StubThemeTransport:
             parsed = json.loads(self.raw.split("*/", 1)[-1])
             parsed["unrelated_after_write"] = True
             self.raw = "/* Shopify header comment */\n" + json.dumps(parsed) + "\n"
+        if self.write_mode.startswith("references_"):
+            prefix, payload = self.raw.split("*/", 1)
+            parsed = json.loads(payload)
+            settings = parsed["sections"][self.product_section_id]["settings"]
+            refs = settings["products"]
+            tails = [value.rsplit("/", 1)[-1] for value in refs]
+            if self.write_mode == "references_numeric":
+                refs = [int(value) for value in tails]
+            elif self.write_mode == "references_handles":
+                refs = [self.reference_handles[value] for value in refs]
+            elif self.write_mode == "references_mixed":
+                refs = [int(tail) if index % 2 else self.reference_handles[value]
+                        for index, (value, tail) in enumerate(zip(refs, tails))]
+            elif self.write_mode == "references_wrong_handle":
+                refs[1] = "not-a-selected-product"
+            elif self.write_mode == "references_wrong_numeric":
+                refs[1] = 999999
+            elif self.write_mode == "references_missing":
+                refs.pop()
+            elif self.write_mode == "references_extra":
+                refs.append(999999)
+            elif self.write_mode == "references_duplicate":
+                refs[-1] = refs[0]
+            elif self.write_mode == "references_reordered":
+                refs.reverse()
+            elif self.write_mode == "references_object":
+                refs[0] = {"id": refs[0]}
+            elif self.write_mode == "references_heading_drift":
+                settings["heading"] = "Merchant changed heading"
+            elif self.write_mode == "references_other_setting_drift":
+                settings["other_setting"] = "Merchant changed another setting"
+            elif self.write_mode == "references_unrelated_section_drift":
+                parsed["sections"]["merchant"]["settings"]["text"] = "Merchant changed"
+            settings["products"] = refs
+            self.raw = prefix + "*/\n" + json.dumps(parsed, ensure_ascii=False) + "\n"
         return ThemeFileWriteResult("WRITE_ATTEMPTED", self.backend_name, request.filename, True)
 
 
@@ -962,6 +1000,8 @@ def test_theme_access_featured_apply_end_to_end_to_assignment_ready(tmp_path, mo
 def _postwrite_backup(tmp_path, monkeypatch, *, write_mode="success"):
     db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
     cli = StubThemeTransport("THEME_ACCESS_CLI", client.raw, write_mode=write_mode)
+    cli.reference_handles = {item["shopify_product_id"]: item["shopify_handle"] for item in plan["items"]}
+    cli.product_section_id = preview["section_id"]
     coordinator = StubThemeCoordinator(StubThemeTransport("ADMIN_GRAPHQL", client.raw), cli,
                                        auto="THEME_ACCESS_CLI")
     preflight = writer.preflight(plan["plan_id"], preview, store_id="s1",
@@ -1087,6 +1127,132 @@ def test_old_store001_verify_failed_backup_metadata_remains_diagnosable(tmp_path
     assert diagnosis["reason_code"] == "POST_WRITE_RAW_ONLY_NORMALIZED"
     assert diagnosis["backend_reason_code"] == "GRAPHQL_SCOPE_MISSING_CLI_READY"
     assert cli.write_attempts == 1
+
+
+@pytest.mark.parametrize(("write_mode", "reason", "reference_format", "status"), [
+    ("success", "POST_WRITE_VERIFIED", "GID", "REMOTE_JSON_VERIFIED"),
+    ("references_numeric", "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED", "NUMERIC", "REMOTE_JSON_VERIFIED"),
+    ("references_handles", "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED", "HANDLE", "REMOTE_JSON_VERIFIED"),
+    ("references_mixed", "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED", "MIXED", "REMOTE_JSON_VERIFIED"),
+    ("references_wrong_handle", "POST_WRITE_PRODUCT_IDS_MISMATCH", "UNKNOWN", "VERIFY_FAILED"),
+    ("references_wrong_numeric", "POST_WRITE_PRODUCT_IDS_MISMATCH", "UNKNOWN", "VERIFY_FAILED"),
+    ("references_missing", "POST_WRITE_PRODUCT_IDS_MISMATCH", "GID", "VERIFY_FAILED"),
+    ("references_extra", "POST_WRITE_PRODUCT_IDS_MISMATCH", "UNKNOWN", "VERIFY_FAILED"),
+    ("references_duplicate", "POST_WRITE_PRODUCT_IDS_MISMATCH", "GID", "VERIFY_FAILED"),
+    ("references_reordered", "POST_WRITE_PRODUCT_IDS_MISMATCH", "GID", "VERIFY_FAILED"),
+    ("references_object", "POST_WRITE_PRODUCT_IDS_MISMATCH", "UNKNOWN", "VERIFY_FAILED"),
+    ("references_heading_drift", "POST_WRITE_SEMANTIC_MISMATCH", "GID", "VERIFY_FAILED"),
+    ("references_other_setting_drift", "POST_WRITE_SEMANTIC_MISMATCH", "GID", "VERIFY_FAILED"),
+    ("references_unrelated_section_drift", "POST_WRITE_UNRELATED_SECTION_DRIFT", "GID", "VERIFY_FAILED"),
+])
+def test_postwrite_product_reference_formats_and_mismatch_matrix(
+        tmp_path, monkeypatch, write_mode, reason, reference_format, status):
+    db, plan, preview, writer, cli, _coordinator, _preflight, applied = _postwrite_backup(
+        tmp_path, monkeypatch, write_mode=write_mode)
+    assert applied["status"] == status
+    assert applied["reason_code"] == reason
+    assert applied["actual_reference_format"] == reference_format
+    assert applied["actual_reference_count"] == (5 if write_mode == "references_extra" else
+        3 if write_mode == "references_missing" else 4)
+    assert applied["expected_reference_count"] == 4
+    assert applied["logical_product_ids_match"] is (reason != "POST_WRITE_PRODUCT_IDS_MISMATCH")
+    assert cli.write_attempts == 1
+    if reason == "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED":
+        assert applied["product_reference_normalized"] is True
+        assert applied["product_reference_semantic_equal"] is True
+        assert applied["semantic_equal"] is False
+        assert applied["unrelated_sections_unchanged"] is True
+        assert applied["prefix_equal"] and applied["suffix_equal"]
+        assert applied["reference_contract"] == "THEME_SCHEMA_VERIFIED"
+    if "drift" in write_mode or "heading" in write_mode or "other_setting" in write_mode:
+        assert applied["product_reference_semantic_equal"] is False
+
+
+def test_product_reference_comparison_is_exact_ordered_and_identity_based():
+    selected = [{"shopify_product_id": f"gid://shopify/Product/{i}", "shopify_handle": f"item-{i}"}
+                for i in range(1, 5)]
+    assert compare_shopify_product_references([f"gid://shopify/Product/{i}" for i in range(1, 5)], selected)["actual_reference_format"] == "GID"
+    assert compare_shopify_product_references([1, 2, 3, 4], selected)["logical_product_ids_match"] is True
+    assert compare_shopify_product_references(["item-1", "item-2", "item-3", "item-4"], selected)["logical_product_ids_match"] is True
+    assert compare_shopify_product_references(["item-1", 2, "item-3", 4], selected)["actual_reference_format"] == "MIXED"
+    for values in (["item-1", "wrong", "item-3", "item-4"], [1, 2, 3, 99],
+                   ["item-1", "item-2", "item-3"], ["item-1", "item-2", "item-3", "item-4", 5],
+                   ["item-1", "item-2", "item-3", "item-3"],
+                   ["item-4", "item-3", "item-2", "item-1"], [{"id": "gid://shopify/Product/1"}, 2, 3, 4]):
+        assert compare_shopify_product_references(values, selected)["logical_product_ids_match"] is False
+
+
+def test_postwrite_product_reference_normalization_one_write_to_assignment_ready(tmp_path, monkeypatch):
+    db, plan, preview, writer, cli, coordinator, preflight, applied = _postwrite_backup(
+        tmp_path, monkeypatch, write_mode="references_handles")
+    assert applied["status"] == "REMOTE_JSON_VERIFIED"
+    assert applied["reason_code"] == "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED"
+    assert cli.write_attempts == 1
+    state = {"featured_products_reviewed_plan_id": plan["plan_id"],
+             "featured_preflight_plan_id": plan["plan_id"],
+             "featured_preflight_preview_hash": preview["preview_hash"]}
+    last_apply = record_featured_apply_result(state, applied, plan["plan_id"])
+    refreshed = FeaturedProductAssignmentService(db=db).get_plan(plan["plan_id"])
+    step6 = resolve_featured_guided_state(state, refreshed, preview, preflight, last_apply)
+    assert (step6["current_step"], step6["primary_action"]) == (6, "OPEN_STOREFRONT")
+    assignment = FeaturedProductAssignmentService(db=db)
+    storefront = assignment.confirm_storefront(plan["plan_id"], checks={
+        "desktop_title": True, "four_cards": True, "product_links": True, "mobile_section": True}, confirmed=True)
+    record_featured_storefront_result(state, storefront)
+    refreshed = assignment.get_plan(plan["plan_id"])
+    step7 = resolve_featured_guided_state(state, refreshed, preview, preflight, last_apply)
+    assert storefront["status"] == "STOREFRONT_VERIFIED"
+    assert (step7["current_step"], step7["primary_action"]) == (7, "OPEN_ASSIGNMENT_CHECK")
+    checklist = assignment.checklist(refreshed, remote_verified=True, storefront_verified=True)
+    record_featured_assignment_result(state, checklist)
+    done = resolve_featured_guided_state(state, refreshed, preview, preflight, last_apply)
+    assert checklist["status"] == "ASSIGNMENT_READY" and done["primary_action"] == "NONE"
+    assert cli.write_attempts == 1
+
+
+def test_postwrite_normalized_reference_restart_diagnosis_and_adoption_no_second_write(tmp_path, monkeypatch):
+    db, plan, preview, writer, cli, coordinator, preflight, applied = _postwrite_backup(
+        tmp_path, monkeypatch, write_mode="references_handles")
+    assert applied["reason_code"] == "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED"
+    with connect(db) as con:
+        backup = con.execute("SELECT folder FROM homepage_featured_theme_backups WHERE backup_id=?",
+                             (applied["backup_id"],)).fetchone()
+        con.execute("UPDATE homepage_featured_theme_backups SET status='VERIFY_FAILED' WHERE backup_id=?",
+                    (applied["backup_id"],))
+        con.execute("UPDATE homepage_featured_product_plans SET status='READY',remote_json_verified=0 WHERE plan_id=?",
+                    (plan["plan_id"],))
+    folder = Path(backup["folder"])
+    metadata = json.loads((folder / "metadata.json").read_text(encoding="utf-8"))
+    metadata.pop("product_field_id", None)
+    metadata.pop("product_field_type", None)
+    metadata.pop("product_reference_format_written", None)
+    (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    durable = writer.latest_post_write_backup("s1", plan["plan_id"])
+    restarted = {"featured_products_plan": FeaturedProductAssignmentService(db=db).get_plan(plan["plan_id"])}
+    hydrate_featured_postwrite_state(restarted, restarted["featured_products_plan"], durable)
+    failure = restarted["featured_last_apply_result"]
+    assert failure["reason_code"] == "POST_WRITE_DIAGNOSIS_REQUIRED"
+    assert resolve_featured_guided_state(restarted, restarted["featured_products_plan"], None, None, failure)["primary_action"] == "DIAGNOSE_POST_WRITE"
+    writes_before_diagnosis = cli.write_attempts
+    diagnosis = writer.diagnose_post_write(applied["backup_id"], backend_coordinator=coordinator)
+    assert diagnosis["reason_code"] == "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED"
+    assert diagnosis["reference_contract"] == "LEGACY_BACKUP_INFERRED"
+    assert diagnosis["actual_reference_format"] == "HANDLE" and diagnosis["product_reference_semantic_equal"]
+    assert cli.write_attempts == writes_before_diagnosis == 1
+    restarted["featured_postwrite_diagnosis"] = diagnosis
+    failure["reason_code"] = diagnosis["reason_code"]
+    adopt_flow = resolve_featured_guided_state(restarted, restarted["featured_products_plan"], None, None, failure)
+    assert adopt_flow["primary_action"] == "ADOPT_POST_WRITE"
+    reads_before_adoption = cli.read_calls
+    adopted = writer.adopt_verified_remote(applied["backup_id"], diagnosis, confirmed=True,
+                                            backend_coordinator=coordinator)
+    assert adopted["status"] == "REMOTE_JSON_VERIFIED"
+    assert cli.read_calls == reads_before_adoption + 1
+    assert cli.write_attempts == 1
+    refreshed = FeaturedProductAssignmentService(db=db).get_plan(plan["plan_id"])
+    step6 = resolve_featured_guided_state(restarted, refreshed, None, None, adopted)
+    assert (step6["current_step"], step6["primary_action"]) == (6, "OPEN_STOREFRONT")
 
 
 @pytest.mark.parametrize("case,expected", [

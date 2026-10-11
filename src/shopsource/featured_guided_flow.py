@@ -21,7 +21,9 @@ def record_featured_apply_result(state: dict, result: dict, plan_id: str | None)
     last_result = {
         key: result.get(key) for key in
         ("status", "reason", "reason_code", "backend_name", "backend_reason_code",
-         "backup_id", "write_performed")
+         "backup_id", "write_performed", "actual_reference_count", "expected_reference_count",
+         "actual_reference_format", "logical_product_ids_match", "raw_product_references_equal",
+         "product_reference_normalized", "product_reference_semantic_equal", "unrelated_sections_unchanged")
     }
     last_result["status"] = status
     last_result["reason_code"] = reason_code
@@ -117,6 +119,23 @@ def resolve_featured_guided_state(state: dict | None, plan: dict | None, preview
         return finish(5, "DIAGNOSE_POST_WRITE", "5단계 · 이전 적용 결과 읽기 전용 진단",
                       "이전 적용 시도가 있습니다. 다시 적용하지 않고 현재 MAIN 테마를 읽어 실제 상태를 확인합니다.")
 
+    if (state.get("featured_last_apply_plan_id") == plan_id
+            and last_apply_result.get("status") == "VERIFY_FAILED"):
+        steps[3]["status"] = "complete"
+        diagnosis = state.get("featured_postwrite_diagnosis") or {}
+        if not diagnosis:
+            return finish(5, "DIAGNOSE_POST_WRITE", "5단계 · 이전 적용 결과 읽기 전용 진단",
+                          "현재 MAIN 테마를 읽기 전용으로 확인합니다. 재적용하지 않습니다.")
+        reason = diagnosis.get("reason_code")
+        if reason in {"POST_WRITE_VERIFIED", "POST_WRITE_RAW_ONLY_NORMALIZED",
+                      "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED"}:
+            label = "검증 상태 확정" if reason == "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED" else "검증 상태 확정"
+            return finish(5, "ADOPT_POST_WRITE", label,
+                          "Shopify에 다시 쓰지 않고 fresh read-only 재진단 후 로컬 상태만 갱신합니다.")
+        return finish(5, "NONE", "5단계 상품 연결 불일치",
+                      "상품 일치를 찾지 못했습니다. 다시 적용하지 마세요.",
+                      problem_code=reason, can_advance=False)
+
     if (plan.get("status") in {"REMOTE_JSON_VERIFIED", "STOREFRONT_VERIFIED"}
             or plan.get("remote_json_verified")):
         steps[1]["status"] = "complete"
@@ -162,9 +181,12 @@ def resolve_featured_guided_state(state: dict | None, plan: dict | None, preview
         if not diagnosis:
             return finish(5, "DIAGNOSE_POST_WRITE", "5단계 적용 결과 확인 필요",
                           "Shopify에 다시 쓰지 않고 현재 MAIN 테마의 저장 결과를 읽기 전용으로 진단합니다.")
-        if reason in {"POST_WRITE_VERIFIED", "POST_WRITE_RAW_ONLY_NORMALIZED"}:
+        if reason in {"POST_WRITE_VERIFIED", "POST_WRITE_RAW_ONLY_NORMALIZED",
+                      "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED"}:
             label = ("검증 상태 확정" if reason == "POST_WRITE_VERIFIED" else
                      "내용상 동일함 확인 및 검증 상태 확정")
+            if reason == "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED":
+                label = "검증 상태 확정"
             return finish(5, "ADOPT_POST_WRITE", label,
                           "Shopify에 다시 쓰지 않고 로컬 검증 상태만 갱신합니다.")
         return finish(5, "NONE", "5단계 적용 결과 확인 필요",
