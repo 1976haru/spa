@@ -99,7 +99,27 @@ def test_verified_apply_storefront_and_assignment_steps():
 
     state["featured_assignment_status"] = "STOREFRONT_VERIFIED"
     flow = resolve_featured_guided_state(state, verified_plan, preview, preflight, last_apply)
-    assert flow["primary_action"] == "NONE"
+    assert (flow["current_step"], flow["primary_action"]) == (7, "OPEN_ASSIGNMENT_CHECK")
+
+
+def test_step6_storefront_confirmation_advances_without_completing_assignment():
+    plan, preview = _plan(), _preview()
+    state, preflight = _preflight(_reviewed_state(), plan, preview)
+    last_apply = {"status": "REMOTE_JSON_VERIFIED"}
+    state["featured_last_apply_plan_id"] = plan["plan_id"]
+
+    before_confirmation = resolve_featured_guided_state(state, plan, preview, preflight, last_apply)
+    assert (before_confirmation["current_step"], before_confirmation["primary_action"]) == (6, "OPEN_STOREFRONT")
+
+    # confirm_storefront() persists storefront_verified on the refreshed durable plan;
+    # its status is not assignment completion and assignment remains unset.
+    confirmed_plan = _plan(status="STOREFRONT_VERIFIED", storefront_verified=True)
+    state["featured_storefront_status"] = "STOREFRONT_VERIFIED"
+    state["featured_assignment_status"] = None
+    after_confirmation = resolve_featured_guided_state(state, confirmed_plan, preview, preflight, last_apply)
+    assert (after_confirmation["current_step"], after_confirmation["primary_action"]) == (7, "OPEN_ASSIGNMENT_CHECK")
+    assert after_confirmation["steps"][5]["status"] == "complete"
+    assert after_confirmation["steps"][6]["status"] == "current"
 
 
 def test_reselection_and_new_preview_invalidate_old_progress():
@@ -132,6 +152,13 @@ def test_guided_ui_has_one_primary_route_and_keeps_recovery_advanced():
     assert '"OPEN_STOREFRONT": featured_storefront_check' in source
     assert '"OPEN_ASSIGNMENT_CHECK": featured_assignment_check' in source
     assert "featured_preflight_plan_id" in source and "featured_preflight_preview_hash" in source
+
+    save_handler = source.split("def save_checks():", 1)[1].split('ui.button("확인 저장"', 1)[0]
+    assert 'state["featured_storefront_status"] = confirmation.get("status")' in save_handler
+    assert 'state["featured_assignment_status"] = None' in save_handler
+    assert '"스토어 확인 완료. 다음은 7단계 과제 제출 확인입니다."' in save_handler
+    assert '"스토어 확인 항목이 아직 남아 있습니다."' in save_handler
+    assert '"추천 상품 상태: " +' not in save_handler
 
     # The guided dispatcher opens the old gate; only the gate callback calls apply.
     dispatcher = source.split("def run_featured_primary_action():", 1)[1].split("async def save_hero_upload", 1)[0]

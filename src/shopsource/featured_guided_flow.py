@@ -118,7 +118,7 @@ def resolve_featured_guided_state(state: dict | None, plan: dict | None, preview
     steps[5]["status"] = "complete"
 
     assignment_status = state.get("featured_assignment_status")
-    if assignment_status not in {"STOREFRONT_VERIFIED", "ASSIGNMENT_READY"}:
+    if assignment_status != "ASSIGNMENT_READY":
         return finish(7, "OPEN_ASSIGNMENT_CHECK", "7단계 · 과제 제출용 확인",
                       "스토어에서 확인한 결과와 제출 체크 항목을 저장합니다.")
     steps[6]["status"] = "complete"

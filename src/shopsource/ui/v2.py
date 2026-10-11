@@ -2455,6 +2455,7 @@ class OperatorUI:
                         state["featured_preflight_preview_hash"] = None
                         state["featured_last_apply_plan_id"] = None
                         state["featured_apply_status"] = "NOT RUN"
+                        state["featured_storefront_status"] = None
                         state["featured_assignment_status"] = None
                         state["preview"] = None
                         state["current_stage"] = "FEATURED_PRODUCTS_READY"
@@ -2675,6 +2676,7 @@ class OperatorUI:
                                 state["featured_preflight_preview_hash"] = preview.get("preview_hash")
                             if result.get("status") == "REMOTE_JSON_VERIFIED":
                                 state["featured_products_plan"] = FeaturedProductAssignmentService().get_plan(plan["plan_id"])
+                                state["featured_storefront_status"] = None
                                 state["featured_assignment_status"] = None
                                 config = get_shopify_connection(self.current_store) or {}
                                 domain = str(config.get("shop_domain") or "").strip().casefold()
@@ -2760,9 +2762,13 @@ class OperatorUI:
                                 "product_links": bool(product_links.value), "mobile_section": bool(mobile_section.value)}
                             confirmation = FeaturedProductAssignmentService().confirm_storefront(plan["plan_id"],
                                 checks=state["featured_human_checks"], confirmed=verified)
+                            state["featured_storefront_status"] = confirmation.get("status")
                             state["featured_assignment_status"] = None
                             state["featured_products_plan"] = FeaturedProductAssignmentService().get_plan(plan["plan_id"])
-                            ui.notify("추천 상품 상태: " + state["featured_assignment_status"], type="positive" if state["featured_assignment_status"] == "STOREFRONT_VERIFIED" else "info")
+                            storefront_verified = bool((state["featured_products_plan"] or {}).get("storefront_verified"))
+                            ui.notify("스토어 확인 완료. 다음은 7단계 과제 제출 확인입니다." if storefront_verified
+                                      else "스토어 확인 항목이 아직 남아 있습니다.",
+                                      type="positive" if storefront_verified else "info")
                             dialog.close()
                             render_featured(state["featured_products_plan"])
                         ui.button("확인 저장", on_click=save_checks).props("color=primary")
