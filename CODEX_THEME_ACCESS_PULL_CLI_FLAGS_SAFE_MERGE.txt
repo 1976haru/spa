@@ -1,0 +1,304 @@
+ShopSource Studio — THEME ACCESS CLI PULL FLAGS SAFE MERGE
+READ-ONLY PULL HOTFIX ONLY
+
+Repository
+- Main repo: D:\shop\001_so_amazon
+- Feature worktree: D:\shop\001_so_amazon_theme_pull_hotfix
+- Remote: https://github.com/1976haru/spa.git
+- Branch: hotfix/theme-access-pull-cli-flags
+- Expected implementation HEAD before this prompt commit: 5461c0a3202d688ed3f60a086fd1048fce45c517
+- Expected main/origin-main: 3eebd1bdbf71bf79588ef0904da874733b6f2975
+
+Feature summary
+- Theme Access CLI theme pull no longer uses unsupported --json
+- theme pull now uses --no-input
+- canonical myshopify domain preserved
+- Theme Access password remains env-only via SHOPIFY_CLI_THEME_TOKEN
+- theme push still retains --json, --nodelete, --strict, --allow-live when needed
+- pull byte preservation covered
+- full suite 1047 passed, 1 skipped
+- Shopify live write 0
+- real credential use/creation 0
+
+Do not run real Store 001 preflight during merge.
+No Shopify live write.
+No real Theme Access credential use.
+No rollback.
+
+======================================================================
+1. CONCURRENCY GATE
+======================================================================
+
+In main repo:
+
+git fetch origin --prune
+
+Record:
+- local main SHA
+- origin/main SHA
+- local feature SHA
+- origin feature SHA
+- merge-base
+- main...feature ahead/behind
+- git status --short
+
+Expected:
+origin/main = 3eebd1bdbf71bf79588ef0904da874733b6f2975
+
+If origin/main moved:
+STOP and report CONCURRENT_MAIN_MOVEMENT.
+Do not auto-rebase/cherry-pick/merge.
+
+Feature HEAD may be one commit ahead of 5461c0a because this safe-merge prompt itself is committed.
+
+======================================================================
+2. PROTECTED FILE GATE
+======================================================================
+
+Record status + SHA256 before merge:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+
+Expected operator-side hashes:
+- stores/001_cabin_tidy.json
+  9A480BE4CD24BF93BEAB8E02483512DB3801F10F506ADC610C38667C5832051F
+- tools/shopify_app/safe_shopify_cli.ps1
+  47A1BDF96BB54ADB0C9C86D7C91962A48EC6C4FDF6A0E73B6EFC8B943C275421
+
+Do not touch/stash/reset/restore:
+- protected files above
+- data/*.sqlite3
+- .env
+- credentials
+- .phase*
+- backups
+- user assets
+- operator temp folders
+
+Existing dirty state must remain byte-for-byte unchanged.
+
+======================================================================
+3. DIFF SCOPE REVIEW
+======================================================================
+
+Expected feature files:
+- CODEX_THEME_ACCESS_PULL_CLI_FLAGS_HOTFIX.txt
+- CODEX_THEME_ACCESS_PULL_CLI_FLAGS_SAFE_MERGE.txt
+- src/shopsource/shopify_theme_cli.py
+- tests/test_shopify_theme_cli.py
+
+Confirm NOT changed:
+- protected files
+- src/shopsource/featured_theme_backend.py
+- src/shopsource/theme_write_backend.py
+- Featured guided-flow files
+- category/reconciliation logic
+
+STOP on unexpected overlap.
+
+======================================================================
+4. HOTFIX SAFETY REVIEW
+======================================================================
+
+Confirm in code/tests:
+
+A. Pull command
+- contains "theme pull"
+- uses verified canonical myshopify domain
+- uses verified numeric theme id
+- uses --only templates/index.json
+- uses isolated --path
+- uses --no-input
+- DOES NOT contain --json
+
+B. Secret transport
+- Theme Access password is supplied only via SHOPIFY_CLI_THEME_TOKEN in subprocess env
+- password is never in argv
+- raw stdout/stderr remains non-returned/non-logged
+- no credential creation/deletion
+
+C. Push remains unchanged
+- theme push still contains --json
+- --nodelete preserved
+- --strict preserved
+- --allow-live only for verified live MAIN path
+- live confirmation gates unchanged
+
+D. Identity safety
+- canonical CLI domain behavior unchanged
+- configured domain binding check unchanged
+- exact theme ID guard unchanged
+- MAIN/role verification unchanged
+- target_is_live logic unchanged
+
+E. Pull content
+- templates/index.json bytes are read exactly
+- comments/CRLF preserved
+- temp cleanup preserved
+- read_file returns read_only metadata
+- pull path performs no Shopify write
+
+If any fail:
+STOP.
+
+======================================================================
+5. PRE-MERGE TEST GATE
+======================================================================
+
+In feature worktree:
+
+python -m compileall -q src tests
+
+Focused:
+python -m pytest -q tests/test_shopify_theme_cli.py tests/test_homepage_featured_products.py tests/test_featured_guided_flow.py tests/test_featured_theme_backend.py tests/test_theme_write_backend.py tests/test_multistore_theme_operations.py tests/test_theme_access_credentials.py tests/test_shopify_g0_readonly_hotfix.py
+
+Full:
+python -m pytest -q --basetemp=<worktree-local-temp>
+
+Also:
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Required:
+FULL SUITE PASS
+Expected >= 1047 passed, 1 skipped
+SHOPIFY LIVE WRITE COUNT = 0
+REAL THEME ACCESS CREDENTIAL USE/CREATION = 0
+
+======================================================================
+6. FAST-FORWARD MERGE ONLY
+======================================================================
+
+Return to main repo.
+
+git fetch origin
+
+Verify origin/main is still exactly the SHA recorded in step 1.
+
+Then:
+git merge --ff-only hotfix/theme-access-pull-cli-flags
+
+If ff-only fails:
+STOP.
+No merge commit.
+No conflict auto-resolution.
+
+======================================================================
+7. POST-MERGE TEST GATE
+======================================================================
+
+On main rerun:
+- compileall
+- focused tests
+- full suite
+- git diff --check
+- CLI help
+- UI help
+
+Verify:
+- protected hashes/status unchanged
+- no credential used/created
+- no Shopify live write
+
+======================================================================
+8. PUSH WITH LAST-SECOND CHECK
+======================================================================
+
+git fetch origin
+
+If origin/main moved:
+STOP BEFORE PUSH.
+Report REMOTE_MAIN_MOVED_AFTER_LOCAL_MERGE.
+Do not force push.
+
+If unchanged:
+git push origin main
+
+Then verify:
+- main == origin/main
+- main...origin/main = 0 0
+
+======================================================================
+9. RETAIN FEATURE WORKTREE
+======================================================================
+
+Retain:
+- hotfix/theme-access-pull-cli-flags
+- D:\shop\001_so_amazon_theme_pull_hotfix
+
+until the first real Store 001 read-only connection recheck succeeds.
+
+======================================================================
+10. SECOND-WINDOW HANDOFF
+======================================================================
+
+Final report must include:
+SECOND_WINDOW_HANDOFF_MAIN_SHA = <new main SHA>
+
+Any other active project window must fetch this SHA before its next main merge.
+
+======================================================================
+11. EXACT NEXT ACTION AFTER SUCCESSFUL MERGE
+======================================================================
+
+Do NOT live apply during merge.
+
+After successful merge:
+1. run ShopSource UI from new main
+2. go to Store 001 > 스토어 디자인 > 홈페이지
+3. follow the one primary Guided Flow action until step 4
+4. if step 4 shows REMOTE_READ_FAILED repair:
+   click "4단계 · 연결 상태 다시 확인"
+5. this explicit action may use the already saved Theme Access credential READ-ONLY
+6. capture the resulting dialog / next guided state
+7. DO NOT click step 5 Shopify apply until the new preflight outcome is reviewed
+
+Useful outcomes after this hotfix:
+- READY_TO_APPLY
+- REMOTE_HASH_DRIFT_RAW_ONLY
+- REMOTE_HASH_DRIFT_SEMANTIC
+- another exact safe reason
+
+======================================================================
+12. FINAL REPORT
+======================================================================
+
+Report:
+[1] pre-merge origin/main SHA
+[2] feature HEAD SHA
+[3] merge-base
+[4] ahead/behind
+[5] protected pre-merge hashes/status
+[6] diff scope
+[7] pull command safety review
+[8] push preservation review
+[9] pre-merge tests
+[10] merge method
+[11] new local main SHA
+[12] post-merge tests
+[13] push result
+[14] final origin/main SHA
+[15] main...origin/main
+[16] protected post-merge hashes/status
+[17] Shopify live write count
+[18] Theme Access credential use/creation count
+[19] feature/worktree retained
+[20] SECOND_WINDOW_HANDOFF_MAIN_SHA
+[21] exact next action
+
+Final flags:
+FAST_FORWARD_ONLY = PASS/FAIL
+THEME_PULL_JSON_REMOVED = YES/NO
+THEME_PUSH_JSON_PRESERVED = YES/NO
+PULL_NO_INPUT = YES/NO
+CANONICAL_DOMAIN_PRESERVED = YES/NO
+PASSWORD_ARGV_EXPOSURE = NO
+READ_ONLY_PULL = YES/NO
+FULL_SUITE_POST_MERGE = PASS/FAIL
+PROTECTED_FILES_UNCHANGED = YES/NO
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_USED = NO
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+MAIN_REMOTE_SYNC = YES/NO
+SECOND_WINDOW_HANDOFF_REQUIRED = YES
