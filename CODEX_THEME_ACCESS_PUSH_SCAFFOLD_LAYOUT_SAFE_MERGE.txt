@@ -1,0 +1,371 @@
+ShopSource Studio — THEME ACCESS PUSH + FEATURED E2E STABILIZATION SAFE MERGE
+ONE COMPRESSED MERGE AFTER FULL MOCK E2E AUDIT
+
+Repository
+- Main repo: D:\shop\001_so_amazon
+- Feature worktree: D:\shop\001_so_amazon_theme_push_layout
+- Remote: https://github.com/1976haru/spa.git
+- Branch: hotfix/theme-access-push-scaffold-layout
+- Expected implementation HEAD before this prompt commit: 3e320f9a5df46cef716729cf54ad28480c15e8fc
+- Expected main/origin-main: acfef6224b6960e1111378287d943f0a37219aa1
+
+Verified feature summary
+- push scaffold now has config/layout/templates
+- pull empty-temp behavior preserved
+- push flags preserved: --only templates/index.json --json --nodelete --strict
+- verified MAIN still requires conditional --allow-live
+- credential remains SHOPIFY_CLI_THEME_TOKEN env-only
+- apply failure reason codes are preserved into safe UI state
+- apply/storefront/assignment state recording centralized in pure helpers
+- mock E2E covers:
+  READY_TO_APPLY
+  -> exact raw backup
+  -> ThemeWriteBackendRouter.write
+  -> push
+  -> post-read
+  -> REMOTE_JSON_VERIFIED
+  -> Guided Flow step 6
+  -> STOREFRONT_VERIFIED
+  -> Guided Flow step 7
+  -> ASSIGNMENT_READY
+- failure mock is fail-closed, no false verify, no auto rollback
+- E2E core tests 2 passed
+- related connection tests 127 passed
+- focused suite 209 passed
+- full suite 1053 passed, 1 skipped
+- synthetic Spark smoke import 1 passed
+- compileall/diff-check/CLI help/UI help passed
+- Shopify live write 0
+- real credential use/creation 0
+
+Goal
+Perform ONE safe merge only. Do not split this into further micro-hotfixes unless an actual merge/test gate fails.
+
+No real Shopify write during merge.
+No real Theme Access credential use.
+No rollback.
+
+======================================================================
+1. CONCURRENCY GATE
+======================================================================
+
+In main repo:
+
+git fetch origin --prune
+
+Record:
+- local main SHA
+- origin/main SHA
+- local feature SHA
+- origin feature SHA
+- merge-base
+- main...feature ahead/behind
+- git status --short
+
+Expected:
+origin/main = acfef6224b6960e1111378287d943f0a37219aa1
+
+If origin/main moved:
+STOP and report CONCURRENT_MAIN_MOVEMENT.
+Do not auto-rebase/cherry-pick/merge.
+
+Feature HEAD may be one commit ahead of 3e320f9 because this safe-merge prompt itself is committed.
+
+======================================================================
+2. PROTECTED FILE GATE
+======================================================================
+
+Record status + SHA256 before merge:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+
+Expected operator-side hashes:
+- stores/001_cabin_tidy.json
+  9A480BE4CD24BF93BEAB8E02483512DB3801F10F506ADC610C38667C5832051F
+- tools/shopify_app/safe_shopify_cli.ps1
+  47A1BDF96BB54ADB0C9C86D7C91962A48EC6C4FDF6A0E73B6EFC8B943C275421
+
+Do not touch/stash/reset/restore:
+- protected files above
+- data/*.sqlite3
+- .env
+- credentials
+- .phase*
+- .recon_focus_initial/
+- pytest temp folders
+- backups
+- user assets
+- operator temp folders
+
+Permission-denied warnings on old temp folders are not a reason to mutate them.
+
+======================================================================
+3. DIFF SCOPE REVIEW
+======================================================================
+
+Expected feature files:
+- CODEX_THEME_ACCESS_PUSH_SCAFFOLD_LAYOUT_HOTFIX.txt
+- CODEX_THEME_ACCESS_PUSH_SCAFFOLD_LAYOUT_SAFE_MERGE.txt
+- src/shopsource/shopify_theme_cli.py
+- src/shopsource/featured_guided_flow.py
+- src/shopsource/ui/v2.py
+- tests/test_shopify_theme_cli.py
+- tests/test_featured_guided_flow.py
+- tests/test_homepage_featured_products.py
+
+Confirm NOT changed:
+- protected files
+- category/reconciliation logic
+- unrelated homepage sections
+- GraphQL protected-access modules unless diff explicitly proves no change
+
+STOP on unexpected overlap.
+
+======================================================================
+4. COMPRESSED E2E SAFETY REVIEW
+======================================================================
+
+Confirm all of the following before merge:
+
+A. Theme Access read path
+- canonical myshopify domain preserved
+- pull temp is empty before CLI invocation
+- _pull() does NOT call _scaffold()
+- pull uses --only templates/index.json
+- pull uses --no-input
+- pull does NOT use --json
+- byte preservation tests remain
+
+B. Theme Access push path
+- _scaffold() creates config/layout/templates
+- config/settings_schema.json preserved
+- no layout/theme.liquid required
+- push includes --only templates/index.json
+- --json preserved
+- --nodelete preserved
+- --strict preserved
+- --allow-live only for verified MAIN
+- --force absent
+- password absent argv
+- password only in SHOPIFY_CLI_THEME_TOKEN env
+
+C. Apply write guards
+- exact current remote raw hash required
+- re-probe immediately before push
+- exact theme identity/role/domain lock preserved
+- no backend fallback after write starts
+- exact raw backup before write
+- post-write pull verification
+- 4 product IDs verified
+- unrelated section diff guard verified
+- prefix/suffix preserved
+- backup status becomes REMOTE_JSON_VERIFIED only on verified success
+- plan status becomes REMOTE_JSON_VERIFIED only on verified success
+- no automatic rollback on ambiguous failure
+
+D. UI / Guided Flow
+- safe backend_reason_code is preserved into featured_last_apply_result.reason_code
+- raw stdout/stderr is never exposed
+- credential/token is never exposed
+- REMOTE_JSON_VERIFIED advances 5 -> 6
+- STOREFRONT_VERIFIED advances 6 -> 7
+- only ASSIGNMENT_READY completes step 7
+- failed apply does not pretend success
+- one-primary-action UX remains
+
+E. Full mock E2E
+One integration test proves:
+READY_TO_APPLY
+-> backup
+-> push
+-> post-read
+-> REMOTE_JSON_VERIFIED
+-> step 6
+-> STOREFRONT_VERIFIED
+-> step 7
+-> ASSIGNMENT_READY
+
+Failure path proves:
+- no false REMOTE_JSON_VERIFIED
+- one attempted write max
+- no automatic rollback
+
+If any fail:
+STOP.
+
+======================================================================
+5. PRE-MERGE TEST GATE
+======================================================================
+
+In feature worktree, use fresh local basetemp names.
+
+Set PYTHONPATH=src as needed on Windows.
+
+python -m compileall -q src tests
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Focused:
+python -m pytest -q tests/test_shopify_theme_cli.py tests/test_homepage_featured_products.py tests/test_featured_guided_flow.py tests/test_featured_theme_backend.py tests/test_theme_write_backend.py tests/test_multistore_theme_operations.py tests/test_theme_access_credentials.py tests/test_shopify_g0_readonly_hotfix.py
+
+Run the explicit E2E tests that prove the full flow.
+
+Full:
+python -m pytest -q --basetemp=<fresh-worktree-local-temp>
+
+Also run the synthetic Spark smoke import used by the feature report.
+
+Required:
+- focused >= 209 passed
+- full >= 1053 passed, 1 skipped
+- E2E core PASS
+- synthetic Spark smoke PASS
+- Shopify live write count 0
+- real Theme Access credential use/creation 0
+
+======================================================================
+6. FAST-FORWARD MERGE ONLY
+======================================================================
+
+Return to main repo.
+
+git fetch origin
+
+Verify origin/main is still exactly the SHA recorded in step 1.
+
+Then:
+git merge --ff-only hotfix/theme-access-push-scaffold-layout
+
+If ff-only fails:
+STOP.
+No merge commit.
+No conflict auto-resolution.
+
+======================================================================
+7. POST-MERGE TEST GATE
+======================================================================
+
+On main rerun:
+- compileall
+- focused suite
+- explicit E2E core tests
+- full suite with fresh basetemp
+- synthetic Spark smoke import
+- git diff --check
+- CLI help
+- UI help
+
+Verify:
+- protected hashes/status unchanged
+- no credential used/created
+- no Shopify live write
+
+======================================================================
+8. PUSH WITH LAST-SECOND CHECK
+======================================================================
+
+git fetch origin
+
+If origin/main moved:
+STOP BEFORE PUSH.
+Report REMOTE_MAIN_MOVED_AFTER_LOCAL_MERGE.
+Do not force push.
+
+If unchanged:
+git push origin main
+
+Then verify:
+- main == origin/main
+- main...origin/main = 0 0
+
+======================================================================
+9. RETAIN FEATURE WORKTREE
+======================================================================
+
+Retain:
+- hotfix/theme-access-push-scaffold-layout
+- D:\shop\001_so_amazon_theme_push_layout
+
+until the first successful real Store 001 step-5 apply and step-6 storefront verification are reviewed.
+
+======================================================================
+10. SECOND-WINDOW HANDOFF
+======================================================================
+
+Final report must include:
+SECOND_WINDOW_HANDOFF_MAIN_SHA = <new main SHA>
+
+Other active window must fetch this SHA before its next main merge.
+
+======================================================================
+11. EXACT NEXT ACTION AFTER SUCCESSFUL MERGE
+======================================================================
+
+Do NOT perform real Shopify write during merge.
+
+After successful merge:
+1. launch ShopSource from new main
+2. Store 001 > 스토어 디자인 > 홈페이지
+3. follow the single Guided Flow primary action
+4. if state restarted, go through 1 -> 2 -> 3 -> 4 once
+5. confirm step 4 returns READY_TO_APPLY
+6. open step 5 apply gate
+7. verify Store 001 / Design by klarjoy / MAIN / 4 products / THEME_ACCESS_CLI READY
+8. check both live confirmations
+9. click "추천 상품만 적용" ONCE
+10. do not refresh/retry repeatedly
+11. capture resulting Guided Flow / last apply result
+12. if REMOTE_JSON_VERIFIED, proceed directly to step 6 storefront check
+13. if not REMOTE_JSON_VERIFIED, use the preserved exact safe reason_code and do NOT create another speculative hotfix before reviewing it
+
+This is the one real external boundary test remaining after the compressed E2E audit.
+
+======================================================================
+12. FINAL REPORT
+======================================================================
+
+Report:
+[1] pre-merge origin/main SHA
+[2] feature HEAD SHA
+[3] merge-base
+[4] ahead/behind
+[5] protected pre-merge hashes/status
+[6] diff scope
+[7] compressed E2E safety review
+[8] pre-merge tests
+[9] E2E core result
+[10] synthetic Spark smoke result
+[11] merge method
+[12] new local main SHA
+[13] post-merge tests
+[14] push result
+[15] final origin/main SHA
+[16] main...origin/main
+[17] protected post-merge hashes/status
+[18] Shopify live write count
+[19] Theme Access credential use/creation count
+[20] feature/worktree retained
+[21] SECOND_WINDOW_HANDOFF_MAIN_SHA
+[22] exact next action
+
+Final flags:
+FAST_FORWARD_ONLY = PASS/FAIL
+COMPRESSED_E2E_AUDIT = PASS/FAIL
+PUSH_REQUIRED_DIRS = PASS/FAIL
+PULL_TEMP_EMPTY_PRESERVED = YES/NO
+THEME_PUSH_JSON_PRESERVED = YES/NO
+PUSH_NODELETE_STRICT_PRESERVED = YES/NO
+LIVE_WRITE_CONFIRMATION_PRESERVED = YES/NO
+SAFE_REASON_CODE_PRESERVED = YES/NO
+MOCK_FEATURED_APPLY_REMOTE_JSON_VERIFIED = YES/NO
+STEP5_TO_STEP6 = PASS/FAIL
+STEP6_TO_STEP7 = PASS/FAIL
+ASSIGNMENT_READY_FLOW = PASS/FAIL
+FULL_SUITE_POST_MERGE = PASS/FAIL
+PROTECTED_FILES_UNCHANGED = YES/NO
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_USED = NO
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+MAIN_REMOTE_SYNC = YES/NO
+SECOND_WINDOW_HANDOFF_REQUIRED = YES
