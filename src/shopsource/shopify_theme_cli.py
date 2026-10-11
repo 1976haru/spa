@@ -42,6 +42,51 @@ def _numeric_theme_id(value) -> str | None:
     return raw if re.fullmatch(r"\d+", raw) else None
 
 
+def _normalized_myshopify_domain(value) -> str | None:
+    """Accept only a bare myshopify hostname; reject URLs and arbitrary hosts."""
+    if not isinstance(value, str):
+        return None
+    domain = value.strip().lower()
+    if not domain or any(char in domain for char in ":/@?#\\") or any(char.isspace() for char in domain):
+        return None
+    if len(domain) > 253:
+        return None
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.myshopify\.com", domain):
+        return None
+    if len(domain.split(".", 1)[0]) > 63:
+        return None
+    return domain
+
+
+def _resolve_cli_store_domain(connection: dict) -> tuple[str, str]:
+    """Resolve the verified CLI host, preferring the stored canonical identity."""
+    canonical_raw = connection.get("canonical_myshopify_domain")
+    if canonical_raw is not None and str(canonical_raw).strip():
+        canonical = _normalized_myshopify_domain(canonical_raw)
+        if canonical is None:
+            raise ValueError("DOMAIN_INVALID")
+        return canonical, "CANONICAL_MYSHOPIFY_DOMAIN"
+    configured = _normalized_myshopify_domain(connection.get("shop_domain"))
+    if configured is None:
+        raise ValueError("DOMAIN_INVALID" if connection.get("shop_domain") else "STORE_NOT_CONFIGURED")
+    return configured, "CONFIGURED_SHOP_DOMAIN_FALLBACK"
+
+
+def _capability_cli_domain(capability: ThemeBackendCapabilities, configured_shop_domain: str) -> str:
+    details = capability.details
+    configured = _normalized_myshopify_domain(details.get("configured_shop_domain") or details.get("shop_domain"))
+    requested = _normalized_myshopify_domain(configured_shop_domain)
+    cli_domain = _normalized_myshopify_domain(details.get("cli_store_domain"))
+    source = details.get("cli_store_domain_source")
+    if (configured is None or requested != configured or cli_domain is None
+            or source not in {"CANONICAL_MYSHOPIFY_DOMAIN", "CONFIGURED_SHOP_DOMAIN_FALLBACK"}
+            or (source == "CANONICAL_MYSHOPIFY_DOMAIN"
+                and _normalized_myshopify_domain(details.get("canonical_myshopify_domain")) != cli_domain)
+            or (source == "CONFIGURED_SHOP_DOMAIN_FALLBACK" and cli_domain != configured)):
+        raise RuntimeError("Verified CLI store identity is required")
+    return cli_domain
+
+
 def _theme_rows(payload) -> list[dict] | None:
     """Read only bounded, documented list wrappers; never recursively search arbitrary data."""
     if isinstance(payload, list):
@@ -132,14 +177,27 @@ class ShopifyThemeCLI:
         if not connection or not connection.get("shop_domain"):
             return ThemeBackendCapabilities(self.backend_name, "STORE_NOT_CONFIGURED", "STORE_NOT_CONFIGURED",
                                             {"cli_version": match.group(0)})
+        try:
+            cli_store_domain, cli_domain_source = _resolve_cli_store_domain(connection)
+        except ValueError as exc:
+            reason = str(exc) if str(exc) in {"DOMAIN_INVALID", "STORE_NOT_CONFIGURED"} else "DOMAIN_INVALID"
+            return ThemeBackendCapabilities(self.backend_name, reason, reason,
+                {"cli_version": match.group(0), "shop_domain": connection.get("shop_domain"),
+                 "configured_shop_domain": connection.get("shop_domain")})
+        domain_details = {"cli_version": match.group(0), "shop_domain": connection["shop_domain"],
+                          "configured_shop_domain": connection["shop_domain"],
+                          "cli_store_domain": cli_store_domain,
+                          "cli_store_domain_source": cli_domain_source}
+        if cli_domain_source == "CANONICAL_MYSHOPIFY_DOMAIN":
+            domain_details["canonical_myshopify_domain"] = cli_store_domain
         if not theme_id:
             return ThemeBackendCapabilities(self.backend_name, "THEME_ID_MISSING", "THEME_ID_MISSING",
-                                            {"cli_version": match.group(0), "shop_domain": connection["shop_domain"]})
+                                            domain_details)
         numeric_id = _numeric_theme_id(theme_id)
         if numeric_id is None:
             return ThemeBackendCapabilities(self.backend_name, "THEME_ID_MISSING", "THEME_ID_MISSING",
-                                            {"cli_version": match.group(0), "shop_domain": connection["shop_domain"]})
-        base = [executable, "theme", "list", "--store", connection["shop_domain"]]
+                                            domain_details)
+        base = [executable, "theme", "list", "--store", cli_store_domain]
         env = {**os.environ, "SHOPIFY_CLI_THEME_TOKEN": password}
         try:
             probe = self.runner([*base, "--id", numeric_id, "--json"], capture_output=True,
@@ -161,42 +219,36 @@ class ShopifyThemeCLI:
             else:
                 if "theme" in diagnostic and any(term in diagnostic for term in ("not found", "no theme", "does not exist")):
                     return ThemeBackendCapabilities(self.backend_name, "THEME_ID_NOT_FOUND", "THEME_ID_NOT_FOUND",
-                        {"cli_version": match.group(0), "shop_domain": connection["shop_domain"],
-                         "verified_theme_id": numeric_id, "identity_verified": False})
+                        {**domain_details, "verified_theme_id": numeric_id, "identity_verified": False})
                 status = _probe_failure_status(diagnostic)
-                return ThemeBackendCapabilities(self.backend_name, status, status,
-                    {"cli_version": match.group(0), "shop_domain": connection["shop_domain"]})
+                return ThemeBackendCapabilities(self.backend_name, status, status, domain_details)
         if getattr(probe, "returncode", 1) != 0:
             diagnostic = f"{getattr(probe, 'stdout', '')} {getattr(probe, 'stderr', '')}"
             status = _probe_failure_status(diagnostic)
-            return ThemeBackendCapabilities(self.backend_name, status, status,
-                {"cli_version": match.group(0), "shop_domain": connection["shop_domain"]})
+            return ThemeBackendCapabilities(self.backend_name, status, status, domain_details)
         try:
             payload = json.loads(getattr(probe, "stdout", ""))
         except (TypeError, json.JSONDecodeError):
             return ThemeBackendCapabilities(self.backend_name, "THEME_LIST_INVALID_JSON", "THEME_LIST_INVALID_JSON",
-                {"cli_version": match.group(0), "shop_domain": connection["shop_domain"]})
+                domain_details)
         themes = _normalize_theme_rows(payload)
         if themes is None:
             return ThemeBackendCapabilities(self.backend_name, "THEME_LIST_INVALID_JSON", "THEME_LIST_INVALID_JSON",
-                {"cli_version": match.group(0), "shop_domain": connection["shop_domain"]})
+                domain_details)
         matched = [theme for theme in themes if theme["id"] == numeric_id]
         if not matched:
             return ThemeBackendCapabilities(self.backend_name, "THEME_ID_NOT_FOUND", "THEME_ID_NOT_FOUND",
-                {"cli_version": match.group(0), "shop_domain": connection["shop_domain"],
-                 "verified_theme_id": numeric_id, "identity_verified": False})
+                {**domain_details, "verified_theme_id": numeric_id, "identity_verified": False})
         if len(matched) != 1:
             return ThemeBackendCapabilities(self.backend_name, "THEME_ID_AMBIGUOUS", "THEME_ID_AMBIGUOUS",
-                {"cli_version": match.group(0), "shop_domain": connection["shop_domain"],
-                 "verified_theme_id": numeric_id, "identity_verified": False})
+                {**domain_details, "verified_theme_id": numeric_id, "identity_verified": False})
         target = matched[0]
         if target["role"] == "unknown":
             return ThemeBackendCapabilities(self.backend_name, "THEME_ROLE_UNKNOWN", "THEME_ROLE_UNKNOWN",
-                {"cli_version": match.group(0), "shop_domain": connection["shop_domain"],
-                 "verified_theme_id": numeric_id, "verified_theme_name": target["name"],
+                {**domain_details, "verified_theme_id": numeric_id, "verified_theme_name": target["name"],
                  "verified_theme_role": "unknown", "identity_verified": True})
         return ThemeBackendCapabilities(self.backend_name, "READY", "READY",
-            {"cli_version": match.group(0), "shop_domain": connection["shop_domain"], "theme_id": numeric_id,
+            {**domain_details, "theme_id": numeric_id,
              "verified_theme_id": numeric_id, "verified_theme_name": target["name"],
              "verified_theme_role": target["role"], "target_is_live": target["role"] == "MAIN",
              "identity_verified": True, "credential_present": True, "merchant_controlled_auth": True})
@@ -212,8 +264,14 @@ class ShopifyThemeCLI:
         capability = self.capability_status(store_id, theme_id=theme_id)
         if not capability.ready:
             return None, capability
-        configured = capability.details.get("shop_domain", "").casefold()
-        if str(shop_domain or "").casefold() != configured:
+        configured = _normalized_myshopify_domain(
+            capability.details.get("configured_shop_domain") or capability.details.get("shop_domain"))
+        requested = _normalized_myshopify_domain(shop_domain)
+        try:
+            _capability_cli_domain(capability, shop_domain)
+        except RuntimeError:
+            return None, ThemeBackendCapabilities(self.backend_name, "STORE_NOT_CONFIGURED", "STORE_MISMATCH")
+        if requested is None or requested != configured:
             return None, ThemeBackendCapabilities(self.backend_name, "STORE_NOT_CONFIGURED", "STORE_MISMATCH")
         if capability.details.get("identity_verified") is not True or (
                 capability.details.get("verified_theme_id") != _numeric_theme_id(theme_id)):
@@ -248,8 +306,7 @@ class ShopifyThemeCLI:
         if capability is None:
             password, capability = self._check_connection(store_id, shop_domain, theme_id)
         else:
-            if (capability.ready is not True or capability.details.get("shop_domain", "").casefold()
-                    != str(shop_domain or "").casefold()
+            if (capability.ready is not True
                     or capability.details.get("verified_theme_id") != _numeric_theme_id(theme_id)
                     or capability.details.get("identity_verified") is not True
                     or capability.details.get("verified_theme_role") not in {"MAIN", "UNPUBLISHED", "DEVELOPMENT", "DEMO"}
@@ -262,10 +319,11 @@ class ShopifyThemeCLI:
                 password = None
         if not password:
             raise RuntimeError(capability.reason_code)
+        cli_store_domain = _capability_cli_domain(capability, shop_domain)
         temp = Path(tempfile.mkdtemp(prefix="shopsource-theme-pull-", dir=self.temp_dir))
         try:
             self._scaffold(temp)
-            command = [self._executable(), "theme", "pull", "--store", shop_domain,
+            command = [self._executable(), "theme", "pull", "--store", cli_store_domain,
                        "--theme", self._theme_id(theme_id), "--only", TARGET_FILE,
                        "--path", str(temp), "--json"]
             if self._invoke(command, password) is None:
@@ -274,7 +332,9 @@ class ShopifyThemeCLI:
             if not target.is_file():
                 raise RuntimeError("Theme Access CLI did not return the requested file")
             content = target.read_bytes().decode("utf-8")
-            return content, {"isolated_path": str(temp), "cli_version": capability.details.get("cli_version")}
+            return content, {"isolated_path": str(temp), "cli_version": capability.details.get("cli_version"),
+                             "cli_store_domain": cli_store_domain,
+                             "cli_store_domain_source": capability.details.get("cli_store_domain_source")}
         finally:
             if not self.retain_diagnostics:
                 shutil.rmtree(temp, ignore_errors=True)
@@ -292,14 +352,18 @@ class ShopifyThemeCLI:
             return None
         return result if result.raw_sha256 == expected_raw_sha256 else None
 
-    def _push(self, request: ThemeFileWriteRequest, password: str, content: str, *, actual_live: bool):
+    def _push(self, request: ThemeFileWriteRequest, password: str, content: str, *, actual_live: bool,
+              cli_store_domain: str):
+        cli_store_domain = _normalized_myshopify_domain(cli_store_domain)
+        if cli_store_domain is None:
+            raise RuntimeError("Verified CLI store identity is required")
         temp = Path(tempfile.mkdtemp(prefix="shopsource-theme-push-", dir=self.temp_dir))
         try:
             self._scaffold(temp)
             target = temp / TARGET_FILE
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content.encode("utf-8"))
-            command = [self._executable(), "theme", "push", "--store", request.shop_domain,
+            command = [self._executable(), "theme", "push", "--store", cli_store_domain,
                        "--theme", self._theme_id(request.theme_id), "--only", TARGET_FILE,
                        "--path", str(temp), "--nodelete", "--strict", "--json"]
             if actual_live:
@@ -353,6 +417,8 @@ class ShopifyThemeCLI:
                                         reason_code=latest.reason_code)
         latest_live = latest.details.get("target_is_live") is True
         if (latest.details.get("verified_theme_id") != capability.details.get("verified_theme_id")
+                or latest.details.get("cli_store_domain") != capability.details.get("cli_store_domain")
+                or latest.details.get("cli_store_domain_source") != capability.details.get("cli_store_domain_source")
                 or latest_live != actual_live or request.target_is_live != latest_live):
             return ThemeFileWriteResult("PRECONDITION_FAILED", self.backend_name, request.filename, False,
                                         reason_code="TARGET_ROLE_MISMATCH")
@@ -360,28 +426,32 @@ class ShopifyThemeCLI:
             return ThemeFileWriteResult("PRECONDITION_FAILED", self.backend_name, request.filename, False,
                                         reason_code="ALLOW_LIVE_REQUIRED")
         expected = raw_sha256(request.content)
-        pushed = self._push(request, password, request.content, actual_live=latest_live)
+        locked_cli_domain = _capability_cli_domain(latest, request.shop_domain)
+        pushed = self._push(request, password, request.content, actual_live=latest_live,
+                            cli_store_domain=locked_cli_domain)
         try:
-            observed = self.read_file(request.store_id, request.shop_domain, request.theme_id, request.filename)
+            observed_content, _metadata = self._pull(request.store_id, request.shop_domain, request.theme_id,
+                                                     request.filename, capability=latest)
+            observed_hash = raw_sha256(observed_content)
         except Exception:
             return ThemeFileWriteResult("ROLLBACK_REQUIRED" if pushed else "WRITE_ATTEMPTED",
                 self.backend_name, request.filename, True, expected_raw_sha256=expected,
                 reason_code="POST_WRITE_READ_FAILED")
-        if observed.raw_sha256 == expected:
+        if observed_hash == expected:
             return ThemeFileWriteResult("REMOTE_JSON_VERIFIED", self.backend_name, request.filename, True,
-                                        expected_raw_sha256=expected, observed_raw_sha256=observed.raw_sha256,
+                                        expected_raw_sha256=expected, observed_raw_sha256=observed_hash,
                                         reason_code=None if pushed else "CLI_PUSH_EXIT_NONZERO_BUT_CONTENT_VERIFIED")
         if not pushed:
             return ThemeFileWriteResult("WRITE_ATTEMPTED", self.backend_name, request.filename, True,
-                expected_raw_sha256=expected, observed_raw_sha256=observed.raw_sha256,
+                expected_raw_sha256=expected, observed_raw_sha256=observed_hash,
                 reason_code="CLI_PUSH_FAILED_CONTENT_NOT_VERIFIED")
-        if observed.raw_sha256 == before.raw_sha256:
+        if observed_hash == before.raw_sha256:
             return ThemeFileWriteResult("VERIFY_FAILED", self.backend_name, request.filename, True,
-                                        expected_raw_sha256=expected, observed_raw_sha256=observed.raw_sha256,
+                                        expected_raw_sha256=expected, observed_raw_sha256=observed_hash,
                                         reason_code="REMOTE_CONTENT_UNCHANGED")
         # A different post-write value may be a merchant edit; never overwrite it automatically.
         return ThemeFileWriteResult("ROLLBACK_REQUIRED", self.backend_name, request.filename, True,
-                                    expected_raw_sha256=expected, observed_raw_sha256=observed.raw_sha256,
+                                    expected_raw_sha256=expected, observed_raw_sha256=observed_hash,
                                     reason_code="VERIFY_FAILED_REVIEW_BEFORE_ROLLBACK")
 
     def rollback_file(self, request: ThemeFileWriteRequest, *, original_content: str,
@@ -418,19 +488,23 @@ class ShopifyThemeCLI:
         password, latest = self._check_connection(request.store_id, request.shop_domain, request.theme_id)
         latest_live = latest.details.get("target_is_live") is True
         if (not password or latest.details.get("verified_theme_id") != capability.details.get("verified_theme_id")
+                or latest.details.get("cli_store_domain") != capability.details.get("cli_store_domain")
+                or latest.details.get("cli_store_domain_source") != capability.details.get("cli_store_domain_source")
                 or latest_live != actual_live or request.target_is_live != latest_live):
             return ThemeFileWriteResult("PRECONDITION_FAILED", self.backend_name, request.filename, False,
                                         reason_code="TARGET_ROLE_MISMATCH" if password else latest.reason_code)
         if latest_live and request.allow_live is not True:
             return ThemeFileWriteResult("PRECONDITION_FAILED", self.backend_name, request.filename, False,
                                         reason_code="ALLOW_LIVE_REQUIRED")
-        if not self._push(request, password, original_content, actual_live=latest_live):
+        locked_cli_domain = _capability_cli_domain(latest, request.shop_domain)
+        if not self._push(request, password, original_content, actual_live=latest_live,
+                          cli_store_domain=locked_cli_domain):
             return ThemeFileWriteResult("ROLLBACK_REQUIRED", self.backend_name, request.filename, True,
                                         expected_raw_sha256=raw_sha256(original_content), reason_code="ROLLBACK_PUSH_FAILED")
         expected = raw_sha256(original_content)
         try:
             restored_raw, _metadata = self._pull(request.store_id, request.shop_domain, request.theme_id,
-                                                 request.filename)
+                                                 request.filename, capability=latest)
             verified = raw_sha256(restored_raw) == expected
         except Exception:
             verified = False

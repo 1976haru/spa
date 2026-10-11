@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from shopsource.shopify_collections import save_connection
+from shopsource.db import connect
 from shopsource.shopify_theme_cli import ShopifyThemeCLI, TARGET_FILE
 from shopsource.theme_write_backend import (ThemeBackendCapabilities, ThemeFileWriteRequest,
                                             ThemeWriteBackendRouter, raw_sha256)
@@ -67,6 +68,11 @@ def setup(tmp_path, monkeypatch, *, runner=None, password="merchant-password", r
     return cli, runner, db, root
 
 
+def set_canonical_domain(db, domain):
+    with connect(db) as con:
+        con.execute("UPDATE shopify_connections SET canonical_myshopify_domain=? WHERE store_id='store-a'", (domain,))
+
+
 def test_cli_backend_password_only_in_env(tmp_path, monkeypatch):
     cli, runner, _, _ = setup(tmp_path, monkeypatch)
     result = cli.read_file("store-a", "example.myshopify.com", "123", TARGET_FILE)
@@ -82,6 +88,96 @@ def test_cli_backend_secret_not_in_logs(tmp_path, monkeypatch, caplog):
         cli.read_file("store-a", "example.myshopify.com", "123", TARGET_FILE)
     assert all("merchant-password" not in " ".join(command) for command, _ in runner.calls)
     assert "merchant-password" not in caplog.text
+
+
+def test_cli_prefers_canonical_myshopify_domain(tmp_path, monkeypatch):
+    cli, runner, db, _ = setup(tmp_path, monkeypatch)
+    set_canonical_domain(db, " KGXBPI-IT.MYSHOPIFY.COM ")
+    capability = cli.capability_status("store-a", theme_id="123")
+    command, _ = next((c, k) for c, k in runner.calls if c[1:3] == ["theme", "list"])
+    assert command[command.index("--store") + 1] == "kgxbpi-it.myshopify.com"
+    assert capability.ready
+    assert capability.details["shop_domain"] == "example.myshopify.com"
+    assert capability.details["configured_shop_domain"] == "example.myshopify.com"
+    assert capability.details["cli_store_domain"] == "kgxbpi-it.myshopify.com"
+    assert capability.details["cli_store_domain_source"] == "CANONICAL_MYSHOPIFY_DOMAIN"
+
+
+def test_cli_falls_back_to_configured_domain_when_canonical_missing(tmp_path, monkeypatch):
+    cli, runner, _, _ = setup(tmp_path, monkeypatch)
+    capability = cli.capability_status("store-a", theme_id="123")
+    command, _ = next((c, k) for c, k in runner.calls if c[1:3] == ["theme", "list"])
+    assert command[command.index("--store") + 1] == "example.myshopify.com"
+    assert capability.details["cli_store_domain_source"] == "CONFIGURED_SHOP_DOMAIN_FALLBACK"
+
+
+def test_cli_list_uses_canonical_domain_for_renamed_store(tmp_path, monkeypatch):
+    cli, runner, db, _ = setup(tmp_path, monkeypatch)
+    set_canonical_domain(db, "kgxbpi-it.myshopify.com")
+    capability = cli.capability_status("store-a", theme_id="123")
+    list_commands = [command for command, _ in runner.calls if command[1:3] == ["theme", "list"]]
+    assert capability.ready and list_commands
+    assert all(command[command.index("--store") + 1] == "kgxbpi-it.myshopify.com" for command in list_commands)
+
+
+def test_pull_uses_same_canonical_domain_as_capability(tmp_path, monkeypatch):
+    cli, runner, db, _ = setup(tmp_path, monkeypatch)
+    set_canonical_domain(db, "kgxbpi-it.myshopify.com")
+    result = cli.read_file("store-a", "example.myshopify.com", "123", TARGET_FILE)
+    capability = cli.capability_status("store-a", theme_id="123")
+    pull_commands = [command for command, _ in runner.calls if command[1:3] == ["theme", "pull"]]
+    assert result.backend_name == "THEME_ACCESS_CLI"
+    assert capability.details["cli_store_domain"] == "kgxbpi-it.myshopify.com"
+    assert pull_commands and all(command[command.index("--store") + 1] == capability.details["cli_store_domain"]
+                                 for command in pull_commands)
+
+
+def test_push_uses_same_canonical_domain_as_capability(tmp_path, monkeypatch):
+    cli, runner, db, _ = setup(tmp_path, monkeypatch)
+    set_canonical_domain(db, "kgxbpi-it.myshopify.com")
+    before = runner.remote
+    request = ThemeFileWriteRequest("store-a", "example.myshopify.com", "123", TARGET_FILE,
+                                    "{}", raw_sha256(before), confirmed=True)
+    result = cli.write_file(request)
+    capability = cli.capability_status("store-a", theme_id="123")
+    remote_commands = [command for command, _ in runner.calls
+                       if len(command) > 2 and command[1:3] in (["theme", "list"], ["theme", "pull"], ["theme", "push"])]
+    assert result.status == "REMOTE_JSON_VERIFIED"
+    assert remote_commands and all(command[command.index("--store") + 1] == capability.details["cli_store_domain"]
+                                   for command in remote_commands)
+
+
+def test_request_configured_domain_can_bind_to_same_store_canonical_cli_domain(tmp_path, monkeypatch):
+    cli, _, db, _ = setup(tmp_path, monkeypatch)
+    set_canonical_domain(db, "kgxbpi-it.myshopify.com")
+    password, capability = cli._check_connection("store-a", "example.myshopify.com", "123")
+    assert password == "merchant-password"
+    assert capability.ready
+    assert capability.details["configured_shop_domain"] == "example.myshopify.com"
+    assert capability.details["cli_store_domain"] == "kgxbpi-it.myshopify.com"
+
+
+def test_malformed_canonical_domain_fails_closed(tmp_path, monkeypatch):
+    cli, runner, db, _ = setup(tmp_path, monkeypatch)
+    set_canonical_domain(db, "https://wrong.example/path")
+    capability = cli.capability_status("store-a", theme_id="123")
+    assert capability.status == "DOMAIN_INVALID"
+    assert not any(command[1:3] == ["theme", "list"] for command, _ in runner.calls)
+
+
+def test_store_id_isolation_unchanged(tmp_path, monkeypatch):
+    cli, runner, _, _ = setup(tmp_path, monkeypatch)
+    password, capability = cli._check_connection("store-a", "another.myshopify.com", "123")
+    assert password is None and capability.reason_code == "STORE_MISMATCH"
+    assert not any(command[1:3] == ["theme", "pull"] for command, _ in runner.calls)
+
+
+def test_no_secret_in_capability_details(tmp_path, monkeypatch):
+    cli, _, db, _ = setup(tmp_path, monkeypatch)
+    set_canonical_domain(db, "kgxbpi-it.myshopify.com")
+    capability = cli.capability_status("store-a", theme_id="123")
+    assert "merchant-password" not in repr(capability.details)
+    assert capability.details["cli_store_domain"] == "kgxbpi-it.myshopify.com"
 
 
 def test_cli_read_uses_only_target_file(tmp_path, monkeypatch):

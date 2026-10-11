@@ -37,6 +37,7 @@ from ..homepage_featured_products import FeaturedProductAssignmentService, Featu
 from ..featured_theme_backend import FeaturedThemeBackendCoordinator
 from ..multistore_theme_operations import MultiStoreThemeOperationsService
 from ..multistore_theme_presentation import next_action as multistore_next_action, next_action_message as multistore_next_action_message, setup_needed_count as multistore_setup_needed_count, status_label as multistore_status_label, table_statuses as multistore_table_statuses
+from ..shopify_theme_cli import _resolve_cli_store_domain
 from ..theme_access_credentials import (credential_present as theme_access_credential_present,
     delete_theme_access_password, save_theme_access_password)
 from ..homepage_session import HomepagePrerequisiteService
@@ -3590,10 +3591,21 @@ class OperatorUI:
             if row is None:
                 ui.notify("먼저 스토어를 선택하세요.", type="warning")
                 return
+            connection = get_shopify_connection(store_id) or {}
+            configured_domain = connection.get("shop_domain") or "미설정"
+            try:
+                cli_domain, cli_domain_source = _resolve_cli_store_domain(connection)
+                cli_domain_source_label = ("canonical myshopify" if cli_domain_source == "CANONICAL_MYSHOPIFY_DOMAIN"
+                                           else "configured fallback")
+            except ValueError:
+                cli_domain, cli_domain_source_label = "확인 불가", "DOMAIN_INVALID"
             detail_title.set_text(f"{row['store_id']} | {row['store_name']}")
             detail_text.set_text("이 정보는 문제 확인을 돕는 고급 정보입니다. 변경 작업은 제공하지 않습니다.")
             advanced_detail_text.set_text("\n".join((
                 f"Shop domain: {row.get('shop_domain') or 'Not configured'}",
+                f"Configured domain: {configured_domain}",
+                f"Theme Access CLI domain: {cli_domain}",
+                f"CLI domain source: {cli_domain_source_label}",
                 f"App binding: {row['app_binding']} · GraphQL state: {row['graphql_state']} ({row.get('selection_reason')})",
                 f"Theme Access credential: {row['theme_access_credential']} · CLI state: {row['theme_access_cli_state']}",
                 f"MAIN theme: {row.get('main_theme_name') or 'Unknown'} | {row.get('main_theme_id') or 'Unknown'} | role {row.get('main_theme_role') or 'Unknown'}",

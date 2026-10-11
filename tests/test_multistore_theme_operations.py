@@ -220,6 +220,15 @@ def test_no_shopify_live_write():
     assert '"write_performed": False' in source
 
 
+def test_multistore_advanced_details_show_cli_domain_identity_only():
+    source = Path("src/shopsource/ui/v2.py").read_text(encoding="utf-8")
+    panel = source[source.index("def _multistore_theme_operations") : source.index("def _stores(self)", source.index("def _multistore_theme_operations"))]
+    assert "Configured domain: {configured_domain}" in panel
+    assert "Theme Access CLI domain: {cli_domain}" in panel
+    assert "CLI domain source: {cli_domain_source_label}" in panel
+    assert '_resolve_cli_store_domain(connection)' in panel
+
+
 def test_dashboard_has_dedicated_navigation_route():
     source = Path("src/shopsource/ui/v2.py").read_text(encoding="utf-8")
     assert '("/theme-operations", "hub", "여러 스토어 테마 관리")' in source
