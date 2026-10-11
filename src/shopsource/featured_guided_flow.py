@@ -14,6 +14,37 @@ FEATURED_GUIDED_STEP_LABELS = (
 )
 
 
+def record_featured_apply_result(state: dict, result: dict, plan_id: str | None) -> dict:
+    """Persist the safe UI-facing apply result without dropping backend diagnostics."""
+    status = result.get("status", "FAILED")
+    reason_code = result.get("reason_code") or result.get("backend_reason_code")
+    last_result = {
+        key: result.get(key) for key in
+        ("status", "reason", "reason_code", "backend_name", "backend_reason_code",
+         "backup_id", "write_performed")
+    }
+    last_result["status"] = status
+    last_result["reason_code"] = reason_code
+    if not last_result.get("reason"):
+        last_result["reason"] = result.get("human_message") or reason_code
+    state["featured_apply_status"] = status
+    state["featured_last_apply_status"] = status
+    state["backup_id"] = result.get("backup_id")
+    state["featured_backend_name"] = result.get("backend_name")
+    state["featured_last_apply_plan_id"] = plan_id
+    state["featured_last_apply_result"] = last_result
+    return last_result
+
+
+def record_featured_storefront_result(state: dict, result: dict) -> None:
+    state["featured_storefront_status"] = result.get("status")
+    state["featured_assignment_status"] = None
+
+
+def record_featured_assignment_result(state: dict, result: dict) -> None:
+    state["featured_assignment_status"] = result.get("status")
+
+
 def _step(number: int, status: str) -> dict:
     return {"number": number, "label": FEATURED_GUIDED_STEP_LABELS[number - 1], "status": status}
 

@@ -1,8 +1,12 @@
 import json
 import hashlib
+import subprocess
 from pathlib import Path
 
 from shopsource.db import connect, init_db
+from shopsource.featured_guided_flow import (record_featured_apply_result,
+    record_featured_assignment_result, record_featured_storefront_result,
+    resolve_featured_guided_state)
 from shopsource.homepage_assignment import HomepageAssignmentService, homepage_assignment_workflow
 from shopsource.homepage_featured_products import (
     FeaturedProductAssignmentService, ShopifyExistingProductReader, discover_featured_product_schema,
@@ -11,6 +15,8 @@ from shopsource.homepage_featured_products import (
 from shopsource.shopify_theme_ids import is_valid_shopify_instance_id, legacy_featured_id_for_store, legacy_shopify_instance_kind, shopify_instance_id
 from shopsource.homepage_automation import _managed_id
 from shopsource.homepage_collections import _section_id
+from shopsource.shopify_collections import save_connection
+from shopsource.shopify_theme_cli import ShopifyThemeCLI, TARGET_FILE
 from shopsource.store_build import STAGES
 from shopsource.store_completion import DOMAINS, StoreCompletionService
 from shopsource.theme_write_backend import (ThemeBackendCapabilities, ThemeFileReadResult,
@@ -734,8 +740,9 @@ def test_beginner_preflight_button_is_explicit_read_only_ui_path():
 def test_featured_ui_preserves_safe_apply_result():
     from pathlib import Path
     source = (Path(__file__).parents[1] / "src/shopsource/ui/v2.py").read_text(encoding="utf-8")
-    assert 'state["featured_last_apply_result"]' in source
-    assert '("status", "reason", "reason_code", "backend_name", "backend_reason_code",' in source
+    guided = (Path(__file__).parents[1] / "src/shopsource/featured_guided_flow.py").read_text(encoding="utf-8")
+    assert "record_featured_apply_result(state, result, plan.get(\"plan_id\"))" in source
+    assert 'result.get("reason_code") or result.get("backend_reason_code")' in guided
     assert "최근 적용 결과:" in source
 
 
@@ -822,6 +829,128 @@ def test_featured_cli_mock_push_failure_fails_closed_without_rollback(tmp_path, 
         assert con.execute(
             "SELECT status FROM homepage_featured_theme_backups WHERE backup_id=?",
             (result["backup_id"],)).fetchone()[0] == "BACKED_UP"
+
+
+def test_theme_access_featured_apply_end_to_end_to_assignment_ready(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    original_raw = client.raw
+    save_connection("s1", "sample.myshopify.com", db=db)
+    with connect(db) as con:
+        con.execute("UPDATE shopify_connections SET canonical_myshopify_domain=? WHERE store_id=?",
+                    ("canonical-shop.myshopify.com", "s1"))
+
+    class ShopifyCLIRunner:
+        def __init__(self, remote):
+            self.remote = remote
+            self.calls = []
+            self.pull_entries = []
+            self.push_entries = []
+            self.upload_count = 0
+
+        def __call__(self, command, **kwargs):
+            self.calls.append((list(command), dict(kwargs)))
+            if command[1:] == ["version"]:
+                return subprocess.CompletedProcess(command, 0, stdout="3.80.0\n", stderr="")
+            if command[1:3] == ["theme", "list"]:
+                payload = [{"id": "55", "name": "MAIN theme", "role": "main"}]
+                return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
+            path = Path(command[command.index("--path") + 1])
+            target = path / TARGET_FILE
+            if command[1:3] == ["theme", "pull"]:
+                entries = tuple(sorted(item.name for item in path.iterdir()))
+                self.pull_entries.append(entries)
+                if entries or "--no-input" not in command or "--json" in command or "--force" in command:
+                    return subprocess.CompletedProcess(command, 1, stdout="", stderr="invalid pull directory")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(self.remote.encode("utf-8"))
+                return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
+            entries = tuple(sorted(item.name for item in path.iterdir()))
+            self.push_entries.append(entries)
+            required = {"config", "layout", "templates"}
+            required_flags = {"--json", "--nodelete", "--strict", "--allow-live"}
+            if (not required.issubset(entries)
+                    or not (path / "config" / "settings_schema.json").is_file()
+                    or not required_flags.issubset(command) or "--force" in command):
+                return subprocess.CompletedProcess(command, 1, stdout="", stderr="invalid push directory")
+            self.remote = target.read_bytes().decode("utf-8")
+            self.upload_count += 1
+            return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
+
+    runner = ShopifyCLIRunner(original_raw)
+    cli_root = tmp_path / "theme-cli"
+    cli_root.mkdir()
+    cli = ShopifyThemeCLI(db=db, runner=runner, which=lambda _name: "shopify.exe",
+                          temp_dir=cli_root, credential_getter=lambda _store: "mock-theme-token")
+    coordinator = StubThemeCoordinator(StubThemeTransport("ADMIN_GRAPHQL", original_raw), cli,
+                                       auto="THEME_ACCESS_CLI")
+
+    capability = cli.capability_status("s1", theme_id=preview["theme"]["id"])
+    assert capability.ready and capability.details["verified_theme_role"] == "MAIN"
+    assert capability.details["cli_store_domain"] == "canonical-shop.myshopify.com"
+    preflight = writer.preflight(plan["plan_id"], preview, store_id="s1",
+                                 backend_coordinator=coordinator)
+    assert preflight["status"] == "READY_TO_APPLY"
+    assert preflight["raw_equal"] and preflight["semantic_equal"]
+    assert preflight["prefix_equal"] and preflight["suffix_equal"]
+
+    state = {"featured_products_reviewed_plan_id": plan["plan_id"],
+             "featured_preflight_plan_id": plan["plan_id"],
+             "featured_preflight_preview_hash": preview["preview_hash"],
+             "featured_preflight_result": preflight}
+    before_apply = resolve_featured_guided_state(state, plan, preview, preflight, None)
+    assert (before_apply["current_step"], before_apply["primary_action"]) == (5, "OPEN_APPLY_GATE")
+
+    applied = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, allow_live=True,
+                           backend_coordinator=coordinator)
+    last_apply = record_featured_apply_result(state, applied, plan["plan_id"])
+    refreshed = FeaturedProductAssignmentService(db=db).get_plan(plan["plan_id"])
+    assert applied["status"] == "REMOTE_JSON_VERIFIED" and applied["write_performed"] is True
+    assert state["featured_apply_status"] == "REMOTE_JSON_VERIFIED"
+    assert runner.upload_count == 1
+    assert runner.pull_entries == [(), (), (), (), ()]
+    assert runner.push_entries == [("config", "layout", "templates")]
+    remote_doc = json.loads(runner.remote.split("*/", 1)[1])
+    assert remote_doc == preview["proposed"]
+    assert remote_doc["sections"]["merchant"]["settings"]["text"] == "Preserve"
+    assert len(remote_doc["sections"][preview["section_id"]]["settings"]["products"]) == 4
+    assert runner.remote.startswith("/* Shopify header comment */\n") and runner.remote.endswith("\n")
+    push_call = next((command, kwargs) for command, kwargs in runner.calls
+                     if command[1:3] == ["theme", "push"])
+    assert push_call[0][push_call[0].index("--store") + 1] == "canonical-shop.myshopify.com"
+    assert "mock-theme-token" not in push_call[0]
+    assert push_call[1]["env"]["SHOPIFY_CLI_THEME_TOKEN"] == "mock-theme-token"
+    assert {"--json", "--nodelete", "--strict", "--allow-live"}.issubset(push_call[0])
+    assert "--force" not in push_call[0]
+
+    with connect(db) as con:
+        backup = con.execute(
+            "SELECT status,folder FROM homepage_featured_theme_backups WHERE backup_id=?",
+            (applied["backup_id"],)).fetchone()
+        plan_status = con.execute(
+            "SELECT status FROM homepage_featured_product_plans WHERE plan_id=?",
+            (plan["plan_id"],)).fetchone()[0]
+    assert Path(backup["folder"]).joinpath("before.raw.json").read_bytes() == original_raw.encode("utf-8")
+    assert backup["status"] == plan_status == "REMOTE_JSON_VERIFIED"
+
+    step6 = resolve_featured_guided_state(state, refreshed, preview, preflight, last_apply)
+    assert (step6["current_step"], step6["primary_action"]) == (6, "OPEN_STOREFRONT")
+    assignment = FeaturedProductAssignmentService(db=db)
+    storefront = assignment.confirm_storefront(plan["plan_id"], checks={
+        "desktop_title": True, "four_cards": True,
+        "product_links": True, "mobile_section": True}, confirmed=True)
+    record_featured_storefront_result(state, storefront)
+    refreshed = assignment.get_plan(plan["plan_id"])
+    assert storefront["status"] == "STOREFRONT_VERIFIED"
+    step7 = resolve_featured_guided_state(state, refreshed, preview, preflight, last_apply)
+    assert (step7["current_step"], step7["primary_action"]) == (7, "OPEN_ASSIGNMENT_CHECK")
+
+    checklist = assignment.checklist(refreshed, remote_verified=True, storefront_verified=True)
+    record_featured_assignment_result(state, checklist)
+    completed = resolve_featured_guided_state(state, refreshed, preview, preflight, last_apply)
+    assert checklist["status"] == "ASSIGNMENT_READY"
+    assert state["featured_assignment_status"] == "ASSIGNMENT_READY"
+    assert completed["primary_action"] == "NONE"
+    assert all(step["status"] == "complete" for step in completed["steps"])
 
 
 def test_featured_rollback_uses_original_backend_and_never_switches(tmp_path, monkeypatch):

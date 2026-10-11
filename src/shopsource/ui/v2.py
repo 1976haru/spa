@@ -34,7 +34,9 @@ from ..homepage_automation import (HomepageAutomationService, assignment_banner_
     suggested_theme_image_ref, upload_approved_hero_asset, validate_homepage_image)
 from ..homepage_assignment import HomepageAssignmentService, homepage_assignment_workflow
 from ..homepage_featured_products import FeaturedProductAssignmentService, FeaturedProductThemeApplyService
-from ..featured_guided_flow import resolve_featured_guided_state
+from ..featured_guided_flow import (record_featured_apply_result,
+    record_featured_assignment_result, record_featured_storefront_result,
+    resolve_featured_guided_state)
 from .guided_flow import render_guided_stepper
 from ..featured_theme_backend import FeaturedThemeBackendCoordinator
 from ..multistore_theme_operations import MultiStoreThemeOperationsService
@@ -2651,15 +2653,7 @@ class OperatorUI:
                                 plan["plan_id"], preview, store_id=self.current_store, confirmed=True,
                                 backend_selection=backend_selection_control.value or "AUTO",
                                 allow_live=bool(live_confirmed.value))
-                            state["featured_apply_status"] = result.get("status", "FAILED")
-                            state["featured_last_apply_status"] = result.get("status", "FAILED")
-                            state["backup_id"] = result.get("backup_id")
-                            state["featured_backend_name"] = result.get("backend_name")
-                            state["featured_last_apply_plan_id"] = plan.get("plan_id")
-                            state["featured_last_apply_result"] = {
-                                key: result.get(key) for key in
-                                ("status", "reason", "reason_code", "backend_name", "backend_reason_code",
-                                 "backup_id", "write_performed")}
+                            record_featured_apply_result(state, result, plan.get("plan_id"))
                             if state["featured_last_apply_result"].get("status") == "CONFLICT":
                                 state["featured_last_apply_result"]["reason"] = (
                                     result.get("human_message") or result.get("reason") or
@@ -2762,8 +2756,7 @@ class OperatorUI:
                                 "product_links": bool(product_links.value), "mobile_section": bool(mobile_section.value)}
                             confirmation = FeaturedProductAssignmentService().confirm_storefront(plan["plan_id"],
                                 checks=state["featured_human_checks"], confirmed=verified)
-                            state["featured_storefront_status"] = confirmation.get("status")
-                            state["featured_assignment_status"] = None
+                            record_featured_storefront_result(state, confirmation)
                             state["featured_products_plan"] = FeaturedProductAssignmentService().get_plan(plan["plan_id"])
                             storefront_verified = bool((state["featured_products_plan"] or {}).get("storefront_verified"))
                             ui.notify("스토어 확인 완료. 다음은 7단계 과제 제출 확인입니다." if storefront_verified
@@ -2787,7 +2780,7 @@ class OperatorUI:
                             ui.label(("✓ " if passed else "확인 필요 · ") + key.replace("_", " ")).classes(
                                 "text-green-700" if passed else "text-amber-800")
                         def complete_assignment_check():
-                            state["featured_assignment_status"] = checklist["status"]
+                            record_featured_assignment_result(state, checklist)
                             if checklist["ready"]:
                                 ui.notify("모든 단계가 완료되었습니다.", type="positive")
                             else:

@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from shopsource.featured_guided_flow import resolve_featured_guided_state
+from shopsource.featured_guided_flow import (record_featured_apply_result,
+    resolve_featured_guided_state)
 
 
 def _plan(plan_id="plan-1", status="READY", *, storefront_verified=False):
@@ -122,6 +123,20 @@ def test_step6_storefront_confirmation_advances_without_completing_assignment():
     assert after_confirmation["steps"][6]["status"] == "current"
 
 
+def test_apply_backend_reason_code_survives_in_ui_state():
+    state = {}
+    result = {"status": "FAILED", "backend_name": "THEME_ACCESS_CLI",
+              "backend_reason_code": "CLI_PUSH_FAILED_CONTENT_NOT_VERIFIED",
+              "write_performed": True}
+
+    last_result = record_featured_apply_result(state, result, "plan-1")
+
+    assert state["featured_apply_status"] == "FAILED"
+    assert state["featured_last_apply_plan_id"] == "plan-1"
+    assert last_result["reason_code"] == "CLI_PUSH_FAILED_CONTENT_NOT_VERIFIED"
+    assert last_result["reason"] == "CLI_PUSH_FAILED_CONTENT_NOT_VERIFIED"
+
+
 def test_reselection_and_new_preview_invalidate_old_progress():
     old_plan, new_plan = _plan("old"), _plan("new")
     old_preview = _preview("old", "old-preview")
@@ -154,8 +169,7 @@ def test_guided_ui_has_one_primary_route_and_keeps_recovery_advanced():
     assert "featured_preflight_plan_id" in source and "featured_preflight_preview_hash" in source
 
     save_handler = source.split("def save_checks():", 1)[1].split('ui.button("확인 저장"', 1)[0]
-    assert 'state["featured_storefront_status"] = confirmation.get("status")' in save_handler
-    assert 'state["featured_assignment_status"] = None' in save_handler
+    assert "record_featured_storefront_result(state, confirmation)" in save_handler
     assert '"스토어 확인 완료. 다음은 7단계 과제 제출 확인입니다."' in save_handler
     assert '"스토어 확인 항목이 아직 남아 있습니다."' in save_handler
     assert '"추천 상품 상태: " +' not in save_handler
