@@ -1,0 +1,282 @@
+ShopSource Studio — THEME ACCESS CANONICAL DOMAIN HOTFIX SAFE MERGE
+
+Repository
+- Main repo: D:\shop\001_so_amazon
+- Hotfix worktree: D:\shop\001_so_amazon_theme_access_domain_hotfix
+- Remote: https://github.com/1976haru/spa.git
+- Branch: hotfix/theme-access-canonical-myshopify-domain
+- Expected implementation HEAD before this prompt commit: 3cbf2487cfb5764dbbec9303128d56214d723183
+- Expected main/origin-main: 8660962cb442f1c605dbed36485a571488cb9bc3
+
+Hotfix summary
+- Theme Access CLI now prefers verified canonical_myshopify_domain
+- configured shop_domain remains ShopSource-facing identity
+- theme list/pull/push transport domain locked to same canonical domain
+- store_id/theme_id/role guards preserved
+- malformed canonical domain fails closed
+- advanced diagnostics show configured vs CLI domain without secrets
+- no real credential use in implementation
+- no Shopify live write
+- full suite 1029 passed, 1 skipped
+
+======================================================================
+1. CONCURRENCY GATE
+======================================================================
+
+In main repo:
+
+git fetch origin --prune
+
+Record:
+- local main SHA
+- origin/main SHA
+- local hotfix SHA
+- origin hotfix SHA
+- merge-base
+- main...hotfix ahead/behind
+- git status --short
+
+Expected:
+origin/main = 8660962cb442f1c605dbed36485a571488cb9bc3
+
+If origin/main moved:
+STOP with CONCURRENT_MAIN_MOVEMENT.
+Do not auto-rebase/cherry-pick/merge.
+
+Hotfix HEAD may be one commit ahead of 3cbf248... because this safe-merge prompt itself is committed.
+
+======================================================================
+2. PROTECTED FILE GATE
+======================================================================
+
+Record status + SHA256:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+
+Expected:
+stores/001_cabin_tidy.json
+9A480BE4CD24BF93BEAB8E02483512DB3801F10F506ADC610C38667C5832051F
+
+tools/shopify_app/safe_shopify_cli.ps1
+47A1BDF96BB54ADB0C9C86D7C91962A48EC6C4FDF6A0E73B6EFC8B943C275421
+
+Do not touch/stash/reset/restore protected dirty files, DB, .env, credentials, .phase*, backups, user assets, operator temp folders.
+
+======================================================================
+3. DIFF SCOPE REVIEW
+======================================================================
+
+Expected files:
+- CODEX_THEME_ACCESS_CANONICAL_MYSHOPIFY_DOMAIN_HOTFIX.txt
+- CODEX_THEME_ACCESS_CANONICAL_MYSHOPIFY_DOMAIN_HOTFIX_SAFE_MERGE.txt
+- src/shopsource/shopify_theme_cli.py
+- src/shopsource/ui/v2.py
+- tests/test_shopify_theme_cli.py
+- tests/test_multistore_theme_operations.py
+
+Confirm NOT changed:
+- src/shopsource/multistore_theme_operations.py
+- src/shopsource/featured_theme_backend.py
+- src/shopsource/theme_write_backend.py
+- category/reconciliation files
+- protected files
+
+STOP on unexpected overlap.
+
+======================================================================
+4. SAFETY REVIEW
+======================================================================
+
+Confirm:
+
+A. CLI domain resolver
+- canonical_myshopify_domain preferred only when valid bare *.myshopify.com
+- configured shop_domain fallback only when canonical absent
+- malformed canonical fails closed
+
+B. transport locking
+- theme list uses cli_store_domain
+- pull uses same locked cli_store_domain
+- push uses same locked cli_store_domain
+- transport domain cannot silently switch after capability verification
+
+C. configured-domain binding
+- caller request still must match configured ShopSource connection
+- canonical domain may differ only within same store record
+- store_id/theme_id/role checks preserved
+
+D. secrets
+- Theme Access password remains env-only
+- no raw credential in logs/details/SQLite/.env
+- capability diagnostics contain only non-secret domain metadata
+
+E. live write safety
+- no Shopify live write during merge/test
+- no real Theme Access credential use during merge/test
+
+======================================================================
+5. PRE-MERGE TESTS
+======================================================================
+
+In hotfix worktree:
+
+python -m compileall -q src tests
+
+Focused:
+python -m pytest -q tests/test_shopify_theme_cli.py tests/test_multistore_theme_operations.py tests/test_featured_theme_backend.py tests/test_homepage_featured_products.py tests/test_theme_write_backend.py tests/test_theme_access_credentials.py tests/test_shopify_g0_readonly_hotfix.py
+
+Full:
+python -m pytest -q --basetemp=<worktree-local-temp>
+
+Also:
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Required:
+FULL SUITE PASS
+Expected >= 1029 passed, 1 skipped
+SHOPIFY LIVE WRITE COUNT = 0
+REAL THEME ACCESS CREDENTIAL USE/CREATION = 0
+
+======================================================================
+6. FAST-FORWARD MERGE ONLY
+======================================================================
+
+Return to main repo.
+
+git fetch origin
+
+Verify origin/main unchanged from step 1.
+
+Then:
+git merge --ff-only hotfix/theme-access-canonical-myshopify-domain
+
+If ff-only fails:
+STOP.
+No merge commit.
+No conflict auto-resolution.
+
+======================================================================
+7. POST-MERGE TESTS
+======================================================================
+
+On main rerun:
+- focused tests
+- full suite
+- compileall
+- diff-check
+- CLI help
+- UI help
+
+Verify:
+- protected hashes/status unchanged
+- no credential altered
+- no Shopify live write
+
+======================================================================
+8. PUSH WITH LAST-SECOND CHECK
+======================================================================
+
+git fetch origin
+
+If origin/main moved:
+STOP before push.
+Report REMOTE_MAIN_MOVED_AFTER_LOCAL_MERGE.
+Do not force push.
+
+If unchanged:
+git push origin main
+
+Then verify:
+- main == origin/main
+- main...origin/main = 0 0
+
+======================================================================
+9. RETAIN HOTFIX WORKTREE
+======================================================================
+
+Retain:
+- hotfix/theme-access-canonical-myshopify-domain
+- D:\shop\001_so_amazon_theme_access_domain_hotfix
+
+until Store 001 completes the first successful read-only Theme Access CLI check.
+
+======================================================================
+10. SECOND WINDOW HANDOFF
+======================================================================
+
+Final report must include:
+SECOND_WINDOW_HANDOFF_MAIN_SHA = <new main SHA>
+
+Other active project windows must fetch that SHA before their next main merge.
+
+======================================================================
+11. EXACT NEXT ACTION AFTER SUCCESS
+======================================================================
+
+Do NOT run live apply in this merge task.
+
+After successful merge:
+1. run ShopSource UI from new main
+2. open "여러 스토어 테마 관리"
+3. select 001 | Cabin Tidy
+4. click "선택한 스토어 읽기 확인"
+5. use the already-saved Theme Access credential; do not re-enter/reissue it yet
+6. inspect advanced info
+
+Expected if canonical-domain mismatch was root cause:
+- Theme Access credential: YES
+- CLI state: READY
+- Configured domain: cabintidy.myshopify.com
+- Theme Access CLI domain: kgxbpi-it.myshopify.com
+- CLI domain source: CANONICAL_MYSHOPIFY_DOMAIN
+- MAIN theme: Design by klarjoy
+- role MAIN
+- Selected backend: THEME_ACCESS_CLI
+- status READY
+
+If CLI still AUTH_FAILED:
+- do NOT live apply
+- do NOT repeatedly retry
+- next step is credential-specific diagnosis/reissue, not another domain code change
+
+======================================================================
+12. FINAL REPORT
+======================================================================
+
+Report:
+[1] pre-merge origin/main
+[2] hotfix HEAD
+[3] merge-base
+[4] ahead/behind
+[5] protected pre hashes/status
+[6] diff scope
+[7] domain safety review
+[8] pre-merge tests
+[9] merge method
+[10] new local main
+[11] post-merge tests
+[12] push result
+[13] final origin/main
+[14] main...origin/main
+[15] protected post hashes/status
+[16] Shopify live write count
+[17] Theme Access credential use/creation count
+[18] hotfix/worktree retained
+[19] SECOND_WINDOW_HANDOFF_MAIN_SHA
+[20] exact read-only retest action
+
+Flags:
+FAST_FORWARD_ONLY = PASS/FAIL
+CANONICAL_MYSHOPIFY_DOMAIN_USED = YES/NO
+CONFIGURED_DOMAIN_BINDING_PRESERVED = YES/NO
+LIST_PULL_PUSH_DOMAIN_LOCKED = YES/NO
+SECRET_SAFE = YES/NO
+FULL_SUITE_POST_MERGE = PASS/FAIL
+PROTECTED_FILES_UNCHANGED = YES/NO
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_USED = NO
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+MAIN_REMOTE_SYNC = YES/NO
+SECOND_WINDOW_HANDOFF_REQUIRED = YES
