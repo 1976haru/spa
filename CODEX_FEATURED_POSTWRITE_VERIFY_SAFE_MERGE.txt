@@ -1,0 +1,376 @@
+ShopSource Studio — FEATURED POST-WRITE RECOVERY SAFE MERGE
+DURABLE VERIFY_FAILED RECOVERY + TOCTOU-SAFE LOCAL ADOPTION
+
+Repository
+- Main repo: D:\shop\001_so_amazon
+- Feature worktree: D:\shop\001_so_amazon_featured_postverify
+- Remote: https://github.com/1976haru/spa.git
+- Branch: hotfix/featured-postwrite-verify-diagnostics
+- Expected implementation HEAD before this prompt commit: d44231e7620de2cbfb4dddf97aefe0dfc5267fd4
+- Expected main/origin-main: 78996aff9f6663b20ed56c351ef5aa0dbb499615
+
+Feature summary
+- post-write VERIFY_FAILED now has exact safe diagnosis classifications
+- backend selection reason remains separate from verify reason
+- latest VERIFY_FAILED / REMOTE_JSON_VERIFIED backup can be recovered durably by store+plan
+- app restart hydrates prior failed apply and routes directly to step 5 read-only diagnosis
+- no second apply required after restart
+- read-only diagnosis compares current MAIN vs before/proposed:
+  raw hash, semantic hash, prefix/suffix, 4 product IDs, unrelated section guard
+- raw-only normalization can be locally adopted without a second Shopify write
+- adoption now performs a FRESH read-only diagnosis at confirmation time
+- stale diagnosis / merchant drift refuses adoption
+- old Store 001 VERIFY_FAILED backup format remains compatible
+- one-write-total restart E2E passes
+- focused 83 passed
+- full suite 1065 passed, 1 skipped
+- compileall/diff-check/CLI help/UI help passed
+- Shopify live write 0
+- real credential use/creation 0
+
+Goal
+Perform ONE safe fast-forward merge only.
+Do not perform any real Store 001 diagnosis or Shopify mutation during merge.
+
+======================================================================
+1. CONCURRENCY GATE
+======================================================================
+
+In main repo:
+
+git fetch origin --prune
+
+Record:
+- local main SHA
+- origin/main SHA
+- local feature SHA
+- origin feature SHA
+- merge-base
+- main...feature ahead/behind
+- git status --short
+
+Expected:
+origin/main = 78996aff9f6663b20ed56c351ef5aa0dbb499615
+
+If origin/main moved:
+STOP and report CONCURRENT_MAIN_MOVEMENT.
+Do not auto-rebase/cherry-pick/merge.
+
+Feature HEAD may be one commit ahead of d44231e because this safe-merge prompt itself is committed.
+
+======================================================================
+2. PROTECTED FILE GATE
+======================================================================
+
+Record status + SHA256 before merge:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+
+Expected operator-side hashes:
+- stores/001_cabin_tidy.json
+  9A480BE4CD24BF93BEAB8E02483512DB3801F10F506ADC610C38667C5832051F
+- tools/shopify_app/safe_shopify_cli.ps1
+  47A1BDF96BB54ADB0C9C86D7C91962A48EC6C4FDF6A0E73B6EFC8B943C275421
+
+Do not touch/stash/reset/restore:
+- protected files above
+- data/*.sqlite3
+- .env
+- credentials
+- .phase*
+- .recon_focus_initial/
+- pytest temp folders
+- backups
+- user assets
+- operator temp folders
+
+Existing dirty state must remain byte-for-byte unchanged.
+
+======================================================================
+3. DIFF SCOPE REVIEW
+======================================================================
+
+Expected feature files:
+- CODEX_FEATURED_POSTWRITE_VERIFY_DIAGNOSTICS.txt
+- CODEX_FEATURED_POSTWRITE_VERIFY_REVIEW_FIX.txt
+- CODEX_FEATURED_POSTWRITE_VERIFY_SAFE_MERGE.txt
+- src/shopsource/featured_guided_flow.py
+- src/shopsource/homepage_featured_products.py
+- src/shopsource/ui/v2.py
+- tests/test_featured_guided_flow.py
+- tests/test_homepage_featured_products.py
+
+Confirm NOT changed:
+- protected files
+- src/shopsource/shopify_theme_cli.py
+- src/shopsource/theme_write_backend.py
+- category/reconciliation logic
+- unrelated homepage features
+- credentials/token modules
+
+STOP on unexpected overlap.
+
+======================================================================
+4. POST-WRITE RECOVERY SAFETY REVIEW
+======================================================================
+
+Confirm all of the following:
+
+A. Failure reason separation
+- final VERIFY_FAILED has exact post-write reason_code
+- backend_reason_code stays separate
+- GRAPHQL_SCOPE_MISSING_CLI_READY is never presented as the verify cause
+
+B. Durable restart recovery
+- latest_post_write_backup() returns safe metadata only
+- query is exact store and optional exact plan
+- ordering is created_at DESC,rowid DESC
+- VERIFY_FAILED is recoverable
+- REMOTE_JSON_VERIFIED can be hydrated as durable success
+- generic BACKED_UP is not treated as a failed write without evidence
+- old Store 001 backup format works
+
+C. Restart UI hydration
+- hydrate only when no newer in-memory apply/backup state exists
+- existing VERIFY_FAILED backup hydrates:
+  backup_id
+  last_apply_plan_id
+  apply status VERIFY_FAILED
+  last_apply reason POST_WRITE_DIAGNOSIS_REQUIRED
+- guided flow routes directly to step 5 DIAGNOSE_POST_WRITE
+- restart does NOT force a second preflight/apply loop
+- no Shopify write during hydration
+
+D. Read-only diagnosis
+- uses original stored backend only
+- exact Store / MAIN theme identity
+- current templates/index.json read only
+- no new backup
+- no DB mutation
+- no rollback
+- raw theme content not exposed to UI
+- safe hashes/booleans/reason only
+
+E. Classification
+- POST_WRITE_VERIFIED
+- POST_WRITE_RAW_ONLY_NORMALIZED
+- POST_WRITE_PRODUCT_IDS_MISMATCH
+- POST_WRITE_UNRELATED_SECTION_DRIFT
+- POST_WRITE_SEMANTIC_MISMATCH
+- POST_WRITE_PREFIX_SUFFIX_MISMATCH
+- POST_WRITE_READ_FAILED
+- POST_WRITE_TARGET_IDENTITY_MISMATCH
+
+F. TOCTOU-safe local adoption
+- explicit confirmation required
+- adoption performs fresh diagnose_post_write()
+- stale UI diagnosis is not trusted for booleans
+- fresh semantic_equal/product_ids_match/unrelated_sections/prefix/suffix/MAIN identity required
+- expected proposed hash must match durable backup row
+- stale diagnosis / current merchant drift => ADOPTION_REFUSED
+- DB remains VERIFY_FAILED when refused
+- no Shopify write
+- no rollback
+- successful adoption writes audit from FRESH diagnosis
+- successful adoption only updates local backup/plan state to REMOTE_JSON_VERIFIED
+
+G. Guided Flow
+- VERIFY_FAILED + POST_WRITE_DIAGNOSIS_REQUIRED -> DIAGNOSE_POST_WRITE
+- safe diagnosis -> ADOPT_POST_WRITE
+- adoption success -> step 6
+- storefront verify -> step 7
+- ASSIGNMENT_READY completes
+- one-primary-action beginner UX preserved
+
+If any fail:
+STOP.
+
+======================================================================
+5. PRE-MERGE TEST GATE
+======================================================================
+
+In feature worktree use fresh unique basetemp.
+
+Set PYTHONPATH=src where needed on Windows.
+
+Run:
+python -m compileall -q src tests
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Focused:
+- restart recovery tests
+- post-write diagnosis/adoption tests
+- stale diagnosis TOCTOU tests
+- Featured guided-flow tests
+- homepage Featured tests
+- Theme Access backend/CLI safety tests
+
+Also explicitly run the one-write-total restart E2E.
+
+Full:
+python -m pytest -q --basetemp=<fresh-worktree-local-temp>
+
+Required:
+- focused >= 83 passed for the reported subset
+- full >= 1065 passed, 1 skipped
+- restart E2E PASS
+- stale diagnosis refusal PASS
+- Shopify live write count = 0
+- real credential use/creation = 0
+
+======================================================================
+6. FAST-FORWARD MERGE ONLY
+======================================================================
+
+Return to main repo.
+
+git fetch origin
+
+Verify origin/main is still exactly the SHA recorded in step 1.
+
+Then:
+git merge --ff-only hotfix/featured-postwrite-verify-diagnostics
+
+If ff-only fails:
+STOP.
+No merge commit.
+No conflict auto-resolution.
+
+======================================================================
+7. POST-MERGE TEST GATE
+======================================================================
+
+On main rerun:
+- compileall
+- focused suite
+- explicit restart E2E
+- explicit stale-diagnosis refusal test
+- full suite with fresh basetemp
+- git diff --check
+- CLI help
+- UI help
+
+Verify:
+- protected hashes/status unchanged
+- no real credential used/created
+- no Shopify live write
+
+======================================================================
+8. PUSH WITH LAST-SECOND CHECK
+======================================================================
+
+git fetch origin
+
+If origin/main moved:
+STOP BEFORE PUSH.
+Report REMOTE_MAIN_MOVED_AFTER_LOCAL_MERGE.
+Do not force push.
+
+If unchanged:
+git push origin main
+
+Then verify:
+- main == origin/main
+- main...origin/main = 0 0
+
+======================================================================
+9. RETAIN FEATURE WORKTREE
+======================================================================
+
+Retain:
+- hotfix/featured-postwrite-verify-diagnostics
+- D:\shop\001_so_amazon_featured_postverify
+
+until the real Store 001 read-only post-write diagnosis and any local-only adoption are reviewed.
+
+======================================================================
+10. SECOND-WINDOW HANDOFF
+======================================================================
+
+Final report must include:
+SECOND_WINDOW_HANDOFF_MAIN_SHA = <new main SHA>
+
+Other active project window must fetch this SHA before its next main merge.
+
+======================================================================
+11. EXACT NEXT ACTION AFTER SUCCESSFUL MERGE
+======================================================================
+
+Do NOT perform a second Shopify apply.
+
+After merge:
+1. launch ShopSource from new main
+2. Store 001 > 스토어 디자인 > 홈페이지
+3. let durable recovery hydrate the existing VERIFY_FAILED backup
+4. expected primary action:
+   "5단계 · 이전 적용 결과 읽기 전용 진단"
+5. click that ONE button
+6. this explicit action may use the already saved Theme Access credential READ-ONLY
+7. capture the result
+8. do NOT click rollback or Shopify apply
+
+If diagnosis is:
+- POST_WRITE_VERIFIED
+or
+- POST_WRITE_RAW_ONLY_NORMALIZED
+then:
+9. open the local-only "검증 상태 확정" dialog
+10. check the explicit confirmation
+11. adoption performs a fresh read-only re-diagnosis
+12. if still safe, update local verification state only
+13. Guided Flow should advance to step 6
+14. no second Shopify write
+
+If mismatch:
+- do not adopt
+- do not reapply
+- review exact reason_code first
+
+======================================================================
+12. FINAL REPORT
+======================================================================
+
+Report:
+[1] pre-merge origin/main SHA
+[2] feature HEAD SHA
+[3] merge-base
+[4] ahead/behind
+[5] protected pre-merge hashes/status
+[6] diff scope
+[7] durable recovery review
+[8] read-only diagnosis review
+[9] TOCTOU adoption review
+[10] pre-merge tests
+[11] restart E2E
+[12] merge method
+[13] new local main SHA
+[14] post-merge tests
+[15] push result
+[16] final origin/main SHA
+[17] main...origin/main
+[18] protected post-merge hashes/status
+[19] Shopify live write count
+[20] Theme Access credential use/creation count
+[21] feature/worktree retained
+[22] SECOND_WINDOW_HANDOFF_MAIN_SHA
+[23] exact next action
+
+Final flags:
+FAST_FORWARD_ONLY = PASS/FAIL
+DURABLE_VERIFY_FAILED_RECOVERY = READY/NOT_READY
+RESTART_ROUTES_TO_POSTWRITE_DIAGNOSIS = YES/NO
+SECOND_APPLY_AFTER_RESTART_REQUIRED = NO
+POST_WRITE_DIAGNOSIS = READY/NOT_READY
+ADOPTION_REVALIDATES_REMOTE = YES/NO
+STALE_DIAGNOSIS_ADOPTION_REFUSED = YES/NO
+ONE_WRITE_TOTAL_RESTART_E2E = PASS/FAIL
+OLD_BACKUP_COMPATIBILITY = PASS/FAIL
+FULL_SUITE_POST_MERGE = PASS/FAIL
+PROTECTED_FILES_UNCHANGED = YES/NO
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_USED = NO
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+MAIN_REMOTE_SYNC = YES/NO
+SECOND_WINDOW_HANDOFF_REQUIRED = YES
