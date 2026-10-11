@@ -1,0 +1,184 @@
+ShopSource Studio — FEATURED GUIDED FLOW REVIEW FIX
+DO NOT MERGE MAIN YET
+
+Repository
+- Baseline main: 29df61c9e360bcfe9390fc50f35057271a7699cb
+- Branch: ux/featured-guided-stepper
+- Current implementation commit: b9c7af6afe0bb53142cf3be714bab4369cd80ad8
+- Existing worktree: D:\shop\001_so_amazon_featured_guided_ux
+
+Context
+The 7-step guided Featured flow is directionally correct and full tests pass, but code review found a real runtime bug in the step-6 storefront confirmation path. Fix it before safe merge.
+
+Do not reset/stash/discard the existing branch work.
+Do not merge main.
+No Shopify live write.
+No real Theme Access credential use.
+
+======================================================================
+1. REQUIRED BUG FIX — STEP 6 STOREFRONT CONFIRMATION
+======================================================================
+
+Current code in src/shopsource/ui/v2.py inside featured_storefront_check() -> save_checks():
+
+- calls:
+  confirmation = FeaturedProductAssignmentService().confirm_storefront(...)
+- then incorrectly sets:
+  state["featured_assignment_status"] = None
+- then immediately does:
+  ui.notify("추천 상품 상태: " + state["featured_assignment_status"], ...)
+
+This can raise TypeError because None is concatenated to str.
+It also throws away the actual confirmation status.
+
+Fix the flow.
+
+Required behavior:
+- keep storefront verification state separate from final assignment step state.
+- after confirm_storefront(), persist the safe returned status explicitly, e.g.
+  state["featured_storefront_status"] = confirmation.get("status")
+- refresh durable plan:
+  state["featured_products_plan"] = FeaturedProductAssignmentService().get_plan(plan["plan_id"])
+- DO NOT mark final assignment step complete here.
+- state["featured_assignment_status"] must remain/reset None until step 7 confirmation.
+- notify using confirmation.get("status") safely, never concatenate None.
+- after successful storefront confirmation, guided resolver should advance to step 7 because refreshed plan.storefront_verified == true.
+
+Expected success:
+confirmation status should normally be STOREFRONT_VERIFIED when all four checks + remote JSON verification are valid.
+
+User-facing message:
+- success: "스토어 확인 완료. 다음은 7단계 과제 제출 확인입니다."
+- otherwise: "스토어 확인 항목이 아직 남아 있습니다."
+No technical status needed in beginner message.
+
+======================================================================
+2. TEST THE BUG DIRECTLY
+======================================================================
+
+Add a focused regression test that exercises the state transition semantics for step 6:
+- applied / REMOTE_JSON_VERIFIED
+- storefront not yet verified -> step 6 OPEN_STOREFRONT
+- after storefront confirmation durable plan has storefront_verified=true
+- assignment_status still None
+- resolver -> step 7 OPEN_ASSIGNMENT_CHECK
+- no TypeError-prone None concatenation pattern remains in the relevant save handler
+
+Prefer extracting a tiny pure/state helper if necessary rather than brittle string-only tests, but keep scope small.
+
+Also add/adjust a static UI test to ensure the step-6 save path uses confirmation status safely.
+
+======================================================================
+3. REVIEW FOR NEARBY STATE-KEY CONSISTENCY
+======================================================================
+
+Review only the Featured guided flow for these state keys:
+- featured_last_apply_status
+- featured_last_apply_result
+- featured_last_apply_plan_id
+- featured_preflight_result
+- featured_preflight_plan_id
+- featured_preflight_preview_hash
+- featured_storefront_status
+- featured_assignment_status
+- featured_products_reviewed_plan_id
+
+Confirm:
+- product reselection invalidates review/preview/preflight/apply-dependent state safely
+- new preview invalidates old preflight
+- failed old apply does not override a fresh successful preflight after new preview
+- step 6 does not prematurely complete step 7
+- step 7 completion uses featured_assignment_status only
+- no stale key typo causes the flow to stick on an earlier step
+
+If a clear bug is found, fix it with minimal scope and tests.
+Do not redesign the whole state model.
+
+======================================================================
+4. MANUAL RENDER / STATIC UX REVIEW
+======================================================================
+
+Without real credential or Shopify writes, verify the Featured card layout conceptually/static:
+
+Beginner default should visibly contain:
+- "추천 상품 만들기 · N/7 완료"
+- 7-step progress
+- "지금 할 일"
+- exactly one large primary action
+- selected products collapsed
+- "고급 / 문제 해결" collapsed
+
+At current real failure state:
+- plan 4/4 READY
+- review complete
+- PREVIEW
+- REMOTE_READ_FAILED
+
+Expected primary:
+"4단계 · 연결 상태 다시 확인"
+
+No same-weight wall of 8 buttons in beginner view.
+
+======================================================================
+5. TESTS
+======================================================================
+
+Run:
+python -m compileall -q src tests
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Focused:
+python -m pytest -q tests/test_featured_guided_flow.py tests/test_homepage_featured_products.py tests/test_homepage_golden_path.py
+
+Full:
+python -m pytest -q --basetemp=<worktree-local-temp>
+
+Expected >= 1045 passed, 1 skipped.
+
+No real credential.
+No Shopify mutation.
+
+======================================================================
+6. COMMIT/PUSH
+======================================================================
+
+Commit validated fix to the SAME branch:
+ux/featured-guided-stepper
+
+Suggested commit:
+Fix Featured guided storefront confirmation state
+
+Push branch.
+Do not merge main.
+
+======================================================================
+7. REPORT
+======================================================================
+
+Report:
+[1] baseline feature SHA
+[2] final feature SHA
+[3] exact bug fixed
+[4] state keys reviewed
+[5] step 6 -> step 7 transition
+[6] beginner current-error primary action
+[7] focused tests
+[8] full suite
+[9] protected files
+[10] Shopify live write count
+[11] real credential use/creation count
+[12] merge readiness
+[13] exact next action
+
+Final flags:
+STOREFRONT_CONFIRMATION_BUG_FIXED = YES/NO
+STEP6_TO_STEP7 = PASS/FAIL
+ONE_PRIMARY_ACTION = YES/NO
+REMOTE_READ_REPAIR = READY/NOT_READY
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_USED = NO
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+FULL_SUITE = PASS/FAIL
+CODE_MERGE_READY = YES/NO
