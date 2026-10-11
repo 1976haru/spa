@@ -1,0 +1,375 @@
+ShopSource Studio — FEATURED POST-WRITE VERIFY DIAGNOSTICS + POLICY STABILIZATION
+ONE COMPRESSED READ-ONLY FORENSIC PASS AFTER REAL VERIFY_FAILED
+NO SECOND LIVE WRITE UNTIL ROOT CAUSE IS CLASSIFIED
+
+Repository
+- Baseline main: 78996aff9f6663b20ed56c351ef5aa0dbb499615
+- Branch: hotfix/featured-postwrite-verify-diagnostics
+- Recommended worktree: D:\shop\001_so_amazon_featured_postverify
+
+Real observed state
+- Step 4 preflight previously returned READY_TO_APPLY
+- User performed Step 5 once with both live confirmations
+- Guided Flow fell back to Step 4
+- Advanced UI now shows:
+  preview: PREVIEW
+  apply: VERIFY_FAILED
+  recent apply result: VERIFY_FAILED (GRAPHQL_SCOPE_MISSING_CLI_READY)
+
+Important code-review finding
+The displayed parenthetical code is NOT the actual verify failure cause.
+In FeaturedProductThemeApplyService.apply(), the final service-level VERIFY_FAILED return currently includes:
+  backend_reason_code = backend selection reason
+  e.g. GRAPHQL_SCOPE_MISSING_CLI_READY
+and does NOT include a specific verification reason_code.
+
+Therefore:
+- actual write may already have occurred
+- do NOT re-apply
+- do NOT rollback
+- do NOT re-run step 4 as a substitute for diagnosis
+- first perform read-only post-write forensics against the existing backup/proposed file and current remote MAIN theme
+
+Mission
+In one compressed pass:
+1. make the final VERIFY_FAILED reason diagnosable,
+2. determine whether the real remote already contains the intended 4-product change,
+3. classify raw-only normalization vs semantic mismatch vs read failure vs product-ID mismatch vs unrelated-section drift,
+4. if and only if the remote state is semantically the exact intended isolated change, provide a safe no-second-write verification/adoption path,
+5. cover the whole behavior with integration tests,
+6. do not perform any real Shopify mutation in development/tests.
+
+======================================================================
+1. SAFETY
+======================================================================
+
+Do not modify:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env
+- credentials
+- category/reconciliation logic
+- unrelated homepage features
+
+No real Shopify write in tests.
+No rollback.
+No second real apply.
+No credential creation/deletion.
+Do not merge main.
+
+Real credential use:
+- implementation/tests: NO
+- a later explicit user-triggered read-only diagnosis may use the already stored Theme Access credential
+- never expose credential values
+
+======================================================================
+2. ROOT CAUSE CLASSIFICATION MODEL
+======================================================================
+
+Add safe reason codes for post-write verification:
+
+POST_WRITE_READ_FAILED
+POST_WRITE_RAW_ONLY_NORMALIZED
+POST_WRITE_SEMANTIC_MISMATCH
+POST_WRITE_PRODUCT_IDS_MISMATCH
+POST_WRITE_UNRELATED_SECTION_DRIFT
+POST_WRITE_PREFIX_SUFFIX_MISMATCH
+POST_WRITE_TARGET_IDENTITY_MISMATCH
+POST_WRITE_VERIFIED
+
+Classification order should be deterministic and first-failing.
+
+Capture only safe facts:
+- current raw hash
+- expected proposed raw hash
+- current semantic hash
+- expected proposed semantic hash
+- raw_equal
+- semantic_equal
+- prefix_equal
+- suffix_equal
+- product_ids_match
+- unrelated_sections_unchanged
+- backend_name
+- theme_id / role
+- backup_id
+- write_performed
+
+Never return raw theme content to UI.
+Never return stdout/stderr/env/token/password.
+
+======================================================================
+3. READ-ONLY POST-WRITE FORENSIC SERVICE
+======================================================================
+
+Add a service method, preferably:
+FeaturedProductThemeApplyService.diagnose_post_write(backup_id, ...)
+
+Requirements:
+- lookup existing backup row
+- read before.raw.json + proposed.raw.json + metadata from backup folder
+- use original stored backend only
+- verify same Store / MAIN theme identity
+- read CURRENT templates/index.json only
+- NO write
+- NO rollback
+- NO backup creation
+- NO DB mutation unless a separate explicit adoption method is later called
+- parse current remote with comment-aware parser
+- compare current vs proposed:
+  raw
+  semantic
+  prefix/suffix
+  product IDs
+  unrelated section diff relative to before
+- return exact safe classification
+
+If current remote is semantically equal to proposed, product IDs match, unrelated sections unchanged, prefix/suffix equal, but raw differs only from formatting/canonicalization:
+  classification = POST_WRITE_RAW_ONLY_NORMALIZED
+
+If everything including raw matches:
+  classification = POST_WRITE_VERIFIED
+
+If semantic differs:
+  identify whether product IDs differ or unrelated sections changed before falling back to POST_WRITE_SEMANTIC_MISMATCH.
+
+======================================================================
+4. SAFE NO-SECOND-WRITE ADOPTION PATH
+======================================================================
+
+If read-only diagnosis proves either:
+
+A. POST_WRITE_VERIFIED
+or
+B. POST_WRITE_RAW_ONLY_NORMALIZED AND ALL of:
+   semantic_equal=True
+   product_ids_match=True
+   unrelated_sections_unchanged=True
+   prefix_equal=True
+   suffix_equal=True
+   exact MAIN identity verified
+
+then allow a separate explicit LOCAL-STATE-ONLY method:
+adopt_verified_remote(backup_id, diagnosis, confirmed=True)
+
+This method must:
+- perform NO Shopify write
+- perform NO rollback
+- update backup status to REMOTE_JSON_VERIFIED
+- update plan status to REMOTE_JSON_VERIFIED
+- set remote_json_verified=1
+- storefront_verified=0
+- record safe diagnosis metadata if schema supports it or leave an audit artifact
+- return write_performed=False
+- return reason_code POST_WRITE_VERIFIED or POST_WRITE_RAW_ONLY_NORMALIZED
+
+Require explicit confirmation in UI:
+"현재 원격 테마가 의도한 추천 상품 변경과 의미적으로 일치함을 확인했습니다. Shopify에 다시 쓰지 않고 검증 상태만 갱신합니다."
+
+Do NOT auto-adopt semantic mismatch.
+
+======================================================================
+5. FIX FINAL APPLY RESULT REASON
+======================================================================
+
+In FeaturedProductThemeApplyService.apply():
+
+Current final failure:
+status = VERIFY_FAILED
+backend_reason_code = backend selection reason
+
+Change behavior so final VERIFY_FAILED returns:
+- reason_code = exact post-write verification classification
+- backend_reason_code = backend selection reason remains separate
+- write_performed=True
+- safe comparison booleans/hashes as appropriate
+
+Do not collapse:
+GRAPHQL_SCOPE_MISSING_CLI_READY
+into the failure reason.
+
+That code only explains why THEME_ACCESS_CLI was selected.
+
+======================================================================
+6. UI — ONE OBVIOUS NEXT ACTION
+======================================================================
+
+When last apply status == VERIFY_FAILED:
+
+Default beginner UI must NOT say only:
+"4단계 · 안전 검사 다시 실행"
+
+Instead show:
+"5단계 적용 결과 확인 필요"
+
+Primary action:
+"적용 결과 읽기 전용 진단"
+
+Help:
+"Shopify에 다시 쓰지 않고 현재 MAIN 테마가 실제로 어떻게 저장되었는지 확인합니다."
+
+After diagnosis:
+
+POST_WRITE_VERIFIED:
+primary = "검증 상태 확정"
+(no Shopify write)
+
+POST_WRITE_RAW_ONLY_NORMALIZED:
+primary = "의미적으로 동일함 확인 후 검증 상태 확정"
+(no Shopify write)
+
+Other mismatch:
+primary = NONE or safe remediation such as "최신 상태로 미리보기 다시 만들기"
+but NO automatic write/rollback.
+
+Advanced details should show exact safe reason code and comparison booleans/hashes.
+
+======================================================================
+7. COMPRESSED TEST MATRIX
+======================================================================
+
+Add integration tests for all important post-write outcomes:
+
+1. exact raw match
+   -> POST_WRITE_VERIFIED
+
+2. raw differs, semantic equal, prefix/suffix equal, IDs match, unrelated unchanged
+   -> POST_WRITE_RAW_ONLY_NORMALIZED
+   -> adopt_verified_remote succeeds with write_performed=False
+
+3. product IDs differ
+   -> POST_WRITE_PRODUCT_IDS_MISMATCH
+   -> adoption refused
+
+4. unrelated merchant section changed
+   -> POST_WRITE_UNRELATED_SECTION_DRIFT
+   -> adoption refused
+
+5. semantic mismatch other than IDs/unrelated
+   -> POST_WRITE_SEMANTIC_MISMATCH
+   -> adoption refused
+
+6. prefix/suffix mismatch
+   -> POST_WRITE_PREFIX_SUFFIX_MISMATCH
+   -> adoption refused
+
+7. read failure
+   -> POST_WRITE_READ_FAILED
+   -> adoption refused
+
+8. target identity mismatch
+   -> POST_WRITE_TARGET_IDENTITY_MISMATCH
+   -> adoption refused
+
+9. final apply VERIFY_FAILED includes exact reason_code separate from backend_reason_code
+
+10. Guided Flow after VERIFY_FAILED offers post-write diagnosis, not generic preflight rerun
+
+11. successful adoption advances step 5 -> 6 without second Shopify write
+
+12. full path:
+READY_TO_APPLY
+-> one write attempt
+-> VERIFY_FAILED due raw-only normalization
+-> read-only diagnosis
+-> local-only adoption
+-> step 6
+-> storefront verify
+-> step 7
+-> ASSIGNMENT_READY
+with total Shopify write attempts == 1
+
+======================================================================
+8. OPTIONAL REAL READ-ONLY DIAGNOSTIC HARNESS
+======================================================================
+
+Provide a CLI/dev helper or UI button for the user-triggered diagnosis.
+
+Rules:
+- explicit click only
+- may use already saved Theme Access credential
+- read-only current templates/index.json
+- no credential display
+- no raw theme content display
+- no write
+- no rollback
+- no new backup
+
+This real diagnostic should be usable after merge to classify the CURRENT already-attempted Store 001 write without applying again.
+
+======================================================================
+9. QUALITY GATES
+======================================================================
+
+Run:
+python -m compileall -q src tests
+git diff --check
+PYTHONPATH=src python -m shopsource.cli --help
+PYTHONPATH=src python -m shopsource.ui.v2 --help
+
+Focused:
+- Featured post-write diagnostics tests
+- Featured guided flow tests
+- homepage featured products tests
+- Theme Access CLI tests
+- backend/router tests
+
+Full:
+python -m pytest -q --basetemp=<fresh-worktree-local-temp>
+
+Expected >= current 1053 passed, 1 skipped.
+
+No real credential.
+No real Shopify network/write.
+
+======================================================================
+10. COMMIT/PUSH
+======================================================================
+
+Commit validated implementation/tests on:
+hotfix/featured-postwrite-verify-diagnostics
+
+Suggested commit:
+Add post-write Featured verification diagnostics
+
+Push branch.
+Do not merge main.
+
+======================================================================
+11. REPORT
+======================================================================
+
+Report:
+[1] baseline SHA
+[2] final feature SHA
+[3] files changed
+[4] exact current bug in VERIFY_FAILED reason propagation
+[5] diagnosis classifications
+[6] read-only forensic method
+[7] no-second-write adoption method
+[8] guided UI behavior
+[9] raw-only normalization test
+[10] mismatch refusal tests
+[11] one-write-total E2E test
+[12] focused tests
+[13] full suite
+[14] protected files
+[15] Shopify live write count
+[16] real credential use/creation count
+[17] merge readiness
+[18] exact next action
+
+Final flags:
+VERIFY_FAILED_REASON_SEPARATED = YES/NO
+POST_WRITE_DIAGNOSIS = READY/NOT_READY
+RAW_ONLY_NORMALIZATION_CLASSIFIED = YES/NO
+LOCAL_ONLY_ADOPTION = READY/NOT_READY
+SECOND_SHOPIFY_WRITE_REQUIRED_FOR_ADOPTION = NO
+ONE_WRITE_TOTAL_E2E = PASS/FAIL
+GUIDED_POSTWRITE_RECOVERY = READY/NOT_READY
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_USED = NO
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+FULL_SUITE = PASS/FAIL
+CODE_MERGE_READY = YES/NO
