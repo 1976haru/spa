@@ -1,0 +1,378 @@
+ShopSource Studio — POST-WRITE DIAGNOSTICS REVIEW FIX
+DURABLE RESTART RECOVERY + TOCTOU-SAFE LOCAL ADOPTION
+SAME BRANCH, NO MAIN MERGE YET
+
+Repository
+- Baseline main: 78996aff9f6663b20ed56c351ef5aa0dbb499615
+- Branch: hotfix/featured-postwrite-verify-diagnostics
+- Current implementation HEAD before this prompt commit: 4248e3884fb9deea1c55bbf4afbb726c9e825db5
+- Existing worktree: D:\shop\001_so_amazon_featured_postverify
+
+Why this review fix is required before safe merge
+The new post-write diagnosis/adoption feature is directionally correct and tests pass, but code review found TWO real production-safety gaps that matter specifically for the already-failed Store 001 apply:
+
+1. RESTART RECOVERY GAP
+- The real failed apply already created a durable homepage_featured_theme_backups row with status VERIFY_FAILED.
+- But UI state fields such as:
+  state["backup_id"]
+  state["featured_last_apply_result"]
+  state["featured_postwrite_diagnosis"]
+  are in-memory.
+- To run the newly added diagnosis code, ShopSource must be restarted on the new main after merge.
+- On restart, backup_id / last apply UI state may be lost.
+- Without durable hydration, Guided Flow can fall back to preflight/apply instead of offering diagnosis of the EXISTING failed write attempt.
+- We must recover the latest post-write backup from DB by store+plan, without a second Shopify write.
+
+2. ADOPTION TOCTOU GAP
+- adopt_verified_remote(backup_id, diagnosis, confirmed=True) currently trusts the diagnosis dict captured earlier.
+- A merchant/theme process could modify MAIN after diagnosis but before user clicks "검증 상태 확정".
+- The method then updates local DB to REMOTE_JSON_VERIFIED without re-reading current remote.
+- This can falsely mark a stale diagnosis as verified.
+- Adoption must re-read/re-diagnose immediately at confirmation time and only update local state if CURRENT remote still qualifies.
+- No Shopify write is needed; a fresh read-only check is sufficient.
+
+Mission
+Fix both gaps in the SAME branch, add restart/TOCTOU regression tests, rerun the full suite, commit/push.
+Do not split into another micro-hotfix.
+Do not merge main yet.
+
+======================================================================
+1. DURABLE LATEST POST-WRITE BACKUP LOOKUP
+======================================================================
+
+Add a read-only service method, e.g.:
+
+FeaturedProductThemeApplyService.latest_post_write_backup(
+    store_id: str,
+    plan_id: str | None = None
+) -> dict | None
+
+Query homepage_featured_theme_backups using:
+- exact store_id
+- plan_id when supplied
+- newest by created_at DESC, rowid DESC
+
+Relevant statuses:
+- VERIFY_FAILED
+- BACKED_UP only if there is evidence a write was attempted (if schema cannot prove this, do NOT treat generic BACKED_UP as a post-write failure)
+- REMOTE_JSON_VERIFIED for durable success hydration if useful
+
+For current recovery, VERIFY_FAILED is the key status.
+
+Return safe fields only:
+- backup_id
+- store_id
+- plan_id
+- theme_id
+- filename
+- status
+- backend_name
+- backend_selection
+- backend_reason_code
+- created_at
+
+No raw content.
+
+======================================================================
+2. RESTART HYDRATION IN FEATURED UI
+======================================================================
+
+When rendering/resolving Featured for a READY plan after app restart:
+
+If in-memory state has no current backup_id / last apply result:
+- query latest_post_write_backup(current_store, current plan_id)
+
+If latest backup status == VERIFY_FAILED:
+hydrate:
+- state["backup_id"] = backup_id
+- state["featured_last_apply_plan_id"] = plan_id
+- state["featured_apply_status"] = "VERIFY_FAILED"
+- state["featured_last_apply_status"] = "VERIFY_FAILED"
+- state["featured_last_apply_result"] = {
+    "status": "VERIFY_FAILED",
+    "reason_code": "POST_WRITE_DIAGNOSIS_REQUIRED",
+    "backend_name": ...,
+    "backend_reason_code": ...,
+    "backup_id": ...,
+    "write_performed": True,
+    "reason": "이전 적용 시도 결과를 읽기 전용으로 확인해야 합니다."
+  }
+
+Do NOT invent the exact post-write mismatch code from the old row.
+The old row only knows VERIFY_FAILED + backend selection reason.
+Use a neutral durable reason:
+POST_WRITE_DIAGNOSIS_REQUIRED
+
+Guided Flow should route:
+step 5 -> DIAGNOSE_POST_WRITE
+label:
+"5단계 · 이전 적용 결과 읽기 전용 진단"
+
+Do NOT force the user back through:
+1 -> 2 -> 3 -> 4 -> second apply
+if the durable plan/backup already proves a prior write attempt that needs diagnosis.
+
+If latest backup is already REMOTE_JSON_VERIFIED and plan has remote_json_verified=1:
+hydrate enough state to route directly to step 6.
+
+Do not overwrite newer in-memory state with an older durable backup.
+
+======================================================================
+3. GUIDED RESOLVER SUPPORT
+======================================================================
+
+Treat:
+- VERIFY_FAILED + reason_code POST_WRITE_DIAGNOSIS_REQUIRED
+the same as other VERIFY_FAILED diagnosis-required states:
+primary_action = DIAGNOSE_POST_WRITE
+
+Do not require the original exact failure reason before diagnosis.
+
+After diagnosis:
+- allowed exact/raw-only -> ADOPT_POST_WRITE
+- mismatch -> block/appropriate safe action
+- never OPEN_APPLY_GATE automatically from a durable VERIFY_FAILED backup
+
+======================================================================
+4. TOCTOU-SAFE ADOPTION
+======================================================================
+
+Refactor adopt_verified_remote so it NEVER relies only on the UI-provided diagnosis dict.
+
+Preferred signature:
+
+adopt_verified_remote(
+    backup_id,
+    diagnosis=None,
+    *,
+    confirmed=False,
+    backend_coordinator=None,
+    client=None,
+) -> dict
+
+At adoption time:
+
+1. require confirmed=True
+2. lookup backup row
+3. perform a FRESH diagnose_post_write(backup_id, same backend/client)
+4. require current fresh diagnosis reason_code in:
+   - POST_WRITE_VERIFIED
+   - POST_WRITE_RAW_ONLY_NORMALIZED
+5. require fresh:
+   semantic_equal=True
+   product_ids_match=True
+   unrelated_sections_unchanged=True
+   prefix_equal=True
+   suffix_equal=True
+   exact MAIN identity verified
+6. require fresh expected_proposed_raw_hash == backup proposed_raw_hash
+7. if a previous diagnosis dict was supplied, require its immutable identity fields to match:
+   backup_id
+   expected_proposed_raw_hash
+   but do NOT trust its booleans over the fresh diagnosis
+8. only then update backup/plan local DB state
+
+If remote changed after the first diagnosis:
+return:
+status = ADOPTION_REFUSED
+reason_code = fresh diagnosis exact code
+write_performed=False
+
+No Shopify write.
+No rollback.
+
+The audit JSON written on adoption must contain the FRESH diagnosis, not stale UI data.
+
+======================================================================
+5. TEST: REALISTIC APP RESTART RECOVERY
+======================================================================
+
+Add an integration test that simulates:
+
+A. first process/session:
+- plan READY
+- preflight READY_TO_APPLY
+- one write attempt
+- final status VERIFY_FAILED
+- backup row persisted as VERIFY_FAILED
+
+B. simulated restart:
+- create a NEW UI-like state dict with no:
+  backup_id
+  featured_last_apply_result
+  preflight session state
+- reload plan from DB
+- hydrate durable post-write state from latest backup
+
+Expected:
+- backup_id recovered
+- last_apply status VERIFY_FAILED
+- reason_code POST_WRITE_DIAGNOSIS_REQUIRED
+- Guided Flow goes directly to step 5 DIAGNOSE_POST_WRITE
+- no second apply
+- no Shopify write during hydration
+
+Then:
+- read-only diagnosis
+- local-only adoption if safe
+- step 6
+
+Total Shopify writes across whole test must remain exactly 1.
+
+======================================================================
+6. TEST: TOCTOU / STALE DIAGNOSIS REFUSAL
+======================================================================
+
+Test:
+1. diagnosis A returns POST_WRITE_RAW_ONLY_NORMALIZED and is adoptable
+2. before adoption, mutate mock remote:
+   - change product IDs OR unrelated merchant section
+3. call adopt_verified_remote with stale diagnosis A
+4. adoption performs fresh read
+5. result = ADOPTION_REFUSED
+6. reason_code reflects fresh mismatch
+7. DB backup stays VERIFY_FAILED
+8. plan stays not REMOTE_JSON_VERIFIED
+9. Shopify write count does not increase
+
+Also test:
+- if current remote remains unchanged and safe, adoption succeeds
+- total Shopify write count stays 1
+
+======================================================================
+7. EXISTING REAL STORE 001 COMPATIBILITY
+======================================================================
+
+The already existing Store 001 backup row was created by older main code.
+
+Ensure diagnosis works with that row format:
+- metadata.json
+- before.raw.json
+- proposed.raw.json
+- selected_products.json
+- backend_name THEME_ACCESS_CLI
+- backend_reason_code may be GRAPHQL_SCOPE_MISSING_CLI_READY
+- backup status VERIFY_FAILED
+
+Do not require newly-added DB columns that the old backup does not have.
+
+If audit metadata storage needs schema changes, make them backward-compatible and optional.
+Prefer file audit artifact over DB migration for this hotfix.
+
+======================================================================
+8. UI PRIMARY ACTION AFTER RESTART
+======================================================================
+
+After merge/restart, expected beginner UI for the current Store 001 case:
+
+추천 상품 만들기 · 4/7 또는 equivalent durable progress
+
+5. Shopify 적용 — 문제 확인 필요
+
+지금 할 일:
+"5단계 · 이전 적용 결과 읽기 전용 진단"
+
+[ 이전 적용 결과 읽기 전용 진단 ]
+
+Help:
+"이전에 Shopify 적용이 한 번 시도되었습니다. 다시 적용하지 않고 현재 MAIN 테마를 읽어 실제 저장 상태를 확인합니다."
+
+Do NOT show:
+"4단계 · 안전 검사 다시 실행"
+as the primary action when a durable VERIFY_FAILED backup exists.
+
+======================================================================
+9. SAFETY
+======================================================================
+
+No real Shopify write.
+No rollback.
+No real Theme Access credential use in tests.
+No credential creation/deletion.
+No main merge.
+
+Do not touch:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env
+- credentials
+- category/reconciliation modules
+- .phase*
+- temp folders
+- backups outside test fixtures
+
+======================================================================
+10. QUALITY GATES
+======================================================================
+
+Run:
+python -m compileall -q src tests
+git diff --check
+PYTHONPATH=src python -m shopsource.cli --help
+PYTHONPATH=src python -m shopsource.ui.v2 --help
+
+Focused:
+- post-write diagnosis/adoption tests
+- restart hydration tests
+- TOCTOU tests
+- Featured guided flow tests
+- homepage Featured tests
+- Theme Access CLI/backend tests
+
+Full:
+python -m pytest -q --basetemp=<fresh-worktree-local-temp>
+
+Expected >= 1062 passed, 1 skipped.
+
+======================================================================
+11. COMMIT/PUSH
+======================================================================
+
+Commit validated changes to SAME branch:
+hotfix/featured-postwrite-verify-diagnostics
+
+Suggested commit:
+Harden Featured post-write recovery across restarts
+
+Push branch.
+Do not merge main.
+
+======================================================================
+12. REPORT
+======================================================================
+
+Report:
+[1] baseline feature SHA
+[2] final feature SHA
+[3] files changed
+[4] restart recovery gap fixed
+[5] durable latest backup lookup
+[6] hydrated state behavior
+[7] Guided Flow after restart
+[8] adoption TOCTOU gap fixed
+[9] fresh re-diagnosis at adoption
+[10] stale diagnosis refusal test
+[11] one-write-total restart E2E
+[12] compatibility with old VERIFY_FAILED backup
+[13] focused tests
+[14] full suite
+[15] protected files
+[16] Shopify live write count
+[17] real credential use/creation count
+[18] merge readiness
+[19] exact next action
+
+Final flags:
+DURABLE_VERIFY_FAILED_RECOVERY = READY/NOT_READY
+RESTART_ROUTES_TO_POSTWRITE_DIAGNOSIS = YES/NO
+SECOND_APPLY_AFTER_RESTART_REQUIRED = NO
+ADOPTION_REVALIDATES_REMOTE = YES/NO
+STALE_DIAGNOSIS_ADOPTION_REFUSED = YES/NO
+ONE_WRITE_TOTAL_RESTART_E2E = PASS/FAIL
+OLD_BACKUP_COMPATIBILITY = PASS/FAIL
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_USED = NO
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+FULL_SUITE = PASS/FAIL
+CODE_MERGE_READY = YES/NO
