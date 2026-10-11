@@ -635,96 +635,236 @@ class FeaturedProductThemeApplyService:
                 return False
         return True
 
-    def apply(self, plan_id: str, preview: dict, *, store_id: str, confirmed: bool = False,
-              backend_selection: str = "AUTO", allow_live: bool = False,
-              backend_coordinator=None, client=None) -> dict:
-        if confirmed is not True: return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Explicit user confirmation required", "write_performed": False}
+    @staticmethod
+    def _preflight_human_message(reason_code: str) -> str:
+        messages = {
+            "EXPLICIT_CONFIRMATION_REQUIRED": "적용 전에 상품 적용 확인이 필요합니다.",
+            "STALE_OR_MISSING_PREVIEW": "추천 상품 미리보기가 없거나 오래되었습니다. 미리보기를 다시 만들어 주세요.",
+            "LATEST_PLAN_CHANGED": "추천 상품 계획이 바뀌었습니다. 최신 계획으로 미리보기를 다시 만들어 주세요.",
+            "FOUR_READY_REQUIRED": "적용 가능한 상품 4개가 준비되지 않았습니다. 상품 상태를 확인해 주세요.",
+            "PREVIEW_IDENTITY_HASH_MISMATCH": "미리보기의 스토어 또는 테마 정보가 현재 상태와 다릅니다. 다시 미리보기해 주세요.",
+            "NO_APPROVED_BACKEND": "테마를 안전하게 읽을 수 있는 연결을 확인하지 못했습니다.",
+            "MAIN_LIVE_CONFIRMATION_REQUIRED": "실제 적용에는 현재 MAIN 테마 변경 확인이 필요합니다. 이 검사는 Shopify를 변경하지 않았습니다.",
+            "MAIN_THEME_IDENTITY_UNVERIFIED": "현재 MAIN 테마인지 확인되지 않았습니다. 테마 정보를 확인해 주세요.",
+            "STORE_NOT_CONFIGURED": "선택한 스토어의 Shopify 연결 정보를 확인할 수 없습니다.",
+            "REMOTE_READ_FAILED": "현재 테마 파일을 안전하게 읽지 못했습니다. 연결 상태를 확인해 주세요.",
+            "REMOTE_HASH_DRIFT_RAW_ONLY": "상품과 테마 내용은 같지만 파일 형식 차이가 있어 안전 검사를 멈췄습니다.",
+            "REMOTE_HASH_DRIFT_SEMANTIC": "미리보기 이후 테마 내용이 달라졌습니다. 최신 테마로 미리보기를 다시 만들어 주세요.",
+            "LEGACY_IDENTITY_INVALID": "기존 추천 상품 영역의 식별 정보를 확인할 수 없습니다.",
+            "ISOLATED_DIFF_UNSAFE": "미리보기에서 추천 상품 영역 외의 변경이 감지되었습니다.",
+            "PRODUCT_IDS_MISMATCH": "미리보기의 상품 목록이 현재 선택된 상품 4개와 다릅니다.",
+            "COMMENTED_JSON_RENDER_MISMATCH": "테마 파일의 주석 또는 형식을 그대로 보존할 수 있는지 확인되지 않았습니다.",
+            "READY_TO_APPLY": "추천 상품 4개를 현재 MAIN 테마에 적용할 준비가 되었습니다. 아직 Shopify는 변경되지 않았습니다.",
+        }
+        return messages.get(reason_code, "안전 검사를 완료하지 못했습니다. 고급 정보를 확인해 주세요.")
+
+    def _preflight_result(self, status: str, reason_code: str, *, backend_name=None,
+                          backend_selection="AUTO", backend_reason_code=None, theme_id=None,
+                          theme_role=None, filename="templates/index.json", source_raw_hash=None,
+                          current_raw_hash=None, source_semantic_hash=None,
+                          current_semantic_hash=None, raw_equal=None, semantic_equal=None,
+                          prefix_equal=None, suffix_equal=None, isolated_diff_safe=None,
+                          product_ids_match=None, proposed_raw_hash=None, **extra) -> dict:
+        return {
+            "status": status, "reason_code": reason_code,
+            "human_message": self._preflight_human_message(reason_code),
+            "reason": self._preflight_human_message(reason_code),
+            "backend_name": backend_name, "backend_selection": backend_selection,
+            "backend_reason_code": backend_reason_code or reason_code,
+            "theme_id": theme_id, "theme_role": theme_role, "filename": filename,
+            "source_raw_hash": source_raw_hash, "current_raw_hash": current_raw_hash,
+            "source_semantic_hash": source_semantic_hash,
+            "current_semantic_hash": current_semantic_hash,
+            "raw_equal": raw_equal, "semantic_equal": semantic_equal,
+            "prefix_equal": prefix_equal, "suffix_equal": suffix_equal,
+            "isolated_diff_safe": isolated_diff_safe,
+            "product_ids_match": product_ids_match,
+            "proposed_raw_hash": proposed_raw_hash,
+            "write_performed": False, **extra,
+        }
+
+    def preflight(self, plan_id: str, preview: dict, *, store_id: str,
+                  backend_selection: str = "AUTO", allow_live: bool = False,
+                  backend_coordinator=None, client=None) -> dict:
+        """Run every Featured apply precondition using read-only capability/read paths.
+
+        ``allow_live`` is intentionally ignored here: preflight never writes and
+        does not require a live-write confirmation checkbox.
+        """
+        result, _context = self._run_preflight(
+            plan_id, preview, store_id=store_id, backend_selection=backend_selection,
+            backend_coordinator=backend_coordinator, client=client,
+            enforce_confirmation=False, confirmed=False, enforce_live=False, allow_live=False,
+        )
+        return result
+
+    def _run_preflight(self, plan_id: str, preview: dict, *, store_id: str,
+                       backend_selection: str, backend_coordinator, client,
+                       enforce_confirmation: bool, confirmed: bool,
+                       enforce_live: bool, allow_live: bool) -> tuple[dict, dict | None]:
+        """Shared ordered gate evaluation. Private context is never returned to UI."""
+        if enforce_confirmation and confirmed is not True:
+            return self._preflight_result("MANUAL_ACTION_REQUIRED", "EXPLICIT_CONFIRMATION_REQUIRED",
+                                          backend_selection=backend_selection), None
         if not isinstance(preview, dict) or preview.get("status") != "PREVIEW" or preview.get("plan_id") != plan_id:
-            return {"status": "CONFLICT", "reason": "Current featured preview is missing or stale", "write_performed": False}
+            return self._preflight_result("CONFLICT", "STALE_OR_MISSING_PREVIEW",
+                                          backend_selection=backend_selection), None
         with connect(self.db) as con:
             row = con.execute("SELECT * FROM homepage_featured_product_plans WHERE plan_id=?", (plan_id,)).fetchone()
-            latest = con.execute("SELECT plan_id FROM homepage_featured_product_plans WHERE store_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1", (str(store_id),)).fetchone()
+            latest = con.execute("SELECT plan_id FROM homepage_featured_product_plans WHERE store_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                                 (str(store_id),)).fetchone()
+            item_rows = con.execute("SELECT * FROM homepage_featured_product_items WHERE plan_id=? ORDER BY position",
+                                    (plan_id,)).fetchall()
         if not row or row["store_id"] != str(store_id) or not latest or latest["plan_id"] != plan_id:
-            return {"status": "CONFLICT", "reason": "Store or latest featured plan changed", "write_performed": False}
-        plan = FeaturedProductAssignmentService(db=self.db).get_plan(plan_id)
-        if not self._four_ready(plan): return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Exactly four unique ACTIVE products with price, image and handle are required", "write_performed": False}
-        source = preview.get("source_document") or {}; theme = preview.get("theme") or {}
+            return self._preflight_result("CONFLICT", "LATEST_PLAN_CHANGED",
+                                          backend_selection=backend_selection), None
+        plan = {**dict(row), "items": [dict(item) for item in item_rows]}
+        if not self._four_ready(plan):
+            return self._preflight_result("MANUAL_ACTION_REQUIRED", "FOUR_READY_REQUIRED",
+                                          backend_selection=backend_selection), None
+
+        source = preview.get("source_document") or {}
+        theme = preview.get("theme") or {}
         filename, section_id = preview.get("template_filename"), preview.get("section_id")
         expected_section = shopify_instance_id("featuredproducts", str(store_id))
         expected_legacy = legacy_featured_id_for_store(store_id)
+        source_raw_hash = source.get("before_raw_hash")
+        source_semantic_hash = source.get("before_semantic_hash")
         if (preview.get("store_id") != str(store_id) or preview.get("featured_products_plan_id") != plan_id
-                or source.get("filename") != filename or preview.get("capability", {}).get("mode") != "DIRECT_PRODUCTS" or section_id != expected_section
-                or not is_valid_shopify_instance_id(section_id)
+                or source.get("filename") != filename or preview.get("capability", {}).get("mode") != "DIRECT_PRODUCTS"
+                or section_id != expected_section or not is_valid_shopify_instance_id(section_id)
                 or filename != "templates/index.json" or not theme.get("id") or theme.get("role") != "MAIN"
-                or not source.get("before_raw_hash") or not source.get("before_semantic_hash")
+                or not source_raw_hash or not source_semantic_hash
                 or not row["preview_hash"] or row["preview_hash"] != preview.get("preview_hash")):
-            return {"status": "CONFLICT", "reason": "Unsupported capability or preview identity/hash mismatch", "write_performed": False}
+            return self._preflight_result("CONFLICT", "PREVIEW_IDENTITY_HASH_MISMATCH",
+                backend_selection=backend_selection, theme_id=theme.get("id"), theme_role=theme.get("role"),
+                source_raw_hash=source_raw_hash, source_semantic_hash=source_semantic_hash), None
+
         from .featured_theme_backend import FeaturedThemeBackendCoordinator
-        from .theme_write_backend import ThemeFileWriteRequest, ThemeWriteBackendRouter
         coordinator = backend_coordinator or FeaturedThemeBackendCoordinator(
             db=self.db, client_factory=self.client_factory, client=client)
-        selected = coordinator.select_backend(store_id, theme["id"], backend_selection, client=client)
+        try:
+            selected = coordinator.select_backend(store_id, theme["id"], backend_selection, client=client)
+        except Exception:
+            return self._preflight_result("MANUAL_ACTION_REQUIRED", "NO_APPROVED_BACKEND",
+                backend_selection=backend_selection, theme_id=theme.get("id"), theme_role="MAIN"), None
         backend, backend_name = selected.get("backend"), selected.get("backend_name")
         backend_reason = selected.get("reason_code")
         if backend is None:
-            return {"status": "MANUAL_ACTION_REQUIRED", "reason": "No approved Featured theme write backend is READY",
-                    "backend_name": None, "backend_selection": backend_selection,
-                    "backend_reason_code": backend_reason, "write_performed": False}
-        if allow_live is not True:
-            return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Explicit MAIN theme live confirmation required",
-                    "backend_name": backend_name, "backend_selection": backend_selection,
-                    "backend_reason_code": "MAIN_LIVE_CONFIRMATION_REQUIRED", "write_performed": False}
-        capability = selected["capabilities"][backend_name]
-        if (capability.details.get("identity_verified") is not True
+            return self._preflight_result("MANUAL_ACTION_REQUIRED", "NO_APPROVED_BACKEND",
+                backend_name=backend_name, backend_selection=backend_selection,
+                backend_reason_code=backend_reason, theme_id=theme.get("id"), theme_role="MAIN"), None
+        if enforce_live and allow_live is not True:
+            return self._preflight_result("MANUAL_ACTION_REQUIRED", "MAIN_LIVE_CONFIRMATION_REQUIRED",
+                backend_name=backend_name, backend_selection=backend_selection,
+                backend_reason_code="MAIN_LIVE_CONFIRMATION_REQUIRED", theme_id=theme.get("id"),
+                theme_role="MAIN", source_raw_hash=source_raw_hash,
+                source_semantic_hash=source_semantic_hash), None
+        capability = selected["capabilities"].get(backend_name)
+        if (not capability or capability.details.get("identity_verified") is not True
                 or not _same_theme_id(capability.details.get("verified_theme_id"), theme["id"])
                 or capability.details.get("verified_theme_role") != "MAIN"
                 or capability.details.get("target_is_live") is not True):
-            return {"status": "CONFLICT", "reason": "Selected backend did not verify the exact MAIN theme",
-                    "backend_name": backend_name, "backend_selection": backend_selection,
-                    "backend_reason_code": "MAIN_THEME_IDENTITY_UNVERIFIED", "write_performed": False}
-        config = get_connection(store_id, db=self.db)
-        if not config:
-            return {"status": "MANUAL_ACTION_REQUIRED", "reason": "Shopify shop is not configured",
-                    "backend_name": backend_name, "backend_selection": backend_selection,
-                    "backend_reason_code": "STORE_NOT_CONFIGURED", "write_performed": False}
+            return self._preflight_result("CONFLICT", "MAIN_THEME_IDENTITY_UNVERIFIED",
+                backend_name=backend_name, backend_selection=backend_selection,
+                backend_reason_code="MAIN_THEME_IDENTITY_UNVERIFIED", theme_id=theme.get("id"),
+                theme_role="MAIN", source_raw_hash=source_raw_hash,
+                source_semantic_hash=source_semantic_hash), None
+        try:
+            config = get_connection(store_id, db=self.db)
+        except Exception:
+            config = None
+        if not config or not config.get("shop_domain"):
+            return self._preflight_result("MANUAL_ACTION_REQUIRED", "STORE_NOT_CONFIGURED",
+                backend_name=backend_name, backend_selection=backend_selection,
+                backend_reason_code="STORE_NOT_CONFIGURED", theme_id=theme.get("id"),
+                theme_role="MAIN", source_raw_hash=source_raw_hash,
+                source_semantic_hash=source_semantic_hash), None
         try:
             before_result = backend.read_file(store_id, config["shop_domain"], theme["id"], filename)
             if (before_result.theme_id != theme["id"] or before_result.filename != filename
                     or before_result.backend_name != backend_name):
-                raise ValueError("Selected backend returned a different target identity")
+                raise ValueError("TARGET_IDENTITY_MISMATCH")
             before_raw = before_result.content
             document = parse_shopify_json_document(before_raw)
-        except (ValueError, ShopifyJsonDocumentError, RuntimeError) as exc:
-            return {"status": "CONFLICT", "reason": str(exc), "backend_name": backend_name,
-                    "backend_selection": backend_selection, "backend_reason_code": "REMOTE_READ_FAILED", "write_performed": False}
-        if document.raw_hash != source["before_raw_hash"] or document.semantic_hash != source["before_semantic_hash"]:
-            return {"status": "CONFLICT", "reason": "Remote source raw/semantic hash drifted", "backend_name": backend_name,
-                    "backend_selection": backend_selection, "backend_reason_code": "REMOTE_HASH_DRIFT", "write_performed": False}
+        except Exception:
+            return self._preflight_result("READ_FAILED", "REMOTE_READ_FAILED",
+                backend_name=backend_name, backend_selection=backend_selection,
+                backend_reason_code="REMOTE_READ_FAILED", theme_id=theme.get("id"), theme_role="MAIN",
+                source_raw_hash=source_raw_hash, source_semantic_hash=source_semantic_hash), None
+
+        raw_equal = document.raw_hash == source_raw_hash
+        semantic_equal = document.semantic_hash == source_semantic_hash
+        prefix_hash = hashlib.sha256(document.prefix.encode("utf-8")).hexdigest()
+        suffix_hash = hashlib.sha256(document.suffix.encode("utf-8")).hexdigest()
+        prefix_equal = source.get("prefix_hash") == prefix_hash if source.get("prefix_hash") else None
+        suffix_equal = source.get("suffix_hash") == suffix_hash if source.get("suffix_hash") else None
+        comparison = {"backend_name": backend_name, "backend_selection": backend_selection,
+            "backend_reason_code": backend_reason, "theme_id": theme.get("id"), "theme_role": "MAIN",
+            "filename": filename, "source_raw_hash": source_raw_hash,
+            "current_raw_hash": document.raw_hash, "source_semantic_hash": source_semantic_hash,
+            "current_semantic_hash": document.semantic_hash, "raw_equal": raw_equal,
+            "semantic_equal": semantic_equal, "prefix_equal": prefix_equal, "suffix_equal": suffix_equal}
+        if not semantic_equal:
+            return self._preflight_result("CONFLICT", "REMOTE_HASH_DRIFT_SEMANTIC", **comparison), None
+        if not raw_equal:
+            return self._preflight_result("CONFLICT", "REMOTE_HASH_DRIFT_RAW_ONLY", **comparison), None
+
         proposed = preview.get("proposed")
         migration = preview.get("migration") or {}
         legacy_id = migration.get("from")
         if legacy_id and (legacy_id != expected_legacy or legacy_shopify_instance_kind(legacy_id) != "featured_products"):
-            return {"status": "CONFLICT", "reason": "Unrecognized legacy migration identity", "backend_name": backend_name,
-                    "backend_selection": backend_selection, "backend_reason_code": "LEGACY_IDENTITY_INVALID", "write_performed": False}
-        guard = validate_isolated_featured_diff(document.parsed, proposed, section_id, legacy_id=legacy_id, store_id=store_id)
-        if not guard["safe"]: return {"status": "CONFLICT", "reason": "Unexpected semantic changes", "unexpected_paths": guard["unexpected_paths"],
-                                      "backend_name": backend_name, "backend_selection": backend_selection,
-                                      "backend_reason_code": "ISOLATED_DIFF_UNSAFE", "write_performed": False}
-        expected_ids = [x["shopify_product_id"] for x in plan["items"]]
+            return self._preflight_result("CONFLICT", "LEGACY_IDENTITY_INVALID", **comparison), None
+        guard = validate_isolated_featured_diff(document.parsed, proposed, section_id,
+                                                legacy_id=legacy_id, store_id=store_id)
+        if not guard["safe"]:
+            return self._preflight_result("CONFLICT", "ISOLATED_DIFF_UNSAFE",
+                isolated_diff_safe=False, unexpected_paths=guard["unexpected_paths"], **comparison), None
+        expected_ids = [item["shopify_product_id"] for item in plan["items"]]
         selected_section = ((proposed.get("sections") or {}).get(section_id) or {}) if isinstance(proposed, dict) else {}
         field_id = (preview.get("capability", {}).get("product_field") or {}).get("id")
         proposed_ids = (selected_section.get("settings") or {}).get(field_id) if field_id else None
         if proposed_ids != expected_ids:
-            return {"status": "CONFLICT", "reason": "Featured preview product IDs no longer match the current four-item plan",
-                    "backend_name": backend_name, "backend_selection": backend_selection,
-                    "backend_reason_code": "PRODUCT_IDS_MISMATCH", "write_performed": False}
+            return self._preflight_result("CONFLICT", "PRODUCT_IDS_MISMATCH",
+                isolated_diff_safe=True, product_ids_match=False, **comparison), None
         proposed_raw = render_shopify_json_document(document, proposed)
         proposed_doc = parse_shopify_json_document(proposed_raw)
         if (proposed_doc.prefix != document.prefix or proposed_doc.suffix != document.suffix
                 or (source.get("proposed_raw_hash") and proposed_doc.raw_hash != source["proposed_raw_hash"])):
-            return {"status": "CONFLICT", "reason": "Comment-aware raw render mismatch", "backend_name": backend_name,
-                    "backend_selection": backend_selection, "backend_reason_code": "COMMENTED_JSON_RENDER_MISMATCH",
-                    "write_performed": False}
+            return self._preflight_result("CONFLICT", "COMMENTED_JSON_RENDER_MISMATCH",
+                isolated_diff_safe=True, product_ids_match=True,
+                proposed_raw_hash=proposed_doc.raw_hash, **comparison), None
+        result = self._preflight_result("READY_TO_APPLY", "READY_TO_APPLY",
+            isolated_diff_safe=True, product_ids_match=True, proposed_raw_hash=proposed_doc.raw_hash,
+            **comparison)
+        context = {"plan": plan, "source": source, "theme": theme, "filename": filename,
+            "section_id": section_id, "legacy_id": legacy_id, "guard": guard,
+            "expected_ids": expected_ids, "document": document, "before_raw": before_raw,
+            "proposed": proposed, "proposed_raw": proposed_raw, "proposed_doc": proposed_doc,
+            "config": config, "selected": selected, "backend": backend,
+            "backend_name": backend_name, "backend_reason": backend_reason,
+            "preview": preview, "result": result}
+        return result, context
+
+    def apply(self, plan_id: str, preview: dict, *, store_id: str, confirmed: bool = False,
+              backend_selection: str = "AUTO", allow_live: bool = False,
+              backend_coordinator=None, client=None) -> dict:
+        preflight, context = self._run_preflight(plan_id, preview, store_id=store_id,
+            backend_selection=backend_selection, backend_coordinator=backend_coordinator,
+            client=client, enforce_confirmation=True, confirmed=confirmed,
+            enforce_live=True, allow_live=allow_live)
+        if preflight["status"] != "READY_TO_APPLY":
+            return {**preflight, "status": ("MANUAL_ACTION_REQUIRED" if preflight["status"] == "MANUAL_ACTION_REQUIRED"
+                    else "CONFLICT" if preflight["status"] in {"CONFLICT", "READ_FAILED"} else preflight["status"]),
+                    "reason": preflight["human_message"], "write_performed": False}
+        plan, source, theme = context["plan"], context["source"], context["theme"]
+        filename, section_id = context["filename"], context["section_id"]
+        document, before_raw = context["document"], context["before_raw"]
+        proposed, proposed_raw, proposed_doc = context["proposed"], context["proposed_raw"], context["proposed_doc"]
+        config, selected = context["config"], context["selected"]
+        backend, backend_name, backend_reason = context["backend"], context["backend_name"], context["backend_reason"]
+        legacy_id, guard, expected_ids = context["legacy_id"], context["guard"], context["expected_ids"]
+        from .theme_write_backend import ThemeFileWriteRequest, ThemeWriteBackendRouter
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         folder = self.export_dir / "theme_backups" / str(store_id) / (stamp + "-featured-products")
         folder.mkdir(parents=True, exist_ok=False)

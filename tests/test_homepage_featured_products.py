@@ -537,15 +537,17 @@ class StubThemeTransport:
     def __init__(self, name, raw, *, ready=True, write_mode="success"):
         self.backend_name, self.raw = name, raw
         self.ready, self.write_mode = ready, write_mode
-        self.write_attempts = 0
+        self.write_attempts, self.read_calls = 0, 0
+        self.verified_role = "MAIN"
 
     def capability_status(self, _store_id, *, theme_id=None):
         return ThemeBackendCapabilities(self.backend_name, "READY" if self.ready else "UNAVAILABLE",
             "READY" if self.ready else "NOT_READY", {"identity_verified": self.ready,
-            "verified_theme_id": theme_id if self.ready else None, "verified_theme_role": "MAIN" if self.ready else None,
+            "verified_theme_id": theme_id if self.ready else None, "verified_theme_role": self.verified_role if self.ready else None,
             "target_is_live": True if self.ready else None})
 
     def read_file(self, store_id, shop_domain, theme_id, filename):
+        self.read_calls += 1
         return ThemeFileReadResult(filename, self.raw, hashlib.sha256(self.raw.encode()).hexdigest(),
             self.backend_name, store_id, shop_domain, theme_id, {"verified_theme_role": "MAIN"})
 
@@ -594,6 +596,150 @@ def test_featured_apply_requires_explicit_main_live_confirmation(tmp_path, monke
     assert result["status"] == "MANUAL_ACTION_REQUIRED"
     assert result["backend_reason_code"] == "MAIN_LIVE_CONFIRMATION_REQUIRED"
     assert graph.write_attempts == cli.write_attempts == 0
+
+
+def test_preflight_never_writes_or_creates_backup(tmp_path, monkeypatch):
+    import shopsource.homepage_featured_products as feature_module
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    graph = StubThemeTransport("ADMIN_GRAPHQL", client.raw)
+    cli = StubThemeTransport("THEME_ACCESS_CLI", client.raw)
+    coordinator = StubThemeCoordinator(graph, cli, auto="THEME_ACCESS_CLI")
+    result = writer.preflight(plan["plan_id"], preview, store_id="s1", backend_selection="AUTO",
+                              allow_live=False, backend_coordinator=coordinator)
+    assert result["status"] == "READY_TO_APPLY" and result["write_performed"] is False
+    assert coordinator.selections == ["AUTO"]
+    assert cli.read_calls == 1 and graph.read_calls == 0
+    assert cli.write_attempts == graph.write_attempts == client.write_count == 0
+    with connect(db) as con:
+        assert con.execute("SELECT COUNT(*) FROM homepage_featured_theme_backups").fetchone()[0] == 0
+    assert not (tmp_path / "exports" / "theme_backups").exists()
+
+
+def test_preflight_ready_to_apply_and_safe_result_has_no_theme_content(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    sentinel = "theme-secret-sentinel-not-for-output"
+    from shopsource.shopify_theme_json import parse_shopify_json_document, render_shopify_json_document
+    doc = parse_shopify_json_document(client.raw)
+    preview["proposed"]["sections"][preview["section_id"]]["settings"]["diagnostic_sentinel"] = sentinel
+    preview["source_document"]["proposed_raw_hash"] = hashlib.sha256(
+        render_shopify_json_document(doc, preview["proposed"]).encode()).hexdigest()
+    graph = StubThemeTransport("ADMIN_GRAPHQL", client.raw)
+    cli = StubThemeTransport("THEME_ACCESS_CLI", client.raw)
+    result = writer.preflight(plan["plan_id"], preview, store_id="s1",
+                              backend_coordinator=StubThemeCoordinator(graph, cli))
+    assert result["status"] == "READY_TO_APPLY"
+    assert result["raw_equal"] and result["semantic_equal"]
+    assert result["prefix_equal"] and result["suffix_equal"]
+    assert result["isolated_diff_safe"] and result["product_ids_match"]
+    assert sentinel not in json.dumps(result)
+
+
+def test_preflight_raw_only_and_semantic_mismatches_are_distinct(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    graph = StubThemeTransport("ADMIN_GRAPHQL", client.raw)
+    raw_cli = StubThemeTransport("THEME_ACCESS_CLI", client.raw + " ")
+    raw_result = writer.preflight(plan["plan_id"], preview, store_id="s1",
+        backend_coordinator=StubThemeCoordinator(graph, raw_cli, auto="THEME_ACCESS_CLI"))
+    assert raw_result["status"] == "CONFLICT"
+    assert raw_result["reason_code"] == "REMOTE_HASH_DRIFT_RAW_ONLY"
+    assert raw_result["raw_equal"] is False and raw_result["semantic_equal"] is True
+
+    parsed = json.loads(client.raw.split("*/", 1)[1])
+    parsed["settings"] = {"merchant_change": True}
+    semantic_cli = StubThemeTransport("THEME_ACCESS_CLI",
+        "/* Shopify header comment */\n" + json.dumps(parsed) + "\n")
+    semantic_result = writer.preflight(plan["plan_id"], preview, store_id="s1",
+        backend_coordinator=StubThemeCoordinator(StubThemeTransport("ADMIN_GRAPHQL", client.raw), semantic_cli,
+                                                 auto="THEME_ACCESS_CLI"))
+    assert semantic_result["status"] == "CONFLICT"
+    assert semantic_result["reason_code"] == "REMOTE_HASH_DRIFT_SEMANTIC"
+    assert semantic_result["raw_equal"] is False and semantic_result["semantic_equal"] is False
+
+
+def test_preflight_latest_plan_changed_and_main_identity_guard(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    FeaturedProductAssignmentService(db=db).create_plan("s1", requested_count=4)
+    coordinator = StubThemeCoordinator(StubThemeTransport("ADMIN_GRAPHQL", client.raw),
+                                       StubThemeTransport("THEME_ACCESS_CLI", client.raw))
+    stale = writer.preflight(plan["plan_id"], preview, store_id="s1", backend_coordinator=coordinator)
+    assert stale["reason_code"] == "LATEST_PLAN_CHANGED"
+
+    db2, plan2, preview2, client2, writer2 = isolated_apply_fixture(tmp_path / "identity", monkeypatch)
+    graph = StubThemeTransport("ADMIN_GRAPHQL", client2.raw)
+    cli = StubThemeTransport("THEME_ACCESS_CLI", client2.raw)
+    cli.verified_role = "UNPUBLISHED"
+    identity = writer2.preflight(plan2["plan_id"], preview2, store_id="s1",
+        backend_coordinator=StubThemeCoordinator(graph, cli, auto="THEME_ACCESS_CLI"))
+    assert identity["reason_code"] == "MAIN_THEME_IDENTITY_UNVERIFIED"
+    assert cli.read_calls == 0
+
+
+def test_preflight_product_ids_and_commented_json_guards(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    graph, cli = StubThemeTransport("ADMIN_GRAPHQL", client.raw), StubThemeTransport("THEME_ACCESS_CLI", client.raw)
+    coordinator = StubThemeCoordinator(graph, cli)
+    section = preview["proposed"]["sections"][preview["section_id"]]
+    section["settings"]["products"] = ["gid://shopify/Product/999"]
+    mismatch = writer.preflight(plan["plan_id"], preview, store_id="s1", backend_coordinator=coordinator)
+    assert mismatch["reason_code"] == "PRODUCT_IDS_MISMATCH" and mismatch["product_ids_match"] is False
+
+    db2, plan2, preview2, client2, writer2 = isolated_apply_fixture(tmp_path / "comment", monkeypatch)
+    preview2["source_document"]["proposed_raw_hash"] = "0" * 64
+    comment = writer2.preflight(plan2["plan_id"], preview2, store_id="s1",
+        backend_coordinator=StubThemeCoordinator(StubThemeTransport("ADMIN_GRAPHQL", client2.raw),
+                                                 StubThemeTransport("THEME_ACCESS_CLI", client2.raw)))
+    assert comment["reason_code"] == "COMMENTED_JSON_RENDER_MISMATCH"
+
+
+def test_apply_reuses_shared_preflight_and_does_not_write_on_conflict(tmp_path, monkeypatch):
+    db, plan, preview, client, writer = isolated_apply_fixture(tmp_path, monkeypatch)
+    cli = StubThemeTransport("THEME_ACCESS_CLI", client.raw + " ")
+    coordinator = StubThemeCoordinator(StubThemeTransport("ADMIN_GRAPHQL", client.raw), cli,
+                                       auto="THEME_ACCESS_CLI")
+    calls = []
+    original = writer._run_preflight
+    def tracked(*args, **kwargs):
+        calls.append(kwargs.get("enforce_live"))
+        return original(*args, **kwargs)
+    monkeypatch.setattr(writer, "_run_preflight", tracked)
+    result = writer.apply(plan["plan_id"], preview, store_id="s1", confirmed=True, allow_live=True,
+                          backend_coordinator=coordinator)
+    assert calls == [True]
+    assert result["reason_code"] == "REMOTE_HASH_DRIFT_RAW_ONLY"
+    assert result["write_performed"] is False and cli.write_attempts == client.write_count == 0
+    with connect(db) as con:
+        assert con.execute("SELECT COUNT(*) FROM homepage_featured_theme_backups").fetchone()[0] == 0
+
+
+def test_beginner_preflight_button_is_explicit_read_only_ui_path():
+    import ast
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "src" / "shopsource" / "ui" / "v2.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    button_line = next(index for index, line in enumerate(source.splitlines(), 1)
+                       if 'ui.button("적용 전 안전 검사"' in line)
+    button_context = "\n".join(source.splitlines()[button_line - 4:button_line + 2])
+    assert "on_click=featured_apply_preflight" in button_context
+    assert source.index('ui.button("추천 상품 미리보기"') < source.index('ui.button("적용 전 안전 검사"')
+    assert source.index('ui.button("적용 전 안전 검사"') < source.index('ui.button("Shopify 적용"', button_line)
+
+    handler = next(node for node in ast.walk(tree)
+                   if isinstance(node, ast.AsyncFunctionDef) and node.name == "featured_apply_preflight")
+    handler_source = ast.get_source_segment(source, handler)
+    assert ".preflight" in handler_source and "allow_live=False" in handler_source
+    assert "FeaturedProductThemeApplyService().apply" not in handler_source
+    assert "ThemeWriteBackendRouter.write" not in handler_source
+    assert "themeFilesUpsert" not in handler_source
+    assert ".rollback" not in handler_source
+
+
+def test_featured_ui_preserves_safe_apply_result():
+    from pathlib import Path
+    source = (Path(__file__).parents[1] / "src/shopsource/ui/v2.py").read_text(encoding="utf-8")
+    assert 'state["featured_last_apply_result"]' in source
+    assert '("status", "reason", "reason_code", "backend_name", "backend_reason_code",' in source
+    assert "최근 적용 결과:" in source
 
 
 def test_featured_cli_pre_read_must_match_preview_raw_hash(tmp_path, monkeypatch):

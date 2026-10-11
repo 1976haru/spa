@@ -2292,6 +2292,7 @@ class OperatorUI:
                 featured_diagnostics = ui.label("로컬 관리 상품 후보: 0 · Shopify 기존 상품 후보: 0 · 최종 사용 가능: 0").classes("ss-help")
                 featured_apply_persistent = ui.label("미리보기: NOT READY · Shopify 적용: NOT RUN").classes("ss-help")
                 featured_post_apply_actions = ui.row().classes("flex-wrap gap-2")
+                featured_last_apply_result = ui.label("").classes("ss-help text-amber-800")
                 featured_table = ui.column().classes("w-full gap-1")
                 with ui.dialog() as featured_review_dialog, ui.card().classes("w-[min(1000px,95vw)] max-h-[85vh] overflow-auto"):
                     ui.label("추천 상품 4개 확인").classes("text-xl font-bold")
@@ -2337,6 +2338,14 @@ class OperatorUI:
                 def render_featured(plan=None):
                     plan = plan or state.get("featured_products_plan")
                     featured_table.clear()
+                    last_apply = state.get("featured_last_apply_result") or {}
+                    if last_apply:
+                        last_status = last_apply.get("status")
+                        last_message = ("원격 테마 JSON 확인 완료" if last_status == "REMOTE_JSON_VERIFIED"
+                                        else last_apply.get("reason") or "안전 검사가 적용을 멈췄습니다.")
+                        featured_last_apply_result.set_text(f"최근 적용 결과: {last_status} · {last_message}")
+                    else:
+                        featured_last_apply_result.set_text("")
                     count = len((plan or {}).get("items", []))
                     featured_status.set_text(f"선택된 상품: {count} / 4 · 상태: {(plan or {}).get('status', 'REVIEW REQUIRED')}")
                     diagnostics = (plan or {}).get("diagnostics") or {}
@@ -2397,6 +2406,66 @@ class OperatorUI:
                         ui.notify("추천 상품 미리보기 준비 완료 · canonical homepage 제안에 포함 · Shopify 변경 없음", type="positive")
                     else:
                         ui.notify("추천 상품 미리보기 수동 확인 필요: " + str(preview.get("reason") or "현재 테마에 안전하게 확인된 상품 리스트 섹션이 없습니다."), type="warning", multi_line=True)
+
+                async def featured_apply_preflight():
+                    plan = state.get("featured_products_plan")
+                    preview = state.get("featured_products_preview")
+                    if not plan or plan.get("status") != "READY" or not preview or preview.get("status") != "PREVIEW":
+                        ui.notify("먼저 추천 상품 계획을 준비하고 미리보기를 만들어 주세요.", type="warning")
+                        return
+                    try:
+                        # Capability and theme reads happen only after this explicit button click.
+                        result = await asyncio.to_thread(
+                            FeaturedProductThemeApplyService().preflight,
+                            plan.get("plan_id"), preview, store_id=self.current_store,
+                            backend_selection="AUTO", allow_live=False)
+                    except Exception:
+                        result = {"status": "READ_FAILED", "reason_code": "REMOTE_READ_FAILED",
+                                  "human_message": "안전 검사를 완료하지 못했습니다. 연결 상태를 확인해 주세요.",
+                                  "backend_name": None, "backend_reason_code": "REMOTE_READ_FAILED",
+                                  "theme_id": (preview.get("theme") or {}).get("id"),
+                                  "theme_role": "MAIN", "filename": "templates/index.json",
+                                  "write_performed": False}
+                    safe_fields = ("status", "reason_code", "human_message", "backend_name",
+                                   "backend_selection", "backend_reason_code", "theme_id", "theme_role",
+                                   "filename", "source_raw_hash", "current_raw_hash",
+                                   "source_semantic_hash", "current_semantic_hash", "raw_equal",
+                                   "semantic_equal", "prefix_equal", "suffix_equal",
+                                   "isolated_diff_safe", "product_ids_match")
+                    safe_result = {key: result.get(key) for key in safe_fields}
+                    safe_result["write_performed"] = False
+                    state["featured_preflight_result"] = safe_result
+                    ready = safe_result.get("status") == "READY_TO_APPLY"
+                    code = safe_result.get("reason_code")
+                    title = ("적용 준비 완료" if ready else
+                             "파일 형식 차이를 확인해야 합니다" if code == "REMOTE_HASH_DRIFT_RAW_ONLY" else
+                             "미리보기 이후 테마가 변경되었습니다" if code == "REMOTE_HASH_DRIFT_SEMANTIC" else
+                             "적용 전 확인이 필요합니다")
+                    theme = preview.get("theme") or {}
+                    backend_label = {"THEME_ACCESS_CLI": "Theme Access",
+                                     "ADMIN_GRAPHQL": "Shopify 연결"}.get(
+                                         safe_result.get("backend_name"), "확인되지 않음")
+                    with ui.dialog() as preflight_dialog, ui.card().classes("w-[min(760px,95vw)] max-h-[85vh] overflow-auto"):
+                        ui.label(title).classes("text-xl font-bold")
+                        ui.label(safe_result.get("human_message") or "안전 검사 결과를 확인해 주세요.").classes("whitespace-pre-wrap")
+                        if ready:
+                            ui.label(f"연결 방식: {backend_label}")
+                            ui.label(f"현재 테마: {theme.get('name') or safe_result.get('theme_id')} / MAIN")
+                            ui.label(f"상품 수: {len(plan.get('items', []))}")
+                            ui.label("스토어 변경 없음 — 이 검사는 읽기 전용입니다.").classes("font-semibold text-green-700")
+                        with ui.expansion("고급 정보 보기", icon="info"):
+                            ui.label(f"reason_code: {safe_result.get('reason_code')}")
+                            ui.label(f"backend: {safe_result.get('backend_name')} · backend reason: {safe_result.get('backend_reason_code')}")
+                            ui.label(f"theme ID: {safe_result.get('theme_id')} · role: {safe_result.get('theme_role')}")
+                            ui.label(f"파일: {safe_result.get('filename')}")
+                            ui.label(f"raw 동일: {safe_result.get('raw_equal')} · semantic 동일: {safe_result.get('semantic_equal')}")
+                            ui.label(f"prefix 동일: {safe_result.get('prefix_equal')} · suffix 동일: {safe_result.get('suffix_equal')}")
+                            ui.label(f"원본 raw hash: {safe_result.get('source_raw_hash')}")
+                            ui.label(f"현재 raw hash: {safe_result.get('current_raw_hash')}")
+                            ui.label(f"원본 semantic hash: {safe_result.get('source_semantic_hash')}")
+                            ui.label(f"현재 semantic hash: {safe_result.get('current_semantic_hash')}")
+                        ui.button("닫기", on_click=preflight_dialog.close).props("outline")
+                    preflight_dialog.open()
 
                 def featured_apply_gate():
                     plan, preview = state.get("featured_products_plan"), state.get("featured_products_preview")
@@ -2464,6 +2533,17 @@ class OperatorUI:
                             state["featured_apply_status"] = result.get("status", "FAILED")
                             state["backup_id"] = result.get("backup_id")
                             state["featured_backend_name"] = result.get("backend_name")
+                            state["featured_last_apply_result"] = {
+                                key: result.get(key) for key in
+                                ("status", "reason", "reason_code", "backend_name", "backend_reason_code",
+                                 "backup_id", "write_performed")}
+                            if state["featured_last_apply_result"].get("status") == "CONFLICT":
+                                state["featured_last_apply_result"]["reason"] = (
+                                    result.get("human_message") or result.get("reason") or
+                                    "안전 검사에서 차이가 발견되어 적용을 멈췄습니다.")
+                            featured_last_apply_result.set_text(
+                                f"최근 적용 결과: {state['featured_last_apply_result'].get('status')} · "
+                                f"{state['featured_last_apply_result'].get('reason') or ''}")
                             featured_apply_persistent.set_text(f"Shopify 적용: {result.get('status')} · storefront 확인 필요")
                             if result.get("status") == "REMOTE_JSON_VERIFIED":
                                 config = get_shopify_connection(self.current_store) or {}
@@ -2539,6 +2619,8 @@ class OperatorUI:
                     ui.button("다시 선택", on_click=lambda: select_featured_products(reselect=True), icon="refresh").props("outline")
                     ui.button("Shopify 상품 다시 읽기", on_click=lambda: select_featured_products(True), icon="cloud_download").props("outline")
                     ui.button("추천 상품 미리보기", on_click=featured_preview, icon="preview").props("outline")
+                    ui.button("적용 전 안전 검사", on_click=featured_apply_preflight,
+                              icon="fact_check").props("outline")
                     ui.button("Shopify 적용", on_click=featured_apply_gate, icon="publish").props("outline")
                     ui.button("추천 상품 롤백", on_click=rollback_featured, icon="undo").props("outline")
                     ui.button("과제 제출용 확인", on_click=featured_assignment_check, icon="checklist").props("outline")
