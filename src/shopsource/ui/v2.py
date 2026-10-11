@@ -34,6 +34,8 @@ from ..homepage_automation import (HomepageAutomationService, assignment_banner_
     suggested_theme_image_ref, upload_approved_hero_asset, validate_homepage_image)
 from ..homepage_assignment import HomepageAssignmentService, homepage_assignment_workflow
 from ..homepage_featured_products import FeaturedProductAssignmentService, FeaturedProductThemeApplyService
+from ..featured_guided_flow import resolve_featured_guided_state
+from .guided_flow import render_guided_stepper
 from ..featured_theme_backend import FeaturedThemeBackendCoordinator
 from ..multistore_theme_operations import MultiStoreThemeOperationsService
 from ..multistore_theme_presentation import next_action as multistore_next_action, next_action_message as multistore_next_action_message, setup_needed_count as multistore_setup_needed_count, status_label as multistore_status_label, table_statuses as multistore_table_statuses
@@ -2288,16 +2290,31 @@ class OperatorUI:
 
             with ui.card().classes("w-full border border-indigo-200 bg-white"):
                 ui.label("추천 상품(신상품)").classes("text-lg font-semibold")
-                featured_status = ui.label("선택된 상품: 0 / 4 · 상태: REVIEW REQUIRED")
-                featured_diagnostics = ui.label("로컬 관리 상품 후보: 0 · Shopify 기존 상품 후보: 0 · 최종 사용 가능: 0").classes("ss-help")
-                featured_apply_persistent = ui.label("미리보기: NOT READY · Shopify 적용: NOT RUN").classes("ss-help")
-                featured_post_apply_actions = ui.row().classes("flex-wrap gap-2")
-                featured_last_apply_result = ui.label("").classes("ss-help text-amber-800")
-                featured_table = ui.column().classes("w-full gap-1")
+                featured_guide_header = ui.label("추천 상품 만들기 · 0/7 완료").classes("font-semibold")
+                featured_stepper = ui.column().classes("w-full gap-1")
+                with ui.card().classes("w-full border border-primary bg-blue-50"):
+                    ui.label("지금 할 일").classes("text-sm font-semibold text-primary")
+                    featured_primary_label = ui.label("").classes("text-lg font-bold")
+                    featured_primary_help = ui.label("").classes("ss-help")
+                    featured_primary_action = ui.column().classes("w-full")
+                with ui.expansion("선택 상품 4개 보기", icon="inventory_2", value=False).classes("w-full") as featured_product_summary:
+                    featured_table = ui.column().classes("w-full gap-1")
+                with ui.expansion("고급 / 문제 해결", icon="build", value=False).classes("w-full"):
+                    featured_status = ui.label("선택된 상품: 0 / 4").classes("ss-help")
+                    featured_diagnostics = ui.label("상품 후보 진단 전").classes("ss-help")
+                    featured_apply_persistent = ui.label("미리보기와 적용 상태: 확인 전").classes("ss-help")
+                    featured_last_apply_result = ui.label("").classes("ss-help text-amber-800")
+                    with ui.row().classes("flex-wrap gap-2"):
+                        ui.button("Shopify 상품 다시 읽기", on_click=lambda: select_featured_products(True), icon="cloud_download").props("outline")
+                        ui.button("다시 선택", on_click=lambda: select_featured_products(reselect=True), icon="refresh").props("outline")
+                        rollback_featured_button = ui.button("추천 상품 롤백", on_click=lambda: rollback_featured(), icon="undo").props("outline")
+                    featured_post_apply_actions = ui.row().classes("flex-wrap gap-2")
+                    featured_advanced_diagnostics = ui.column().classes("w-full")
                 with ui.dialog() as featured_review_dialog, ui.card().classes("w-[min(1000px,95vw)] max-h-[85vh] overflow-auto"):
                     ui.label("추천 상품 4개 확인").classes("text-xl font-bold")
                     featured_review_cards = ui.column().classes("w-full gap-3")
                     ui.button("닫기", on_click=featured_review_dialog.close).props("outline")
+                    ui.button("상품 4개 확인 완료", on_click=lambda: confirm_featured_review(), icon="check").props("color=primary")
 
                 def safe_featured_url(item):
                     from urllib.parse import urlparse
@@ -2335,30 +2352,82 @@ class OperatorUI:
                                         else: ui.label("스토어 주소를 확인할 수 없어 링크를 만들지 않았습니다.").classes("text-xs text-amber-700")
                     featured_review_dialog.open()
 
+                def confirm_featured_review():
+                    plan = state.get("featured_products_plan") or {}
+                    if plan.get("status") not in {"READY", "REMOTE_JSON_VERIFIED", "STOREFRONT_VERIFIED"} or len(plan.get("items", [])) != 4:
+                        ui.notify("검증된 상품 4개가 준비되어야 확인을 완료할 수 있습니다.", type="warning")
+                        return
+                    state["featured_products_reviewed_plan_id"] = plan.get("plan_id")
+                    featured_review_dialog.close()
+                    render_featured(plan)
+
                 def render_featured(plan=None):
                     plan = plan or state.get("featured_products_plan")
-                    featured_table.clear()
+                    count = len((plan or {}).get("items", []))
+                    preflight = state.get("featured_preflight_result") or {}
                     last_apply = state.get("featured_last_apply_result") or {}
+                    if (last_apply and state.get("featured_last_apply_plan_id") == (plan or {}).get("plan_id")
+                            and last_apply.get("status") != "REMOTE_JSON_VERIFIED"):
+                        visible_preflight = last_apply
+                    else:
+                        visible_preflight = preflight
+                    flow = resolve_featured_guided_state(state, plan,
+                        state.get("featured_products_preview"), visible_preflight, last_apply)
+                    completed = sum(step["status"] == "complete" for step in flow["steps"])
+                    featured_guide_header.set_text(f"추천 상품 만들기 · {completed}/7 완료")
+                    render_guided_stepper(ui, featured_stepper, flow["steps"])
+                    featured_primary_label.set_text(flow["primary_label"])
+                    featured_primary_help.set_text(flow["primary_help"])
+                    featured_primary_action.clear()
+                    if flow["primary_action"] == "OPEN_STOREFRONT":
+                        with featured_primary_action:
+                            ui.button(flow["primary_label"], on_click=run_featured_primary_action,
+                                      icon="arrow_forward").props("color=primary size=lg").classes("w-full")
+                    elif flow["primary_action"] != "NONE":
+                        with featured_primary_action:
+                            ui.button(flow["primary_label"], on_click=run_featured_primary_action,
+                                      icon="arrow_forward").props("color=primary size=lg").classes("w-full")
+
+                    reviewed = state.get("featured_products_reviewed_plan_id") == (plan or {}).get("plan_id")
+                    featured_product_summary.set_visibility(bool(reviewed and count))
+                    featured_table.clear()
+                    with featured_table:
+                        for item in (plan or {}).get("items", []):
+                            ui.label(f"{item['position']}. {item.get('title') or '제목 없음'} · {item.get('merchandising_group') or 'Other'} · ${item.get('price') or 0:.2f}")
+                        if not count:
+                            ui.label("추천 상품 4개를 먼저 불러오세요.").classes("ss-help")
+
+                    diagnostics = (plan or {}).get("diagnostics") or {}
+                    excluded = diagnostics.get("reason_counts") or {}
+                    featured_status.set_text(f"선택 상품: {count} / 4 · {((plan or {}).get('status') or 'REVIEW REQUIRED')}")
+                    featured_diagnostics.set_text(
+                        f"로컬 후보: {diagnostics.get('managed_count', 0)} · 스토어 후보: {diagnostics.get('remote_eligible_count', 0)} · "
+                        f"최종 사용 가능: {diagnostics.get('eligible_count', 0)} · 제외: 비활성 {excluded.get('NOT_STOREFRONT_ELIGIBLE', 0)} / "
+                        f"이미지 없음 {excluded.get('NEEDS_IMAGE', 0)} / 가격 없음 {excluded.get('MISSING_VALID_RETAIL_PRICE', 0)}")
+                    preview = state.get("featured_products_preview") or {}
+                    featured_apply_persistent.set_text(
+                        f"미리보기: {preview.get('status', 'NOT READY')} · 적용: {state.get('featured_apply_status', 'NOT RUN')}")
                     if last_apply:
                         last_status = last_apply.get("status")
-                        last_message = ("원격 테마 JSON 확인 완료" if last_status == "REMOTE_JSON_VERIFIED"
-                                        else last_apply.get("reason") or "안전 검사가 적용을 멈췄습니다.")
+                        last_message = ("스토어에서 확인할 수 있습니다." if last_status == "REMOTE_JSON_VERIFIED"
+                                        else last_apply.get("reason") or "안전 검사에서 멈췄습니다.")
                         featured_last_apply_result.set_text(f"최근 적용 결과: {last_status} · {last_message}")
                     else:
                         featured_last_apply_result.set_text("")
-                    count = len((plan or {}).get("items", []))
-                    featured_status.set_text(f"선택된 상품: {count} / 4 · 상태: {(plan or {}).get('status', 'REVIEW REQUIRED')}")
-                    diagnostics = (plan or {}).get("diagnostics") or {}
-                    excluded = diagnostics.get("reason_counts") or {}
-                    featured_diagnostics.set_text(
-                        f"로컬 관리 상품 후보: {diagnostics.get('managed_count', 0)} · Shopify 기존 상품 후보: {diagnostics.get('remote_eligible_count', 0)} · "
-                        f"최종 사용 가능: {diagnostics.get('eligible_count', 0)} · 제외: ACTIVE 아님 {excluded.get('NOT_STOREFRONT_ELIGIBLE', 0)} / "
-                        f"이미지 없음 {excluded.get('NEEDS_IMAGE', 0)} / 가격 없음 {excluded.get('MISSING_VALID_RETAIL_PRICE', 0)} / 기타 {sum(v for k, v in excluded.items() if k not in {'NOT_STOREFRONT_ELIGIBLE','NEEDS_IMAGE','MISSING_VALID_RETAIL_PRICE'})}")
-                    with featured_table:
-                        for item in (plan or {}).get("items", []):
-                            ui.label(f"{item['position']}. {item['title']} · {item.get('merchandising_group') or 'Other'} · ${item.get('price') or 0:.2f} · {item['remote_status']}")
-                        if not count:
-                            ui.label("실제 Shopify mapping, 판매가, 이미지, ACTIVE 상태가 검증된 상품이 필요합니다.").classes("ss-help")
+                    backup_id = state.get("backup_id")
+                    backup_details = FeaturedProductThemeApplyService().backup_details(backup_id) if backup_id else None
+                    if backup_details and backup_details.get("status") in {"REMOTE_JSON_VERIFIED", "VERIFY_FAILED"}:
+                        rollback_featured_button.enable()
+                    else:
+                        rollback_featured_button.disable()
+                    featured_advanced_diagnostics.clear()
+                    if visible_preflight:
+                        with featured_advanced_diagnostics:
+                            with ui.expansion("마지막 안전 검사 상세 정보", value=False):
+                                ui.label(f"reason_code: {visible_preflight.get('reason_code')}")
+                                ui.label(f"backend: {visible_preflight.get('backend_name')} · reason: {visible_preflight.get('backend_reason_code')}")
+                                ui.label(f"theme ID: {visible_preflight.get('theme_id')} · role: {visible_preflight.get('theme_role')}")
+                                ui.label(f"파일: {visible_preflight.get('filename')}")
 
                 def select_featured_products(force_remote=False, reselect=False):
                     try:
@@ -2380,6 +2449,13 @@ class OperatorUI:
                                     include_existing=True, force_remote=bool(force_remote))
                         state["featured_products_plan"] = plan
                         state["featured_products_preview"] = None
+                        state["featured_products_reviewed_plan_id"] = None
+                        state["featured_preflight_result"] = None
+                        state["featured_preflight_plan_id"] = None
+                        state["featured_preflight_preview_hash"] = None
+                        state["featured_last_apply_plan_id"] = None
+                        state["featured_apply_status"] = "NOT RUN"
+                        state["featured_assignment_status"] = None
                         state["preview"] = None
                         state["current_stage"] = "FEATURED_PRODUCTS_READY"
                         render_featured(plan)
@@ -2394,9 +2470,16 @@ class OperatorUI:
                     except Exception as exc: ui.notify(_safe_error(exc), type="negative")
 
                 def featured_preview():
+                    # A newly requested preview invalidates any earlier safety check.
+                    state["featured_preflight_result"] = None
+                    state["featured_preflight_plan_id"] = None
+                    state["featured_preflight_preview_hash"] = None
+                    if state.get("featured_last_apply_status") not in {None, "REMOTE_JSON_VERIFIED"}:
+                        state["featured_last_apply_plan_id"] = None
                     context = resolve_homepage_context("FEATURED_PREVIEW")
                     if context.error:
                         ui.notify(context.error.get("message") or "추천 상품 미리보기에 필요한 정보를 확인하세요.", type="warning", multi_line=True)
+                        render_featured()
                         return
                     preview = (context.canonical_preview or {}).get("featured_products_preview") or {}
                     state["featured_products_preview"] = preview
@@ -2407,21 +2490,21 @@ class OperatorUI:
                     else:
                         ui.notify("추천 상품 미리보기 수동 확인 필요: " + str(preview.get("reason") or "현재 테마에 안전하게 확인된 상품 리스트 섹션이 없습니다."), type="warning", multi_line=True)
 
-                async def featured_apply_preflight():
+                async def execute_featured_preflight():
                     plan = state.get("featured_products_plan")
                     preview = state.get("featured_products_preview")
                     if not plan or plan.get("status") != "READY" or not preview or preview.get("status") != "PREVIEW":
                         ui.notify("먼저 추천 상품 계획을 준비하고 미리보기를 만들어 주세요.", type="warning")
-                        return
+                        return None
                     try:
-                        # Capability and theme reads happen only after this explicit button click.
+                        # Only an explicit beginner action reaches this read-only call.
                         result = await asyncio.to_thread(
                             FeaturedProductThemeApplyService().preflight,
                             plan.get("plan_id"), preview, store_id=self.current_store,
                             backend_selection="AUTO", allow_live=False)
                     except Exception:
                         result = {"status": "READ_FAILED", "reason_code": "REMOTE_READ_FAILED",
-                                  "human_message": "안전 검사를 완료하지 못했습니다. 연결 상태를 확인해 주세요.",
+                                  "human_message": "현재 MAIN 테마 파일을 읽지 못했습니다. 연결 상태를 확인해 주세요.",
                                   "backend_name": None, "backend_reason_code": "REMOTE_READ_FAILED",
                                   "theme_id": (preview.get("theme") or {}).get("id"),
                                   "theme_role": "MAIN", "filename": "templates/index.json",
@@ -2435,40 +2518,77 @@ class OperatorUI:
                     safe_result = {key: result.get(key) for key in safe_fields}
                     safe_result["write_performed"] = False
                     state["featured_preflight_result"] = safe_result
-                    ready = safe_result.get("status") == "READY_TO_APPLY"
-                    code = safe_result.get("reason_code")
+                    state["featured_preflight_plan_id"] = plan.get("plan_id")
+                    state["featured_preflight_preview_hash"] = preview.get("preview_hash")
+                    if (state.get("featured_last_apply_plan_id") == plan.get("plan_id")
+                            and state.get("featured_last_apply_status") not in {None, "REMOTE_JSON_VERIFIED"}):
+                        state["featured_last_apply_plan_id"] = None
+                    render_featured(plan)
+                    return safe_result
+
+                def show_featured_preflight_result(result):
+                    preview = state.get("featured_products_preview") or {}
+                    code = result.get("reason_code")
+                    read_failed = code == "REMOTE_READ_FAILED"
+                    ready = result.get("status") == "READY_TO_APPLY"
                     title = ("적용 준비 완료" if ready else
+                             "4단계에서 연결 확인이 필요합니다" if read_failed else
                              "파일 형식 차이를 확인해야 합니다" if code == "REMOTE_HASH_DRIFT_RAW_ONLY" else
                              "미리보기 이후 테마가 변경되었습니다" if code == "REMOTE_HASH_DRIFT_SEMANTIC" else
                              "적용 전 확인이 필요합니다")
-                    theme = preview.get("theme") or {}
-                    backend_label = {"THEME_ACCESS_CLI": "Theme Access",
-                                     "ADMIN_GRAPHQL": "Shopify 연결"}.get(
-                                         safe_result.get("backend_name"), "확인되지 않음")
                     with ui.dialog() as preflight_dialog, ui.card().classes("w-[min(760px,95vw)] max-h-[85vh] overflow-auto"):
                         ui.label(title).classes("text-xl font-bold")
-                        ui.label(safe_result.get("human_message") or "안전 검사 결과를 확인해 주세요.").classes("whitespace-pre-wrap")
+                        if read_failed:
+                            ui.label("상품과 미리보기는 준비되었습니다. Theme Access가 현재 MAIN 테마 파일을 읽는 과정에서 멈췄습니다. 아래 버튼으로 읽기 연결만 다시 확인하세요. Shopify는 변경되지 않습니다.").classes("whitespace-pre-wrap")
+                        else:
+                            ui.label(result.get("human_message") or "안전 검사 결과를 확인해 주세요.").classes("whitespace-pre-wrap")
                         if ready:
-                            ui.label(f"연결 방식: {backend_label}")
-                            ui.label(f"현재 테마: {theme.get('name') or safe_result.get('theme_id')} / MAIN")
-                            ui.label(f"상품 수: {len(plan.get('items', []))}")
+                            ui.label("선택한 상품 4개와 미리보기가 안전 검사 기준을 통과했습니다.")
                             ui.label("스토어 변경 없음 — 이 검사는 읽기 전용입니다.").classes("font-semibold text-green-700")
-                        with ui.expansion("고급 정보 보기", icon="info"):
-                            ui.label(f"reason_code: {safe_result.get('reason_code')}")
-                            ui.label(f"backend: {safe_result.get('backend_name')} · backend reason: {safe_result.get('backend_reason_code')}")
-                            ui.label(f"theme ID: {safe_result.get('theme_id')} · role: {safe_result.get('theme_role')}")
-                            ui.label(f"파일: {safe_result.get('filename')}")
-                            ui.label(f"raw 동일: {safe_result.get('raw_equal')} · semantic 동일: {safe_result.get('semantic_equal')}")
-                            ui.label(f"prefix 동일: {safe_result.get('prefix_equal')} · suffix 동일: {safe_result.get('suffix_equal')}")
-                            ui.label(f"원본 raw hash: {safe_result.get('source_raw_hash')}")
-                            ui.label(f"현재 raw hash: {safe_result.get('current_raw_hash')}")
-                            ui.label(f"원본 semantic hash: {safe_result.get('source_semantic_hash')}")
-                            ui.label(f"현재 semantic hash: {safe_result.get('current_semantic_hash')}")
-                        ui.button("닫기", on_click=preflight_dialog.close).props("outline")
+                        with ui.expansion("고급 정보 보기", icon="info", value=False):
+                            ui.label(f"reason_code: {result.get('reason_code')}")
+                            ui.label(f"backend: {result.get('backend_name')} · backend reason: {result.get('backend_reason_code')}")
+                            ui.label(f"theme ID: {result.get('theme_id')} · role: {result.get('theme_role')}")
+                            ui.label(f"파일: {result.get('filename')}")
+                            ui.label(f"raw 동일: {result.get('raw_equal')} · semantic 동일: {result.get('semantic_equal')}")
+                            ui.label(f"prefix 동일: {result.get('prefix_equal')} · suffix 동일: {result.get('suffix_equal')}")
+                            ui.label(f"원본 raw hash: {result.get('source_raw_hash')}")
+                            ui.label(f"현재 raw hash: {result.get('current_raw_hash')}")
+                            ui.label(f"원본 semantic hash: {result.get('source_semantic_hash')}")
+                            ui.label(f"현재 semantic hash: {result.get('current_semantic_hash')}")
+                        if read_failed:
+                            async def retry_connection():
+                                preflight_dialog.close()
+                                await featured_recheck_connection()
+                            ui.button("연결 상태 다시 확인", on_click=retry_connection,
+                                      icon="refresh").props("color=primary size=lg").classes("w-full")
+                            ui.button("나중에 하기", on_click=preflight_dialog.close).props("outline")
+                        else:
+                            ui.button("닫기", on_click=preflight_dialog.close).props("outline")
                     preflight_dialog.open()
+
+                async def featured_apply_preflight():
+                    result = await execute_featured_preflight()
+                    if result is not None:
+                        show_featured_preflight_result(result)
+
+                async def featured_recheck_connection():
+                    ui.notify("연결 상태를 읽기 전용으로 확인합니다. Shopify는 변경하지 않습니다.", type="info")
+                    result = await execute_featured_preflight()
+                    if result is None:
+                        return
+                    if result.get("status") == "READY_TO_APPLY":
+                        ui.notify("연결 확인 완료. 다시 적용 전 안전 검사를 실행합니다.", type="positive")
+                    show_featured_preflight_result(result)
 
                 def featured_apply_gate():
                     plan, preview = state.get("featured_products_plan"), state.get("featured_products_preview")
+                    current_flow = resolve_featured_guided_state(
+                        state, plan, preview, state.get("featured_preflight_result"),
+                        state.get("featured_last_apply_result"))
+                    if current_flow.get("primary_action") != "OPEN_APPLY_GATE":
+                        ui.notify("적용 전 안전 검사를 먼저 완료해 주세요.", type="warning")
+                        return
                     if not plan or not preview or preview.get("status") != "PREVIEW":
                         ui.notify("추천 상품 미리보기를 먼저 준비하세요. 전체 홈페이지 상태와는 별개입니다.", type="warning"); return
                     theme = preview.get("theme") or {}
@@ -2531,8 +2651,10 @@ class OperatorUI:
                                 backend_selection=backend_selection_control.value or "AUTO",
                                 allow_live=bool(live_confirmed.value))
                             state["featured_apply_status"] = result.get("status", "FAILED")
+                            state["featured_last_apply_status"] = result.get("status", "FAILED")
                             state["backup_id"] = result.get("backup_id")
                             state["featured_backend_name"] = result.get("backend_name")
+                            state["featured_last_apply_plan_id"] = plan.get("plan_id")
                             state["featured_last_apply_result"] = {
                                 key: result.get(key) for key in
                                 ("status", "reason", "reason_code", "backend_name", "backend_reason_code",
@@ -2541,11 +2663,19 @@ class OperatorUI:
                                 state["featured_last_apply_result"]["reason"] = (
                                     result.get("human_message") or result.get("reason") or
                                     "안전 검사에서 차이가 발견되어 적용을 멈췄습니다.")
-                            featured_last_apply_result.set_text(
-                                f"최근 적용 결과: {state['featured_last_apply_result'].get('status')} · "
-                                f"{state['featured_last_apply_result'].get('reason') or ''}")
-                            featured_apply_persistent.set_text(f"Shopify 적용: {result.get('status')} · storefront 확인 필요")
+                                state["featured_preflight_result"] = {
+                                    "status": "CONFLICT", "reason_code": result.get("reason_code"),
+                                    "human_message": result.get("human_message") or result.get("reason"),
+                                    "backend_name": result.get("backend_name"),
+                                    "backend_reason_code": result.get("backend_reason_code"),
+                                    "theme_id": result.get("theme_id") or theme.get("id"),
+                                    "theme_role": "MAIN", "filename": "templates/index.json",
+                                    "write_performed": False}
+                                state["featured_preflight_plan_id"] = plan.get("plan_id")
+                                state["featured_preflight_preview_hash"] = preview.get("preview_hash")
                             if result.get("status") == "REMOTE_JSON_VERIFIED":
+                                state["featured_products_plan"] = FeaturedProductAssignmentService().get_plan(plan["plan_id"])
+                                state["featured_assignment_status"] = None
                                 config = get_shopify_connection(self.current_store) or {}
                                 domain = str(config.get("shop_domain") or "").strip().casefold()
                                 if re.fullmatch(r"[a-z0-9][a-z0-9-]*\.myshopify\.com", domain):
@@ -2556,6 +2686,7 @@ class OperatorUI:
                                             folder = FeaturedProductAssignmentService().export_report(plan["plan_id"])
                                             ui.notify("추천 상품 과제 보고서를 저장했습니다: " + str(folder), type="positive")
                                         ui.button("추천 상품 보고서 내보내기", on_click=export_featured_report, icon="download").props("outline")
+                            render_featured(state.get("featured_products_plan") or plan)
                             dialog.close()
                             ui.notify("추천 상품 isolated apply: " + result.get("status", "FAILED"), type="positive" if result.get("status") == "REMOTE_JSON_VERIFIED" else "warning")
                         ui.button("취소", on_click=dialog.close).props("outline")
@@ -2566,7 +2697,8 @@ class OperatorUI:
                 async def rollback_featured():
                     backup_id = state.get("backup_id")
                     backup_details = FeaturedProductThemeApplyService().backup_details(backup_id) if backup_id else {}
-                    if not backup_id: ui.notify("추천 상품 적용 backup이 없습니다.", type="warning"); return
+                    if not backup_details or backup_details.get("status") not in {"REMOTE_JSON_VERIFIED", "VERIFY_FAILED"}:
+                        ui.notify("롤백 가능한 적용 백업을 찾지 못했습니다.", type="warning"); return
                     with ui.dialog() as dialog, ui.card():
                         ui.label(f"Backup: {backup_id} | Original backend: {(backup_details or {}).get('backend_name') or 'ADMIN_GRAPHQL_LEGACY'} | Theme: {(backup_details or {}).get('theme_id')} / MAIN live")
                         ui.label("추천 상품 section만 exact raw backup으로 롤백합니다.")
@@ -2580,20 +2712,42 @@ class OperatorUI:
                             result = await asyncio.to_thread(FeaturedProductThemeApplyService().rollback,
                                                             backup_id, confirmed=True, allow_live=bool(live_confirmed.value))
                             state["featured_apply_status"] = result.get("status", "FAILED")
-                            featured_apply_persistent.set_text("Shopify 적용: " + result.get("status", "FAILED"))
+                            state["featured_last_apply_status"] = result.get("status", "FAILED")
+                            state["featured_last_apply_result"] = {
+                                "status": result.get("status", "FAILED"),
+                                "reason_code": result.get("backend_reason_code"),
+                                "reason": "롤백 결과를 확인하고 새 미리보기를 다시 준비하세요."}
+                            state["featured_last_apply_plan_id"] = state.get("featured_products_plan", {}).get("plan_id")
+                            if result.get("status") == "ROLLED_BACK":
+                                plan = state.get("featured_products_plan") or {}
+                                if plan.get("plan_id"):
+                                    state["featured_products_plan"] = FeaturedProductAssignmentService().get_plan(plan["plan_id"])
+                                state["featured_products_preview"] = None
+                                state["featured_preflight_result"] = None
+                                state["featured_preflight_plan_id"] = None
+                                state["featured_preflight_preview_hash"] = None
+                                state["featured_apply_status"] = "NOT RUN"
+                            render_featured()
                             dialog.close()
                             ui.notify("추천 상품 전용 롤백: " + result.get("status", "FAILED"), type="positive" if result.get("status") == "ROLLED_BACK" else "warning")
                         ui.button("취소", on_click=dialog.close).props("outline")
                         ui.button("추천 상품만 롤백", on_click=perform_rollback).props("color=negative")
                     dialog.open()
 
-                def featured_assignment_check():
+                def featured_storefront_check():
                     plan = state.get("featured_products_plan") or {}
-                    verified = state.get("featured_apply_status") == "REMOTE_JSON_VERIFIED"
+                    verified = (state.get("featured_apply_status") == "REMOTE_JSON_VERIFIED"
+                                or bool(plan.get("remote_json_verified")))
                     checks = FeaturedProductAssignmentService().checklist(plan, remote_verified=verified,
                         storefront_verified=bool(plan.get("storefront_verified")))
                     with ui.dialog() as dialog, ui.card().classes("w-[min(720px,95vw)]"):
-                        ui.label("추천 상품 과제 확인").classes("text-xl font-bold")
+                        ui.label("6단계 · 스토어에서 직접 확인").classes("text-xl font-bold")
+                        config = get_shopify_connection(self.current_store) or {}
+                        domain = str(config.get("shop_domain") or "").strip().casefold()
+                        if re.fullmatch(r"[a-z0-9][a-z0-9-]*\.myshopify\.com", domain):
+                            ui.link("스토어를 새 탭에서 열기", f"https://{domain}/", new_tab=True).classes("text-primary")
+                        else:
+                            ui.label("스토어 주소를 확인할 수 없어 링크를 표시하지 못했습니다.").classes("text-amber-800")
                         for key, passed in checks["checks"].items():
                             ui.label(("✓ " if passed else "확인 필요 · ") + key.replace("_", " ")).classes("text-green-700" if passed else "text-amber-800")
                         human = state.get("featured_human_checks", {})
@@ -2606,24 +2760,56 @@ class OperatorUI:
                                 "product_links": bool(product_links.value), "mobile_section": bool(mobile_section.value)}
                             confirmation = FeaturedProductAssignmentService().confirm_storefront(plan["plan_id"],
                                 checks=state["featured_human_checks"], confirmed=verified)
-                            state["featured_assignment_status"] = confirmation["status"]
+                            state["featured_assignment_status"] = None
                             state["featured_products_plan"] = FeaturedProductAssignmentService().get_plan(plan["plan_id"])
                             ui.notify("추천 상품 상태: " + state["featured_assignment_status"], type="positive" if state["featured_assignment_status"] == "STOREFRONT_VERIFIED" else "info")
                             dialog.close()
+                            render_featured(state["featured_products_plan"])
                         ui.button("확인 저장", on_click=save_checks).props("color=primary")
                     dialog.open()
 
-                with ui.row().classes("flex-wrap gap-2"):
-                    ui.button("추천 상품 자동 구성", on_click=select_featured_products, icon="auto_awesome").props("color=primary")
-                    ui.button("상품 4개 보기", on_click=show_featured_review, icon="view_list").props("outline")
-                    ui.button("다시 선택", on_click=lambda: select_featured_products(reselect=True), icon="refresh").props("outline")
-                    ui.button("Shopify 상품 다시 읽기", on_click=lambda: select_featured_products(True), icon="cloud_download").props("outline")
-                    ui.button("추천 상품 미리보기", on_click=featured_preview, icon="preview").props("outline")
-                    ui.button("적용 전 안전 검사", on_click=featured_apply_preflight,
-                              icon="fact_check").props("outline")
-                    ui.button("Shopify 적용", on_click=featured_apply_gate, icon="publish").props("outline")
-                    ui.button("추천 상품 롤백", on_click=rollback_featured, icon="undo").props("outline")
-                    ui.button("과제 제출용 확인", on_click=featured_assignment_check, icon="checklist").props("outline")
+                def featured_assignment_check():
+                    plan = state.get("featured_products_plan") or {}
+                    verified = state.get("featured_apply_status") == "REMOTE_JSON_VERIFIED"
+                    checklist = FeaturedProductAssignmentService().checklist(
+                        plan, remote_verified=verified,
+                        storefront_verified=bool(plan.get("storefront_verified")))
+                    with ui.dialog() as dialog, ui.card().classes("w-[min(720px,95vw)]"):
+                        ui.label("7단계 · 과제 제출용 확인").classes("text-xl font-bold")
+                        ui.label("제출 전 추천 상품과 스토어 확인 항목을 살펴봅니다.")
+                        for key, passed in checklist["checks"].items():
+                            ui.label(("✓ " if passed else "확인 필요 · ") + key.replace("_", " ")).classes(
+                                "text-green-700" if passed else "text-amber-800")
+                        def complete_assignment_check():
+                            state["featured_assignment_status"] = checklist["status"]
+                            if checklist["ready"]:
+                                ui.notify("모든 단계가 완료되었습니다.", type="positive")
+                            else:
+                                ui.notify("아직 확인할 항목이 남아 있습니다.", type="warning")
+                            dialog.close()
+                            render_featured(plan)
+                        ui.button("확인", on_click=complete_assignment_check).props("color=primary")
+                        ui.button("닫기", on_click=dialog.close).props("outline")
+                    dialog.open()
+
+                def run_featured_primary_action():
+                    flow = resolve_featured_guided_state(state, state.get("featured_products_plan"),
+                        state.get("featured_products_preview"), state.get("featured_preflight_result"),
+                        state.get("featured_last_apply_result"))
+                    handlers = {
+                        "REFRESH_PRODUCTS": select_featured_products,
+                        "REVIEW_PRODUCTS": show_featured_review,
+                        "BUILD_PREVIEW": featured_preview,
+                        "RUN_PREFLIGHT": featured_apply_preflight,
+                        "RECHECK_THEME_CONNECTION": featured_recheck_connection,
+                        "OPEN_APPLY_GATE": featured_apply_gate,
+                        "OPEN_STOREFRONT": featured_storefront_check,
+                        "OPEN_ASSIGNMENT_CHECK": featured_assignment_check,
+                    }
+                    handler = handlers.get(flow["primary_action"])
+                    if handler:
+                        return handler()
+
                 render_featured()
 
             async def save_hero_upload(event):

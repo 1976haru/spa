@@ -482,7 +482,7 @@ def test_featured_review_ui_is_dialog_with_cards_images_and_safe_links():
     source = (Path(__file__).parents[1] / "src/shopsource/ui/v2.py").read_text(encoding="utf-8")
     assert "ui.dialog() as featured_review_dialog" in source
     assert "featured_review_cards" in source and "ui.image(item[\"image_url\"])" in source
-    assert "ui.link(\"스토어에서 보기\"" in source and "on_click=show_featured_review" in source
+    assert "ui.link(\"스토어에서 보기\"" in source and '"REVIEW_PRODUCTS": show_featured_review' in source
     assert "myshopify\\.com" in source
     render = source.split("def render_featured", 1)[1].split("def select_featured_products", 1)[0]
     assert "selection_reason" not in render and "verification_status" not in render
@@ -717,15 +717,12 @@ def test_beginner_preflight_button_is_explicit_read_only_ui_path():
 
     source = (Path(__file__).resolve().parents[1] / "src" / "shopsource" / "ui" / "v2.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
-    button_line = next(index for index, line in enumerate(source.splitlines(), 1)
-                       if 'ui.button("적용 전 안전 검사"' in line)
-    button_context = "\n".join(source.splitlines()[button_line - 4:button_line + 2])
-    assert "on_click=featured_apply_preflight" in button_context
-    assert source.index('ui.button("추천 상품 미리보기"') < source.index('ui.button("적용 전 안전 검사"')
-    assert source.index('ui.button("적용 전 안전 검사"') < source.index('ui.button("Shopify 적용"', button_line)
+    assert '"RUN_PREFLIGHT": featured_apply_preflight' in source
+    assert '"OPEN_APPLY_GATE": featured_apply_gate' in source
+    assert 'ui.button(flow["primary_label"], on_click=run_featured_primary_action' in source
 
     handler = next(node for node in ast.walk(tree)
-                   if isinstance(node, ast.AsyncFunctionDef) and node.name == "featured_apply_preflight")
+                   if isinstance(node, ast.AsyncFunctionDef) and node.name == "execute_featured_preflight")
     handler_source = ast.get_source_segment(source, handler)
     assert ".preflight" in handler_source and "allow_live=False" in handler_source
     assert "FeaturedProductThemeApplyService().apply" not in handler_source

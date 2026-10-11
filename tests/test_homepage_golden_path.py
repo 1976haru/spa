@@ -254,7 +254,7 @@ def test_homepage_upstream_change_invalidates_downstream_preview(golden_service)
 def test_homepage_button_contracts_have_visible_effect_and_no_silent_review_button():
     from pathlib import Path
     source = (Path(__file__).parents[1] / "src/shopsource/ui/v2.py").read_text(encoding="utf-8")
-    assert "on_click=show_featured_review" in source and "featured_review_dialog.open()" in source
+    assert '"REVIEW_PRODUCTS": show_featured_review' in source and "featured_review_dialog.open()" in source
     assert "resolve_homepage_context(\"FEATURED_PREVIEW\")" in source
     assert "resolve_homepage_context(\"FULL_PREVIEW\")" in source
     assert "resolve_homepage_context(\"ASSIGNMENT_CHECK\")" in source
