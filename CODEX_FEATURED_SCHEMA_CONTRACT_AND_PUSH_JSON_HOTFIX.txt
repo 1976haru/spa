@@ -1,0 +1,486 @@
+ShopSource Studio — FEATURED SCHEMA CONTRACT + THEME PUSH JSON ERROR HOTFIX
+ONE COMPRESSED ROOT-CAUSE FIX AFTER FORENSIC RESULT A
+
+Repository
+- Baseline main: 606bc1eee9e444acd2ee7e68392a953555c385f8
+- Branch: hotfix/featured-schema-contract-and-push-json
+- Recommended worktree: D:\shop\001_so_amazon_featured_schema_pushjson
+
+CONFIRMED REAL FORENSIC FACTS
+- Existing failed backup: HFPB_a87a1f3e3b28f0b5
+- Plan: HFP_78156f919516a807abad
+- MAIN theme: gid://shopify/OnlineStoreTheme/162910503161
+- File: templates/index.json
+- Current raw == before.raw exactly
+- Current semantic == before semantic
+- Current != proposed
+- Target section ssfeaturedproductsb530645c3492 is absent from current
+- Target section is absent from order
+- No unrelated merchant drift
+- Therefore: WRITE_NOT_APPLIED_CURRENT_EQUALS_BEFORE
+- Existing backup metadata says:
+  product_field_id = "product"
+  product_field_type = "product"
+- Proposed section type:
+  featured-product-information
+- Plan contains 4 products
+
+CONFIRMED CODE BUG
+discover_featured_product_schema() currently does:
+  next(setting where type in {"product_list", "product"})
+and labels either one as DIRECT_PRODUCTS.
+
+build_theme_preview() then does:
+  settings[product_field_id] = [four Shopify product IDs]
+
+This means a single-product schema setting:
+  {"type": "product", "id": "product"}
+can receive a four-item list.
+
+That violates the Shopify schema contract:
+- type=product is a single product picker
+- type=product_list is the multi-product picker
+
+CONFIRMED PUSH OBSERVABILITY GAP
+Shopify CLI theme push --json can report per-asset upload errors in JSON under theme.errors/theme.warning.
+The process can complete without the remote asset changing.
+Current _push() uses only subprocess returncode and discards JSON output, so it can report an attempted/successful push even when templates/index.json was rejected.
+
+MISSION
+Fix BOTH root causes in one branch:
+1. never generate four-product JSON into a single-product setting
+2. parse Shopify CLI push --json result and fail closed on per-asset errors
+
+Also perform one read-only capability audit for Store 001 to discover the real native multi-product options before choosing the final strategy.
+Do not perform any live Shopify write in this implementation phase.
+
+======================================================================
+1. SAFETY
+======================================================================
+
+Do not modify:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env
+- credentials
+- category/reconciliation logic
+- unrelated homepage features
+
+No Shopify mutation.
+No theme push against real Store 001.
+No rollback.
+No product/collection mutation.
+No credential creation/deletion.
+Do not merge main.
+
+A real Theme Access credential MAY be used only for an explicit READ-ONLY capability audit.
+Never print/export the credential.
+
+======================================================================
+2. PHASE 0 — REAL STORE 001 READ-ONLY SCHEMA AUDIT
+======================================================================
+
+Before coding, inspect current MAIN theme's relevant section schemas read-only.
+
+Goal:
+Find every section capable of representing 4 recommended products.
+
+Collect SAFE metadata only:
+- section filename/type
+- schema name
+- section-level settings:
+  * product_list fields
+  * product fields
+  * collection fields
+- block schemas:
+  * block type/name
+  * product fields in blocks
+  * max_blocks if available
+- presets if relevant
+
+Do not output full Liquid source.
+
+Classify candidates:
+A. NATIVE_PRODUCT_LIST
+   section-level type=product_list and limit >=4 or no restrictive limit
+
+B. NATIVE_PRODUCT_BLOCKS
+   section supports >=4 repeatable blocks where each block contains one type=product setting
+
+C. NATIVE_COLLECTION
+   section-level type=collection and can display at least 4 products
+
+D. SINGLE_PRODUCT_ONLY
+   only type=product section-level setting; NOT valid for 4-product plan
+
+Report sorted candidate list before implementation.
+
+Preferred strategy:
+A > B > C.
+Do NOT use D for requested_count=4.
+
+If A exists in real theme, implement A and keep B/C as tested fallback capabilities.
+If no A but B exists, implement safe block-based representation.
+If only C exists, return a controlled prerequisite requiring a verified collection containing the exact four products; do not mutate collections in this branch.
+If none A/B/C exists, fail closed with MULTI_PRODUCT_SECTION_UNAVAILABLE.
+
+======================================================================
+3. FIX SCHEMA DISCOVERY CONTRACT
+======================================================================
+
+Refactor discover_featured_product_schema() so "product" and "product_list" are NEVER treated as equivalent.
+
+Recommended candidate model:
+- DIRECT_PRODUCT_LIST
+- PRODUCT_BLOCKS
+- FEATURED_COLLECTION
+- SINGLE_PRODUCT_ONLY
+
+For a requested_count > 1:
+- DIRECT_PRODUCT_LIST is compatible
+- PRODUCT_BLOCKS compatible only when block capacity >= requested_count
+- FEATURED_COLLECTION compatible only when a verified collection handle/id is supplied
+- SINGLE_PRODUCT_ONLY incompatible
+
+The selected capability must include:
+- strategy
+- section filename/type
+- product_field id/type when relevant
+- collection field when relevant
+- block schema information when relevant
+- requested_count
+- capacity
+- compatibility reason
+
+Never silently degrade a 4-product plan to one product.
+
+======================================================================
+4. BUILD PREVIEW WITH EXACT SCHEMA TYPES
+======================================================================
+
+For DIRECT_PRODUCT_LIST:
+- require product_field.type == "product_list"
+- write exactly 4 product references
+- preserve order
+- ensure schema limit >=4 if limit exists
+
+For PRODUCT_BLOCKS:
+- create exactly four blocks using the proven block type
+- each block's single product field gets ONE product reference, not an array
+- include required block_order if Shopify JSON section contract requires it
+- do not invent unrelated settings
+- preserve unrelated sections/order
+
+For FEATURED_COLLECTION:
+- require verified collection identity containing intended products before READY preview
+- no collection mutation here
+
+For SINGLE_PRODUCT_ONLY:
+- return MULTI_PRODUCT_SECTION_UNAVAILABLE or choose the next compatible candidate
+- NEVER set a list into a product field
+
+======================================================================
+5. PREVIEW/APPLY VALIDATION
+======================================================================
+
+Before preview status can be PREVIEW:
+- validate selected schema strategy against requested_count=4
+- validate generated target section value shapes
+
+Add pure validator:
+validate_featured_section_against_capability(section, capability, requested_count)
+
+Examples:
+- product type must be scalar/string/null, never list
+- product_list must be list of exactly requested_count for this assignment
+- block product must be scalar per block
+- exactly four logical selected products must be represented
+
+If invalid:
+status = BLOCKED
+reason_code = FEATURED_SCHEMA_VALUE_TYPE_MISMATCH
+Shopify write must be impossible.
+
+Preflight must revalidate the same contract.
+Apply must revalidate before backup/write.
+
+======================================================================
+6. THEME PUSH --json RESULT MUST BE PARSED
+======================================================================
+
+Current pull/push binary capture solved cp949, but push --json output contains useful machine-readable result.
+
+Refactor only PUSH invocation to safely capture bytes and parse UTF-8 JSON.
+
+Do not revert to locale text mode.
+
+Recommended:
+- _invoke(..., return_output=False) remains binary for generic pull
+- a dedicated _invoke_json() or _push_json() for push:
+  capture_output=True
+  text=False
+  timeout
+  env with SHOPIFY_CLI_THEME_TOKEN
+  decode stdout as UTF-8 with errors="replace" ONLY after process completion
+  parse JSON
+  never print raw output
+
+Expected Shopify CLI JSON:
+theme.warning may exist
+theme.errors may contain per-asset upload errors
+
+Success requires ALL:
+- process returncode acceptable
+- parsed JSON is valid
+- theme.id matches verified target
+- theme.role matches live/main expectations if available
+- NO theme.errors entries
+- NO push warning indicating pushed with errors
+
+If errors exist:
+return safe structured failure:
+reason_code = CLI_PUSH_ASSET_REJECTED
+write_performed = True (attempt occurred)
+safe fields:
+- affected_asset_names only
+- error_count
+- error_categories if derivable without raw text
+Do NOT expose raw error messages by default.
+
+If JSON cannot be parsed:
+reason_code = CLI_PUSH_RESULT_UNPARSEABLE
+then post-read still determines whether content actually changed.
+Never assume success from exit code alone.
+
+======================================================================
+7. WRITE RESULT TRUTH TABLE
+======================================================================
+
+After push attempt ALWAYS post-read templates/index.json.
+
+Classify:
+
+A. observed == proposed
+  REMOTE_JSON_VERIFIED
+
+B. observed == before AND CLI JSON had asset errors
+  FAILED / CLI_PUSH_ASSET_REJECTED
+
+C. observed == before AND JSON unparseable/unknown
+  VERIFY_FAILED / REMOTE_CONTENT_UNCHANGED
+
+D. observed is different from before and proposed
+  ROLLBACK_REQUIRED / VERIFY_FAILED_REVIEW_BEFORE_ROLLBACK
+
+Do not let service-level Featured diagnostics overwrite a precise lower-level push failure with PRODUCT_IDS_MISMATCH when current == before.
+
+At Featured apply layer, preserve:
+- write_result.reason_code
+- write_result status
+- write_performed
+- before/current/proposed hash relation
+
+If current == before:
+prefer:
+WRITE_NOT_APPLIED_CURRENT_EQUALS_BEFORE
+or lower-level CLI_PUSH_ASSET_REJECTED
+rather than POST_WRITE_PRODUCT_IDS_MISMATCH.
+
+======================================================================
+8. EXISTING STORE 001 FAILED BACKUP CLASSIFICATION
+======================================================================
+
+Current existing backup must remain untouched.
+
+Add diagnosis priority:
+1. identity/read failure
+2. current raw == before raw and current semantic == before semantic:
+   POST_WRITE_NOT_APPLIED
+3. target section missing
+4. target section order missing
+5. product field missing
+6. product refs mismatch
+7. unrelated drift
+8. normalization cases
+
+For the existing Store 001 forensic data, unit/integration fixture must classify:
+POST_WRITE_NOT_APPLIED
+NOT POST_WRITE_PRODUCT_IDS_MISMATCH.
+
+No adoption is allowed for POST_WRITE_NOT_APPLIED.
+
+======================================================================
+9. RECOVERY UX
+======================================================================
+
+For durable existing Store 001 backup after merge:
+
+Show:
+"5단계 적용되지 않음"
+
+Help:
+"이전 적용 시도에서 Shopify가 변경 파일을 저장하지 않았습니다. 현재 테마는 적용 전 상태와 동일합니다."
+
+Do NOT show:
+"상품 연결 불일치"
+
+Primary action after code knows a valid new compatible capability:
+"새 안전 미리보기 만들기"
+
+This action:
+- creates a new preview using corrected schema strategy
+- does NOT write
+- invalidates old preflight
+- preserves old backup as historical failed attempt
+
+Then normal:
+preview -> preflight -> user explicit apply gate
+
+A second live write may be allowed only AFTER:
+- existing current == before is re-confirmed
+- new preview uses a schema-compatible strategy
+- preflight READY_TO_APPLY
+- user explicitly confirms live write again
+
+Do NOT auto-apply.
+
+======================================================================
+10. TEST MATRIX
+======================================================================
+
+Schema tests:
+1. product_list with limit >=4 -> DIRECT_PRODUCT_LIST READY
+2. product_list limit <4 -> incompatible
+3. product only -> SINGLE_PRODUCT_ONLY, never DIRECT
+4. product-only candidate plus product_list candidate -> product_list wins
+5. product blocks capacity >=4 -> PRODUCT_BLOCKS
+6. product blocks capacity <4 -> incompatible
+7. collection candidate -> FEATURED_COLLECTION fallback
+8. no compatible candidate -> MULTI_PRODUCT_SECTION_UNAVAILABLE
+9. generated product_list setting is list
+10. generated single product block setting is scalar
+11. list assigned to type=product is rejected before preview/write
+
+Push JSON tests:
+12. returncode 0 + theme.errors -> CLI_PUSH_ASSET_REJECTED
+13. returncode 0 + warning pushed with errors -> rejected
+14. returncode 0 + valid JSON no errors -> continue post-read
+15. invalid JSON -> CLI_PUSH_RESULT_UNPARSEABLE + post-read truth
+16. stdout UTF-8 remains cp949-safe
+17. secret never exposed
+
+Existing backup tests:
+18. current == before, target missing -> POST_WRITE_NOT_APPLIED
+19. must not misclassify as PRODUCT_IDS_MISMATCH
+20. no local-only adoption allowed
+21. Guided Flow offers new safe preview, not rollback/reapply
+
+One-write future E2E:
+22. compatible product_list preview
+-> READY_TO_APPLY
+-> one mocked push JSON success
+-> post-read proposed
+-> REMOTE_JSON_VERIFIED
+-> Step 6 -> Step 7 -> ASSIGNMENT_READY
+
+Rejected-asset E2E:
+23. incompatible value fixture
+-> push JSON asset error
+-> remote remains before
+-> CLI_PUSH_ASSET_REJECTED
+-> no false verify
+-> no auto rollback
+
+======================================================================
+11. REAL STORE 001 READ-ONLY AUDIT REPORT
+======================================================================
+
+Include in completion report:
+- all A/B/C/D candidates found
+- chosen strategy for Store 001
+- exact reason old strategy was invalid
+- whether a fresh corrected preview can be created immediately
+- whether any collection prerequisite is required
+
+Do NOT perform real write.
+
+======================================================================
+12. QUALITY GATES
+======================================================================
+
+Run:
+python -m compileall -q src tests
+git diff --check
+PYTHONPATH=src python -m shopsource.cli --help
+PYTHONPATH=src python -m shopsource.ui.v2 --help
+
+Focused:
+- theme schema discovery tests
+- Featured preview/apply tests
+- Theme Access CLI tests
+- post-write diagnosis/recovery tests
+- Guided Flow tests
+- backend/router tests
+
+Full:
+python -m pytest -q --basetemp=<fresh-worktree-local-temp>
+
+Expected >= current 1083 passed, 1 skipped.
+
+======================================================================
+13. COMMIT/PUSH
+======================================================================
+
+Commit validated implementation/tests on:
+hotfix/featured-schema-contract-and-push-json
+
+Suggested commit:
+Fix Featured schema contract and parse Theme CLI push errors
+
+Push branch.
+Do not merge main.
+
+======================================================================
+14. REPORT
+======================================================================
+
+Report:
+[1] baseline SHA
+[2] final feature SHA
+[3] files changed
+[4] real Store 001 schema candidates
+[5] chosen safe strategy
+[6] old product-vs-product_list bug
+[7] preview schema validation
+[8] push JSON parsing
+[9] asset rejection classification
+[10] current==before diagnosis priority
+[11] existing backup now classified as POST_WRITE_NOT_APPLIED
+[12] recovery UX
+[13] one-write future E2E
+[14] rejected-asset E2E
+[15] focused tests
+[16] full suite
+[17] protected files
+[18] real read-only credential use count
+[19] Shopify live write count
+[20] merge readiness
+[21] exact next action
+
+Final flags:
+REAL_SCHEMA_AUDIT = PASS/FAIL
+SINGLE_PRODUCT_USED_FOR_MULTI_PRODUCT = NO
+PRODUCT_LIST_STRATEGY = READY/NOT_READY
+PRODUCT_BLOCK_STRATEGY = READY/NOT_READY
+COLLECTION_FALLBACK = READY/NOT_READY
+SCHEMA_VALUE_VALIDATION = PASS/FAIL
+PUSH_JSON_ERRORS_PARSED = YES/NO
+CLI_PUSH_ASSET_REJECTED_CLASSIFIED = YES/NO
+POST_WRITE_NOT_APPLIED_CLASSIFIED = YES/NO
+EXISTING_BACKUP_MISCLASSIFICATION_FIXED = YES/NO
+AUTO_REAPPLY = NO
+AUTO_ROLLBACK = NO
+SHOPIFY_LIVE_WRITE_COUNT = 0
+FULL_SUITE = PASS/FAIL
+CODE_MERGE_READY = YES/NO
