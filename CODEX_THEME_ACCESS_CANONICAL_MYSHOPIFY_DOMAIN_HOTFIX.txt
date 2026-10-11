@@ -1,0 +1,284 @@
+ShopSource Studio — THEME ACCESS CANONICAL MYSHOPIFY DOMAIN HOTFIX
+FIX CLI AUTH AGAINST VERIFIED CANONICAL STORE IDENTITY
+
+Repository
+- Main: 8660962cb442f1c605dbed36485a571488cb9bc3
+- Branch: hotfix/theme-access-canonical-myshopify-domain
+- Recommended worktree: D:\shop\001_so_amazon_theme_access_domain_hotfix
+
+Observed real Store 001 state
+- Theme Access credential: YES
+- CLI state: AUTH_FAILED
+- GraphQL state: SCOPE_MISSING
+- MAIN theme identity: verified
+- selected backend: NO_WRITE_BACKEND
+
+Important code finding
+shopify_connections already stores:
+- shop_domain
+- canonical_myshopify_domain
+- primary_domain
+
+ShopifyAuthService already obtains authoritative shop.myshopifyDomain and persists canonical_myshopify_domain.
+
+But ShopifyThemeCLI currently authenticates all theme commands using connection["shop_domain"].
+
+For stores whose configured/primary/renamed domain differs from canonical_myshopify_domain, Theme Access CLI should use the verified canonical myshopify domain as the CLI --store identity.
+
+Mission
+Use canonical_myshopify_domain for Theme Access CLI commands whenever it is present and valid, while keeping caller/store binding safe and preserving configured domain for ShopSource presentation/business identity.
+
+No Shopify mutation in this task.
+No credential creation/replacement.
+No live write.
+
+======================================================================
+1. DOMAIN RESOLUTION HELPER
+======================================================================
+
+In src/shopsource/shopify_theme_cli.py add a small internal helper, e.g.
+
+_resolve_cli_store_domain(connection) -> (domain, source)
+
+Preferred precedence:
+1. canonical_myshopify_domain if valid *.myshopify.com
+2. shop_domain if valid
+3. otherwise STORE_NOT_CONFIGURED / DOMAIN_INVALID
+
+Do not use arbitrary primary custom domains for Theme Access CLI when canonical_myshopify_domain exists.
+
+Validation:
+- lowercase/strip
+- no scheme/path/query/userinfo
+- hostname only
+- canonical must end with ".myshopify.com"
+- reuse an existing safe domain validator if appropriate
+
+Return non-secret source metadata:
+CANONICAL_MYSHOPIFY_DOMAIN
+or
+CONFIGURED_SHOP_DOMAIN_FALLBACK
+
+======================================================================
+2. CAPABILITY CHECK
+======================================================================
+
+ShopifyThemeCLI.capability_status():
+
+Current:
+base = [shopify, theme, list, --store, connection["shop_domain"]]
+
+Change to use resolved CLI store domain.
+
+Keep configured ShopSource domain separately in details:
+- configured_shop_domain
+- cli_store_domain
+- cli_store_domain_source
+
+Do not break existing fields callers/tests rely on.
+If "shop_domain" must remain for compatibility, keep it as configured shop_domain and add cli_store_domain separately.
+
+Theme list command must use cli_store_domain.
+
+======================================================================
+3. READ/PULL/PUSH DOMAIN USE
+======================================================================
+
+All Shopify CLI remote commands must use the same locked, verified cli_store_domain:
+- theme list
+- theme pull
+- theme push
+
+Do not select a different domain after write starts.
+
+The caller may still pass request.shop_domain / configured ShopSource domain.
+_check_connection must validate caller store identity against the configured connection, then use capability.details["cli_store_domain"] for transport.
+
+Do NOT reject simply because request.shop_domain != cli_store_domain when:
+- request.shop_domain matches connection["shop_domain"]
+- cli_store_domain is the stored canonical_myshopify_domain
+- both belong to the same already verified store record
+
+Do not weaken store_id/theme_id/role checks.
+
+======================================================================
+4. STORE IDENTITY SAFETY
+======================================================================
+
+Use existing verified fields where available:
+- shopify_shop_gid
+- canonical_myshopify_domain
+- shop_domain
+
+Do not invent cross-store alias matching.
+
+A Theme Access password remains keyed per store_id.
+
+If canonical domain is present but malformed:
+- fail closed rather than silently using an unrelated host
+or use configured domain fallback only if safe and clearly reason-coded.
+
+Do not query/write extra Shopify data just to resolve this if current connection record already contains canonical identity.
+
+======================================================================
+5. MULTI-STORE ADVANCED DIAGNOSTIC
+======================================================================
+
+In advanced info only, show non-secret transport identity when available:
+
+Configured domain: ...
+Theme Access CLI domain: ...
+CLI domain source: canonical myshopify / configured fallback
+
+Do NOT expose credentials.
+
+Beginner main table need not show this.
+
+If CLI returns AUTH_FAILED after this fix, beginner next action may remain read-check / credential troubleshooting; do not falsely claim the password is bad.
+
+======================================================================
+6. AUTH_FAILED SEMANTICS
+======================================================================
+
+Do not broaden AUTH_FAILED further.
+
+Optional safe improvement:
+classify obvious Shopify CLI diagnostic categories without displaying raw stderr:
+- AUTH_FAILED
+- STORE_NOT_FOUND
+- NETWORK_ERROR
+- UNSUPPORTED_CLI
+- THEME_ID_NOT_FOUND
+
+But do not log raw output or secrets.
+
+The main objective is canonical domain routing, not diagnostic redesign.
+
+======================================================================
+7. REAL STORE 001 EXPECTED READ-ONLY RETEST AFTER MERGE
+======================================================================
+
+This implementation task must not use the real credential.
+
+After merge, operator will click:
+"선택한 스토어 읽기 확인"
+
+Expected if domain mismatch was root cause:
+- Theme Access credential: YES
+- CLI state: READY
+- MAIN theme exact identity verified
+- AUTO backend: THEME_ACCESS_CLI
+- status: READY
+
+If it still shows AUTH_FAILED:
+then investigate/reissue the Theme Access password separately.
+Do not automatically delete or replace it.
+
+======================================================================
+8. TESTS
+======================================================================
+
+Add/update tests at minimum:
+
+test_cli_prefers_canonical_myshopify_domain
+test_cli_falls_back_to_configured_domain_when_canonical_missing
+test_cli_list_uses_canonical_domain_for_renamed_store
+test_pull_uses_same_canonical_domain_as_capability
+test_push_uses_same_canonical_domain_as_capability
+test_request_configured_domain_can_bind_to_same_store_canonical_cli_domain
+test_malformed_canonical_domain_fails_closed_or_safe_fallback_per_policy
+test_store_id_isolation_unchanged
+test_theme_id_role_guards_unchanged
+test_no_secret_in_capability_details
+test_no_shopify_live_write
+
+Include a fixture resembling:
+connection = {
+  "shop_domain": "cabintidy.myshopify.com",
+  "canonical_myshopify_domain": "kgxbpi-it.myshopify.com",
+  "shopify_shop_gid": "gid://shopify/Shop/83388137721",
+  ...
+}
+
+Assert CLI argv --store receives:
+kgxbpi-it.myshopify.com
+
+Do not hardcode Store 001 behavior in production code; fixture only.
+
+======================================================================
+9. PROTECTED FILES
+======================================================================
+
+Do not modify:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env
+- credentials
+- category/reconciliation behavior
+- Featured business rules
+- backups/user assets
+
+No real Theme Access credential creation.
+No Shopify live write.
+
+======================================================================
+10. QUALITY GATES
+======================================================================
+
+Run:
+python -m compileall -q src tests
+focused Shopify theme CLI / backend / multistore tests
+python -m pytest -q --basetemp=<worktree-local-temp>
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Expected full suite >= 1019 passed, 1 skipped.
+
+======================================================================
+11. COMMIT / PUSH
+======================================================================
+
+Stay on:
+hotfix/theme-access-canonical-myshopify-domain
+
+Suggested commit:
+git commit -m "Use canonical myshopify domain for Theme Access CLI"
+
+Push branch.
+Do not merge main.
+
+======================================================================
+12. COMPLETION REPORT
+======================================================================
+
+Report:
+
+[1] baseline SHA
+[2] final SHA
+[3] files changed
+[4] canonical domain resolver
+[5] CLI list domain
+[6] pull domain
+[7] push domain
+[8] configured-vs-canonical binding safety
+[9] advanced diagnostic fields
+[10] auth status behavior
+[11] focused tests
+[12] full-suite result
+[13] protected files
+[14] Shopify live write count
+[15] real credential creation count
+[16] merge readiness
+[17] exact read-only retest after merge
+
+Final flags:
+CANONICAL_MYSHOPIFY_DOMAIN_USED = YES/NO
+CONFIGURED_DOMAIN_BINDING_PRESERVED = YES/NO
+LIST_PULL_PUSH_DOMAIN_LOCKED = YES/NO
+SECRET_SAFE = YES/NO
+FULL_SUITE = PASS/FAIL
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+CODE_MERGE_READY = YES/NO
