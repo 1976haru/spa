@@ -1,0 +1,243 @@
+ShopSource Studio — THEME ACCESS CLI PULL EMPTY-TEMP HOTFIX
+FIX REMOTE_READ_FAILED CAUSED BY INVALID NONEMPTY TEMP THEME DIRECTORY
+NO LIVE SHOPIFY WRITE
+
+Repository
+- Baseline main: c594d7246e2cb7092a273dafeab9ebbffca125a9
+- Branch: hotfix/theme-access-pull-empty-temp
+- Recommended worktree: D:\shop\001_so_amazon_theme_pull_empty_temp
+
+Observed real failure after previous pull-flag hotfix
+- Store 001 Theme Access capability/list = READY
+- canonical CLI domain = kgxbpi-it.myshopify.com
+- MAIN theme identity verified
+- Featured Guided Flow reaches step 4
+- preflight still returns REMOTE_READ_FAILED
+- source hashes exist from preview, current hashes remain None
+- no Shopify write occurred
+
+Verified Shopify CLI source behavior
+Current Shopify CLI pull service validates the --path directory before download:
+- if directory is empty => proceed
+- if non-empty and missing required theme directories => confirmation gate
+- required directories are config, layout, templates
+- our current ShopSource _pull() calls _scaffold(temp) BEFORE theme pull
+- _scaffold creates config + templates, but NOT layout
+- therefore the temp directory becomes non-empty but is NOT recognized as a valid theme directory
+- with --no-input, the CLI cannot complete the confirmation flow, so no requested file is downloaded
+
+Current ShopSource _pull() sequence:
+1. mkdtemp()
+2. _scaffold(temp)  <-- creates invalid partial theme directory for pull
+3. shopify theme pull ... --path temp --no-input
+4. target templates/index.json missing
+5. REMOTE_READ_FAILED
+
+Mission
+For read-only pull, leave the isolated temp directory EMPTY before invoking Shopify CLI.
+Keep _scaffold() for push/write only.
+
+Do NOT add hidden --force unless absolutely necessary.
+Empty directory is safer and matches Shopify CLI validation behavior.
+
+======================================================================
+1. SAFETY
+======================================================================
+
+Do not modify:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env
+- credentials
+- Featured selection logic
+- category/reconciliation logic
+- Guided Flow logic unless test updates require no-op compatibility
+
+No actual Shopify push.
+No themeFilesUpsert.
+No rollback.
+No credential creation/deletion.
+No real credential use in tests.
+Do not merge main.
+
+======================================================================
+2. MINIMAL CODE FIX
+======================================================================
+
+In src/shopsource/shopify_theme_cli.py:
+
+Inside ShopifyThemeCLI._pull():
+
+Current:
+    temp = mkdtemp(...)
+    try:
+        self._scaffold(temp)
+        command = [... "theme", "pull", ..., "--path", str(temp), "--no-input"]
+
+Change to:
+    temp = mkdtemp(...)
+    try:
+        # DO NOT scaffold for pull.
+        # Leave temp empty so Shopify CLI does not require directory confirmation.
+        command = [... "theme", "pull", ..., "--path", str(temp), "--no-input"]
+
+Requirements:
+- remove only the _scaffold(temp) call from _pull()
+- keep _scaffold(temp) in _push()
+- keep pull --no-input
+- keep pull without --json
+- keep canonical store domain
+- keep numeric verified theme ID
+- keep --only templates/index.json
+- keep isolated --path
+- keep password env-only via SHOPIFY_CLI_THEME_TOKEN
+- keep cleanup in finally
+
+Do not weaken store/theme/role identity checks.
+
+======================================================================
+3. DO NOT USE --force BY DEFAULT
+======================================================================
+
+Shopify CLI currently has a hidden pull --force flag for bypassing directory confirmation.
+Do NOT add it in the normal path.
+
+Reason:
+- isolated temp is under our control
+- empty temp naturally passes Shopify's directory validation
+- avoiding hidden --force is safer and more future-proof
+
+A comment explaining this design is welcome.
+
+======================================================================
+4. TESTS
+======================================================================
+
+Update tests/test_shopify_theme_cli.py.
+
+Required tests:
+
+A. pull temp starts empty
+- mock runner receives theme pull command
+- inspect --path directory at invocation
+- assert it contains no ShopSource scaffold artifacts before CLI mock writes output
+- specifically config/settings_schema.json must NOT exist before mocked pull
+- layout dir is not required because directory is empty
+
+B. mock Shopify directory-gate regression
+Create a mock runner behavior that emulates:
+- if --path is non-empty and does not contain config/layout/templates => command returns success/no-download or failure
+- if --path is empty => writes templates/index.json and succeeds
+
+Test must prove current fixed code succeeds.
+
+C. pull command flags remain:
+- --no-input present
+- --json absent
+- --only templates/index.json
+- canonical store domain
+- numeric theme id
+
+D. push remains:
+- _scaffold(temp) still used
+- push path has valid scaffold needed by local push
+- --json remains
+- --nodelete remains
+- --strict remains
+- --allow-live only when verified live
+
+E. byte preservation:
+- comments and CRLF preserved exactly
+
+F. secret safety:
+- password only in SHOPIFY_CLI_THEME_TOKEN env
+- password absent argv
+- no real credential/network
+
+======================================================================
+5. FEATURED PREFLIGHT REGRESSION
+======================================================================
+
+Run existing Featured preflight/guided tests.
+
+Confirm:
+- successful CLI read can reach READY_TO_APPLY or later hash classification
+- genuine read failures remain REMOTE_READ_FAILED and fail closed
+- preflight never creates backup
+- preflight never writes
+- guided step 4 remains one-primary-action UX
+
+No hash policy change in this hotfix.
+
+======================================================================
+6. QUALITY GATES
+======================================================================
+
+Run:
+python -m compileall -q src tests
+git diff --check
+python -m shopsource.cli --help
+python -m shopsource.ui.v2 --help
+
+Focused:
+python -m pytest -q tests/test_shopify_theme_cli.py tests/test_homepage_featured_products.py tests/test_featured_guided_flow.py tests/test_featured_theme_backend.py tests/test_theme_write_backend.py tests/test_multistore_theme_operations.py tests/test_theme_access_credentials.py tests/test_shopify_g0_readonly_hotfix.py
+
+Full:
+python -m pytest -q --basetemp=<worktree-local-temp>
+
+Expected >= 1047 passed, 1 skipped.
+
+======================================================================
+7. COMMIT/PUSH
+======================================================================
+
+Commit only validated code/tests/prompt files on:
+hotfix/theme-access-pull-empty-temp
+
+Suggested commit:
+Fix Theme Access pull temp directory validation
+
+Push same branch.
+Do not merge main.
+
+======================================================================
+8. COMPLETION REPORT
+======================================================================
+
+Report:
+[1] baseline SHA
+[2] final feature SHA
+[3] files changed
+[4] prior pull temp state
+[5] new pull temp state
+[6] why Shopify CLI directory validation failed before
+[7] _scaffold removed from pull only
+[8] _scaffold preserved for push
+[9] pull flags preserved
+[10] canonical domain preserved
+[11] credential transport preserved
+[12] read-only guarantee
+[13] focused tests
+[14] full suite
+[15] protected files
+[16] Shopify live write count
+[17] real credential use/creation count
+[18] merge readiness
+[19] exact next action
+
+Final flags:
+PULL_TEMP_EMPTY_BEFORE_CLI = YES/NO
+PULL_SCAFFOLD_REMOVED = YES/NO
+PUSH_SCAFFOLD_PRESERVED = YES/NO
+PULL_NO_INPUT = YES/NO
+THEME_PULL_JSON_REMOVED = YES/NO
+THEME_PUSH_JSON_PRESERVED = YES/NO
+CANONICAL_DOMAIN_PRESERVED = YES/NO
+PASSWORD_ARGV_EXPOSURE = NO
+READ_ONLY_PULL = YES/NO
+SHOPIFY_LIVE_WRITE_COUNT = 0
+REAL_THEME_ACCESS_CREDENTIAL_USED = NO
+REAL_THEME_ACCESS_CREDENTIAL_CREATED = NO
+FULL_SUITE = PASS/FAIL
+CODE_MERGE_READY = YES/NO
