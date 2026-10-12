@@ -56,6 +56,14 @@ def hydrate_featured_postwrite_state(state: dict, plan: dict, backup: dict | Non
             "backend_reason_code": backup.get("backend_reason_code"),
             "backup_id": backup.get("backup_id"), "write_performed": True,
             "reason": "이전 적용 시도 결과를 읽기 전용으로 진단해야 합니다."}
+    elif backup.get("status") == "NOT_APPLIED":
+        state["featured_apply_status"] = state["featured_last_apply_status"] = "POST_WRITE_NOT_APPLIED"
+        state["featured_strategy"] = backup.get("featured_strategy")
+        state["featured_last_apply_result"] = {
+            "status": "POST_WRITE_NOT_APPLIED", "reason_code": "POST_WRITE_NOT_APPLIED",
+            "backend_name": backup.get("backend_name"), "backup_id": backup.get("backup_id"),
+            "write_performed": True,
+            "reason": "이전 적용은 Shopify에 저장되지 않았습니다. 현재 스토어는 적용 전 상태입니다. 새 방식으로 안전하게 다시 준비합니다."}
     elif backup.get("status") == "REMOTE_JSON_VERIFIED" and plan.get("remote_json_verified"):
         state["featured_apply_status"] = state["featured_last_apply_status"] = "REMOTE_JSON_VERIFIED"
         state["featured_last_apply_result"] = {
@@ -110,6 +118,16 @@ def resolve_featured_guided_state(state: dict | None, plan: dict | None, preview
                 "problem_code": state.get("featured_load_problem"), "can_advance": True}
     steps[0]["status"] = "complete"
 
+    if last_apply_result.get("reason_code") == "POST_WRITE_NOT_APPLIED":
+        steps[1]["status"] = "complete"
+        collection_required = (state.get("featured_strategy") == "NATIVE_COLLECTION"
+                              or plan.get("featured_strategy") == "NATIVE_COLLECTION")
+        if collection_required and (not plan.get("collection_handle") or state.get("featured_collection_verified") is not True):
+            return finish(3, "PREPARE_FEATURED_COLLECTION", "3단계 · 추천 상품 컬렉션 준비",
+                "이전 적용은 Shopify에 저장되지 않았습니다. 현재 스토어는 적용 전 상태입니다. 새 방식으로 안전하게 다시 준비합니다.")
+        return finish(3, "BUILD_PREVIEW", "3단계 · 추천 상품 미리보기 만들기",
+            "이전 적용은 Shopify에 저장되지 않았습니다. 현재 스토어는 적용 전 상태입니다. 새 방식으로 안전하게 다시 준비합니다.")
+
     # A durable failed write takes precedence over transient review/preview
     # session state: resuming it must never lead back to another apply.
     durable_failure = (last_apply_result.get("status") == "VERIFY_FAILED"
@@ -151,6 +169,12 @@ def resolve_featured_guided_state(state: dict | None, plan: dict | None, preview
         return finish(2, "REVIEW_PRODUCTS", "2단계 · 상품 4개 확인",
                       "상품 네 개와 가격·이미지를 확인하고 완료를 눌러 주세요.")
     steps[1]["status"] = "complete"
+
+    if ((state.get("featured_strategy") == "NATIVE_COLLECTION"
+         or plan.get("featured_strategy") == "NATIVE_COLLECTION")
+        and (not plan.get("collection_handle") or state.get("featured_collection_verified") is False)):
+        return finish(3, "PREPARE_FEATURED_COLLECTION", "3단계 · 추천 상품 컬렉션 준비",
+                      "선택한 상품 4개를 담는 New Arrivals 컬렉션을 먼저 준비합니다. 테마 write는 없습니다.")
 
     preview_current = (preview.get("status") == "PREVIEW" and preview.get("plan_id") == plan_id)
     preflight_matches = (

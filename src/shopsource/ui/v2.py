@@ -2821,11 +2821,49 @@ class OperatorUI:
                     if state.get("featured_last_apply_result") is not None:
                         state["featured_last_apply_result"]["reason_code"] = result.get("reason_code")
                         state["featured_last_apply_result"]["reason"] = result.get("reason_code")
+                        if result.get("reason_code") == "POST_WRITE_NOT_APPLIED":
+                            state["featured_last_apply_result"]["status"] = "POST_WRITE_NOT_APPLIED"
+                            state["featured_apply_status"] = state["featured_last_apply_status"] = "POST_WRITE_NOT_APPLIED"
                     render_featured()
                     ui.notify("5단계 적용 결과 읽기 전용 진단: " + str(result.get("reason_code")),
                               type="positive" if result.get("reason_code") in {
                                   "POST_WRITE_VERIFIED", "POST_WRITE_RAW_ONLY_NORMALIZED",
                                   "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED"} else "warning")
+
+                async def featured_collection_prepare():
+                    from ..featured_collection_bridge import FeaturedCollectionPrerequisiteService
+                    plan = state.get("featured_products_plan") or {}
+                    service = FeaturedCollectionPrerequisiteService()
+                    preview = await asyncio.to_thread(service.dry_run, plan, store_id=self.current_store)
+                    if preview.get("status") != "DRY_RUN_READY":
+                        ui.notify("컬렉션 준비가 차단되었습니다: " + str(preview.get("reason_code") or preview.get("action")), type="warning")
+                        return
+                    with ui.dialog() as dialog, ui.card().classes("w-[min(680px,95vw)]"):
+                        ui.label("추천 상품 컬렉션 준비 확인").classes("text-xl font-bold")
+                        ui.label(f"Store {self.current_store} · New Arrivals · 선택 상품 {len(preview.get('selected_product_ids') or [])}개")
+                        ui.label("예상 작업: " + str(preview.get("action")))
+                        ui.label("Shopify theme write: NO")
+                        ui.label("컬렉션 변경은 최종 확인 후에만 실행됩니다.")
+                        confirm_members = ui.checkbox("선택한 정확한 상품 4개만 포함되는 것을 확인했습니다.")
+                        confirm_publish = ui.checkbox("ShopSource 소유 컬렉션 생성/수정 및 Online Store 공개를 확인했습니다.")
+                        async def commit_prepare():
+                            if confirm_members.value is not True or confirm_publish.value is not True:
+                                ui.notify("두 항목을 모두 확인해야 합니다.", type="warning"); return
+                            result = await asyncio.to_thread(service.prepare, plan, confirmed=True,
+                                expected_preview=preview, store_id=self.current_store)
+                            if result.get("status") == "VERIFIED":
+                                plan["collection_handle"] = result["handle"]
+                                state["featured_strategy"] = "NATIVE_COLLECTION"
+                                state["featured_collection_verified"] = True
+                                state["featured_products_plan"] = plan
+                                ui.notify("컬렉션 멤버십과 Online Store 공개를 확인했습니다.", type="positive")
+                            else:
+                                ui.notify("컬렉션 검증 실패: " + str(result.get("reason_code") or result.get("status")), type="warning")
+                            dialog.close()
+                            render_featured(plan)
+                        ui.button("취소", on_click=dialog.close).props("outline")
+                        ui.button("컬렉션 준비 실행", on_click=commit_prepare).props("color=primary")
+                    dialog.open()
 
                 def featured_postwrite_adoption():
                     backup_id = state.get("backup_id")
@@ -2869,6 +2907,7 @@ class OperatorUI:
                         "OPEN_ASSIGNMENT_CHECK": featured_assignment_check,
                         "DIAGNOSE_POST_WRITE": featured_postwrite_diagnosis,
                         "ADOPT_POST_WRITE": featured_postwrite_adoption,
+                        "PREPARE_FEATURED_COLLECTION": featured_collection_prepare,
                     }
                     handler = handlers.get(flow["primary_action"])
                     if handler:
@@ -2904,6 +2943,12 @@ class OperatorUI:
                 if context.canonical_preview:
                     state["featured_products_preview"] = context.canonical_preview.get("featured_products_preview")
                 statuses = context.statuses
+                if statuses.get("featured_strategy"):
+                    state["featured_strategy"] = statuses["featured_strategy"]
+                if statuses.get("featured_collection"):
+                    state["featured_collection_verified"] = statuses["featured_collection"] == "VERIFIED"
+                elif operation == "FEATURED_PREVIEW":
+                    state["featured_collection_verified"] = False
                 preview_status = statuses.get("preview", "NOT READY")
                 homepage_session_status.set_text(
                     f"Brand: {statuses.get('brand', 'WAITING')} · Collections: {statuses.get('collections', 'WAITING')} · "

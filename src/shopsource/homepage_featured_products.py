@@ -645,10 +645,13 @@ class FeaturedProductAssignmentService:
             count_field = capability.get("count_field")
             if (not isinstance(proof, dict) or proof.get("verified") is not True
                     or proof.get("handle") != plan.get("collection_handle")
-                    or proof.get("product_ids") != expected_ids):
+                    or proof.get("published") is not True
+                    or proof.get("membership_set_match") is not True
+                    or len(set(proof.get("product_ids") or [])) != 4
+                    or set(proof.get("product_ids") or []) != set(expected_ids)):
                 return {"status": "MANUAL_ACTION_REQUIRED", "reason": "FEATURED_COLLECTION_MEMBERSHIP_UNVERIFIED",
                         "write_performed": False}
-            verified_collection = {"verified": True, "handle": proof["handle"], "product_ids": list(proof["product_ids"])}
+            verified_collection = dict(proof)
             if not count_field or count_field.get("max", 0) < 4:
                 return {"status": "BLOCKED", "reason": "FEATURED_SCHEMA_VALUE_TYPE_MISMATCH", "write_performed": False}
             settings[capability["collection_field"]["id"]] = proof["handle"]
@@ -694,10 +697,29 @@ class FeaturedProductAssignmentService:
                 "preview_hash": preview_hash, "source_document": source_document,
                 "write_performed": False, "unrelated_sections_preserved": True}
 
-    def verify_remote(self, plan_id: str, *, preview_hash: str, remote_section: dict | None) -> dict:
+    def verify_remote(self, plan_id: str, *, preview_hash: str, remote_section: dict | None,
+                      featured_collection_service=None) -> dict:
         plan = self.get_plan(plan_id)
         if not plan.get("preview_hash") or plan["preview_hash"] != preview_hash:
             return {"status": "CONFLICT", "reason": "STALE_PREVIEW", "write_performed": False}
+        if plan.get("collection_handle"):
+            from .featured_collection_bridge import FeaturedCollectionPrerequisiteService
+            collection_service = featured_collection_service or FeaturedCollectionPrerequisiteService(db=self.db)
+            proof = collection_service.verify_for_plan(plan, store_id=plan["store_id"])
+            section_handle = (remote_section or {}).get("collection_handle")
+            section_count = (remote_section or {}).get("max_products")
+            verified = bool(remote_section and remote_section.get("visible", True)
+                and section_handle == plan["collection_handle"] and section_count == 4
+                and proof.get("status") == "VERIFIED" and proof.get("published") is True
+                and len(set(proof.get("product_ids") or [])) == 4
+                and {x.get("shopify_product_id") for x in plan.get("items", [])} == set(proof.get("product_ids") or []))
+            if verified:
+                with connect(self.db) as con:
+                    con.execute("UPDATE homepage_featured_product_plans SET status='REMOTE_JSON_VERIFIED',remote_json_verified=1,storefront_verified=0,remote_verified=0,updated_at=? WHERE plan_id=?", (_now(), plan_id))
+            return {"status": "VERIFIED" if verified else "REVIEW_REQUIRED",
+                    "section_visible": verified, "product_ids_match": verified,
+                    "collection_proof": {key: proof.get(key) for key in ("collection_id", "handle", "published", "membership_hash")} if verified else None,
+                    "write_performed": False}
         visible = bool(remote_section and remote_section.get("visible", True))
         remote_ids = list((remote_section or {}).get("product_ids") or [])
         expected = [x["shopify_product_id"] for x in plan["items"]]
@@ -745,22 +767,33 @@ class FeaturedProductAssignmentService:
 
 class FeaturedProductThemeApplyService:
     """Guarded one-section theme writer; deliberately separate from homepage apply."""
-    def __init__(self, *, db=None, export_dir: str | Path | None = None, client_factory=ShopifyGraphQLClient):
+    def __init__(self, *, db=None, export_dir: str | Path | None = None, client_factory=ShopifyGraphQLClient,
+                 featured_collection_service=None):
         self.db, self.export_dir, self.client_factory = db, Path(export_dir) if export_dir else EXPORT_DIR, client_factory
+        self.featured_collection_service = featured_collection_service
         _install(db)
 
     def latest_post_write_backup(self, store_id: str, plan_id: str | None = None) -> dict | None:
         """Return safe durable recovery metadata; never expose saved theme contents."""
-        query = ("SELECT backup_id,store_id,plan_id,theme_id,filename,status,backend_name,"
+        query = ("SELECT backup_id,store_id,plan_id,theme_id,filename,status,backend_name,folder,"
                  "backend_selection,backend_reason_code,created_at FROM homepage_featured_theme_backups "
-                 "WHERE store_id=? AND status IN ('VERIFY_FAILED','REMOTE_JSON_VERIFIED')")
+                 "WHERE store_id=? AND status IN ('VERIFY_FAILED','NOT_APPLIED','REMOTE_JSON_VERIFIED')")
         params = [str(store_id)]
         if plan_id is not None:
             query += " AND plan_id=?"; params.append(str(plan_id))
         query += " ORDER BY created_at DESC,rowid DESC LIMIT 1"
         with connect(self.db) as con:
             row = con.execute(query, params).fetchone()
-        return dict(row) if row else None
+        if not row: return None
+        result = dict(row)
+        try:
+            metadata = json.loads((Path(result["folder"]) / "metadata.json").read_text(encoding="utf-8"))
+            if metadata.get("featured_strategy") == "NATIVE_COLLECTION":
+                result["featured_strategy"] = metadata.get("featured_strategy")
+        except (OSError, ValueError, TypeError):
+            pass
+        result.pop("folder", None)
+        return result
 
     @staticmethod
     def _remote_document(theme: dict, filename: str):
@@ -995,15 +1028,37 @@ class FeaturedProductThemeApplyService:
             collection_id = (schema_capability.get("collection_field") or {}).get("id")
             count_field = schema_capability.get("count_field") or {}
             proof = preview.get("verified_collection") or {}
-            shape_ok = (proof.get("verified") is True and proof.get("product_ids") == expected_ids
+            collection_field = schema_capability.get("collection_field") or {}
+            shape_ok = (collection_field.get("type") == "collection"
+                        and proof.get("verified") is True and proof.get("published") is True
+                        and proof.get("membership_set_match") is True
+                        and len(set(proof.get("product_ids") or [])) == 4
+                        and set(proof.get("product_ids") or []) == set(expected_ids)
                         and proof.get("handle") == selected_settings.get(collection_id)
                         and selected_settings.get(count_field.get("id")) == 4
-                        and count_field.get("type") == "range")
+                        and count_field.get("type") == "range"
+                        and count_field.get("min", 0) <= 4 <= count_field.get("max", 0))
         else:
             shape_ok = False
         if not shape_ok:
             return self._preflight_result("CONFLICT", "PRODUCT_IDS_MISMATCH",
                 isolated_diff_safe=True, product_ids_match=False, **comparison), None
+        collection_proof = None
+        if strategy == "NATIVE_COLLECTION":
+            from .featured_collection_bridge import FeaturedCollectionPrerequisiteService
+            collection_service = self.featured_collection_service or FeaturedCollectionPrerequisiteService(
+                db=self.db, client=client, client_factory=self.client_factory)
+            collection_proof = collection_service.verify_for_plan(plan, store_id=store_id)
+            preview_proof = preview.get("verified_collection") or {}
+            if (collection_proof.get("status") != "VERIFIED"
+                    or collection_proof.get("collection_id") != preview_proof.get("collection_id")
+                    or collection_proof.get("membership_hash") != preview_proof.get("membership_hash")
+                    or collection_proof.get("handle") != selected_settings.get((schema_capability.get("collection_field") or {}).get("id"))
+                    or set(collection_proof.get("product_ids") or []) != set(expected_ids)
+                    or collection_proof.get("published") is not True
+                    or collection_proof.get("publication_id") != preview_proof.get("publication_id")):
+                return self._preflight_result("CONFLICT", "FEATURED_COLLECTION_CHANGED_ABORT",
+                    isolated_diff_safe=True, product_ids_match=True, **comparison), None
         proposed_raw = render_shopify_json_document(document, proposed)
         proposed_doc = parse_shopify_json_document(proposed_raw)
         if (proposed_doc.prefix != document.prefix or proposed_doc.suffix != document.suffix
@@ -1021,6 +1076,7 @@ class FeaturedProductThemeApplyService:
             "config": config, "selected": selected, "backend": backend,
             "backend_name": backend_name, "backend_reason": backend_reason,
             "preview": preview, "result": result}
+        context["collection_proof"] = collection_proof
         return result, context
 
     def apply(self, plan_id: str, preview: dict, *, store_id: str, confirmed: bool = False,
@@ -1044,6 +1100,10 @@ class FeaturedProductThemeApplyService:
         product_field = preview["capability"].get("product_field") or {}
         product_field_id = product_field.get("id")
         product_field_type = product_field.get("type")
+        strategy = (preview.get("capability") or {}).get("strategy")
+        collection_field = (preview.get("capability") or {}).get("collection_field") or {}
+        count_field = (preview.get("capability") or {}).get("count_field") or {}
+        collection_proof = context.get("collection_proof")
         from .theme_write_backend import ThemeFileWriteRequest, ThemeWriteBackendRouter
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         folder = self.export_dir / "theme_backups" / str(store_id) / (stamp + "-featured-products")
@@ -1054,7 +1114,17 @@ class FeaturedProductThemeApplyService:
             "before_raw_hash": document.raw_hash, "before_semantic_hash": document.semantic_hash,
             "proposed_raw_hash": proposed_doc.raw_hash, "selected_products": items, "timestamp": _now(),
             "product_field_id": product_field_id, "product_field_type": product_field_type,
-            "product_reference_format_written": "gid",
+            "product_reference_format_written": "gid" if strategy != "NATIVE_COLLECTION" else None,
+            "featured_strategy": strategy,
+            "collection_id": (collection_proof or {}).get("collection_id"),
+            "collection_handle": (collection_proof or {}).get("handle"),
+            "collection_field_id": collection_field.get("id"),
+            "collection_count_field_id": count_field.get("id"),
+            "selected_product_ids_hash": hashlib.sha256(json.dumps(sorted(expected_ids), separators=(",", ":")).encode()).hexdigest() if strategy == "NATIVE_COLLECTION" else None,
+            "verified_collection_membership_hash": (collection_proof or {}).get("membership_hash"),
+            "publication_id": (collection_proof or {}).get("publication_id"),
+            "publication_status": (collection_proof or {}).get("publication_status"),
+            "reference_contract": "FEATURED_COLLECTION_EXACT_4" if strategy == "NATIVE_COLLECTION" else "THEME_SCHEMA_VERIFIED",
             "backend_name": backend_name, "backend_selection": backend_selection,
             "backend_reason_code": backend_reason}
         (folder / "before.raw.json").write_text(before_raw, encoding="utf-8", newline="")
@@ -1076,6 +1146,20 @@ class FeaturedProductThemeApplyService:
         request = ThemeFileWriteRequest(store_id=str(store_id), shop_domain=config["shop_domain"],
             theme_id=theme["id"], filename=filename, content=proposed_raw,
             expected_remote_raw_hash=document.raw_hash, confirmed=True, allow_live=True, target_is_live=True)
+        if strategy == "NATIVE_COLLECTION":
+            from .featured_collection_bridge import FeaturedCollectionPrerequisiteService
+            collection_service = self.featured_collection_service or FeaturedCollectionPrerequisiteService(
+                db=self.db, client=client, client_factory=self.client_factory)
+            latest_proof = collection_service.verify_for_plan(plan, store_id=store_id)
+            if (latest_proof.get("status") != "VERIFIED"
+                    or latest_proof.get("collection_id") != collection_proof.get("collection_id")
+                    or latest_proof.get("membership_hash") != collection_proof.get("membership_hash")
+                    or latest_proof.get("publication_id") != collection_proof.get("publication_id")):
+                with connect(self.db) as con:
+                    con.execute("UPDATE homepage_featured_theme_backups SET status='PREFLIGHT_ABORTED',backend_reason_code='FEATURED_COLLECTION_CHANGED_ABORT' WHERE backup_id=?",
+                                (backup_id,))
+                return {"status": "CONFLICT", "reason_code": "FEATURED_COLLECTION_CHANGED_ABORT",
+                        "backup_id": backup_id, "backend_name": backend_name, "write_performed": False}
         write_result = ThemeWriteBackendRouter.write(selected, request)
         if not write_result.write_performed:
             return {"status": "CONFLICT" if write_result.reason_code == "REMOTE_CHANGED_ABORT" else "FAILED",
@@ -1089,13 +1173,24 @@ class FeaturedProductThemeApplyService:
             after_result = backend.read_file(store_id, config["shop_domain"], theme["id"], filename)
         except (ValueError, ShopifyJsonDocumentError, RuntimeError):
             after_result = None
+        post_collection_proof = None
+        if strategy == "NATIVE_COLLECTION":
+            from .featured_collection_bridge import FeaturedCollectionPrerequisiteService
+            collection_service = self.featured_collection_service or FeaturedCollectionPrerequisiteService(
+                db=self.db, client=client, client_factory=self.client_factory)
+            post_collection_proof = collection_service.verify_for_plan(plan, store_id=store_id)
         facts = self._post_write_facts(document, proposed_doc, after_result, section_id=section_id,
             product_field_id=product_field_id, expected_ids=expected_ids,
             selected_products=items, product_field_type=product_field_type,
             reference_contract="THEME_SCHEMA_VERIFIED",
             legacy_id=legacy_id, store_id=str(store_id), expected_backend=backend_name,
-            expected_theme_id=theme["id"], expected_filename=filename)
-        verified = facts["reason_code"] in {"POST_WRITE_VERIFIED", "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED"}
+            expected_theme_id=theme["id"], expected_filename=filename,
+            strategy=strategy, collection_field_id=collection_field.get("id"),
+            collection_count_field_id=count_field.get("id"), collection_handle=(collection_proof or {}).get("handle"),
+            collection_proof=post_collection_proof,
+            expected_collection_id=(collection_proof or {}).get("collection_id"),
+            expected_publication_id=(collection_proof or {}).get("publication_id"))
+        verified = facts["reason_code"] in {"POST_WRITE_VERIFIED", "POST_WRITE_PRODUCT_REFERENCES_NORMALIZED", "POST_WRITE_VERIFIED_COLLECTION"}
         status = "REMOTE_JSON_VERIFIED" if verified else "VERIFY_FAILED"
         with connect(self.db) as con:
             con.execute("UPDATE homepage_featured_theme_backups SET status=? WHERE backup_id=?", (status, backup_id))
@@ -1108,7 +1203,10 @@ class FeaturedProductThemeApplyService:
     def _post_write_facts(before_doc, proposed_doc, current_result, *, section_id, product_field_id,
                           expected_ids, selected_products, product_field_type=None,
                           reference_contract="THEME_SCHEMA_VERIFIED", legacy_id, store_id,
-                          expected_backend, expected_theme_id, expected_filename):
+                          expected_backend, expected_theme_id, expected_filename,
+                          strategy=None, collection_field_id=None, collection_count_field_id=None,
+                          collection_handle=None, collection_proof=None,
+                          expected_collection_id=None, expected_publication_id=None):
         base = {"backend_name": expected_backend, "theme_id": expected_theme_id,
                 "theme_role": "MAIN", "expected_proposed_raw_hash": proposed_doc.raw_hash,
                 "expected_proposed_semantic_hash": proposed_doc.semantic_hash,
@@ -1147,6 +1245,51 @@ class FeaturedProductThemeApplyService:
                     "suffix_equal": current_doc.suffix == before_doc.suffix,
                     "unrelated_sections_unchanged": True,
                     "reason_code": "POST_WRITE_NOT_APPLIED"}
+        if strategy == "NATIVE_COLLECTION":
+            section = ((current or {}).get("sections") or {}).get(section_id) or {}
+            proposed_section = ((proposed_doc.parsed or {}).get("sections") or {}).get(section_id) or {}
+            settings = section.get("settings") or {}
+            actual_handle = settings.get(collection_field_id)
+            actual_count = settings.get(collection_count_field_id)
+            guard = validate_isolated_featured_diff(before_doc.parsed, current, section_id,
+                                                     legacy_id=legacy_id, store_id=store_id)
+            facts = {**base, "current_raw_hash": current_doc.raw_hash,
+                "current_semantic_hash": current_doc.semantic_hash,
+                "raw_equal": current_doc.raw_hash == proposed_doc.raw_hash,
+                "semantic_equal": current_doc.semantic_hash == proposed_doc.semantic_hash,
+                "prefix_equal": current_doc.prefix == before_doc.prefix,
+                "suffix_equal": current_doc.suffix == before_doc.suffix,
+                "unrelated_sections_unchanged": guard["safe"],
+                "collection_id": (collection_proof or {}).get("collection_id"),
+                "collection_handle": actual_handle,
+                "collection_membership_verified": (collection_proof or {}).get("status") == "VERIFIED",
+                "collection_published": (collection_proof or {}).get("published") is True,
+                "collection_product_count": len((collection_proof or {}).get("product_ids") or []),
+                "expected_collection_id": expected_collection_id,
+                "expected_publication_id": expected_publication_id,
+                "reference_contract": "FEATURED_COLLECTION_EXACT_4"}
+            if section.get("type") != proposed_section.get("type"):
+                reason = "POST_WRITE_SEMANTIC_MISMATCH"
+            elif actual_handle != collection_handle:
+                reason = "POST_WRITE_COLLECTION_HANDLE_MISMATCH"
+            elif actual_count != 4:
+                reason = "POST_WRITE_COLLECTION_COUNT_MISMATCH"
+            elif ((collection_proof or {}).get("reason_code") == "FEATURED_COLLECTION_PUBLICATION_UNVERIFIED"
+                  or (collection_proof or {}).get("publication_id") != expected_publication_id
+                  or (collection_proof or {}).get("published") is not True):
+                reason = "POST_WRITE_COLLECTION_PUBLICATION_DRIFT"
+            elif ((collection_proof or {}).get("status") != "VERIFIED"
+                  or (collection_proof or {}).get("collection_id") != expected_collection_id):
+                reason = "POST_WRITE_COLLECTION_MEMBERSHIP_DRIFT"
+            elif not facts["unrelated_sections_unchanged"]:
+                reason = "POST_WRITE_UNRELATED_SECTION_DRIFT"
+            elif not facts["prefix_equal"] or not facts["suffix_equal"]:
+                reason = "POST_WRITE_PREFIX_SUFFIX_MISMATCH"
+            elif facts["raw_equal"]:
+                reason = "POST_WRITE_VERIFIED_COLLECTION"
+            else:
+                reason = "POST_WRITE_VERIFIED_COLLECTION"
+            return {**facts, "reason_code": reason}
         actual_values = (((current or {}).get("sections") or {}).get(section_id) or {}).get(
             "settings", {}).get(product_field_id) if isinstance(current, dict) else None
         references = compare_shopify_product_references(actual_values, selected_products)
@@ -1207,22 +1350,23 @@ class FeaturedProductThemeApplyService:
                     "backup_id": backup_id, "backend_name": row.get("backend_name"),
                     "write_performed": False}
         expected_ids = [item.get("shopify_product_id") for item in selected_products]
+        collection_strategy = metadata.get("featured_strategy") == "NATIVE_COLLECTION"
         section = ((proposed_doc.parsed.get("sections") or {}).get(row["section_id"]) or {})
         settings = section.get("settings") or {}
         derived_field_id = next((key for key, value in settings.items() if value == expected_ids), None)
         metadata_field_id = metadata.get("product_field_id")
-        if metadata_field_id is not None and metadata_field_id != derived_field_id:
+        if not collection_strategy and metadata_field_id is not None and metadata_field_id != derived_field_id:
             return {"status": "DIAGNOSIS_FAILED", "reason_code": "POST_WRITE_PRODUCT_IDS_MISMATCH",
                     "backup_id": backup_id, "backend_name": row.get("backend_name"),
                     "write_performed": False}
-        product_field_id = metadata_field_id or derived_field_id
-        if not product_field_id:
+        product_field_id = None if collection_strategy else (metadata_field_id or derived_field_id)
+        if not collection_strategy and not product_field_id:
             return {"status": "DIAGNOSIS_FAILED", "reason_code": "POST_WRITE_PRODUCT_IDS_MISMATCH",
                     "backup_id": backup_id, "backend_name": row.get("backend_name"),
                     "write_performed": False}
         stored_field_type = metadata.get("product_field_type")
         product_field_type = stored_field_type if stored_field_type in {"product", "product_list"} else "product_list"
-        reference_contract = ("THEME_SCHEMA_VERIFIED" if stored_field_type in {"product", "product_list"}
+        reference_contract = ("FEATURED_COLLECTION_EXACT_4" if collection_strategy else "THEME_SCHEMA_VERIFIED" if stored_field_type in {"product", "product_list"}
                               else "LEGACY_BACKUP_INFERRED")
         from .featured_theme_backend import FeaturedThemeBackendCoordinator
         coordinator = backend_coordinator or FeaturedThemeBackendCoordinator(
@@ -1253,14 +1397,32 @@ class FeaturedProductThemeApplyService:
                                                        row["theme_id"], row["filename"])
             except Exception:
                 current_result = None
+        collection_proof = None
+        if collection_strategy and identity_ok and current_result is not None:
+            from .featured_collection_bridge import FeaturedCollectionPrerequisiteService
+            collection_service = self.featured_collection_service or FeaturedCollectionPrerequisiteService(
+                db=self.db, client=client, client_factory=self.client_factory)
+            try:
+                collection_proof = collection_service.verify_for_plan(self.get_plan(row["plan_id"]), store_id=row["store_id"])
+            except Exception:
+                collection_proof = {"status": "UNVERIFIED", "reason_code": "POST_WRITE_COLLECTION_MEMBERSHIP_DRIFT"}
         facts = self._post_write_facts(before_doc, proposed_doc, current_result,
             section_id=row["section_id"], product_field_id=product_field_id, expected_ids=expected_ids,
             selected_products=selected_products, product_field_type=product_field_type,
             reference_contract=reference_contract,
             legacy_id=legacy_featured_id_for_store(row["store_id"]), store_id=row["store_id"],
-            expected_backend=selection, expected_theme_id=row["theme_id"], expected_filename=row["filename"])
+            expected_backend=selection, expected_theme_id=row["theme_id"], expected_filename=row["filename"],
+            strategy="NATIVE_COLLECTION" if collection_strategy else None,
+            collection_field_id=metadata.get("collection_field_id"),
+            collection_count_field_id=metadata.get("collection_count_field_id"),
+            collection_handle=metadata.get("collection_handle"), collection_proof=collection_proof,
+            expected_collection_id=metadata.get("collection_id"),
+            expected_publication_id=metadata.get("publication_id"))
         if not identity_ok:
             facts["reason_code"] = "POST_WRITE_TARGET_IDENTITY_MISMATCH"
+        elif facts.get("reason_code") == "POST_WRITE_NOT_APPLIED":
+            with connect(self.db) as con:
+                con.execute("UPDATE homepage_featured_theme_backups SET status='NOT_APPLIED',backend_reason_code='POST_WRITE_NOT_APPLIED' WHERE backup_id=?", (backup_id,))
         return {"status": "POST_WRITE_DIAGNOSIS", "backup_id": backup_id,
                 "plan_id": row["plan_id"], "backend_reason_code": row.get("backend_reason_code"),
                 **facts, "write_performed": False}

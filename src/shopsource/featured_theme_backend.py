@@ -29,8 +29,48 @@ class FeaturedThemeBackendCoordinator:
         self.db = db
         self.client_factory = client_factory
         self.client_override = client
-        self.cli_backend = cli_backend or ShopifyThemeCLI(db=db)
+        self.cli_backend = cli_backend or ShopifyThemeCLI(db=db, main_identity_verifier=self.verify_main_identity)
+        if cli_backend is not None and hasattr(cli_backend, "main_identity_verifier"):
+            cli_backend.main_identity_verifier = self.verify_main_identity
         self._install_schema()
+
+    def verify_main_identity(self, store_id, target_theme_id):
+        """Fresh, read-only MAIN proof composed with the caller's exact CLI ID."""
+        config, gql = self._client(store_id)
+        if not config or not gql:
+            return {"verified": False, "reason_code": "CREDENTIAL_MISSING"}
+        try:
+            scopes = {str(x.get("handle") or "") for x in
+                (gql.execute(FEATURED_SCOPES_QUERY).get("currentAppInstallation") or {}).get("accessScopes", [])}
+            if "read_themes" not in scopes:
+                return {"verified": False, "reason_code": "READ_THEMES_SCOPE_MISSING"}
+            rows = []
+            cursor = None
+            for _page in range(10):
+                payload = gql.execute("query FeaturedMainThemes($after:String) { themes(first:100,after:$after) { nodes { id name role } pageInfo { hasNextPage endCursor } } }",
+                                      {"after": cursor}).get("themes", {})
+                rows.extend(payload.get("nodes") or [])
+                page = payload.get("pageInfo") or {}
+                if page.get("hasNextPage") is not True:
+                    break
+                next_cursor = page.get("endCursor")
+                if not next_cursor or next_cursor == cursor:
+                    return {"verified": False, "reason_code": "MAIN_THEME_IDENTITY_PAGINATION_FAILED"}
+                cursor = next_cursor
+            else:
+                return {"verified": False, "reason_code": "MAIN_THEME_IDENTITY_PAGINATION_LIMIT"}
+        except Exception:
+            return {"verified": False, "reason_code": "GRAPHQL_MAIN_IDENTITY_READ_FAILED"}
+        mains = [row for row in rows if isinstance(row, dict) and str(row.get("role", "")).upper() == "MAIN"]
+        target = str(target_theme_id).rsplit("/", 1)[-1]
+        if len(mains) != 1:
+            return {"verified": False, "reason_code": "MAIN_THEME_IDENTITY_AMBIGUOUS"}
+        actual = str(mains[0].get("id", "")).rsplit("/", 1)[-1]
+        if actual != target:
+            return {"verified": False, "reason_code": "MAIN_THEME_IDENTITY_MISMATCH"}
+        return {"verified": True, "verified_theme_id": actual, "verified_theme_role": "MAIN",
+                "verified_theme_name": mains[0].get("name"), "target_is_live": True,
+                "configured_shop_domain": config.get("shop_domain")}
 
     def _install_schema(self):
         with connect(self.db) as con:

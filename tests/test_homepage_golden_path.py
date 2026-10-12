@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -180,6 +181,77 @@ def test_homepage_golden_path_fresh_session_to_assignment_review(golden_service)
     assert all("mutation" not in query.casefold() for query in FakeReadOnlyShopifyGraphQL.calls)
     with connect(db) as con:
         assert con.execute("SELECT COUNT(*) FROM store_homepage_previews WHERE store_id='001'").fetchone()[0] >= 2
+
+
+def test_collection_strategy_requires_fresh_proof_and_injects_it_into_preview(golden_service):
+    service, db = golden_service
+    initial = service.resolve("001", "DESIGN", state={})
+    plan = initial.featured_product_plan
+    plan["collection_handle"] = "shopsource-homepage-featured"
+    snapshot = initial.theme_snapshot
+    legacy_id = legacy_featured_id_for_store("001")
+    snapshot["template"]["sections"][legacy_id]["type"] = "product-list"
+    from shopsource.shopify_theme_json import parse_shopify_json_document
+    document = parse_shopify_json_document(snapshot["theme_files"]["templates/index.json"])
+    document.parsed["sections"][legacy_id]["type"] = "product-list"
+    from shopsource.shopify_theme_json import render_shopify_json_document
+    snapshot["theme_files"]["templates/index.json"] = render_shopify_json_document(document, document.parsed)
+    rendered_document = parse_shopify_json_document(snapshot["theme_files"]["templates/index.json"])
+    snapshot["template_document"] = {"filename": "templates/index.json", **rendered_document.metadata(include_affixes=False)}
+    snapshot["theme_files"].pop("sections/featured-products.liquid")
+    snapshot["theme_files"].pop("sections/featured-collection.liquid")
+    snapshot["theme_files"]["sections/product-list.liquid"] = "{% for product in section.settings.collection.products limit: section.settings.max_products %}{% endfor %}" + _section("Featured products", [
+        {"type": "collection", "id": "collection", "label": "Collection"},
+        {"type": "range", "id": "max_products", "label": "Maximum", "min": 1, "max": 16, "step": 1}])
+
+    class Proof:
+        def __init__(self, status="VERIFIED"): self.status = status
+        def verify_for_plan(self, plan, *, store_id=None):
+            if self.status != "VERIFIED": return {"status": "UNVERIFIED", "reason_code": "FEATURED_COLLECTION_MEMBERSHIP_UNVERIFIED"}
+            return {"status": "VERIFIED", "verified": True, "collection_id": "gid://shopify/Collection/9",
+                "handle": "shopsource-homepage-featured",
+                "product_ids": [item["shopify_product_id"] for item in plan["items"]],
+                "membership_set_match": True, "membership_hash": "fixture-hash", "published": True,
+                "publication_id": "gid://shopify/Publication/1", "publication_status": "PUBLISHED"}
+
+    service.featured_collection_service = Proof("UNVERIFIED")
+    snapshot_time = datetime.now(timezone.utc).isoformat()
+    blocked = service.resolve("001", "FEATURED_PREVIEW", state={"featured_products_plan": plan,
+        "snapshot": snapshot, "snapshot_store_id": "001", "snapshot_read_at": snapshot_time})
+    assert blocked.error["reason_code"] == "FEATURED_COLLECTION_MEMBERSHIP_UNVERIFIED"
+    assert "verified_collection" not in snapshot
+
+    service.featured_collection_service = Proof()
+    ready = service.resolve("001", "FEATURED_PREVIEW", state={"featured_products_plan": plan,
+        "snapshot": snapshot, "snapshot_store_id": "001", "snapshot_read_at": snapshot_time})
+    featured_preview = ready.canonical_preview["featured_products_preview"]
+    assert ready.error is None and featured_preview["status"] == "PREVIEW", featured_preview.get("reason")
+    assert featured_preview["verified_collection"]["collection_id"] == "gid://shopify/Collection/9"
+    assert featured_preview["proposed"]["sections"][featured_preview["section_id"]]["settings"] == {
+        "collection": "shopsource-homepage-featured", "max_products": 4}
+    with connect(db) as con:
+        persisted = con.execute("SELECT collection_handle FROM homepage_featured_product_plans WHERE plan_id=?",
+                                 (plan["plan_id"],)).fetchone()[0]
+    assert persisted == "shopsource-homepage-featured"
+
+
+def test_collection_assignment_visibility_uses_handle_exact_four_and_publication():
+    from shopsource.homepage_session import HomepagePrerequisiteService
+    ids = [f"gid://shopify/Product/{number}" for number in range(1, 5)]
+    items = [{"shopify_product_id": item, "shopify_handle": f"product-{index}", "remote_status": "ACTIVE",
+              "image_url": "https://cdn.example/item.jpg", "price": 10} for index, item in enumerate(ids)]
+    proof = {"verified": True, "published": True, "membership_set_match": True,
+             "handle": "shopsource-homepage-featured", "product_ids": ids}
+    featured = {"plan_id": "p1", "items": items, "remote_json_verified": True,
+                "storefront_verified": True}
+    preview = {"status": "PREVIEW", "featured_products_plan_id": "p1",
+        "proposed": {"sections": {"featured": {"settings": {"collection": proof["handle"], "max_products": 4}}}},
+        "featured_products_preview": {"status": "PREVIEW", "section_id": "featured",
+            "capability": {"strategy": "NATIVE_COLLECTION", "collection_field": {"id": "collection"},
+                           "count_field": {"id": "max_products"}}, "verified_collection": proof}}
+    result = HomepagePrerequisiteService._assignment_check(preview, featured)
+    assert result["checks"]["featured_products_visible_in_proposal"] is True
+    assert result["status"] == "ASSIGNMENT_READY"
 
 
 def test_homepage_golden_path_no_cached_snapshot_auto_reads_theme(golden_service):

@@ -147,11 +147,12 @@ class ShopifyThemeCLI:
 
     def __init__(self, *, db=None, runner: Callable = subprocess.run, which: Callable = shutil.which,
                  temp_dir: str | Path | None = None, retain_diagnostics: bool = False,
-                 credential_getter: Callable = get_theme_access_password):
+                 credential_getter: Callable = get_theme_access_password, main_identity_verifier=None):
         self.db, self.runner, self.which = db, runner, which
         self.temp_dir = Path(temp_dir) if temp_dir else None
         self.retain_diagnostics = retain_diagnostics
         self.credential_getter = credential_getter
+        self.main_identity_verifier = main_identity_verifier
 
     def _executable(self):
         return self.which("shopify")
@@ -170,6 +171,24 @@ class ShopifyThemeCLI:
         match = re.search(r"(?<!\d)(\d+)\.(\d+)(?:\.(\d+))?", version_text)
         if getattr(result, "returncode", 1) != 0 or not match or int(match.group(1)) < MINIMUM_THEME_ACCESS_CLI_MAJOR:
             return ThemeBackendCapabilities(self.backend_name, "UNSUPPORTED_CLI", "UNSUPPORTED_CLI")
+        if self.main_identity_verifier is not None:
+            if not theme_id:
+                return ThemeBackendCapabilities(self.backend_name, "THEME_ID_MISSING", "THEME_ID_MISSING")
+            read = self.read_capability_status(store_id, theme_id=theme_id)
+            if not read.read_ready:
+                return ThemeBackendCapabilities(self.backend_name, read.status, read.reason_code, read.details)
+            try:
+                identity = self.main_identity_verifier(store_id, theme_id)
+            except Exception:
+                identity = None
+            if not identity or identity.get("verified") is not True:
+                return ThemeBackendCapabilities(self.backend_name, "LIVE_ROLE_UNVERIFIED", "LIVE_ROLE_UNVERIFIED",
+                    {**read.details, "identity_verified": False, "live_role_verified": False,
+                     "identity_source": "ADMIN_GRAPHQL_READ_THEMES"})
+            return ThemeBackendCapabilities(self.backend_name, "READY", "GRAPHQL_MAIN_IDENTITY_VERIFIED",
+                {**read.details, **identity, "identity_verified": True, "live_role_verified": True,
+                 "identity_source": "ADMIN_GRAPHQL_READ_THEMES", "transport_state": "THEME_ACCESS_EXACT_ID_READ_READY",
+                 "cli_version": match.group(0), "target_is_live": True})
         password = self.credential_getter(store_id)
         if not password:
             return ThemeBackendCapabilities(self.backend_name, "CREDENTIAL_MISSING", "CREDENTIAL_MISSING",

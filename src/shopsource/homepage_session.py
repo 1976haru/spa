@@ -107,11 +107,13 @@ def _normalized_brand(brand: dict) -> dict:
 class HomepagePrerequisiteService:
     """Resolve the complete local/read-only context for any homepage action."""
 
-    def __init__(self, *, db=None, theme_reader=None, product_reader=None, theme_reader_factory=ShopifyThemeReader):
+    def __init__(self, *, db=None, theme_reader=None, product_reader=None, theme_reader_factory=ShopifyThemeReader,
+                 featured_collection_service=None):
         self.db = db
         self.theme_reader = theme_reader
         self.product_reader = product_reader
         self.theme_reader_factory = theme_reader_factory
+        self.featured_collection_service = featured_collection_service
 
     def resolve(self, store_id: str, operation: str, *, state: dict | None = None,
                 force_theme: bool = False, force_products: bool = False,
@@ -206,6 +208,27 @@ class HomepagePrerequisiteService:
                     return session
                 if operation == "FEATURED_PREVIEW":
                     from .homepage_automation import discover_homepage_sections, _hash
+                    from .homepage_featured_products import discover_featured_product_schema
+                    capability = discover_featured_product_schema(snapshot.get("theme_files") or {})
+                    if capability.get("strategy") == "NATIVE_COLLECTION":
+                        session.statuses["featured_strategy"] = "NATIVE_COLLECTION"
+                        from .featured_collection_bridge import FeaturedCollectionPrerequisiteService
+                        collection_service = self.featured_collection_service or FeaturedCollectionPrerequisiteService(db=self.db)
+                        proof = collection_service.verify_for_plan(saved_featured, store_id=store_id)
+                        if proof.get("status") != "VERIFIED":
+                            session.error = {"status": "MISSING_PREREQUISITE",
+                                "reason_code": "FEATURED_COLLECTION_MEMBERSHIP_UNVERIFIED",
+                                "message": "추천 상품 컬렉션 준비가 필요합니다.",
+                                "diagnostics": {"reason_code": proof.get("reason_code")}}
+                            session.statuses["featured_collection"] = "UNVERIFIED"
+                            session.statuses["featured_collection_action"] = "PREPARE_FEATURED_COLLECTION"
+                            return session
+                        saved_featured["collection_handle"] = proof["handle"]
+                        with connect(self.db) as con:
+                            con.execute("UPDATE homepage_featured_product_plans SET collection_handle=?,updated_at=? WHERE plan_id=?",
+                                        (proof["handle"], datetime.now(timezone.utc).isoformat(timespec="seconds"), saved_featured["plan_id"]))
+                        snapshot["verified_collection"] = proof
+                        session.statuses["featured_collection"] = "VERIFIED"
                     feature_preview = FeaturedProductAssignmentService(db=self.db).build_theme_preview(saved_featured, snapshot)
                     feature_preview.update(store_id=str(store_id), theme=snapshot.get("theme"),
                         template_filename=snapshot.get("template_filename"),
@@ -327,7 +350,19 @@ class HomepagePrerequisiteService:
         section = ((canonical or {}).get("sections") or {}).get(section_id) if section_id else None
         settings = (section or {}).get("settings") or {}
         selected = [x.get("shopify_product_id") for x in (featured or {}).get("items", [])]
-        visible = bool(section and any(value == selected or (isinstance(value, list) and value == selected) for value in settings.values()))
+        proof = (preview.get("featured_products_preview") or {}).get("verified_collection") or {}
+        capability = (preview.get("featured_products_preview") or {}).get("capability") or {}
+        if capability.get("strategy") == "NATIVE_COLLECTION":
+            collection_field = (capability.get("collection_field") or {}).get("id")
+            count_field = (capability.get("count_field") or {}).get("id")
+            visible = bool(section and proof.get("verified") is True and proof.get("published") is True
+                and proof.get("membership_set_match") is True
+                and len(set(proof.get("product_ids") or [])) == 4
+                and set(proof.get("product_ids") or []) == set(selected)
+                and settings.get(collection_field) == proof.get("handle")
+                and settings.get(count_field) == 4)
+        else:
+            visible = bool(section and any(value == selected or (isinstance(value, list) and value == selected) for value in settings.values()))
         items = (featured or {}).get("items", [])
         storefront_confirmed = bool((featured or {}).get("storefront_verified"))
         checks = {"featured_products_4_of_4": len(items) == 4,
