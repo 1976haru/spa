@@ -1,0 +1,782 @@
+ShopSource Studio — FULL PRODUCTION REHEARSAL + SHADOW STORE 001 + FAULT-INJECTION STRESS
+NO REAL WRITES. FIX DEFECTS UNTIL ZERO UNEXPECTED FAILURES.
+
+Repository
+- Feature baseline: f9d4c8836b17cfa599e2ef2e8dfc9f0095a226a0
+- Branch: test/full-production-rehearsal-shadow
+- Main must remain untouched.
+- The feature branch hotfix/featured-schema-contract-and-push-json must remain intact.
+
+User goal
+Before the user performs another real Shopify test, exercise ShopSource like a real store build:
+sourcing -> safety/classification -> product decisions -> Shopify product sync -> collections ->
+navigation/mega menu -> homepage -> category shortcuts -> Featured exact-4 collection ->
+theme preview/preflight/apply -> post-write verification -> storefront/assignment/final readiness.
+
+The user wants defects found and fixed in simulation first, not discovered one-by-one in production.
+
+NON-NEGOTIABLE
+- Do not merge main.
+- Do not perform any REAL Shopify mutation.
+- Do not perform any REAL Amazon/Keepa paid/provider mutation or chargeable sourcing operation.
+- Do not call paid image generation.
+- Real external access is READ-ONLY only and only in the Shadow Store 001 phase.
+- Never print secrets.
+- Never change global Shopify CLI.
+- Never touch protected dirty files.
+
+Protected/local files:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env
+- credentials
+- .phase*
+- .recon_focus_initial/
+- user assets/temp folders
+- existing theme backups
+Preserve them byte-for-byte/status-for-status.
+
+Known protected hashes:
+- stores/001_cabin_tidy.json
+  9A480BE4CD24BF93BEAB8E02483512DB3801F10F506ADC610C38667C5832051F
+- tools/shopify_app/safe_shopify_cli.ps1
+  47A1BDF96BB54ADB0C9C86D7C91962A48EC6C4FDF6A0E73B6EFC8B943C275421
+
+============================================================
+A. TEST PHILOSOPHY
+============================================================
+
+Build a reusable Production Rehearsal harness around EXISTING ShopSource services.
+Do not build a parallel fake business application.
+
+Rules:
+1. Exercise real orchestration/service/domain code wherever possible.
+2. Replace only external side-effect adapters with deterministic simulators/fakes.
+3. Use the same validation/preflight/backup/post-write logic that production uses.
+4. Do not weaken assertions to make tests pass.
+5. When a test exposes a real defect:
+   - fix production code
+   - add a regression test
+   - rerun focused tests
+   - rerun complete rehearsal
+   - rerun full suite
+6. Zero unexpected failures is required for release candidate status.
+
+No new dependency is required. Prefer pytest parametrization + Python random.Random(seed)
+instead of adding Hypothesis or heavy browser packages.
+
+============================================================
+B. THREE REHEARSAL MODES
+============================================================
+
+Implement three clearly separated modes.
+
+1) SYNTHETIC_FULL_E2E
+- No network.
+- Fresh temp SQLite DB.
+- Synthetic Amazon/Keepa-like candidate fixtures.
+- Fake Shopify Admin GraphQL.
+- Fake Theme Access CLI.
+- Fake storefront renderer/verifier.
+- Exercise the full pipeline end-to-end.
+
+2) SHADOW_STORE_001
+- Read current Store 001/local catalog and allowed Shopify state READ-ONLY.
+- NEVER write to real DB or Shopify.
+- Clone only needed local DB/state into a temp rehearsal DB.
+- All would-be mutations go to simulator state.
+- Use real Store 001 product/theme/schema facts where available.
+- Confirm current operational read prerequisites:
+  * app/store identity
+  * granted scopes
+  * fresh MAIN theme identity through Admin GraphQL read_themes
+  * Theme Access exact-ID read capability
+  * deterministic Featured handle conflict status
+  * current exact four selected products still readable/ACTIVE
+- No raw token/secret/output.
+
+3) FAULT_INJECTION
+- No network.
+- Deterministic seeded faults applied at every external boundary and restart boundary.
+- Expected safe failures must be classified, not treated as unexpected failures.
+
+============================================================
+C. REHEARSAL HARNESS
+============================================================
+
+Create a focused reusable harness, for example:
+- src/shopsource/rehearsal.py
+- tests/test_full_production_rehearsal.py
+- tests/test_production_rehearsal_faults.py
+- tests/test_production_rehearsal_multistore.py
+
+Names may differ if a better existing-home is found.
+
+Provide:
+ProductionRehearsalRunner
+
+Suggested public API:
+run_synthetic(seed=...)
+run_shadow_store001(read_only=True)
+run_fault_matrix(seed_range=...)
+run_restart_matrix()
+run_idempotency_matrix()
+run_multistore_isolation(store_count=100)
+
+Return structured results; do not rely on console parsing.
+
+All simulator state lives in temp directories/DBs.
+No simulator code may import/save real credentials.
+
+============================================================
+D. FULL GOLDEN PATH
+============================================================
+
+The synthetic golden path must exercise real ShopSource transitions from start to final readiness.
+
+Minimum path:
+
+01 store identity/config fixture
+02 sourcing request/plan
+03 candidate capture/import
+04 dedupe / ASIN identity
+05 store classification
+06 source safety/freshness
+07 pricing/margin policy
+08 product content readiness
+09 product media-rights/readiness
+10 Store Decisions
+11 product sync preview
+12 mocked product sync
+13 remote product verification
+14 collection plan
+15 collection dry-run
+16 mocked collection creation/update
+17 exact membership verification
+18 collection publication verification
+19 navigation plan
+20 navigation preview
+21 mocked navigation sync
+22 navigation verification
+23 mega-menu preview
+24 mocked mega-menu apply
+25 mega-menu verify
+26 homepage plan
+27 hero readiness
+28 category shortcut plan
+29 Featured product plan, exactly 4
+30 Featured collection prerequisite dry-run
+31 explicit simulated user confirmation
+32 mocked exact-4 Featured collection create/update
+33 Featured publication verify
+34 real schema-based Featured preview
+35 collection-backed preview proof
+36 fresh MAIN identity mock
+37 Theme Access exact-ID read mock
+38 preflight READY_TO_APPLY
+39 explicit simulated live confirmation
+40 exactly ONE mocked theme write
+41 push JSON parse
+42 post-read
+43 POST_WRITE_VERIFIED_COLLECTION
+44 storefront checks
+45 assignment checklist
+46 ASSIGNMENT_READY
+47 production/no-placeholder audit
+48 final launch/readiness result
+
+For manual gates that are intentionally part of production UX, simulate an explicit human approval event.
+Never silently bypass them.
+
+============================================================
+E. STORE 001 REAL FACTS IN SHADOW MODE
+============================================================
+
+Use current real facts read-only, without hardcoding them as success.
+
+Expected historical facts may be asserted only after fresh read:
+- store 001 Cabin Tidy
+- canonical CLI domain kgxbpi-it.myshopify.com
+- target theme ID 162910503161
+- Theme: Design by klarjoy
+- actual schema audit previously found:
+  product-list.liquid
+  C_NATIVE_COLLECTION
+  collection field
+  max_products supports >=4
+
+Featured selected products currently expected:
+1. LAINLOY Foldable Car Seat Back Organizer...
+2. Car Backseat Organizer, 7-in-1...
+3. Car Trunk Organizer...
+4. Car Cup Holder Gap Filler Organizer...
+
+Do not fail merely because titles have minor formatting differences.
+Identity must use verified Shopify product IDs/handles.
+
+Shadow rules:
+- Copy/derive data into a temp DB.
+- Do not update the real ShopSource DB.
+- Read-only external calls may inspect:
+  current app scopes,
+  current MAIN theme,
+  current product identities,
+  existing collection handle conflict,
+  publication identity,
+  Theme Access exact-ID read.
+- Any create/update/publish/theme push call MUST be redirected to simulator and MUST assert that real network mutation adapter was never invoked.
+
+Shadow output must include:
+SHADOW_REAL_READS_PERFORMED
+SHADOW_REAL_WRITES_PERFORMED = 0
+SHADOW_LOCAL_PROTECTED_DB_WRITES = 0
+
+============================================================
+F. SHOPIFY SIMULATOR
+============================================================
+
+Implement/extend a deterministic Shopify simulator sufficient to exercise production code contracts.
+
+State:
+- shop identity
+- scopes
+- publications
+- products
+- product handles/status/images/prices
+- collections
+- collection ownership/mappings
+- exact collection membership
+- publication state
+- menus/navigation
+- theme list/MAIN identity
+- theme files
+- Theme Access CLI command outcomes
+- storefront projection
+
+All fake mutations must use the same shapes expected by production adapters.
+
+Support:
+- product create/update responses
+- collectionCreate with exact manual product selections
+- collectionUpdate selectionsToAdd/selectionsToRemove
+- publishablePublish
+- collection membership re-read
+- menu/navigation writes where production code supports them
+- Theme Access pull/push
+- push --json success/errors/warnings/unparseable output
+- post-write theme read
+
+Track counters:
+mock_product_write_count
+mock_collection_write_count
+mock_publication_write_count
+mock_navigation_write_count
+mock_theme_write_count
+
+Golden path Featured requirement:
+mock_theme_write_count == 1
+
+No duplicate remote entity creation on repeat runs.
+
+============================================================
+G. SYNTHETIC SOURCING DATA
+============================================================
+
+Generate realistic deterministic candidate datasets.
+
+At least:
+- 250 candidate source rows per primary golden run
+- enough accepted candidates to fill Store 001 categories
+- duplicates
+- variants
+- missing images
+- missing price
+- stale source
+- out-of-stock
+- restricted/reject candidates
+- fitment-risk examples
+- good production candidates
+
+Do not lower existing source-safety or media-rights policies.
+Fixtures must satisfy policies legitimately for passing products.
+
+Run multiple catalog shapes:
+- minimum viable catalog
+- normal catalog
+- large catalog
+- highly duplicated catalog
+- many rejected candidates
+- same-category-heavy catalog
+
+============================================================
+H. FAULT MATRIX
+============================================================
+
+Implement at minimum the following named faults and assert SAFE EXPECTED behavior.
+
+SOURCE / CATALOG
+01 source timeout
+02 source 429
+03 source 500
+04 malformed source row
+05 duplicate ASIN
+06 conflicting identity
+07 missing price
+08 invalid price
+09 missing image
+10 stale source
+11 out of stock
+12 restricted product
+13 unsupported multi-variant
+14 category imbalance
+15 only 3 eligible Featured products
+16 >4 eligible Featured products
+
+PRODUCT SYNC
+17 product create failure
+18 product update failure
+19 duplicate handle
+20 remote ID mismatch
+21 partial batch failure
+22 verification mismatch
+23 retry after transient error
+
+COLLECTIONS
+24 unmanaged deterministic Featured handle exists
+25 owned mapping ID mismatch
+26 mapped collection missing
+27 Featured collection has 3 products
+28 Featured collection has 5 products
+29 wrong 4 products
+30 publication missing
+31 publication mutation failure
+32 membership update async timeout
+33 membership changes after preview
+34 collection deleted after preview
+
+NAVIGATION / MEGA MENU
+35 target collection missing
+36 duplicate menu target
+37 stale navigation preview
+38 navigation remote drift
+39 mega-menu stale preview
+40 manual editor drift
+
+HOMEPAGE / THEME
+41 read_themes missing
+42 GraphQL MAIN missing
+43 two ambiguous MAIN results if adapter can surface it
+44 target theme ID differs from fresh MAIN
+45 Theme Access credential missing
+46 Theme Access exact read fails
+47 preflight remote hash drift raw-only
+48 preflight semantic drift
+49 section schema changes after preview
+50 collection proof stale
+51 cp949-hostile UTF-8 CLI output
+52 theme push returncode 0 + asset errors
+53 push warning "pushed with errors"
+54 push JSON invalid
+55 push reports success but remote unchanged
+56 push remote becomes neither before nor proposed
+57 unrelated section drift
+58 collection handle normalized/changed
+59 max_products != 4 after write
+60 storefront section absent after verified JSON
+
+RESTART / DURABILITY
+61 process crash after sourcing
+62 after product preview
+63 after partial product sync
+64 after collection prep
+65 after navigation
+66 after Featured collection prepare
+67 after Featured preview
+68 after preflight
+69 immediately before theme push
+70 immediately after mock push before local status update
+71 after post-write verify before Step 6
+72 after Step 6 before Step 7
+
+SECURITY / ISOLATION
+73 accidental secret in exception
+74 raw CLI output contains token-like value
+75 Store 001 state requested through Store 002 session
+76 cross-store mapping collision
+77 duplicate deterministic section ID across store scope
+78 protected-file write attempt
+
+For every injected failure assert:
+- reason/status is deterministic and safe
+- no unintended downstream mutation
+- no auto rollback unless explicitly designed and safe
+- no auto reapply
+- no secret leakage
+- resumable path where applicable
+
+============================================================
+I. RANDOMIZED SEEDED STRESS
+============================================================
+
+After named faults pass, run deterministic randomized scenarios.
+
+Minimum:
+- seeds 1..100 for synthetic catalog/workflow variation
+- each seed mutates catalog size, rejection ratio, duplicate ratio, category skew,
+  transient API fault placement, restart point and harmless response formatting
+
+Record:
+- seed
+- expected terminal category
+- actual terminal category
+- unexpected exception count
+
+Requirements:
+UNEXPECTED_EXCEPTION_COUNT = 0
+NONDETERMINISTIC_RESULT_COUNT = 0
+
+Re-run failing seed after fixes to prove reproducibility.
+
+============================================================
+J. RESTART / RESUME MATRIX
+============================================================
+
+Persist a rehearsal checkpoint after every major stage.
+
+For each restart point:
+- construct a new service/runner instance
+- reopen the temp DB/state
+- resume using public APIs
+- ensure already-completed side effects are not duplicated
+
+Critical Featured restart:
+after mock theme push but before local success persistence:
+- remote simulator contains proposed
+- restart
+- read-only diagnosis detects applied state
+- local state reconciles without second theme push
+
+For NOT_APPLIED:
+- remote remains before
+- restart routes back to safe Step 3
+- no rollback
+- no adoption
+- no automatic second push
+
+============================================================
+K. IDEMPOTENCY X10
+============================================================
+
+Run the same successful store-build input 10 times against the same simulator state.
+
+After run 1 and run 10 assert stable counts/identity:
+- no duplicate Shopify products
+- no duplicate managed collections
+- exactly one owned Featured collection
+- exactly four Featured members
+- no duplicate menu entries
+- no duplicate managed homepage section
+- no duplicate section in order
+- no unnecessary theme writes on already-correct state
+- final storefront semantics unchanged
+
+Report entity counts after run 1 and run 10.
+
+============================================================
+L. MULTI-STORE ISOLATION — 100 STORES
+============================================================
+
+Create 100 synthetic store IDs.
+
+Run representative pipeline operations with overlapping:
+- product titles
+- handles where store-local reuse is legal
+- collection titles
+- deterministic Featured handle
+- section purpose
+
+Assert:
+- DB rows always scoped to store_id
+- credential lookup keys never cross store
+- product mappings never cross store
+- collection ownership never cross store
+- theme IDs never cross store
+- backups never cross store
+- Guided Flow state never cross store
+- Store 001 mutation cannot change Store 002..100 simulator state
+
+At least 10 stores should run full Featured path.
+All 100 must run identity/isolation invariants.
+
+============================================================
+M. UI / BEGINNER-FLOW CONTRACT
+============================================================
+
+Test the actual Guided Flow resolver and UI action mapping without a real browser.
+
+Assert at every state:
+- at most one primary action
+- Korean beginner label exists
+- destructive/live actions require explicit confirmation
+- advanced diagnostics do not become required beginner inputs
+- POST_WRITE_NOT_APPLIED routes to safe preparation
+- collection prerequisite appears before preview for C strategy
+- actual apply is impossible before collection proof + preflight + live role verification
+- Step 6 only after REMOTE_JSON_VERIFIED
+- Step 7 only after storefront confirmation
+- final "모든 단계 완료" only when ASSIGNMENT_READY
+
+If a lightweight UI smoke runner already exists, use it.
+Do not add Playwright/Selenium just for this pass.
+
+============================================================
+N. CODE CONSISTENCY / CONTRACT AUDIT
+============================================================
+
+Before stress execution, audit interfaces between:
+- StoreBuildOrchestrator stage handlers
+- ProductionGoldenPathService
+- product sync publisher
+- collection publisher
+- navigation
+- mega menu
+- homepage session
+- Featured plan
+- Featured collection bridge
+- Featured theme backend
+- Theme Access CLI
+- Guided Flow
+- assignment checks
+
+Check:
+- reason-code vocabulary is stable
+- status transitions are legal
+- write_performed truthfulness
+- IDs/GIDs/handles normalized consistently
+- raw vs semantic hashes not confused
+- collection-backed vs direct-product strategies do not share invalid assumptions
+- restart hydration uses durable state
+- no hidden dependency on in-memory state
+- no stale preview accepted
+- no live role cached across apply
+
+Fix real contract defects found.
+
+============================================================
+O. SHADOW STORE 001 READ-ONLY OPERATIONAL CHECK
+============================================================
+
+After offline stress is green, perform ONE controlled real read-only shadow check.
+
+Allowed real reads:
+- configured app/store identity
+- granted scopes
+- products required for Featured
+- Online Store publication identity
+- current MAIN theme via Admin GraphQL read_themes
+- exact target theme ID equality
+- Theme Access exact-ID templates/index.json read
+- deterministic Featured collection handle lookup/membership if it exists
+
+Forbidden:
+- any mutation
+- any theme push
+- any collection create/update/publish
+- any product write
+- any menu write
+
+Required findings:
+- APP_STORE_IDENTITY = PASS/FAIL
+- READ_PRODUCTS = PASS/FAIL
+- READ_THEMES = PASS/FAIL
+- READ_PUBLICATIONS = PASS/FAIL/NOT_GRANTED
+- WRITE_PRODUCTS_SCOPE_PRESENT = YES/NO
+- WRITE_PUBLICATIONS_SCOPE_PRESENT = YES/NO
+- GRAPHQL_MAIN_THEME_ID = safe ID
+- EXPECTED_THEME_ID_MATCH = YES/NO
+- THEME_ACCESS_EXACT_ID_READ = PASS/FAIL
+- FEATURED_HANDLE_STATE = ABSENT/OWNED/UNMANAGED_CONFLICT/UNKNOWN
+- SELECTED_PRODUCTS_REMOTE_READY = 4/4 or n/4
+- REAL_READ_CALLS = n
+- REAL_WRITE_CALLS = 0
+
+If a required future write scope is missing:
+do not fail code stress.
+Mark:
+LIVE_PREREQUISITE = MISSING_SCOPE
+and list the missing scope name only.
+
+============================================================
+P. FIX-UNTIL-GREEN LOOP
+============================================================
+
+Run this loop:
+
+1. contract audit
+2. focused rehearsal tests
+3. named fault matrix
+4. 100 seeded randomized scenarios
+5. restart matrix
+6. idempotency x10
+7. multi-store isolation x100
+8. shadow Store 001 read-only check
+9. full existing pytest suite
+
+If any UNEXPECTED failure occurs:
+- find root cause
+- fix production code
+- add regression
+- repeat from step 2
+- continue until zero unexpected failures
+
+Do not call an expected safety block a failure.
+Do not relabel unexpected defects as expected just to get green.
+
+============================================================
+Q. REQUIRED TEST/QUALITY GATES
+============================================================
+
+Run:
+python -m compileall -q src tests
+git diff --check
+PYTHONPATH=src python -m shopsource.cli --help
+PYTHONPATH=src python -m shopsource.ui.v2 --help
+
+Existing full suite baseline:
+1097 passed, 1 skipped
+
+Final full suite must be >= baseline with no unexpected failure.
+
+Use fresh --basetemp outside protected folders.
+
+Also run a dedicated command or pytest marker that produces a final structured rehearsal result.
+
+============================================================
+R. STRUCTURED REHEARSAL REPORT
+============================================================
+
+Write a sanitized runtime report OUTSIDE protected repo state, e.g.
+D:\shop\_shopsource_rehearsal_reports\<timestamp>\FULL_PRODUCTION_REHEARSAL_REPORT.json
+
+Also write a concise markdown summary.
+
+Report:
+- feature baseline SHA
+- final rehearsal SHA
+- synthetic golden runs
+- named fault scenarios total/pass/fail
+- randomized seeds total/pass/fail
+- restart scenarios total/pass/fail
+- idempotency runs
+- multistore count
+- unexpected exception count
+- nondeterministic count
+- regression fixes made
+- final full pytest result
+- protected hashes/status
+- shadow Store001 real-read findings
+- real external write counters
+- final release recommendation
+
+Do not put credentials/raw API payloads in report.
+
+============================================================
+S. COMMIT / PUSH
+============================================================
+
+If stress exposes defects, fix them on:
+test/full-production-rehearsal-shadow
+
+Commit:
+- reusable rehearsal harness
+- tests
+- production defect fixes
+- no generated runtime report unless repo conventions explicitly require it
+
+Push branch.
+
+Do NOT merge main.
+
+If zero production code defects are found, still commit the reusable rehearsal harness/tests if useful and non-invasive.
+
+Suggested commit:
+Add full production rehearsal and stress coverage
+
+============================================================
+T. RELEASE GATE
+============================================================
+
+Final status definitions:
+
+READY_FOR_CONTROLLED_LIVE_PILOT only if:
+- synthetic golden E2E PASS
+- named fault matrix 100% expected behavior
+- 100 seeded scenarios 0 unexpected failures
+- restart matrix PASS
+- idempotency x10 PASS
+- multistore isolation x100 PASS
+- Guided Flow contract PASS
+- full suite PASS
+- protected files unchanged
+- real external writes = 0
+- Shadow Store 001 required reads are successful
+- required future live scopes are present OR explicitly identified as the only remaining prerequisite
+
+NOT_READY if any code correctness/safety defect remains.
+
+============================================================
+U. FINAL REPORT FORMAT
+============================================================
+
+Return:
+
+[1] baseline SHA
+[2] final branch SHA
+[3] files changed
+[4] production defects discovered
+[5] production defects fixed
+[6] synthetic golden E2E count/result
+[7] named fault matrix count/result
+[8] randomized seed count/result
+[9] restart matrix count/result
+[10] idempotency x10 result
+[11] multi-store isolation x100 result
+[12] Guided Flow/UI contract result
+[13] StoreBuild/Production contract result
+[14] Shadow Store 001 read-only result
+[15] real scope findings
+[16] MAIN/theme identity findings
+[17] deterministic Featured handle state
+[18] selected products remote readiness
+[19] full pytest result
+[20] compileall/diff/help result
+[21] protected file verification
+[22] REAL external write counters
+[23] report directory + JSON SHA256
+[24] release recommendation
+[25] exact next action
+[26] merge readiness
+
+Final flags:
+SYNTHETIC_FULL_E2E = PASS/FAIL
+SOURCE_TO_HOMEPAGE = PASS/FAIL
+FEATURED_C_COLLECTION_E2E = PASS/FAIL
+NAMED_FAULT_MATRIX = PASS/FAIL
+SEEDED_STRESS_100 = PASS/FAIL
+RESTART_RESUME_MATRIX = PASS/FAIL
+IDEMPOTENCY_X10 = PASS/FAIL
+MULTISTORE_ISOLATION_100 = PASS/FAIL
+GUIDED_FLOW_CONTRACT = PASS/FAIL
+ZERO_UNEXPECTED_EXCEPTIONS = YES/NO
+ZERO_NONDETERMINISTIC_RESULTS = YES/NO
+SHADOW_STORE001 = PASS/FAIL
+REAL_SHOPIFY_WRITE_COUNT = 0
+REAL_SOURCE_PAID_CALL_COUNT = 0
+REAL_IMAGE_PAID_CALL_COUNT = 0
+PROTECTED_FILES_UNCHANGED = YES/NO
+FULL_SUITE = PASS/FAIL
+READY_FOR_CONTROLLED_LIVE_PILOT = YES/NO
+CODE_MERGE_READY = YES/NO
+
+Do not merge main.
