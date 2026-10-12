@@ -1,0 +1,678 @@
+ShopSource Studio — FEATURED COLLECTION BRIDGE + COLLECTION-AWARE VERIFY + COMPOSITE MAIN ROLE
+COMPLETE THE REAL C_NATIVE_COLLECTION PATH BEFORE MERGE
+
+Repository
+- Main baseline: 606bc1eee9e444acd2ee7e68392a953555c385f8
+- Branch: hotfix/featured-schema-contract-and-push-json
+- Current feature HEAD before this prompt: 34978a7ee8c4e6e62b1b07af1a0ae097d0ceb949
+
+Confirmed real audit
+- Store 001 exact-ID section pull succeeded.
+- 40 section schemas parsed, 0 invalid.
+- Candidates: A product_list=0, B product blocks=0, C collection=1, D single product=4.
+- Chosen real strategy: C_NATIVE_COLLECTION.
+- Real section: product-list.liquid.
+- Collection field: collection.
+- max_products supports >=4.
+- Existing previous Step-5 write did NOT apply; current MAIN templates/index.json == BEFORE.
+
+IMPORTANT REVIEW FINDING
+The current feature branch is code-safe but NOT operationally complete for Store 001 yet.
+
+The following gaps still exist:
+
+1. build_theme_preview() for NATIVE_COLLECTION requires:
+   snapshot["verified_collection"]
+   AND plan.collection_handle
+   AND exact four product IDs.
+   But HomepagePrerequisiteService currently does not populate verified_collection,
+   and Featured plan creation defaults collection_handle=None.
+
+2. Guided Flow has no beginner action that prepares/verifies the exact four-product
+   featured collection before preview.
+
+3. featured_guided_flow.py was not updated for POST_WRITE_NOT_APPLIED.
+   Current durable recovery can still strand the user at Step 5 instead of routing
+   back to a corrected safe preview path.
+
+4. Apply/post-write verification is still product-field-centric:
+   product_field_id is None for collection strategy.
+   _post_write_facts() therefore cannot prove a collection-backed section after a
+   successful write.
+
+5. Homepage assignment check still determines "visible in proposal" by looking for
+   the selected product ID list directly in section settings.
+   A collection-backed section stores a collection handle, so the final assignment
+   can remain false even when the correct four-product collection is configured.
+
+6. Theme Access CLI list/info still cannot prove MAIN role.
+   However existing ShopifyThemeReader/Admin GraphQL read_themes path can query
+   themes { id name role } and identify MAIN. We should use a fresh GraphQL READ
+   to prove live role, while Theme Access CLI remains the actual write transport.
+   Do not weaken live-write safety.
+
+MISSION
+Finish the real C_NATIVE_COLLECTION end-to-end path in this SAME branch,
+then run full regression tests and push.
+Do NOT merge main yet.
+Do NOT perform real Shopify writes during implementation/tests.
+
+======================================================================
+1. SAFETY
+======================================================================
+
+No real Shopify collection mutation.
+No real theme push.
+No rollback.
+No publication mutation.
+No credential creation/deletion.
+Do not change global Shopify CLI.
+Do not touch:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env
+- .phase*
+- .recon_focus_initial/
+- existing backup/audit folders
+
+Read-only real calls are allowed only when explicitly needed to verify:
+- current app scopes
+- current MAIN theme ID/role
+- existing collection handle conflicts
+No raw token/output disclosure.
+
+======================================================================
+2. FEATURED COLLECTION PREREQUISITE SERVICE
+======================================================================
+
+Implement a dedicated Featured collection bridge.
+Prefer a new focused service/module, e.g.
+  FeaturedCollectionPrerequisiteService
+rather than overloading category strategy behavior.
+
+Purpose:
+For C_NATIVE_COLLECTION, maintain ONE ShopSource-owned collection per store
+containing EXACTLY the four selected Featured products.
+
+Recommended identity:
+- collection_key: homepage-featured-products
+- title: New Arrivals
+- deterministic handle: shopsource-homepage-featured
+
+The same handle may exist independently per Shopify store.
+Do not include store ID in customer-visible title.
+
+Ownership:
+- Persist a ShopSource mapping/binding in local DB.
+- Never auto-adopt an unmanaged collection that happens to use the same handle.
+- If remote handle exists without matching ShopSource ownership evidence:
+  status = FEATURED_COLLECTION_HANDLE_CONFLICT
+  no mutation.
+
+Store at minimum:
+- store_id
+- collection_key
+- collection_id
+- handle
+- title
+- expected_product_ids_hash
+- last_verified_product_ids_json
+- publication_id or publication verification state
+- updated_at
+
+No sensitive credentials.
+
+======================================================================
+3. READ-ONLY DRY-RUN
+======================================================================
+
+Implement a dry-run that reads:
+- current granted scopes
+- Online Store publication
+- remote collection by deterministic handle / mapped ID
+- exact collection membership IDs
+- collection source identity if useful
+- publication status
+
+Required collection scopes:
+READ path:
+- read_products
+- read_publications as needed
+
+WRITE path later:
+- write_products
+- write_publications
+
+Dry-run actions:
+- CREATE
+- NO_CHANGE
+- UPDATE_MEMBERSHIP
+- PUBLISH_ONLY
+- UPDATE_AND_PUBLISH
+- CONFLICT
+- MISSING_SCOPES
+
+Rules:
+A. no remote collection + no mapping -> CREATE
+B. remote collection + no mapping -> CONFLICT
+C. mapping points to missing remote -> CONFLICT
+D. mapping ID differs from remote handle result -> CONFLICT
+E. owned collection exact membership set == selected four and published -> NO_CHANGE
+F. owned collection membership differs -> UPDATE_MEMBERSHIP
+G. exact membership but unpublished -> PUBLISH_ONLY
+
+For collection-backed Featured assignment, membership order does not need to be
+used as identity proof if the collection contains exactly the same 4 unique
+products and max_products=4.
+Use set equality for collection membership.
+Do not loosen direct product_list/product-block ordering checks.
+
+======================================================================
+4. EXPLICIT COLLECTION WRITE GATE
+======================================================================
+
+Implement one beginner action:
+"추천 상품 컬렉션 준비"
+
+This is a prerequisite inside Step 3, before "추천 상품 미리보기 만들기".
+
+First click:
+- performs dry-run only
+- opens a confirmation dialog
+- shows:
+  Store 001 / New Arrivals / selected 4 products
+  action CREATE / UPDATE / PUBLISH
+  Shopify theme write: NO
+  Shopify collection write: will occur only after final confirmation
+
+Require explicit confirmation checkbox(es).
+
+Final button:
+"컬렉션 준비 실행"
+
+Only then may the service mutate collection/publication.
+
+No automatic mutation.
+
+======================================================================
+5. CREATE EXACT FOUR-PRODUCT COLLECTION
+======================================================================
+
+Use Shopify Admin GraphQL API version already configured for the store.
+
+For modern collectionCreate use CollectionCreateInput.sources with a conditions
+source whose inclusion.selections explicitly contains the four selected products.
+The project API version 2026-07 supports manual selections in collection sources.
+
+Use:
+- title = New Arrivals
+- handle = deterministic ShopSource handle
+- source title = ShopSource Featured Products
+- target type PRODUCTS
+- inclusion selections = exact four product IDs
+
+Do NOT create condition/tag rules for this collection.
+It must be a curated exact-membership collection.
+
+Shopify creates collections unpublished by default.
+After creation, publish explicitly to Online Store only when:
+- write_publications is granted
+- the exact Online Store publication ID was read/verified
+- user confirmed the operation
+
+Post-create/post-update verify:
+- exact collection ID
+- exact handle
+- exactly 4 unique selected product IDs as a set
+- no extra product
+- published to verified Online Store publication
+
+If publication fails:
+status = FEATURED_COLLECTION_PUBLICATION_FAILED
+do not continue to theme preview.
+
+If membership verification fails:
+status = FEATURED_COLLECTION_MEMBERSHIP_VERIFY_FAILED
+do not continue.
+
+If the API returns async job for membership update:
+poll read-only with a bounded timeout, then verify final membership.
+Never assume job success.
+
+======================================================================
+6. UPDATE EXISTING OWNED FEATURED COLLECTION
+======================================================================
+
+For an already-owned collection whose selected four products changed:
+
+Use the current collection source/manual selections contract.
+Prefer collectionUpdate with:
+- selectionsToAdd
+- selectionsToRemove
+
+Compute exact set diff from fresh remote membership.
+
+Never remove products from an unmanaged collection.
+Never update a collection unless ownership mapping and remote ID/handle agree.
+
+After update:
+fresh read
+exact set of four
+no extras
+publication verified.
+
+======================================================================
+7. INJECT VERIFIED COLLECTION PROOF INTO HOMEPAGE SESSION
+======================================================================
+
+HomepagePrerequisiteService must provide a canonical proof for FEATURED_PREVIEW.
+
+When current Featured plan uses C_NATIVE_COLLECTION:
+- load/read the owned featured collection binding
+- fresh-verify remote membership
+- require same four selected IDs
+- require publication ready
+- populate snapshot or feature-preview context with:
+
+verified_collection = {
+  "verified": true,
+  "collection_id": "...",
+  "handle": "shopsource-homepage-featured",
+  "product_ids": [four selected IDs in plan order OR canonical safe list],
+  "membership_set_match": true,
+  "published": true
+}
+
+Also persist/update plan.collection_handle locally after verified preparation.
+
+Do not fake proof from local DB alone.
+Remote read is required for PREVIEW.
+
+If proof absent:
+return:
+FEATURED_COLLECTION_MEMBERSHIP_UNVERIFIED
+
+Guided Flow should respond with primary action:
+"3단계 · 추천 상품 컬렉션 준비"
+
+======================================================================
+8. FIX GUIDED FLOW RECOVERY
+======================================================================
+
+Update featured_guided_flow.py.
+
+Existing old failed backup with:
+POST_WRITE_NOT_APPLIED
+must NOT strand user at Step 5.
+
+Because current remote == BEFORE and no merchant drift:
+- mark the previous write attempt as historical failed/not-applied
+- route user back to corrected Step 3 path
+- if C strategy requires collection, primary action = PREPARE_FEATURED_COLLECTION
+- once collection verified, primary action = BUILD_PREVIEW
+
+Beginner text:
+"이전 적용은 Shopify에 저장되지 않았습니다. 현재 스토어는 적용 전 상태입니다. 새 방식으로 안전하게 다시 준비합니다."
+
+No rollback.
+No adoption.
+No auto reapply.
+
+Durable restart must preserve this path.
+
+======================================================================
+9. COLLECTION-AWARE PREFLIGHT
+======================================================================
+
+Current preflight already validates NATIVE_COLLECTION proof, but harden it:
+
+Require:
+- verified_collection.verified = true
+- published = true
+- collection handle equals section collection setting
+- exact selected 4 product IDs by SET equality
+- exactly 4 unique IDs
+- max_products setting == 4
+- capability strategy == NATIVE_COLLECTION
+- collection field type == collection
+
+Fresh collection verification should be performed or proof freshness bounded so
+the user cannot prepare collection, change membership manually, then apply stale preview.
+
+At theme apply gate:
+fresh re-read collection membership/publication before READY_TO_APPLY.
+
+If drift:
+FEATURED_COLLECTION_CHANGED_ABORT
+no theme write.
+
+======================================================================
+10. COLLECTION-AWARE BACKUP METADATA
+======================================================================
+
+For NATIVE_COLLECTION backup metadata store:
+- featured_strategy = NATIVE_COLLECTION
+- collection_id
+- collection_handle
+- collection_field_id
+- collection_count_field_id
+- selected product IDs hash
+- verified collection membership hash
+- publication ID/status
+
+Do not store secret data.
+
+Do not set misleading:
+product_reference_format_written="gid"
+for collection strategy.
+
+Use:
+reference_contract = FEATURED_COLLECTION_EXACT_4
+
+======================================================================
+11. COLLECTION-AWARE POST-WRITE VERIFICATION
+======================================================================
+
+This is critical.
+
+For NATIVE_COLLECTION do NOT call product-field reference comparison.
+
+Post-write theme verification must prove:
+A. current target section exists
+B. section type == audited product-list type
+C. collection setting == verified collection handle
+D. max_products == 4
+E. unrelated sections unchanged
+F. prefix/suffix safe
+G. remote collection fresh read still contains exact selected four products
+H. collection remains published
+
+Reason codes:
+POST_WRITE_VERIFIED_COLLECTION
+POST_WRITE_COLLECTION_HANDLE_MISMATCH
+POST_WRITE_COLLECTION_COUNT_MISMATCH
+POST_WRITE_COLLECTION_MEMBERSHIP_DRIFT
+POST_WRITE_COLLECTION_PUBLICATION_DRIFT
+
+POST_WRITE_VERIFIED_COLLECTION should produce REMOTE_JSON_VERIFIED.
+
+Existing direct strategies retain existing product reference logic.
+
+diagnose_post_write() for new collection-strategy backups must use stored
+strategy/collection metadata.
+Legacy old backup remains POST_WRITE_NOT_APPLIED because current == before.
+
+======================================================================
+12. COLLECTION-AWARE verify_remote / ASSIGNMENT CHECK
+======================================================================
+
+Fix FeaturedProductAssignmentService.verify_remote() and
+HomepagePrerequisiteService._assignment_check().
+
+For NATIVE_COLLECTION:
+visibility/readiness is true when:
+- target section exists
+- section collection setting matches verified collection handle
+- max_products == 4
+- verified collection contains exact selected 4
+- publication ready
+
+Do NOT require a raw selected-product-ID array inside theme section settings.
+
+Final assignment must be capable of reaching ASSIGNMENT_READY for collection-backed
+themes.
+
+======================================================================
+13. COMPOSITE FRESH MAIN ROLE VERIFICATION
+======================================================================
+
+Do not rely on Shopify CLI theme list/info; they are currently unreliable here.
+
+Use the existing Admin GraphQL READ path already present in ShopifyThemeReader /
+FeaturedThemeBackendCoordinator.
+
+Fresh live-role verifier:
+1. use configured Admin GraphQL app
+2. require read_themes scope
+3. query themes(first:...)
+4. find exactly one role MAIN
+5. require MAIN theme ID == target Theme Access exact theme ID
+6. require store/shop identity already verified by existing app binding/domain logic
+
+Then Theme Access CLI write capability may be composed as:
+
+GRAPHQL_MAIN_IDENTITY_VERIFIED
++
+THEME_ACCESS_EXACT_ID_READ_READY
++
+pre-write remote hash matches
++
+explicit user live confirmation
+=
+THEME_ACCESS_CLI_LIVE_WRITE_READY
+
+Do NOT require GraphQL write_themes for this composite because GraphQL is only
+providing read-only identity proof; Theme Access CLI is the write transport.
+
+Do NOT cache the MAIN role for apply.
+Fresh verify at:
+- preflight/apply gate
+- immediately before push
+
+If GraphQL MAIN verification fails:
+LIVE_ROLE_UNVERIFIED
+no theme push.
+
+Do not weaken:
+- --allow-live requirement
+- explicit confirmation
+- exact target theme ID
+- remote hash TOCTOU gate
+
+======================================================================
+14. BEGINNER UI
+======================================================================
+
+Keep one primary action.
+
+Expected Store 001 recovery flow:
+
+Step 1 products loaded
+Step 2 4 products reviewed
+Step 3:
+  old POST_WRITE_NOT_APPLIED recognized
+  -> "추천 상품 컬렉션 준비"
+  -> explicit collection create/update confirmation
+  -> remote exact-4 verification
+  -> "추천 상품 미리보기 만들기"
+Step 4 preflight
+Step 5 theme apply gate
+Step 6 storefront
+Step 7 assignment
+
+Advanced details may show:
+- strategy: COLLECTION
+- collection handle
+- collection membership 4/4
+- publication ready
+- MAIN identity source: ADMIN_GRAPHQL_READ_THEMES
+- theme write backend: THEME_ACCESS_CLI
+
+Do not expose raw IDs in beginner view unless already shown in advanced diagnostics.
+
+======================================================================
+15. TEST MATRIX
+======================================================================
+
+Collection prerequisite:
+1. no collection -> dry-run CREATE
+2. unmanaged matching handle -> CONFLICT
+3. owned ID/handle mismatch -> CONFLICT
+4. owned exact 4 + published -> NO_CHANGE
+5. owned wrong membership -> UPDATE_MEMBERSHIP
+6. exact membership unpublished -> PUBLISH_ONLY
+7. create mutation uses exact four manual selections
+8. no condition/tag rule used
+9. create followed by publication verify
+10. update computes add/remove exact diff
+11. async update job bounded poll
+12. post-write membership exact 4
+13. no extra products accepted
+14. missing write_products blocked
+15. missing write_publications blocked
+
+Session/Guided Flow:
+16. collection proof injected only after fresh remote verify
+17. missing proof -> PREPARE_FEATURED_COLLECTION
+18. POST_WRITE_NOT_APPLIED routes back to Step 3
+19. restart durable route same
+20. no rollback/adoption offered for NOT_APPLIED
+
+Preflight/apply:
+21. collection membership changed after preview -> abort before theme write
+22. unpublished after preview -> abort
+23. fresh GraphQL MAIN id == Theme Access target -> live write capability READY
+24. different MAIN id -> blocked
+25. missing read_themes -> blocked
+26. Theme Access exact pull ready alone is insufficient for live write
+
+Post-write:
+27. collection section handle/count + exact collection membership -> POST_WRITE_VERIFIED_COLLECTION
+28. handle mismatch -> fail
+29. count mismatch -> fail
+30. membership drift -> fail
+31. publication drift -> fail
+32. unrelated section drift -> fail
+
+Assignment:
+33. collection-backed proposal visible check PASS
+34. final checklist can reach ASSIGNMENT_READY
+
+Future full E2E mock:
+selected 4
+-> collection dry-run CREATE
+-> explicit collection confirmation
+-> collection create + publish mocks
+-> fresh exact 4 verify
+-> collection-backed preview
+-> fresh composite MAIN role verify
+-> READY_TO_APPLY
+-> one mocked Theme Access theme push
+-> push JSON success
+-> post-read collection section verified
+-> Step 6
+-> Step 7
+-> ASSIGNMENT_READY
+
+Assert:
+REAL_SHOPIFY_WRITE_COUNT = 0 during tests
+MOCK_THEME_WRITE_COUNT = 1
+MOCK_COLLECTION_PREP_USER_ACTION_COUNT = 1
+
+======================================================================
+16. REAL CALL POLICY DURING THIS BRANCH
+======================================================================
+
+Allowed:
+- read current app scopes
+- read themes via GraphQL
+- read remote collection handles/membership/publication
+- exact-ID Theme Access read pull
+
+Forbidden:
+- real collectionCreate/update/publish
+- real theme push
+
+If a real scope/identity read shows a missing permission:
+report it.
+Do not ask user for secrets.
+Do not mutate scopes automatically.
+
+======================================================================
+17. QUALITY GATES
+======================================================================
+
+Run:
+python -m compileall -q src tests
+git diff --check
+PYTHONPATH=src python -m shopsource.cli --help
+PYTHONPATH=src python -m shopsource.ui.v2 --help
+
+Focused:
+- Featured collection prerequisite tests
+- homepage session collection proof tests
+- Guided Flow recovery tests
+- collection-aware preflight/apply tests
+- collection-aware post-write diagnosis tests
+- assignment readiness tests
+- Theme Access composite MAIN identity tests
+- push JSON parser tests
+
+Full:
+python -m pytest -q --basetemp=<fresh-worktree-local-temp>
+
+Expected > current 1087 passed, 1 skipped.
+
+======================================================================
+18. COMMIT/PUSH
+======================================================================
+
+After all tests pass:
+- commit to same branch
+  hotfix/featured-schema-contract-and-push-json
+- push branch
+- do NOT merge main
+
+Suggested commit:
+Complete collection-backed Featured product flow
+
+======================================================================
+19. REPORT
+======================================================================
+
+Report:
+[1] baseline feature SHA
+[2] final feature SHA
+[3] files changed
+[4] real Admin GraphQL scopes read result
+[5] fresh MAIN theme identity result
+[6] collection prerequisite architecture
+[7] deterministic collection handle/title
+[8] ownership conflict rules
+[9] create exact-4 selections contract
+[10] publication contract
+[11] update/reselection contract
+[12] snapshot proof injection
+[13] POST_WRITE_NOT_APPLIED recovery
+[14] collection-aware preflight
+[15] collection-aware backup metadata
+[16] collection-aware post-write verification
+[17] assignment check fix
+[18] composite MAIN role verifier
+[19] beginner Guided Flow
+[20] focused tests
+[21] full suite
+[22] protected files
+[23] real collection/theme write count
+[24] merge readiness
+[25] exact next action
+
+Final flags:
+C_NATIVE_COLLECTION_END_TO_END = READY/NOT_READY
+FEATURED_COLLECTION_PREREQUISITE = READY/NOT_READY
+FEATURED_COLLECTION_OWNERSHIP_GUARD = PASS/FAIL
+EXACT_FOUR_MEMBERSHIP = PASS/FAIL
+ONLINE_STORE_PUBLICATION_VERIFY = PASS/FAIL
+POST_WRITE_NOT_APPLIED_RECOVERY = PASS/FAIL
+COLLECTION_AWARE_PREFLIGHT = PASS/FAIL
+COLLECTION_AWARE_POST_WRITE = PASS/FAIL
+COLLECTION_AWARE_ASSIGNMENT_READY = PASS/FAIL
+GRAPHQL_MAIN_PLUS_THEME_ACCESS_COMPOSITE = READY/NOT_READY
+LIVE_ROLE_FRESH_VERIFY = PASS/FAIL
+AUTO_REAPPLY = NO
+AUTO_ROLLBACK = NO
+REAL_COLLECTION_WRITE_COUNT = 0
+REAL_THEME_WRITE_COUNT = 0
+FULL_SUITE = PASS/FAIL
+CODE_MERGE_READY = YES/NO
