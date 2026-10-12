@@ -1,0 +1,405 @@
+ShopSource Studio — DETERMINISTIC RETAINED READ-ONLY SCHEMA AUDIT
+DO NOT DEPEND ON TERMINAL OUTPUT RECOVERY
+
+Repository
+- Main baseline: 606bc1eee9e444acd2ee7e68392a953555c385f8
+- Branch: hotfix/featured-schema-contract-and-push-json
+- Current branch HEAD before this prompt: 7ed9e2b1fa4e4a64e4b1b997ef006b9c795e223b
+- Worktree: D:\shop\001_so_amazon_featured_schema_pushjson
+
+Problem to solve
+The previous exact-ID audit could not determine whether pull succeeded because command output/result recovery was lost.
+Do NOT repeat the same pattern.
+This pass must persist the audit artifacts and a sanitized summary to a deterministic directory, so success/failure can be verified from filesystem state even if terminal output truncates.
+
+Known target
+- Store ID: 001
+- canonical domain: kgxbpi-it.myshopify.com
+- exact theme ID: 162910503161
+- global Shopify CLI: 4.9.3
+- saved Theme Access credential exists
+- previous exact-ID templates/index.json pull has succeeded in this project
+- no real Shopify write is allowed
+
+======================================================================
+1. SAFETY
+======================================================================
+
+READ-ONLY only.
+
+Forbidden:
+- theme push
+- rollback
+- product/collection mutation
+- DB mutation
+- credential creation/deletion
+- printing credential
+- printing raw CLI stdout/stderr
+- changing global Shopify CLI
+- code implementation before audit PASS
+- commit/push before audit PASS
+
+Do not touch:
+- stores/001_cabin_tidy.json
+- tools/shopify_app/safe_shopify_cli.ps1
+- data/*.sqlite3
+- .env
+- .phase*
+- .recon_focus_initial/
+- existing pytest temp dirs
+- existing backup folders
+
+======================================================================
+2. USE A DETERMINISTIC RETAINED AUDIT DIRECTORY
+======================================================================
+
+Use exactly:
+
+D:\shop\_shopsource_readonly_schema_audit\store001_theme162910503161
+
+Inside it create fresh subdirectories:
+- sections_glob
+- full_theme
+- reports
+
+Do NOT place audit files in the repo.
+
+If this audit root already exists:
+- do not delete the old root
+- create a timestamped child under it, e.g.
+  run_YYYYMMDD_HHMMSS
+and use that run directory.
+
+At the end, REPORT THE EXACT RUN DIRECTORY.
+
+======================================================================
+3. CREATE A LOCAL TEMP AUDIT SCRIPT OUTSIDE THE REPO
+======================================================================
+
+Create:
+<run_dir>\readonly_schema_audit.py
+
+This is a diagnostic script only and must NOT be committed.
+
+Run it from the feature worktree with:
+PYTHONPATH=src
+
+The script must:
+- import get_theme_access_password from shopsource.theme_access_credentials
+- retrieve Store 001 credential in memory
+- print only CREDENTIAL_PRESENT=YES/NO
+- never serialize the credential
+- locate shopify executable with shutil.which("shopify")
+- use subprocess with capture_output=True, text=False, timeout
+- set SHOPIFY_CLI_THEME_TOKEN only in child env
+- never print raw stdout/stderr
+
+Use the exact domain/theme constants above.
+
+======================================================================
+4. PULL ATTEMPT A — SECTIONS GLOB
+======================================================================
+
+Create an EMPTY:
+<run_dir>\sections_glob
+
+Run exactly once:
+
+shopify theme pull
+  --store kgxbpi-it.myshopify.com
+  --theme 162910503161
+  --only sections/*.liquid
+  --path <run_dir>\sections_glob
+  --no-input
+
+Important:
+Pass the argument as literal:
+  "sections/*.liquid"
+to subprocess argv.
+Do not let PowerShell expand it.
+
+After process completion, ignore terminal rendering.
+Inspect filesystem directly.
+
+Collect:
+- returncode
+- count of files recursively created
+- count of sections/*.liquid files
+- whether templates/index.json appeared
+- total bytes of pulled section files
+- safe filenames only
+
+Define:
+GLOB_PULL_FILES_PRESENT = YES if at least 1 sections/*.liquid file exists.
+
+If files are present, treat the read-only pull as usable even if returncode is nonzero, but preserve returncode in report.
+
+If zero section files, proceed to fallback.
+
+======================================================================
+5. PULL ATTEMPT B — FULL THEME FALLBACK
+======================================================================
+
+Only if Attempt A produced zero section Liquid files.
+
+Create EMPTY:
+<run_dir>\full_theme
+
+Run exactly once:
+
+shopify theme pull
+  --store kgxbpi-it.myshopify.com
+  --theme 162910503161
+  --path <run_dir>\full_theme
+  --no-input
+
+After completion inspect filesystem directly.
+
+Collect:
+- returncode
+- total file count
+- sections/*.liquid count
+- templates/index.json present YES/NO
+- config/settings_schema.json present YES/NO
+- total bytes
+
+Define:
+FULL_PULL_FILES_PRESENT = YES if at least 1 sections/*.liquid exists.
+
+If neither A nor B yields any section Liquid:
+- write reports/AUDIT_RESULT.json with failure state
+- STOP
+- no implementation
+
+Do NOT depend on CLI stdout to decide whether files were pulled.
+
+======================================================================
+6. PERSIST SANITIZED COMMAND DIAGNOSTICS
+======================================================================
+
+For each pull attempt write a small JSON object into:
+reports/pull_glob_status.json
+reports/pull_full_status.json
+
+Allowed fields only:
+{
+  "cli_version": "...",
+  "returncode": n,
+  "stdout_json_parsed": true/false,
+  "stdout_top_level_keys": [...],
+  "stderr_structured_error_type": "... or null",
+  "section_file_count": n,
+  "total_file_count": n,
+  "files_present": true/false
+}
+
+Do NOT store:
+- raw stdout
+- raw stderr
+- error full message
+- token
+- env dump
+- request headers
+
+If output contains JSON, parse only safe structural keys.
+If not JSON, store parsed=false only.
+
+======================================================================
+7. PARSE SCHEMAS FROM FILESYSTEM
+======================================================================
+
+Select source:
+- sections_glob if it has section files
+- else full_theme
+
+For every sections/*.liquid:
+- read UTF-8 with errors=replace
+- find {% schema %} ... {% endschema %}
+- json.loads schema
+- count parse success/failure
+
+Do not store full Liquid or full schema JSON in report.
+
+Persist:
+reports/schema_candidates.json
+
+Safe candidate entry fields:
+- filename
+- schema_name
+- strategy
+- compatible_for_4
+- section_setting_id
+- section_setting_type
+- limit
+- max_blocks
+- block_type
+- block_product_field_id
+- collection_field_id
+- evidence_reason
+
+Classify:
+
+A / NATIVE_PRODUCT_LIST
+- section-level setting type == product_list
+- limit absent or >=4
+
+B / NATIVE_PRODUCT_BLOCKS
+- block definition contains setting type == product
+- max_blocks absent or >=4
+
+C / NATIVE_COLLECTION
+- section-level setting type == collection
+- capacity >=4 only when schema provides enough evidence
+- otherwise C_UNPROVEN
+
+D / SINGLE_PRODUCT_ONLY
+- section-level product setting without compatible A/B/C capacity
+
+A section can expose multiple capabilities; record all meaningful candidates.
+
+Selection priority:
+A > B > C
+D never valid for 4 direct products.
+
+======================================================================
+8. WRITE ONE AUTHORITATIVE AUDIT RESULT FILE
+======================================================================
+
+Write:
+<run_dir>\reports\AUDIT_RESULT.json
+
+Fields:
+{
+  "audit_status": "PASS" | "FAIL",
+  "run_dir": "...",
+  "cli_version": "...",
+  "credential_present": true,
+  "target_domain": "kgxbpi-it.myshopify.com",
+  "target_theme_id": "162910503161",
+  "pull_source": "sections_glob" | "full_theme" | null,
+  "glob_returncode": n,
+  "glob_section_count": n,
+  "full_returncode": n|null,
+  "full_section_count": n,
+  "schema_parsed_count": n,
+  "schema_invalid_count": n,
+  "candidate_A_count": n,
+  "candidate_B_count": n,
+  "candidate_C_count": n,
+  "candidate_D_count": n,
+  "chosen_strategy": "... or null",
+  "chosen_filename": "... or null",
+  "chosen_field_or_block": "... or null",
+  "shopify_write_count": 0
+}
+
+PASS requires:
+- at least one section Liquid pulled
+- at least one schema parsed
+- at least one compatible A/B/C candidate
+
+If sections pulled and parsed but no A/B/C:
+audit_status=FAIL
+chosen_strategy=MULTI_PRODUCT_SECTION_UNAVAILABLE
+
+======================================================================
+9. VERIFY THE RESULT FILE EXPLICITLY
+======================================================================
+
+After script exits, run:
+
+Get-Content <run_dir>\reports\AUDIT_RESULT.json
+Get-Content <run_dir>\reports\schema_candidates.json
+
+These files are the source of truth.
+Do not rely on prior terminal subprocess output.
+
+Also report:
+- exact run_dir
+- file sizes of both reports
+- SHA256 of AUDIT_RESULT.json
+
+If these files cannot be read:
+STOP.
+No implementation.
+
+======================================================================
+10. RESUME IMPLEMENTATION ONLY ON AUDIT PASS
+======================================================================
+
+If AUDIT_RESULT.audit_status == PASS:
+resume:
+CODEX_FEATURED_SCHEMA_CONTRACT_AND_PUSH_JSON_HOTFIX.txt
+
+Use exact chosen strategy from schema_candidates.json.
+
+Required fixes still include:
+- product != product_list
+- 4-item plan can never use single product field
+- preview schema value-shape validator
+- push --json structured error parser
+- current==before => POST_WRITE_NOT_APPLIED before product mismatch
+- recovery UX -> 새 안전 미리보기 만들기
+- no auto reapply
+- no auto rollback
+- read-only capability separated from live-write role verification
+
+Do NOT perform real Shopify write.
+
+If audit_status != PASS:
+STOP with report only.
+
+======================================================================
+11. TEST/COMMIT IF IMPLEMENTATION RESUMES
+======================================================================
+
+Only after audit PASS and code implementation:
+- compileall
+- diff --check
+- CLI/UI help
+- focused schema/ThemeCLI/Featured/recovery tests
+- full pytest fresh basetemp
+- no real Shopify write
+
+Then commit/push same branch.
+No main merge.
+
+======================================================================
+12. FINAL REPORT
+======================================================================
+
+Report:
+
+[1] exact run directory
+[2] CLI version
+[3] glob pull returncode + section count
+[4] full fallback returncode + section count
+[5] AUDIT_RESULT.json SHA256
+[6] parsed/invalid schema counts
+[7] A/B/C/D counts
+[8] chosen strategy
+[9] chosen filename
+[10] chosen field/block
+[11] audit status
+[12] implementation resumed YES/NO
+[13] files changed if resumed
+[14] focused tests
+[15] full suite
+[16] Shopify live write count
+[17] credential creation/deletion
+[18] final feature SHA
+[19] merge readiness
+[20] exact next action
+
+Final flags:
+AUDIT_RESULT_FILE_CREATED = YES/NO
+AUDIT_RESULT_FILE_READABLE = YES/NO
+EXACT_ID_READ_ONLY_PULL = PASS/FAIL
+REAL_SCHEMA_AUDIT = PASS/FAIL
+PRODUCT_LIST_CANDIDATE = YES/NO
+PRODUCT_BLOCK_CANDIDATE = YES/NO
+COLLECTION_CANDIDATE = YES/NO
+SINGLE_PRODUCT_USED_FOR_MULTI_PRODUCT = NO
+IMPLEMENTATION_RESUMED = YES/NO
+SHOPIFY_LIVE_WRITE_COUNT = 0
+CODE_MERGE_READY = YES/NO
