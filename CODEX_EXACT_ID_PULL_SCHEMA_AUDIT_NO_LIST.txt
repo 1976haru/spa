@@ -1,0 +1,401 @@
+ShopSource Studio — EXACT-ID READ-ONLY SCHEMA AUDIT WITHOUT THEME LIST/INFO
+THEN RESUME FEATURED SCHEMA + PUSH-JSON HOTFIX
+DO NOT TEST MORE CLI VERSIONS
+
+Repository
+- Baseline main: 606bc1eee9e444acd2ee7e68392a953555c385f8
+- Branch: hotfix/featured-schema-contract-and-push-json
+- Current branch HEAD before this prompt: 058131ea15d561dbc62f4e3c158b0f6c85c965e3
+
+CONFIRMED FACTS
+- Global CLI 4.9.3:
+  theme list -> STRUCTURED_ABORT
+  theme info -> STRUCTURED_ABORT
+- Temporary CLI 4.8.5:
+  theme list -> JSON_INVALID / exit 2
+  theme info -> JSON_INVALID / exit 2
+- BOTH_VERSIONS_FAILED for list/info.
+- Earlier, using the same Store 001 Theme Access credential, an exact-ID READ-ONLY:
+  theme pull --theme 162910503161 --only templates/index.json
+  succeeded.
+- That forensic proved CURRENT templates/index.json == BEFORE exactly.
+- Therefore the credential is not proven globally invalid.
+- The current blocker is specifically list/info identity probing.
+- For a READ-ONLY schema audit, role verification is not required if we target the exact store + exact numeric theme ID and perform only theme pull.
+- For LIVE WRITE, role verification remains mandatory and must stay blocked until separately solved.
+
+MISSION
+Stop testing more CLI versions.
+Do NOT make theme list/info a prerequisite for read-only schema inspection.
+Use exact-ID theme pull only, audit the real Store 001 section schemas, then resume the schema-contract + push-json implementation in the same branch.
+Do not perform a live write.
+
+======================================================================
+1. SAFETY
+======================================================================
+
+No Shopify write.
+No theme push.
+No rollback.
+No product/collection mutation.
+No credential creation/deletion.
+Never print credential.
+Never print raw CLI stdout/stderr.
+Do not touch protected files, DBs, .env, phase/recon/temp folders.
+Do not merge main.
+
+Real saved Theme Access credential may be used READ-ONLY for exact-ID theme pull only.
+
+Target:
+- canonical domain: kgxbpi-it.myshopify.com
+- exact numeric theme ID: 162910503161
+
+Important:
+For this audit record:
+READ_TARGET_ID_VERIFIED_BY_EXACT_PULL = possible
+LIVE_MAIN_ROLE_VERIFIED = NO
+Do not conflate them.
+
+======================================================================
+2. EXACT-ID READ-ONLY PULL
+======================================================================
+
+Use GLOBAL CLI 4.9.3 only.
+Do not run theme list.
+Do not run theme info.
+Do not test 4.8.5 again.
+
+Create a fresh isolated EMPTY temp directory outside repo.
+
+First attempt exactly one:
+shopify theme pull
+  --store kgxbpi-it.myshopify.com
+  --theme 162910503161
+  --only "sections/*.liquid"
+  --path <empty-temp>
+  --no-input
+
+Use SHOPIFY_CLI_THEME_TOKEN only in child env.
+Capture bytes safely.
+Do not expose raw output.
+
+If glob pull succeeds:
+- continue.
+
+If glob pull fails because glob/pattern is unsupported or no files returned:
+- do ONE fallback full read-only pull into a NEW isolated empty temp:
+  shopify theme pull
+    --store kgxbpi-it.myshopify.com
+    --theme 162910503161
+    --path <empty-temp-2>
+    --no-input
+
+This is allowed because:
+- exact numeric theme ID is explicit
+- operation is read-only
+- directory is isolated
+- repo is untouched
+
+If full pull also fails:
+STOP with sanitized code EXACT_ID_PULL_FAILED.
+No implementation.
+
+Do not require role MAIN for this read-only audit.
+
+======================================================================
+3. AUDIT REAL SECTION SCHEMAS
+======================================================================
+
+Parse only pulled sections/*.liquid files.
+
+Extract {% schema %} JSON safely.
+Ignore invalid/non-JSON schemas but count them.
+
+Classify all candidate sections:
+
+A. NATIVE_PRODUCT_LIST
+- section-level setting type == "product_list"
+- limit >=4 or no restrictive limit
+
+B. NATIVE_PRODUCT_BLOCKS
+- repeatable block schema contains setting type == "product"
+- max_blocks >=4 or no restrictive max below 4
+
+C. NATIVE_COLLECTION
+- section-level setting type == "collection"
+- section schema/settings indicate product rendering capacity >=4
+- if capacity cannot be proven, mark C_UNPROVEN instead of compatible
+
+D. SINGLE_PRODUCT_ONLY
+- only section-level setting type == "product"
+- never valid for requested_count=4
+
+For each candidate report safe metadata only:
+- section filename
+- schema name
+- strategy A/B/C/D
+- relevant setting id/type
+- limit/max_blocks
+- compatible requested_count=4 YES/NO
+
+Do not output full Liquid.
+
+Selection priority:
+A > B > C
+D invalid.
+
+If no compatible A/B/C:
+STOP with MULTI_PRODUCT_SECTION_UNAVAILABLE.
+No speculative code.
+
+======================================================================
+4. RESUME ORIGINAL FEATURED HOTFIX AFTER REAL AUDIT PASS
+======================================================================
+
+Only if a real A/B/C candidate is found, continue implementation from:
+CODEX_FEATURED_SCHEMA_CONTRACT_AND_PUSH_JSON_HOTFIX.txt
+
+Use real audit evidence only.
+
+Required implementation:
+
+A. Schema discovery contract
+- "product" and "product_list" never equivalent
+- capability strategies:
+  DIRECT_PRODUCT_LIST
+  PRODUCT_BLOCKS
+  FEATURED_COLLECTION
+  SINGLE_PRODUCT_ONLY
+- requested_count=4 must reject SINGLE_PRODUCT_ONLY
+
+B. Preview value-shape validation
+- product_list -> list of exactly 4
+- product block -> scalar product per block
+- collection -> verified collection prerequisite
+- assigning list to product -> FEATURED_SCHEMA_VALUE_TYPE_MISMATCH
+- invalid preview cannot reach apply
+
+C. Existing failed backup diagnosis priority
+For current Store 001 fixture:
+current == before
+=> POST_WRITE_NOT_APPLIED
+before any product-reference mismatch.
+No adoption.
+
+D. Recovery UX
+Existing failed backup:
+"5단계 적용되지 않음"
+"이전 적용 시도에서 Shopify가 변경 파일을 저장하지 않았습니다."
+
+Primary:
+"새 안전 미리보기 만들기"
+
+This is local/read-only.
+No automatic apply.
+
+E. Theme push --json result parsing
+Implement/test only; do NOT invoke real push.
+
+Push subprocess remains binary capture.
+After completion:
+- decode stdout UTF-8 errors=replace
+- parse JSON
+- never display raw output
+- inspect safe structured fields
+- theme.errors non-empty => CLI_PUSH_ASSET_REJECTED
+- warning indicating pushed with errors => rejected
+- invalid/unparseable JSON => CLI_PUSH_RESULT_UNPARSEABLE
+- always post-read in write path to establish truth
+
+Truth table:
+1. observed == proposed -> REMOTE_JSON_VERIFIED
+2. observed == before + asset errors -> CLI_PUSH_ASSET_REJECTED
+3. observed == before + unknown/unparseable push result -> REMOTE_CONTENT_UNCHANGED / POST_WRITE_NOT_APPLIED
+4. observed neither before nor proposed -> VERIFY_FAILED_REVIEW_BEFORE_ROLLBACK
+
+Do not collapse current==before into PRODUCT_IDS_MISMATCH.
+
+======================================================================
+5. SEPARATE READ CAPABILITY FROM LIVE WRITE CAPABILITY
+======================================================================
+
+The current Theme Access architecture over-couples exact-ID read with list/info role probing.
+
+Introduce the smallest safe separation needed:
+
+READ-ONLY exact-theme pull capability:
+- exact store binding
+- canonical domain
+- exact numeric theme ID
+- saved credential present
+- exact-ID pull succeeds
+- role may be UNKNOWN
+- allows READ ONLY
+
+LIVE WRITE capability:
+- still requires fresh verified live role / MAIN
+- if list/info cannot establish role, status:
+  LIVE_ROLE_UNVERIFIED
+- apply button must remain blocked
+- do not weaken existing confirmation/allow_live gates
+
+This allows:
+- schema audit
+- preflight read diagnostics where role is not material
+while preserving:
+- no live write until role is proven
+
+Do not invent or trust cached MAIN for write.
+
+======================================================================
+6. TEST MATRIX
+======================================================================
+
+Add tests for:
+
+Exact-ID read capability:
+1. list/info unavailable but exact-ID pull succeeds -> READ_ONLY_READY
+2. same state -> LIVE_ROLE_UNVERIFIED
+3. exact-ID pull failure -> READ_FAILED
+4. no write path can proceed from READ_ONLY_READY alone
+
+Schema:
+5. product_list >=4 -> DIRECT_PRODUCT_LIST
+6. product_list <4 -> reject
+7. product only -> SINGLE_PRODUCT_ONLY reject for 4
+8. product_list beats product
+9. product blocks capacity >=4 -> PRODUCT_BLOCKS
+10. product blocks capacity <4 -> reject
+11. collection proven -> fallback
+12. no A/B/C -> MULTI_PRODUCT_SECTION_UNAVAILABLE
+13. list assigned to product rejected
+
+Existing backup:
+14. current==before -> POST_WRITE_NOT_APPLIED
+15. no PRODUCT_IDS_MISMATCH misclassification
+16. no adoption
+17. UX offers new safe preview
+
+Push JSON:
+18. return 0 + theme.errors -> CLI_PUSH_ASSET_REJECTED
+19. return 0 + pushed-with-errors warning -> rejected
+20. valid success + post-read proposed -> REMOTE_JSON_VERIFIED
+21. invalid JSON + post-read before -> POST_WRITE_NOT_APPLIED
+22. UTF-8 binary output remains safe
+
+Future E2E:
+23. compatible real-strategy fixture
+-> preview
+-> preflight mock role verified
+-> one mocked write
+-> push JSON success
+-> post-read proposed
+-> REMOTE_JSON_VERIFIED
+-> step6 -> step7 -> ASSIGNMENT_READY
+
+No real Shopify write.
+
+======================================================================
+7. LIVE ROLE VERIFICATION IS A SEPARATE GATE
+======================================================================
+
+Do NOT solve this by:
+- trusting old cached role
+- assuming exact-ID means MAIN
+- always passing --allow-live
+- weakening confirmation
+
+For this branch, it is acceptable that after implementation:
+- read/schema path is READY
+- live apply remains blocked with LIVE_ROLE_UNVERIFIED
+
+We will solve fresh MAIN role verification only after schema strategy and push error handling are merged/tested.
+
+This prevents another long dependency chain.
+
+======================================================================
+8. QUALITY GATES
+======================================================================
+
+Run:
+python -m compileall -q src tests
+git diff --check
+PYTHONPATH=src python -m shopsource.cli --help
+PYTHONPATH=src python -m shopsource.ui.v2 --help
+
+Focused:
+- Theme Access exact-read capability tests
+- schema discovery/preview tests
+- Featured post-write/recovery tests
+- push JSON parser tests
+- Guided Flow tests
+- backend/router tests
+
+Full:
+python -m pytest -q --basetemp=<fresh-worktree-local-temp>
+
+Expected >= current 1083 passed, 1 skipped.
+
+======================================================================
+9. COMMIT/PUSH
+======================================================================
+
+Only if exact-ID real schema audit passes AND implementation/tests pass:
+- commit same branch
+- push same branch
+- no main merge
+
+Suggested commit:
+Fix Featured schema contract with exact-ID read audit
+
+If audit fails:
+- no implementation
+- no commit
+
+======================================================================
+10. FINAL REPORT
+======================================================================
+
+[1] Global CLI version
+[2] Exact-ID sections glob pull result
+[3] Full exact-ID pull fallback result if used
+[4] READ_TARGET_ID_VERIFIED_BY_EXACT_PULL YES/NO
+[5] LIVE_MAIN_ROLE_VERIFIED YES/NO
+[6] Parsed schema count / invalid schema count
+[7] Candidate A count
+[8] Candidate B count
+[9] Candidate C count
+[10] Candidate D count
+[11] Chosen strategy
+[12] Exact chosen section filename/schema/field strategy
+[13] Old single-product bug confirmed YES/NO
+[14] POST_WRITE_NOT_APPLIED classification
+[15] push JSON parser status
+[16] READ_ONLY_READY separation
+[17] LIVE_ROLE_UNVERIFIED behavior
+[18] focused tests
+[19] full suite
+[20] Shopify live write count
+[21] credential creation/deletion count
+[22] final feature SHA
+[23] merge readiness
+[24] exact next action
+
+Final flags:
+THEME_LIST_INFO_REQUIRED_FOR_SCHEMA_AUDIT = NO
+EXACT_ID_READ_ONLY_PULL = PASS/FAIL
+REAL_SCHEMA_AUDIT = PASS/FAIL
+READ_ONLY_READY = YES/NO
+LIVE_ROLE_UNVERIFIED = YES/NO
+SINGLE_PRODUCT_USED_FOR_MULTI_PRODUCT = NO
+PRODUCT_LIST_STRATEGY = READY/NOT_READY
+PRODUCT_BLOCK_STRATEGY = READY/NOT_READY
+COLLECTION_FALLBACK = READY/NOT_READY
+SCHEMA_VALUE_VALIDATION = PASS/FAIL
+PUSH_JSON_ERRORS_PARSED = YES/NO
+POST_WRITE_NOT_APPLIED_CLASSIFIED = YES/NO
+AUTO_REAPPLY = NO
+AUTO_ROLLBACK = NO
+SHOPIFY_LIVE_WRITE_COUNT = 0
+FULL_SUITE = PASS/FAIL
+CODE_MERGE_READY = YES/NO
