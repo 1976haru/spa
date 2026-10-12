@@ -2633,6 +2633,8 @@ class OperatorUI:
                                     f"Selected: {summary.get('selected_backend') or 'NO_WRITE_BACKEND'} "
                                     f"({summary.get('selection_reason')}) | GraphQL: {summary.get('graphql_state')} | "
                                     f"Theme Access CLI: {summary.get('theme_access_cli_state')} | "
+                                    f"read: {summary.get('theme_access_read_state')} · "
+                                    f"live role: {summary.get('theme_access_live_role_state')} | "
                                     f"Verified theme: {summary.get('verified_theme_id') or theme.get('id')} / "
                                     f"{summary.get('verified_theme_role') or 'unverified'}" +
                                     ("\nGraphQL scope is granted but exemption is not yet verified. "

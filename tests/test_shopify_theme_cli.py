@@ -35,6 +35,7 @@ class Runner:
         self.pull_scaffold_exists = []
         self.push_path_entries = []
         self.push_scaffold_exists = []
+        self.push_output_override = None
 
     def __call__(self, command, **kwargs):
         self.calls.append((list(command), dict(kwargs)))
@@ -74,6 +75,8 @@ class Runner:
             return subprocess.CompletedProcess(command, 1, stdout="", stderr="invalid theme directory")
         if self.fail_push:
             return subprocess.CompletedProcess(command, 1, stdout="merchant-password", stderr="merchant-password")
+        if self.push_output_override is not None:
+            return subprocess.CompletedProcess(command, 0, stdout=self.push_output_override, stderr="")
         self.remote = file_path.read_bytes().decode("utf-8")
         return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
 
@@ -203,7 +206,7 @@ def test_no_secret_in_capability_details(tmp_path, monkeypatch):
 
 def test_cli_read_uses_only_target_file(tmp_path, monkeypatch):
     cli, runner, _, _ = setup(tmp_path, monkeypatch)
-    cli.read_file("store-a", "example.myshopify.com", "123", TARGET_FILE)
+    result = cli.read_file("store-a", "example.myshopify.com", "123", TARGET_FILE)
     command, _ = next((c, k) for c, k in runner.calls if c[1:3] == ["theme", "pull"])
     only_index = command.index("--only")
     assert command[only_index + 1] == "templates/index.json"
@@ -213,6 +216,33 @@ def test_cli_read_uses_only_target_file(tmp_path, monkeypatch):
     assert command[command.index("--path") + 1]
     assert "--json" not in command
     assert "--no-input" in command
+    assert not any(command[1:3] == ["theme", "list"] for command, _ in runner.calls)
+    assert result.metadata["capability_state"] == "READ_ONLY_READY"
+    assert result.metadata["live_role_verified"] is False
+
+
+def test_push_json_theme_errors_are_not_treated_as_success(tmp_path, monkeypatch):
+    cli, runner, _, _ = setup(tmp_path, monkeypatch)
+    runner.push_output_override = json.dumps({"theme": {"errors": [{"asset": "templates/index.json", "code": "invalid_json"}]}})
+    before = runner.remote
+    request = ThemeFileWriteRequest("store-a", "example.myshopify.com", "123", TARGET_FILE,
+        "{\"sections\":{},\"order\":[]}", raw_sha256(before), confirmed=True)
+    result = cli.write_file(request)
+    assert result.status == "VERIFY_FAILED"
+    assert result.reason_code == "CLI_PUSH_ASSET_REJECTED"
+    assert result.metadata["error_count"] == 1
+    assert result.metadata["affected_asset_names"] == [TARGET_FILE]
+
+
+def test_push_json_invalid_output_is_sanitized_and_postread_wins(tmp_path, monkeypatch):
+    cli, runner, _, _ = setup(tmp_path, monkeypatch)
+    runner.push_output_override = "not json merchant-password"
+    before = runner.remote
+    request = ThemeFileWriteRequest("store-a", "example.myshopify.com", "123", TARGET_FILE,
+        "{\"sections\":{},\"order\":[\"changed\"]}", raw_sha256(before), confirmed=True)
+    result = cli.write_file(request)
+    assert result.reason_code == "POST_WRITE_NOT_APPLIED"
+    assert "merchant-password" not in repr(result)
 
 
 def test_capability_ready_pull_without_json_flag_preserves_file_bytes(tmp_path, monkeypatch):
@@ -383,8 +413,8 @@ def test_cli_write_verify_failure_requires_reviewed_rollback(tmp_path, monkeypat
     before = runner.remote
     result = cli.write_file(ThemeFileWriteRequest("store-a", "example.myshopify.com", "123", TARGET_FILE,
         "{}", raw_sha256(before), confirmed=True))
-    assert result.status == "WRITE_ATTEMPTED" and result.write_performed is True
-    assert "merchant-password" not in result.reason_code
+    assert result.status == "VERIFY_FAILED" and result.write_performed is True
+    assert result.reason_code == "POST_WRITE_NOT_APPLIED"
 
 
 def test_cli_rollback_restores_exact_raw_only_after_current_hash_check(tmp_path, monkeypatch):

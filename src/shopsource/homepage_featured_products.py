@@ -338,6 +338,25 @@ def merchandising_suitability(candidate: dict) -> int:
     return score
 
 
+def _valid_featured_schema_values(capability: dict, settings: dict, items: list[dict]) -> bool:
+    """Validate generated JSON values against exact Shopify section setting types."""
+    strategy = capability.get("strategy")
+    field = capability.get("product_field")
+    if strategy == "NATIVE_PRODUCT_LIST":
+        value = settings.get((field or {}).get("id"))
+        limit = field.get("limit") if isinstance(field, dict) else None
+        return (isinstance(value, list) and len(value) == 4 and len(set(value)) == 4
+                and all(isinstance(x, str) and x.startswith("gid://shopify/Product/") for x in value)
+                and (limit is None or limit >= 4))
+    if strategy == "NATIVE_COLLECTION":
+        collection = capability.get("collection_field") or {}
+        count = capability.get("count_field") or {}
+        return (isinstance(settings.get(collection.get("id")), str)
+                and settings.get(count.get("id")) == 4 and count.get("type") == "range"
+                and count.get("min", 0) <= 4 <= count.get("max", 0))
+    return False
+
+
 def discover_featured_product_schema(section_files: dict[str, str]) -> dict:
     """Use only proven schema field types/ids; never infer from a theme name."""
     if not isinstance(section_files, dict):
@@ -351,26 +370,57 @@ def discover_featured_product_schema(section_files: dict[str, str]) -> dict:
         except (json.JSONDecodeError, TypeError): continue
         settings = schema.get("settings") or []
         if not isinstance(settings, list) or any(not isinstance(field, dict) for field in settings): continue
-        collection = next((x for x in settings if x.get("type") == "collection"), None)
-        product_list = next((x for x in settings if x.get("type") in {"product_list", "product"}), None)
-        if not collection and not product_list: continue
         searchable = f"{filename} {schema.get('name', '')}".casefold()
         if not any(word in searchable for word in ("featured", "product", "collection")): continue
         def field(kind):
             return next((x for x in settings if kind in f"{x.get('id','')} {x.get('label','')}".casefold()), None)
-        mode = "DIRECT_PRODUCTS" if product_list else "FEATURED_COLLECTION"
-        candidates.append({"filename": filename, "type": filename.rsplit("/", 1)[-1].removesuffix(".liquid"),
-                           "mode": mode, "confidence": "HIGH", "schema": schema,
-                           "product_field": product_list, "collection_field": collection,
-                           "heading_field": field("heading") or field("title"),
-                           "subheading_field": field("subheading") or field("description"),
-                           "count_field": field("product") if collection else None,
-                           "columns_desktop_field": field("columns desktop"),
-                           "columns_mobile_field": field("columns mobile"), "image_ratio_field": field("image ratio")})
+        common = {"filename": filename, "type": filename.rsplit("/", 1)[-1].removesuffix(".liquid"),
+                  "confidence": "HIGH", "schema": schema,
+                  "heading_field": field("heading") or field("title"),
+                  "subheading_field": field("subheading") or field("description"),
+                  "columns_desktop_field": field("columns desktop"),
+                  "columns_mobile_field": field("columns mobile"), "image_ratio_field": field("image ratio")}
+        product_list = next((x for x in settings if x.get("type") == "product_list"), None)
+        if product_list:
+            limit = product_list.get("limit")
+            compatible = limit is None or (isinstance(limit, int) and not isinstance(limit, bool) and limit >= 4)
+            candidates.append({**common, "strategy": "NATIVE_PRODUCT_LIST", "mode": "DIRECT_PRODUCTS",
+                               "product_field": product_list, "collection_field": None,
+                               "limit": limit, "compatible_for_4": compatible})
+        product_block = next((b for b in (schema.get("blocks") or []) if isinstance(b, dict) and any(
+            isinstance(s, dict) and s.get("type") == "product" for s in b.get("settings", []))), None)
+        if product_block:
+            block_field = next(s for s in product_block["settings"] if s.get("type") == "product")
+            max_blocks = schema.get("max_blocks")
+            compatible = max_blocks is None or (isinstance(max_blocks, int) and max_blocks >= 4)
+            candidates.append({**common, "strategy": "NATIVE_PRODUCT_BLOCKS", "mode": "PRODUCT_BLOCKS",
+                               "product_field": block_field, "block_type": product_block.get("type"),
+                               "max_blocks": max_blocks, "compatible_for_4": compatible})
+        collection = next((x for x in settings if x.get("type") == "collection"), None)
+        if collection:
+            count_field = next((x for x in settings if x.get("type") == "range" and isinstance(x.get("id"), str)
+                                and re.search(r"section\.settings\." + re.escape(x["id"]), raw)), None)
+            maximum = count_field.get("max") if count_field else None
+            collection_used = bool(re.search(r"section\.settings\." + re.escape(collection.get("id", "")), raw))
+            loop_uses_collection = bool(re.search(
+                r"(?:for|paginate)\s+[^\n{}]*section\.settings\." + re.escape(collection.get("id", "")), raw, re.I))
+            compatible = (collection_used and loop_uses_collection and isinstance(maximum, (int, float)) and maximum >= 4)
+            candidates.append({**common, "strategy": "NATIVE_COLLECTION", "mode": "FEATURED_COLLECTION",
+                               "product_field": None, "collection_field": collection,
+                               "count_field": count_field, "limit": maximum, "compatible_for_4": compatible})
+        for single in (x for x in settings if x.get("type") == "product"):
+            candidates.append({**common, "strategy": "SINGLE_PRODUCT_ONLY", "mode": "SINGLE_PRODUCT_ONLY",
+                               "product_field": single, "collection_field": None, "compatible_for_4": False})
     if not candidates:
         return {"status": "MANUAL_ACTION_REQUIRED", "confidence": "LOW", "reason": "현재 테마에 안전하게 확인된 상품 리스트 섹션이 없습니다."}
-    candidates.sort(key=lambda x: (x["mode"] != "DIRECT_PRODUCTS", x["filename"]))
-    return {"status": "READY", **candidates[0]}
+    priority = {"NATIVE_PRODUCT_LIST": 0, "NATIVE_PRODUCT_BLOCKS": 1,
+                "NATIVE_COLLECTION": 2, "SINGLE_PRODUCT_ONLY": 3}
+    candidates.sort(key=lambda x: (not x.get("compatible_for_4", False), priority[x["strategy"]], x["filename"]))
+    chosen = candidates[0]
+    if not chosen.get("compatible_for_4"):
+        return {"status": "MANUAL_ACTION_REQUIRED", "confidence": "LOW",
+                "reason": "MULTI_PRODUCT_SECTION_UNAVAILABLE", "candidates": candidates}
+    return {"status": "READY", **chosen}
 
 
 class FeaturedProductAssignmentService:
@@ -581,12 +631,36 @@ class FeaturedProductAssignmentService:
         settings = {}
         if capability.get("heading_field"): settings[capability["heading_field"]["id"]] = plan["heading"]
         if capability.get("subheading_field") and plan.get("subheading"): settings[capability["subheading_field"]["id"]] = plan["subheading"]
-        if capability["mode"] == "DIRECT_PRODUCTS": settings[capability["product_field"]["id"]] = [x["shopify_product_id"] for x in plan["items"]]
-        elif plan.get("collection_handle"): settings[capability["collection_field"]["id"]] = plan["collection_handle"]
-        else: return {"status": "MANUAL_ACTION_REQUIRED", "reason": "추천 컬렉션 handle이 연결되지 않았습니다. 컬렉션 연결을 먼저 확인하세요.", "fallback": {
-            "collection_key": plan.get("collection_key") or "homepage-new-arrivals", "title": plan["heading"],
-            "owned_tag": "shopsource:homepage:featured-products", "preserve_merchant_tags": True}, "write_performed": False}
+        blocks = None
+        verified_collection = None
+        strategy = capability.get("strategy")
+        if strategy == "NATIVE_PRODUCT_LIST":
+            settings[capability["product_field"]["id"]] = [x["shopify_product_id"] for x in plan["items"]]
+        elif strategy == "NATIVE_PRODUCT_BLOCKS":
+            blocks = [{"type": capability["block_type"], "settings": {
+                capability["product_field"]["id"]: item["shopify_product_id"]}} for item in plan["items"]]
+        elif strategy == "NATIVE_COLLECTION":
+            proof = snapshot.get("verified_collection")
+            expected_ids = [x["shopify_product_id"] for x in plan["items"]]
+            count_field = capability.get("count_field")
+            if (not isinstance(proof, dict) or proof.get("verified") is not True
+                    or proof.get("handle") != plan.get("collection_handle")
+                    or proof.get("product_ids") != expected_ids):
+                return {"status": "MANUAL_ACTION_REQUIRED", "reason": "FEATURED_COLLECTION_MEMBERSHIP_UNVERIFIED",
+                        "write_performed": False}
+            verified_collection = {"verified": True, "handle": proof["handle"], "product_ids": list(proof["product_ids"])}
+            if not count_field or count_field.get("max", 0) < 4:
+                return {"status": "BLOCKED", "reason": "FEATURED_SCHEMA_VALUE_TYPE_MISMATCH", "write_performed": False}
+            settings[capability["collection_field"]["id"]] = proof["handle"]
+            settings[count_field["id"]] = 4
+        else:
+            return {"status": "BLOCKED", "reason": "FEATURED_SCHEMA_VALUE_TYPE_MISMATCH", "write_performed": False}
+        if strategy != "NATIVE_PRODUCT_BLOCKS" and not _valid_featured_schema_values(capability, settings, plan.get("items", [])):
+            return {"status": "BLOCKED", "reason": "FEATURED_SCHEMA_VALUE_TYPE_MISMATCH", "write_performed": False}
+        if blocks is not None and len(blocks) != 4:
+            return {"status": "BLOCKED", "reason": "FEATURED_SCHEMA_VALUE_TYPE_MISMATCH", "write_performed": False}
         before = sections.get(section_id); desired = {"type": capability["type"], "settings": settings}
+        if blocks is not None: desired["blocks"] = blocks
         if legacy_id:
             legacy_section = sections.get(legacy_id) or {}
             legacy_settings = legacy_section.get("settings") or {}
@@ -616,6 +690,7 @@ class FeaturedProductAssignmentService:
         return {"status": "PREVIEW", "plan_id": plan["plan_id"], "capability": capability, "current": current,
                 "proposed": proposed, "section_id": section_id, "action": "NO_CHANGE" if before == desired else "UPDATE" if before else "CREATE",
                 "migration": {"from": legacy_id, "to": section_id} if legacy_id else None,
+                "verified_collection": verified_collection,
                 "preview_hash": preview_hash, "source_document": source_document,
                 "write_performed": False, "unrelated_sections_preserved": True}
 
@@ -812,7 +887,8 @@ class FeaturedProductThemeApplyService:
         source_raw_hash = source.get("before_raw_hash")
         source_semantic_hash = source.get("before_semantic_hash")
         if (preview.get("store_id") != str(store_id) or preview.get("featured_products_plan_id") != plan_id
-                or source.get("filename") != filename or preview.get("capability", {}).get("mode") != "DIRECT_PRODUCTS"
+                or source.get("filename") != filename or preview.get("capability", {}).get("strategy") not in {
+                    "NATIVE_PRODUCT_LIST", "NATIVE_PRODUCT_BLOCKS", "NATIVE_COLLECTION"}
                 or section_id != expected_section or not is_valid_shopify_instance_id(section_id)
                 or filename != "templates/index.json" or not theme.get("id") or theme.get("role") != "MAIN"
                 or not source_raw_hash or not source_semantic_hash
@@ -903,9 +979,29 @@ class FeaturedProductThemeApplyService:
                 isolated_diff_safe=False, unexpected_paths=guard["unexpected_paths"], **comparison), None
         expected_ids = [item["shopify_product_id"] for item in plan["items"]]
         selected_section = ((proposed.get("sections") or {}).get(section_id) or {}) if isinstance(proposed, dict) else {}
-        field_id = (preview.get("capability", {}).get("product_field") or {}).get("id")
-        proposed_ids = (selected_section.get("settings") or {}).get(field_id) if field_id else None
-        if proposed_ids != expected_ids:
+        schema_capability = preview.get("capability") or {}
+        strategy = schema_capability.get("strategy")
+        selected_settings = selected_section.get("settings") or {}
+        if strategy == "NATIVE_PRODUCT_LIST":
+            field_id = (schema_capability.get("product_field") or {}).get("id")
+            shape_ok = selected_settings.get(field_id) == expected_ids if field_id else False
+        elif strategy == "NATIVE_PRODUCT_BLOCKS":
+            field_id = (schema_capability.get("product_field") or {}).get("id")
+            block_type = schema_capability.get("block_type")
+            blocks = selected_section.get("blocks") or []
+            shape_ok = (len(blocks) == 4 and [((b.get("settings") or {}).get(field_id)) for b in blocks] == expected_ids
+                        and all(b.get("type") == block_type for b in blocks))
+        elif strategy == "NATIVE_COLLECTION":
+            collection_id = (schema_capability.get("collection_field") or {}).get("id")
+            count_field = schema_capability.get("count_field") or {}
+            proof = preview.get("verified_collection") or {}
+            shape_ok = (proof.get("verified") is True and proof.get("product_ids") == expected_ids
+                        and proof.get("handle") == selected_settings.get(collection_id)
+                        and selected_settings.get(count_field.get("id")) == 4
+                        and count_field.get("type") == "range")
+        else:
+            shape_ok = False
+        if not shape_ok:
             return self._preflight_result("CONFLICT", "PRODUCT_IDS_MISMATCH",
                 isolated_diff_safe=True, product_ids_match=False, **comparison), None
         proposed_raw = render_shopify_json_document(document, proposed)
@@ -1031,7 +1127,9 @@ class FeaturedProductThemeApplyService:
         if (current_result.backend_name != expected_backend
                 or not _same_theme_id(current_result.theme_id, expected_theme_id)
                 or current_result.filename != expected_filename
-                or current_result.metadata.get("verified_theme_role", "MAIN") != "MAIN"):
+                or current_result.metadata.get("verified_theme_role", "MAIN") not in {"MAIN", "unknown"}
+                or (current_result.metadata.get("verified_theme_role") == "unknown"
+                    and current_result.metadata.get("read_only") is not True)):
             return {**base, "reason_code": "POST_WRITE_TARGET_IDENTITY_MISMATCH",
                     "current_raw_hash": current_result.raw_sha256, "current_semantic_hash": None}
         try:
@@ -1040,6 +1138,15 @@ class FeaturedProductThemeApplyService:
             return {**base, "reason_code": "POST_WRITE_SEMANTIC_MISMATCH",
                     "current_raw_hash": current_result.raw_sha256, "current_semantic_hash": None}
         current = current_doc.parsed
+        if current_doc.raw_hash == before_doc.raw_hash:
+            return {**base, "current_raw_hash": current_doc.raw_hash,
+                    "current_semantic_hash": current_doc.semantic_hash,
+                    "raw_equal": current_doc.raw_hash == proposed_doc.raw_hash,
+                    "semantic_equal": current_doc.semantic_hash == proposed_doc.semantic_hash,
+                    "prefix_equal": current_doc.prefix == before_doc.prefix,
+                    "suffix_equal": current_doc.suffix == before_doc.suffix,
+                    "unrelated_sections_unchanged": True,
+                    "reason_code": "POST_WRITE_NOT_APPLIED"}
         actual_values = (((current or {}).get("sections") or {}).get(section_id) or {}).get(
             "settings", {}).get(product_field_id) if isinstance(current, dict) else None
         references = compare_shopify_product_references(actual_values, selected_products)

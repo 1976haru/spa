@@ -239,6 +239,8 @@ class FeaturedThemeBackendCoordinator:
         selected = self.select_backend(store_id, theme_id, selection)
         graph = selected["capabilities"]["ADMIN_GRAPHQL"]
         cli = selected["capabilities"]["THEME_ACCESS_CLI"]
+        read_status = getattr(self.cli_backend, "read_capability_status", None)
+        read_cli = read_status(store_id, theme_id=theme_id) if theme_id and callable(read_status) else None
         has_credential = credential_present(store_id)
         main = graph.details if graph.details.get("identity_verified") else cli.details
         if not identity.get("id"):
@@ -249,6 +251,10 @@ class FeaturedThemeBackendCoordinator:
                 "verification_attempt": bool(graph.details.get("verification_attempt")),
                 "theme_access_cli_state": "READY" if cli.ready else ("CREDENTIAL_MISSING" if not has_credential else cli.reason_code),
                 "theme_access_cli_reason_code": cli.reason_code,
+                "theme_access_read_state": read_cli.status if read_cli else "UNAVAILABLE",
+                "theme_access_live_role_state": ("LIVE_ROLE_VERIFIED" if cli.details.get("identity_verified") is True
+                                                  and cli.details.get("verified_theme_role") == "MAIN"
+                                                  else "LIVE_ROLE_UNVERIFIED"),
                 "selected_backend": selected.get("backend_name"), "selection_reason": selected.get("reason_code"),
                 "verified_theme_id": identity.get("id") or main.get("verified_theme_id"),
                 "verified_theme_name": identity.get("name") or main.get("verified_theme_name"),

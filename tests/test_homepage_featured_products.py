@@ -328,8 +328,31 @@ def test_collection_fallback_uses_owned_tag_and_preserves_merchant_tags(tmp_path
     db, svc = service(tmp_path); seed_four(db); plan = svc.create_plan("s1")
     preview = svc.build_theme_preview(plan, {"theme_files": theme_files("collection"), "template": {"sections": {}, "order": []}})
     assert preview["status"] == "MANUAL_ACTION_REQUIRED"
-    assert preview["fallback"]["owned_tag"] == "shopsource:homepage:featured-products"
-    assert preview["fallback"]["preserve_merchant_tags"] is True
+    assert preview["reason"] == "MULTI_PRODUCT_SECTION_UNAVAILABLE"
+    assert preview.get("write_performed") is False
+
+
+def test_schema_discovery_does_not_conflate_single_product_and_product_list():
+    raw = """{% schema %}{"name":"Featured product","settings":[
+      {"type":"product","id":"product"}]}{% endschema %}"""
+    capability = discover_featured_product_schema({"sections/featured.liquid": raw})
+    assert capability["status"] == "MANUAL_ACTION_REQUIRED"
+    assert capability["reason"] == "MULTI_PRODUCT_SECTION_UNAVAILABLE"
+
+
+def test_collection_schema_requires_liquid_loop_and_four_item_capacity():
+    raw = """{% assign n = section.settings.max_products %}
+      {% for product in section.settings.collection.products limit: n %}{% endfor %}
+      {% schema %}{"name":"Product list","settings":[
+      {"type":"collection","id":"collection"},
+      {"type":"range","id":"max_products","min":1,"max":16,"step":1,"default":4}]}
+      {% endschema %}"""
+    capability = discover_featured_product_schema({"sections/product-list.liquid": raw})
+    assert capability["status"] == "READY"
+    assert capability["strategy"] == "NATIVE_COLLECTION"
+    assert capability["collection_field"]["type"] == "collection"
+    assert capability["count_field"]["type"] == "range"
+    assert capability["count_field"]["max"] >= 4
 
 
 def test_stale_preview_conflict_and_remote_verify(tmp_path):
@@ -948,7 +971,7 @@ def test_theme_access_featured_apply_end_to_end_to_assignment_ready(tmp_path, mo
                            backend_coordinator=coordinator)
     last_apply = record_featured_apply_result(state, applied, plan["plan_id"])
     refreshed = FeaturedProductAssignmentService(db=db).get_plan(plan["plan_id"])
-    assert applied["status"] == "REMOTE_JSON_VERIFIED" and applied["write_performed"] is True
+    assert applied["status"] == "REMOTE_JSON_VERIFIED" and applied["write_performed"] is True, applied.get("reason_code")
     assert state["featured_apply_status"] == "REMOTE_JSON_VERIFIED"
     assert runner.upload_count == 1
     assert runner.pull_entries == [(), (), (), (), ()]

@@ -256,6 +256,36 @@ class ShopifyThemeCLI:
              "verified_theme_role": target["role"], "target_is_live": target["role"] == "MAIN",
              "identity_verified": True, "credential_present": True, "merchant_controlled_auth": True})
 
+    def read_capability_status(self, store_id: str, *, theme_id: str) -> ThemeBackendCapabilities:
+        """Bind an exact-ID read without asserting that the target theme is MAIN."""
+        executable = self._executable()
+        if not executable:
+            return ThemeBackendCapabilities(self.backend_name, "CLI_NOT_INSTALLED", "CLI_NOT_INSTALLED")
+        numeric_id = _numeric_theme_id(theme_id)
+        if numeric_id is None:
+            return ThemeBackendCapabilities(self.backend_name, "THEME_ID_MISSING", "THEME_ID_MISSING")
+        try:
+            connection = get_connection(store_id, db=self.db)
+            password = self.credential_getter(store_id)
+        except Exception:
+            connection, password = None, None
+        if not password:
+            return ThemeBackendCapabilities(self.backend_name, "CREDENTIAL_MISSING", "CREDENTIAL_MISSING")
+        if not connection or not connection.get("shop_domain"):
+            return ThemeBackendCapabilities(self.backend_name, "STORE_NOT_CONFIGURED", "STORE_NOT_CONFIGURED")
+        try:
+            cli_domain, domain_source = _resolve_cli_store_domain(connection)
+        except ValueError:
+            return ThemeBackendCapabilities(self.backend_name, "DOMAIN_INVALID", "DOMAIN_INVALID")
+        details = {
+            "theme_id": numeric_id, "verified_theme_id": numeric_id,
+            "shop_domain": connection["shop_domain"], "configured_shop_domain": connection["shop_domain"],
+            "cli_store_domain": cli_domain, "cli_store_domain_source": domain_source,
+            "identity_verified": False, "live_role_verified": False,
+            "credential_present": True, "merchant_controlled_auth": True}
+        if domain_source == "CANONICAL_MYSHOPIFY_DOMAIN": details["canonical_myshopify_domain"] = cli_domain
+        return ThemeBackendCapabilities(self.backend_name, "READ_ONLY_READY", "LIVE_ROLE_UNVERIFIED", details)
+
     @staticmethod
     def _theme_id(theme_id: str) -> str:
         value = _numeric_theme_id(theme_id)
@@ -308,7 +338,13 @@ class ShopifyThemeCLI:
         if not _safe_target(filename):
             raise ValueError("Only templates/index.json is allowed in Phase A")
         if capability is None:
-            password, capability = self._check_connection(store_id, shop_domain, theme_id)
+            capability = self.read_capability_status(store_id, theme_id=theme_id)
+            password = self.credential_getter(store_id) if capability.read_ready else None
+            requested = _normalized_myshopify_domain(shop_domain)
+            configured = _normalized_myshopify_domain(capability.details.get("configured_shop_domain"))
+            if requested != configured:
+                password = None
+                capability = ThemeBackendCapabilities(self.backend_name, "STORE_NOT_CONFIGURED", "STORE_MISMATCH")
         else:
             if (capability.ready is not True
                     or capability.details.get("verified_theme_id") != _numeric_theme_id(theme_id)
@@ -348,7 +384,9 @@ class ShopifyThemeCLI:
         content, metadata = self._pull(store_id, shop_domain, theme_id, filename)
         return ThemeFileReadResult(filename, content, raw_sha256(content), self.backend_name,
                                    str(store_id), str(shop_domain), str(theme_id),
-                                   {**metadata, "read_only": True})
+                                   {**metadata, "read_only": True,
+                                    "verified_theme_role": "unknown", "live_role_verified": False,
+                                    "capability_state": "READ_ONLY_READY"})
 
     def verify_file(self, store_id, shop_domain, theme_id, filename, expected_raw_sha256):
         try:
@@ -373,8 +411,36 @@ class ShopifyThemeCLI:
                        "--path", str(temp), "--nodelete", "--strict", "--json"]
             if actual_live:
                 command.append("--allow-live")
-            result = self._invoke(command, password)
-            return result is not None
+            env = os.environ.copy()
+            env["SHOPIFY_CLI_THEME_TOKEN"] = password
+            try:
+                result = self.runner(command, capture_output=True, text=False, timeout=120, check=False, env=env)
+            except Exception:
+                return {"ok": False, "reason_code": "CLI_PUSH_FAILED", "metadata": {}}
+            try:
+                stdout = getattr(result, "stdout", b"") or b""
+                if isinstance(stdout, str): stdout = stdout.encode("utf-8", errors="replace")
+                payload = json.loads(stdout.decode("utf-8", errors="replace"))
+            except (TypeError, ValueError, UnicodeError):
+                return {"ok": False, "reason_code": "CLI_PUSH_RESULT_UNPARSEABLE", "metadata": {}}
+            theme = payload.get("theme", {}) if isinstance(payload, dict) else {}
+            errors = theme.get("errors", []) if isinstance(theme, dict) else []
+            if not errors and isinstance(payload, dict): errors = payload.get("errors", [])
+            warnings = theme.get("warnings", []) if isinstance(theme, dict) else []
+            asset_names = []
+            if isinstance(errors, list):
+                for error in errors:
+                    if isinstance(error, dict):
+                        name = error.get("asset") or error.get("filename") or error.get("key")
+                        if isinstance(name, str) and _safe_target(name): asset_names.append(name)
+            metadata = {"error_count": len(errors) if isinstance(errors, list) else int(bool(errors)),
+                        "warning_count": len(warnings) if isinstance(warnings, list) else int(bool(warnings)),
+                        "affected_asset_names": sorted(set(asset_names))}
+            if errors:
+                return {"ok": False, "reason_code": "CLI_PUSH_ASSET_REJECTED", "metadata": metadata}
+            if getattr(result, "returncode", 1) != 0:
+                return {"ok": False, "reason_code": "CLI_PUSH_FAILED", "metadata": metadata}
+            return {"ok": True, "reason_code": None, "metadata": metadata}
         finally:
             if not self.retain_diagnostics:
                 shutil.rmtree(temp, ignore_errors=True)
@@ -432,28 +498,33 @@ class ShopifyThemeCLI:
                                         reason_code="ALLOW_LIVE_REQUIRED")
         expected = raw_sha256(request.content)
         locked_cli_domain = _capability_cli_domain(latest, request.shop_domain)
-        pushed = self._push(request, password, request.content, actual_live=latest_live,
+        push_result = self._push(request, password, request.content, actual_live=latest_live,
                             cli_store_domain=locked_cli_domain)
         try:
             observed_content, _metadata = self._pull(request.store_id, request.shop_domain, request.theme_id,
                                                      request.filename, capability=latest)
             observed_hash = raw_sha256(observed_content)
         except Exception:
-            return ThemeFileWriteResult("ROLLBACK_REQUIRED" if pushed else "WRITE_ATTEMPTED",
+            return ThemeFileWriteResult("ROLLBACK_REQUIRED" if push_result["ok"] else "WRITE_ATTEMPTED",
                 self.backend_name, request.filename, True, expected_raw_sha256=expected,
                 reason_code="POST_WRITE_READ_FAILED")
         if observed_hash == expected:
             return ThemeFileWriteResult("REMOTE_JSON_VERIFIED", self.backend_name, request.filename, True,
                                         expected_raw_sha256=expected, observed_raw_sha256=observed_hash,
-                                        reason_code=None if pushed else "CLI_PUSH_EXIT_NONZERO_BUT_CONTENT_VERIFIED")
-        if not pushed:
-            return ThemeFileWriteResult("WRITE_ATTEMPTED", self.backend_name, request.filename, True,
+                                        reason_code=push_result.get("reason_code"))
+        if observed_hash == before.raw_sha256 and push_result.get("reason_code") == "CLI_PUSH_ASSET_REJECTED":
+            return ThemeFileWriteResult("VERIFY_FAILED", self.backend_name, request.filename, True,
                 expected_raw_sha256=expected, observed_raw_sha256=observed_hash,
-                reason_code="CLI_PUSH_FAILED_CONTENT_NOT_VERIFIED")
+                reason_code="CLI_PUSH_ASSET_REJECTED", metadata=push_result.get("metadata", {}))
         if observed_hash == before.raw_sha256:
             return ThemeFileWriteResult("VERIFY_FAILED", self.backend_name, request.filename, True,
-                                        expected_raw_sha256=expected, observed_raw_sha256=observed_hash,
-                                        reason_code="REMOTE_CONTENT_UNCHANGED")
+                expected_raw_sha256=expected, observed_raw_sha256=observed_hash,
+                reason_code="POST_WRITE_NOT_APPLIED", metadata=push_result.get("metadata", {}))
+        if not push_result["ok"]:
+            return ThemeFileWriteResult("WRITE_ATTEMPTED", self.backend_name, request.filename, True,
+                expected_raw_sha256=expected, observed_raw_sha256=observed_hash,
+                reason_code=push_result.get("reason_code") or "CLI_PUSH_FAILED_CONTENT_NOT_VERIFIED",
+                metadata=push_result.get("metadata", {}))
         # A different post-write value may be a merchant edit; never overwrite it automatically.
         return ThemeFileWriteResult("ROLLBACK_REQUIRED", self.backend_name, request.filename, True,
                                     expected_raw_sha256=expected, observed_raw_sha256=observed_hash,
@@ -503,7 +574,7 @@ class ShopifyThemeCLI:
                                         reason_code="ALLOW_LIVE_REQUIRED")
         locked_cli_domain = _capability_cli_domain(latest, request.shop_domain)
         if not self._push(request, password, original_content, actual_live=latest_live,
-                          cli_store_domain=locked_cli_domain):
+                          cli_store_domain=locked_cli_domain).get("ok"):
             return ThemeFileWriteResult("ROLLBACK_REQUIRED", self.backend_name, request.filename, True,
                                         expected_raw_sha256=raw_sha256(original_content), reason_code="ROLLBACK_PUSH_FAILED")
         expected = raw_sha256(original_content)

@@ -26,6 +26,10 @@ class ThemeBackendCapabilities:
     def ready(self) -> bool:
         return self.status == "READY"
 
+    @property
+    def read_ready(self) -> bool:
+        return self.status in {"READY", "READ_ONLY_READY"}
+
 
 @dataclass(frozen=True)
 class ThemeFileReadResult:
