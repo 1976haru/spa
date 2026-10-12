@@ -1,0 +1,163 @@
+ShopSource Studio — READ-ONLY THEME IDENTITY FALLBACK + SCHEMA AUDIT RESUME
+
+Baseline main: 606bc1eee9e444acd2ee7e68392a953555c385f8
+Branch: hotfix/featured-schema-contract-and-push-json
+Current branch HEAD before this prompt: e4123d84d2cb7676e01f64d513725dd946f87bff
+
+Context
+- Previous forensic already proved current Store 001 MAIN file equals BEFORE and prior write did not apply.
+- New schema hotfix is blocked because ad-hoc theme list returned a structured abort 6 times.
+- Do NOT code the schema strategy yet.
+- First recover a reliable READ-ONLY identity path and complete the real MAIN schema audit.
+
+Important Shopify CLI facts
+- Current Shopify CLI upstream supports:
+  shopify theme list --store ... --id ... --json
+- Current Shopify CLI upstream also supports:
+  shopify theme info --store ... --theme <id> --json
+  and its JSON includes theme.id, theme.name, theme.role, theme.shop.
+- SHOPIFY_CLI_THEME_TOKEN is the supported env var for Theme Access password.
+
+Mission
+1. Diagnose the local theme-list abort without printing raw CLI output or credentials.
+2. If theme list remains unusable, use theme info --theme <numeric-id> --json as the READ-ONLY identity fallback.
+3. Once exact MAIN identity is verified, pull only read-only section schema files needed for the audit.
+4. Produce the candidate strategy report.
+5. Do NOT modify implementation yet unless the schema audit completes successfully.
+
+Safety
+- No Shopify write
+- No rollback
+- No product/collection mutation
+- No credential creation/deletion
+- No code changes before schema audit success
+- No commit/push unless actual implementation later occurs
+- Never print credential
+- Never print raw CLI stderr/stdout
+- Only print sanitized categories/codes
+
+Step A — local CLI capability fingerprint
+Record safely:
+- resolved shopify executable path
+- shopify version
+- exact canonical domain
+- numeric theme id 162910503161
+- whether credential is present: YES/NO only
+
+Do not print token.
+
+Step B — theme-list structured abort classification
+Run exactly ONE normal theme-list attempt using env-only Theme Access credential:
+  shopify theme list --store <canonical-domain> --id 162910503161 --json
+
+Capture bytes safely and decode UTF-8 with errors=replace after process completion.
+Do not print raw output.
+
+Classify sanitized result into:
+- LIST_OK
+- UNSUPPORTED_ID_OPTION
+- AUTH_FAILED
+- NETWORK_ERROR
+- THEME_NOT_FOUND
+- JSON_INVALID
+- STRUCTURED_ABORT_OTHER
+
+If nonzero, inspect only machine-safe markers:
+- process return code
+- whether stdout parses as JSON
+- top-level JSON keys
+- safe error type/code/name fields
+- presence of terms categories, not full message text
+
+Step C — fallback identity using theme info
+If LIST_OK is false, try exactly once:
+  shopify theme info --store <canonical-domain> --theme 162910503161 --json
+
+Use same env-only credential.
+Parse JSON safely.
+Require:
+- theme.id == 162910503161
+- theme.role == MAIN or live-equivalent normalized to MAIN
+- theme.shop matches canonical domain
+- theme.name is non-empty
+
+If this passes:
+IDENTITY_VERIFIED_BY = THEME_INFO_JSON
+
+If this fails:
+STOP.
+Report sanitized category.
+Do not pull schemas.
+
+Step D — schema pull after verified identity
+After identity verification only, use an isolated EMPTY temp directory.
+
+Prefer a read-only pull of section Liquid files:
+  shopify theme pull --store <canonical-domain> --theme 162910503161 --only "sections/*.liquid" --path <empty-temp> --no-input
+
+If glob form is unsupported, do not guess repeatedly.
+Fallback:
+- obtain safe file listing using a read-only CLI-supported mechanism if available
+- or pull only known candidate section files already referenced by existing ShopSource snapshot/capability evidence
+- never push
+
+Do not modify repo files.
+Read pulled schema blocks from temp only.
+
+Step E — candidate report
+Inspect schema blocks and report only metadata.
+
+Classify every candidate:
+A NATIVE_PRODUCT_LIST
+- section-level setting type=product_list
+- capacity >=4 or no restrictive limit
+
+B NATIVE_PRODUCT_BLOCKS
+- repeatable block with type=product
+- max_blocks >=4 or equivalent capacity
+
+C NATIVE_COLLECTION
+- section-level setting type=collection
+- section can render >=4 items
+
+D SINGLE_PRODUCT_ONLY
+- only section-level type=product
+
+For each candidate report:
+- section filename/type
+- schema name
+- strategy A/B/C/D
+- product/collection field ids and types
+- relevant limits/max_blocks
+- compatibility with requested_count=4
+
+Preferred:
+A > B > C
+D is invalid for 4 products.
+
+Step F — only after successful schema audit
+If candidate A/B/C exists:
+- continue the original CODEX_FEATURED_SCHEMA_CONTRACT_AND_PUSH_JSON_HOTFIX.txt implementation
+- use the real candidate evidence
+- then run tests and commit/push same branch
+
+If no A/B/C:
+- STOP with MULTI_PRODUCT_SECTION_UNAVAILABLE
+- no speculative implementation
+
+Final report
+THEME_LIST_RESULT = ...
+THEME_INFO_FALLBACK = PASS/FAIL/NOT_NEEDED
+IDENTITY_VERIFIED_BY = THEME_LIST_JSON/THEME_INFO_JSON/NONE
+MAIN_THEME_ID = 162910503161 or UNKNOWN
+MAIN_ROLE = MAIN or UNKNOWN
+SCHEMA_PULL = PASS/FAIL
+CANDIDATE_A_COUNT = n
+CANDIDATE_B_COUNT = n
+CANDIDATE_C_COUNT = n
+CANDIDATE_D_COUNT = n
+CHOSEN_STRATEGY = ...
+SHOPIFY_WRITE_COUNT = 0
+ROLLBACK_COUNT = 0
+CODE_CHANGED_BEFORE_AUDIT = NO
+IMPLEMENTATION_RESUMED = YES/NO
