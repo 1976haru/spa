@@ -1,0 +1,297 @@
+ShopSource Studio — COMPRESSED CLI COMPATIBILITY A/B + REAL SCHEMA AUDIT
+READ-ONLY FIRST, THEN RESUME IMPLEMENTATION ONLY IF EVIDENCE IS SUFFICIENT
+
+Repository
+- Baseline main: 606bc1eee9e444acd2ee7e68392a953555c385f8
+- Branch: hotfix/featured-schema-contract-and-push-json
+- Current branch HEAD before this prompt: 0f9fb31341a4409f4404a018490e18fe7764193a
+
+Why this pass exists
+- Global Shopify CLI is now 4.9.3.
+- With 4.9.3, both theme list and theme info returned structured abort for Store 001 using the existing Theme Access credential.
+- Earlier Store 001 read-only Theme Access pull had succeeded and the failed Step-5 forensic proved CURRENT == BEFORE.
+- Shopify CLI 4.9.x is very recent; do not assume the store credential is bad from list/info abort alone.
+- We need a read-only compatibility A/B against the previous stable 4.8.5 WITHOUT replacing the user's global CLI.
+
+MISSION
+1. Compare 4.9.3 vs 4.8.5 read-only behavior using the SAME canonical domain, exact theme ID, and existing Theme Access credential.
+2. Do not modify the global Shopify CLI installation.
+3. If 4.8.5 succeeds, use ONLY that pinned temporary CLI for the schema audit.
+4. If the schema audit succeeds, resume the existing FEATURED_SCHEMA_CONTRACT_AND_PUSH_JSON implementation in the same branch.
+5. If both versions fail, stop with a sanitized classification and do not implement schema guesses.
+
+SAFETY
+- NO Shopify write
+- NO theme push
+- NO rollback
+- NO product/collection mutation
+- NO credential creation/deletion
+- NEVER print credential
+- NEVER print raw verbose output
+- No global npm install/uninstall/update
+- Do not touch protected files, DBs, .env, phase/temp folders
+- No code changes before schema audit succeeds
+
+KNOWN TARGET
+- Store ID: 001
+- canonical domain: kgxbpi-it.myshopify.com
+- theme numeric ID: 162910503161
+- expected role: MAIN
+- existing Theme Access credential: present in Windows Credential Manager
+- global CLI observed: 4.9.3
+
+======================================================================
+PHASE A — BUILD A SANITIZED READ-ONLY RUNNER
+======================================================================
+
+Use Python or PowerShell to invoke commands with:
+- SHOPIFY_CLI_THEME_TOKEN set only in child environment
+- UTF-8-safe byte capture
+- no raw stdout/stderr printed
+- timeout
+- return code + parsed JSON safe fields only
+
+Safe diagnostic output may include:
+- CLI version
+- return code
+- JSON parsed YES/NO
+- top-level keys
+- error.type / error.code / error.name if structured
+- HTTP status if explicitly present as a numeric safe field
+- theme id/name/role/shop when command succeeds
+- no full error message
+- no headers
+- no request body
+- no token
+
+======================================================================
+PHASE B — A/B TEST 4.9.3 VS 4.8.5
+======================================================================
+
+B1. Current global 4.9.3
+Run once each:
+- theme list --store <canonical> --id 162910503161 --json --no-input
+- theme info --store <canonical> --theme 162910503161 --json --no-input
+
+Classify each safely.
+
+B2. Pinned 4.8.5 WITHOUT global install change
+Use one of these temporary mechanisms:
+- npx --yes @shopify/cli@4.8.5 ...
+or equivalent npm exec that does not alter the global Shopify CLI.
+
+Confirm the invoked CLI reports exactly 4.8.5 before using it.
+
+Run once each:
+- theme list --store <canonical> --id 162910503161 --json --no-input
+- theme info --store <canonical> --theme 162910503161 --json --no-input
+
+Use the same child env token.
+
+Classification for each command:
+PASS
+AUTH_FAILED
+NETWORK_ERROR
+THEME_NOT_FOUND
+UNSUPPORTED_OPTION
+STRUCTURED_ABORT
+JSON_INVALID
+OTHER_SAFE_CODE
+
+Do not repeat more than one attempt per command/version unless a transient timeout occurs.
+
+======================================================================
+PHASE C — DECISION
+======================================================================
+
+If 4.9.3 fails and 4.8.5 passes:
+- CLI_COMPAT_RESULT = PIN_4_8_5_FOR_THEME_ACCESS
+- Do NOT downgrade/uninstall global 4.9.3.
+- Use the temporary 4.8.5 executable for the schema audit only.
+- Record this as evidence for a later ShopSource runtime version-pinning policy.
+
+If both pass:
+- prefer global 4.9.3 and continue.
+
+If both fail:
+- STOP.
+- No schema implementation.
+- Report exact sanitized classifications.
+- Do not regenerate credential automatically.
+
+If 4.9.3 passes and 4.8.5 fails:
+- use 4.9.3.
+
+======================================================================
+PHASE D — VERIFY MAIN IDENTITY
+======================================================================
+
+Using the selected working CLI version:
+Prefer theme info --json because it directly returns exact theme metadata.
+
+Require:
+- id == 162910503161
+- role normalized == MAIN
+- shop == kgxbpi-it.myshopify.com
+- non-empty theme name
+
+If theme info unavailable but theme list passes:
+- require one unambiguous matching id with MAIN role
+
+If identity cannot be proven:
+STOP.
+
+======================================================================
+PHASE E — READ-ONLY REAL SCHEMA AUDIT
+======================================================================
+
+After identity verification only.
+
+Use an isolated empty temp directory.
+
+Attempt a SINGLE read-only schema pull with the selected working CLI:
+theme pull
+  --store <canonical>
+  --theme 162910503161
+  --only "sections/*.liquid"
+  --path <empty-temp>
+  --no-input
+
+If the CLI treats the glob literally or rejects it:
+- classify once
+- then use a safe fallback that does not write:
+  1. if current theme pull supports multiple --only values, use known candidate filenames discovered from local theme snapshot/evidence
+  2. otherwise read-only pull the theme into an isolated temp directory, but only if this does not modify the repo and identity is verified
+- no push under any circumstance
+
+Inspect only schema blocks in the temp copy.
+
+Report candidate metadata only, not full Liquid.
+
+Classify:
+A NATIVE_PRODUCT_LIST
+- section-level type=product_list
+- limit >=4 or no restrictive limit
+
+B NATIVE_PRODUCT_BLOCKS
+- repeatable block with a type=product field
+- capacity >=4
+
+C NATIVE_COLLECTION
+- section-level type=collection
+- section can display >=4 products
+
+D SINGLE_PRODUCT_ONLY
+- section-level type=product only
+
+For every candidate:
+- section filename
+- schema name
+- strategy A/B/C/D
+- relevant setting id/type
+- relevant limit/max_blocks
+- requested_count=4 compatibility
+
+Selection priority:
+A > B > C
+D is never valid for 4-product direct injection.
+
+======================================================================
+PHASE F — RESUME EXISTING HOTFIX ONLY AFTER AUDIT PASS
+======================================================================
+
+If A/B/C candidate exists:
+Resume the original:
+CODEX_FEATURED_SCHEMA_CONTRACT_AND_PUSH_JSON_HOTFIX.txt
+
+Use ONLY evidence from the real schema audit.
+
+Also implement a CLI version-compatibility policy based on the A/B result:
+
+If 4.9.3 fails but 4.8.5 passes:
+- do NOT hardcode "latest"
+- introduce a small, explicit supported Theme CLI runtime policy
+- default working/pinned version for Theme Access = 4.8.5 until compatibility is revalidated
+- do not silently download on every operation
+- provide one local setup/bootstrap path and cached executable/package location
+- expose current Theme CLI version and compatibility state under advanced diagnostics
+- beginner UI only shows "Theme 연결 준비됨" or "지원되지 않는 CLI 버전"
+- no auto-upgrade
+- unit tests cover supported and unsupported versions
+
+If both versions pass:
+- no pinning code needed.
+
+Then implement:
+- product vs product_list contract separation
+- A/B/C strategy support as real evidence requires
+- preview value-shape validation
+- push --json structured error parsing
+- current==before => POST_WRITE_NOT_APPLIED priority
+- recovery UX "새 안전 미리보기 만들기"
+- no auto reapply/rollback
+
+======================================================================
+PHASE G — TESTS
+======================================================================
+
+Before commit:
+- compileall
+- diff-check
+- CLI/UI help
+- focused schema/Featured/Theme CLI/recovery tests
+- full pytest with fresh basetemp
+
+No real Shopify write in tests.
+
+======================================================================
+PHASE H — COMMIT/PUSH
+======================================================================
+
+Only if schema audit succeeded and implementation/tests succeeded:
+- commit on same branch
+- push same branch
+- do NOT merge main
+
+If audit fails:
+- leave code unchanged
+- do not commit implementation
+
+======================================================================
+FINAL REPORT
+======================================================================
+
+[1] Global CLI version
+[2] 4.9.3 theme list result
+[3] 4.9.3 theme info result
+[4] 4.8.5 temporary CLI verified version
+[5] 4.8.5 theme list result
+[6] 4.8.5 theme info result
+[7] CLI_COMPAT_RESULT
+[8] Identity verification method/version
+[9] Schema pull result
+[10] A/B/C/D candidate counts
+[11] Chosen strategy
+[12] Whether CLI pinning policy was implemented
+[13] Schema implementation resumed YES/NO
+[14] Tests
+[15] Shopify write count
+[16] Credential creation/deletion count
+[17] Code changed before schema audit YES/NO
+[18] Final feature SHA if implemented
+[19] Merge readiness
+[20] Exact next action
+
+Final flags:
+GLOBAL_CLI_4_9_3_TESTED = YES
+PINNED_CLI_4_8_5_TESTED = YES
+CLI_COMPAT_RESULT = ...
+MAIN_IDENTITY_VERIFIED = YES/NO
+REAL_SCHEMA_AUDIT = PASS/FAIL
+PRODUCT_LIST_CANDIDATE = YES/NO
+PRODUCT_BLOCK_CANDIDATE = YES/NO
+COLLECTION_CANDIDATE = YES/NO
+SINGLE_PRODUCT_USED_FOR_MULTI_PRODUCT = NO
+SHOPIFY_LIVE_WRITE_COUNT = 0
+CODE_CHANGED_BEFORE_AUDIT = NO
+CODE_MERGE_READY = YES/NO
